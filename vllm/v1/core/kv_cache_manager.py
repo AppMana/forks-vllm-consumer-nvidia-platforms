@@ -350,6 +350,9 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        block_ids_to_skip_releasing = self._block_ids_to_skip_releasing(
+            new_computed_block_list
+        )
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
@@ -364,7 +367,9 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            if not self._has_enough_free_blocks(
+                num_blocks_to_allocate, block_ids_to_skip_releasing
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -392,8 +397,11 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        if num_blocks_to_allocate > available_blocks:
+        if not self._has_enough_free_blocks(
+            num_blocks_to_allocate,
+            block_ids_to_skip_releasing,
+            reserved_blocks=reserved_blocks,
+        ):
             # Cannot allocate new blocks
             return None
 
@@ -466,6 +474,31 @@ class KVCacheManager:
         """
         self.block_pool.evict_blocks(block_ids)
 
+    @staticmethod
+    def _block_ids_to_skip_releasing(
+        blocks: tuple[Sequence[KVCacheBlock], ...],
+    ) -> set[int]:
+        return {
+            block.block_id
+            for group_blocks in blocks
+            for block in group_blocks
+            if not block.is_null
+        }
+
+    def _has_enough_free_blocks(
+        self,
+        num_blocks: int,
+        block_ids_to_skip_releasing: set[int] | None = None,
+        reserved_blocks: int = 0,
+    ) -> bool:
+        required_free_blocks = num_blocks + reserved_blocks
+        if required_free_blocks <= self.block_pool.get_num_free_blocks():
+            return True
+        self.coordinator.release_protected_prompt_blocks(
+            required_free_blocks, block_ids_to_skip_releasing
+        )
+        return required_free_blocks <= self.block_pool.get_num_free_blocks()
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,
@@ -475,6 +508,7 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        self.coordinator.release_protected_prompt_blocks()
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
