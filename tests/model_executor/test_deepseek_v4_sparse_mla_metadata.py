@@ -115,6 +115,33 @@ def test_indexed_d512_multi_prefill_rejects_cached_prefix(monkeypatch) -> None:
     )
 
 
+def test_indexed_d512_fused_sink_prefill_requires_env_and_split(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_FUSED_SINK_PREFILL",
+        False,
+        raising=False,
+    )
+    assert not flashmla._use_indexed_d512_fused_sink_prefill(
+        split_prefill=True,
+    )
+
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_FUSED_SINK_PREFILL",
+        True,
+        raising=False,
+    )
+    assert not flashmla._use_indexed_d512_fused_sink_prefill(
+        split_prefill=False,
+    )
+    assert flashmla._use_indexed_d512_fused_sink_prefill(
+        split_prefill=True,
+    )
+
+
 def test_prefill_has_cached_prefix_detects_extend_rows() -> None:
     assert not flashmla._prefill_has_cached_prefix(
         seq_lens_cpu=torch.tensor([6, 4], dtype=torch.int32),

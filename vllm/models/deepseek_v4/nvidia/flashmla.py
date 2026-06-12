@@ -41,6 +41,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_d512_chunked_sparse_mla_attention,
     accumulate_indexed_d512_split_sparse_mla_attention,
+    accumulate_indexed_d512_split_sparse_mla_attention_with_sink,
     accumulate_indexed_sparse_mla_attention_chunk,
     build_combined_sparse_mla_decode_valid_mask,
     finish_sparse_mla_attention_with_sink,
@@ -490,6 +491,13 @@ def _allow_indexed_d512_prefill_request_count(
         request_count > 1
         and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL
         and not has_cached_prefix
+    )
+
+
+def _use_indexed_d512_fused_sink_prefill(*, split_prefill: bool) -> bool:
+    return (
+        split_prefill
+        and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_FUSED_SINK_PREFILL
     )
 
 
@@ -1112,21 +1120,38 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 indexed_d512_chunked_buffers is not None
                 and indexed_d512_chunked_buffers[0].shape[0] >= num_tokens
             )
+            finished_with_sink = False
             if can_use_indexed_d512_scores:
                 assert indexed_d512_scores is not None
-                accumulate_indexed_d512_split_sparse_mla_attention(
-                    q=q_chunk,
-                    kv_flat=kv_flat,
-                    indices=indices_chunk_full,
-                    lens=lens_chunk,
-                    scale=layer.scale,
-                    max_score=max_score,
-                    denom=denom,
-                    acc=subset_acc,
-                    scores=indexed_d512_scores[
-                        :num_tokens, :, : combined_indices.shape[-1]
-                    ],
-                )
+                scores = indexed_d512_scores[
+                    :num_tokens, :, : combined_indices.shape[-1]
+                ]
+                if _use_indexed_d512_fused_sink_prefill(split_prefill=True):
+                    accumulate_indexed_d512_split_sparse_mla_attention_with_sink(
+                        q=q_chunk,
+                        kv_flat=kv_flat,
+                        indices=indices_chunk_full,
+                        lens=lens_chunk,
+                        scale=layer.scale,
+                        max_score=max_score,
+                        denom=denom,
+                        attn_sink=layer.attn_sink,
+                        output=output[token_start:token_end],
+                        scores=scores,
+                    )
+                    finished_with_sink = True
+                else:
+                    accumulate_indexed_d512_split_sparse_mla_attention(
+                        q=q_chunk,
+                        kv_flat=kv_flat,
+                        indices=indices_chunk_full,
+                        lens=lens_chunk,
+                        scale=layer.scale,
+                        max_score=max_score,
+                        denom=denom,
+                        acc=subset_acc,
+                        scores=scores,
+                    )
             elif can_use_indexed_d512_chunked:
                 assert indexed_d512_chunked_buffers is not None
                 (
@@ -1173,13 +1198,14 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                         acc=subset_acc,
                     )
 
-            finish_sparse_mla_attention_with_sink(
-                max_score,
-                denom,
-                subset_acc,
-                layer.attn_sink,
-                output=output[token_start:token_end],
-            )
+            if not finished_with_sink:
+                finish_sparse_mla_attention_with_sink(
+                    max_score,
+                    denom,
+                    subset_acc,
+                    layer.attn_sink,
+                    output=output[token_start:token_end],
+                )
             if output.shape[1] > layer.n_local_heads:
                 output[token_start:token_end, layer.n_local_heads :].zero_()
 
