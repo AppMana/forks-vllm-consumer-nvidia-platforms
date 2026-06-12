@@ -52,3 +52,35 @@ def test_indexed_d512_split_topk_keeps_small_c128a_prefills() -> None:
     assert flashmla._is_indexed_d512_split_topk(512)
     assert flashmla._is_indexed_d512_split_topk(1152)
     assert not flashmla._is_indexed_d512_split_topk(1280)
+
+
+def test_indexed_d512_multi_prefill_requires_opt_in(monkeypatch) -> None:
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL",
+        True,
+    )
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL",
+        False,
+        raising=False,
+    )
+
+    kwargs = {
+        "compress_ratio": 4,
+        "head_dim": 512,
+        "num_prefills": 2,
+        "combined_topk": 640,
+        "max_prefill_seq_len": 65536,
+        "swa_only": False,
+    }
+    assert not flashmla._use_indexed_d512_split_prefill(**kwargs)
+
+    monkeypatch.setattr(
+        flashmla.envs,
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL",
+        True,
+        raising=False,
+    )
+    assert flashmla._use_indexed_d512_split_prefill(**kwargs)

@@ -367,6 +367,7 @@ def _write_sparse_mla_prefill_stats(
     query_tokens: int,
     combined_topk: int,
     combined_lens: torch.Tensor,
+    max_prefill_seq_len: int | None = None,
     combined_indices: torch.Tensor | None = None,
     gather_region_size: int = 0,
     swa_region_offset: int = 0,
@@ -408,6 +409,8 @@ def _write_sparse_mla_prefill_stats(
             "padding_candidate_visits": padding_visits,
             "combined_lens": lens_summary,
         }
+        if max_prefill_seq_len is not None:
+            row["max_prefill_seq_len"] = int(max_prefill_seq_len)
         region_work = _sparse_mla_candidate_region_work_summary(
             query_tokens=int(query_tokens),
             combined_topk=int(combined_topk),
@@ -460,7 +463,7 @@ def _use_indexed_d512_split_prefill(
         and not swa_only
         and compress_ratio in (4, 128)
         and head_dim == 512
-        and num_prefills == 1
+        and _allow_indexed_d512_prefill_request_count(num_prefills)
         and _is_indexed_d512_split_topk(combined_topk)
         and max_prefill_seq_len >= _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
     )
@@ -471,6 +474,13 @@ def _is_indexed_d512_split_topk(combined_topk: int) -> bool:
         _INDEXED_D512_SPLIT_PREFILL_MIN_TOPK
         <= combined_topk
         <= _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
+    )
+
+
+def _allow_indexed_d512_prefill_request_count(request_count: int) -> bool:
+    return request_count == 1 or (
+        request_count > 1
+        and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL
     )
 
 
@@ -489,7 +499,7 @@ def _use_indexed_d512_chunked_prefill(
         and not swa_only
         and compress_ratio in (4, 128)
         and head_dim == 512
-        and num_prefills == 1
+        and _allow_indexed_d512_prefill_request_count(num_prefills)
         and combined_topk > _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
         and max_prefill_seq_len >= _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
     )
@@ -1035,7 +1045,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL
             and layer.compress_ratio in (4, 128)
             and q.shape[-1] == 512
-            and kv.shape[0] == 1
+            and _allow_indexed_d512_prefill_request_count(kv.shape[0])
             and _is_indexed_d512_split_topk(combined_indices.shape[-1])
             and len(state_buffers) == 4
         ):
@@ -1046,7 +1056,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL
             and layer.compress_ratio in (4, 128)
             and q.shape[-1] == 512
-            and kv.shape[0] == 1
+            and _allow_indexed_d512_prefill_request_count(kv.shape[0])
             and combined_indices.shape[-1] > _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
             and len(state_buffers) == 7
         ):
@@ -1334,6 +1344,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 max_query_chunk_tokens, int(query_end - query_start)
             )
         combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
+        max_prefill_seq_len = int(seq_lens_cpu.max().item())
 
         workspace_manager = current_workspace_manager()
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
@@ -1349,7 +1360,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 head_dim=int(self.head_dim),
                 num_prefills=int(num_prefills),
                 combined_topk=int(combined_topk),
-                max_prefill_seq_len=int(seq_lens_cpu.max().item()),
+                max_prefill_seq_len=max_prefill_seq_len,
                 swa_only=swa_only,
             )
             if not indexed_d512_split_prefill:
@@ -1358,7 +1369,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     head_dim=int(self.head_dim),
                     num_prefills=int(num_prefills),
                     combined_topk=int(combined_topk),
-                    max_prefill_seq_len=int(seq_lens_cpu.max().item()),
+                    max_prefill_seq_len=max_prefill_seq_len,
                     swa_only=swa_only,
                 )
             extra_specs: list[tuple[tuple[int, ...], torch.dtype]] = []
@@ -1552,6 +1563,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     layer_prefix=self.prefix,
                     compress_ratio=self.compress_ratio,
                     num_prefills=chunk_size,
+                    max_prefill_seq_len=max_prefill_seq_len,
                     query_tokens=int(query_end - query_start),
                     combined_topk=combined_indices.shape[-1],
                     combined_lens=combined_lens,

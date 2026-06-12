@@ -55,6 +55,7 @@ def test_sparse_mla_prefill_stats_writer_emits_region_and_overlap(
         layer_prefix="model.layers.0.self_attn",
         compress_ratio=128,
         num_prefills=1,
+        max_prefill_seq_len=16384,
         query_tokens=2,
         combined_topk=4,
         combined_lens=torch.tensor([4, 3], dtype=torch.int32),
@@ -81,6 +82,7 @@ def test_sparse_mla_prefill_stats_writer_emits_region_and_overlap(
     assert len(rows) == 1
     row = rows[0]
     assert row["kind"] == "deepseek_v4_sparse_mla_prefill_stats"
+    assert row["max_prefill_seq_len"] == 16384
     assert row["candidate_slots"] == 8
     assert row["effective_candidate_visits"] == 7
     assert row["candidate_region_work"]["compressed"]["effective_candidate_visits"] == 3

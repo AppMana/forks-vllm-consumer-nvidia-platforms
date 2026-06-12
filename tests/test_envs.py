@@ -55,6 +55,25 @@ def test_deepseek_v4_sparse_mla_stats_path_env(
     assert envs.VLLM_DEEPSEEK_V4_SPARSE_MLA_STATS_PATH == "/tmp/sparse_mla_stats"
 
 
+def test_deepseek_v4_indexed_d512_multi_prefill_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv(
+        "VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL",
+        raising=False,
+    )
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+    assert envs.VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL is False
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL", "1")
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+    assert envs.VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL is True
+
+
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
     monkeypatch.setenv("VLLM_PORT", "1234")
