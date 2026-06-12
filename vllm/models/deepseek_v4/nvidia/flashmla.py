@@ -457,13 +457,17 @@ def _use_indexed_d512_split_prefill(
     combined_topk: int,
     max_prefill_seq_len: int,
     swa_only: bool,
+    has_cached_prefix: bool = False,
 ) -> bool:
     return (
         envs.VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL
         and not swa_only
         and compress_ratio in (4, 128)
         and head_dim == 512
-        and _allow_indexed_d512_prefill_request_count(num_prefills)
+        and _allow_indexed_d512_prefill_request_count(
+            num_prefills,
+            has_cached_prefix=has_cached_prefix,
+        )
         and _is_indexed_d512_split_topk(combined_topk)
         and max_prefill_seq_len >= _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
     )
@@ -477,11 +481,35 @@ def _is_indexed_d512_split_topk(combined_topk: int) -> bool:
     )
 
 
-def _allow_indexed_d512_prefill_request_count(request_count: int) -> bool:
+def _allow_indexed_d512_prefill_request_count(
+    request_count: int,
+    *,
+    has_cached_prefix: bool = False,
+) -> bool:
     return request_count == 1 or (
         request_count > 1
         and envs.VLLM_DEEPSEEK_V4_INDEXED_D512_MULTI_PREFILL
+        and not has_cached_prefix
     )
+
+
+def _prefill_has_cached_prefix(
+    *,
+    seq_lens_cpu: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    num_decodes: int,
+    num_prefills: int,
+) -> bool:
+    if num_prefills <= 0:
+        return False
+    prefill_start = num_decodes
+    prefill_end = num_decodes + num_prefills
+    query_lens_cpu = (
+        query_start_loc_cpu[prefill_start + 1 : prefill_end + 1]
+        - query_start_loc_cpu[prefill_start:prefill_end]
+    )
+    prefix_lens_cpu = seq_lens_cpu[prefill_start:prefill_end] - query_lens_cpu
+    return bool(torch.any(prefix_lens_cpu > 0).item())
 
 
 def _use_indexed_d512_chunked_prefill(
@@ -492,6 +520,7 @@ def _use_indexed_d512_chunked_prefill(
     combined_topk: int,
     max_prefill_seq_len: int,
     swa_only: bool,
+    has_cached_prefix: bool = False,
 ) -> bool:
     return (
         envs.VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL
@@ -499,7 +528,10 @@ def _use_indexed_d512_chunked_prefill(
         and not swa_only
         and compress_ratio in (4, 128)
         and head_dim == 512
-        and _allow_indexed_d512_prefill_request_count(num_prefills)
+        and _allow_indexed_d512_prefill_request_count(
+            num_prefills,
+            has_cached_prefix=has_cached_prefix,
+        )
         and combined_topk > _INDEXED_D512_SPLIT_PREFILL_MAX_TOPK
         and max_prefill_seq_len >= _INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS
     )
@@ -1345,6 +1377,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             )
         combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
         max_prefill_seq_len = int(seq_lens_cpu.max().item())
+        has_cached_prefix = _prefill_has_cached_prefix(
+            seq_lens_cpu=seq_lens_cpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            num_decodes=int(num_decodes),
+            num_prefills=int(num_prefills),
+        )
 
         workspace_manager = current_workspace_manager()
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
@@ -1362,6 +1400,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 combined_topk=int(combined_topk),
                 max_prefill_seq_len=max_prefill_seq_len,
                 swa_only=swa_only,
+                has_cached_prefix=has_cached_prefix,
             )
             if not indexed_d512_split_prefill:
                 indexed_d512_chunked_prefill = _use_indexed_d512_chunked_prefill(
@@ -1371,6 +1410,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     combined_topk=int(combined_topk),
                     max_prefill_seq_len=max_prefill_seq_len,
                     swa_only=swa_only,
+                    has_cached_prefix=has_cached_prefix,
                 )
             extra_specs: list[tuple[tuple[int, ...], torch.dtype]] = []
             if indexed_d512_split_prefill:
