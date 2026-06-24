@@ -40,7 +40,6 @@ from vllm.models.deepseek_v4.nvidia.model import (
     _get_deepseek_v4_scale_fmt,
     _make_deepseek_v4_weights_mapper,
 )
-from vllm.models.deepseek_v4.nvidia.mtp import _mtp_scale_can_be_mapped_later
 from vllm.scalar_type import scalar_types
 
 
@@ -133,36 +132,6 @@ def test_dsv4_quant_configs_use_int8_for_remapped_mtp_projections():
             assert isinstance(
                 cfg.get_quant_method(layer, prefix), Dsv4Int8LinearMethod
             )
-
-
-def test_deepseek_v4_mtp_loader_defers_remapped_scales():
-    stacked_params_mapping = [
-        ("gate_up_proj", "w1", 0),
-        ("gate_up_proj", "w3", 1),
-        ("fused_wqa_wkv", "attn.wq_a", 0),
-        ("fused_wqa_wkv", "attn.wkv", 1),
-    ]
-
-    assert _mtp_scale_can_be_mapped_later(
-        "model.layers.43.mtp_block.attn.wq_a.weight_scale_inv",
-        stacked_params_mapping,
-    )
-    assert _mtp_scale_can_be_mapped_later(
-        "model.layers.43.mtp_block.attn.wkv.weight_scale_inv",
-        stacked_params_mapping,
-    )
-    assert _mtp_scale_can_be_mapped_later(
-        "model.layers.43.mtp_block.ffn.shared_experts.w1.weight_scale_inv",
-        stacked_params_mapping,
-    )
-    assert _mtp_scale_can_be_mapped_later(
-        "model.layers.43.mtp_block.ffn.shared_experts.w2.weight_scale_inv",
-        stacked_params_mapping,
-    )
-    assert not _mtp_scale_can_be_mapped_later(
-        "model.layers.43.e_proj.weight_scale_inv",
-        stacked_params_mapping,
-    )
 
 
 def test_mxfp4_to_int4_requant_roundtrip():

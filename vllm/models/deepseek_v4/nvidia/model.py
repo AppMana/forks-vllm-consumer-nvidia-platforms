@@ -1279,6 +1279,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             layer.ffn.finalize_mega_moe_weights()
 
 
+def _get_deepseek_v4_scale_fmt(config) -> str:
+    """Scale format declared by the checkpoint's quantization_config.
+
+    Defaults to ``ue8m0`` (the MXFP4 release format). The regenerated
+    Ampere int4mse/int8 checkpoints set this explicitly so the loader knows
+    how to interpret expert/linear scales.
+    """
+    quantization_config = getattr(config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        return quantization_config.get("scale_fmt", "ue8m0")
+    return getattr(quantization_config, "scale_fmt", None) or "ue8m0"
+
+
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
         # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
