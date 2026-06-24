@@ -16,10 +16,13 @@ import torch
 
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
+    accumulate_indexed_sparse_mla_attention_chunk,
     finish_gathered_sparse_mla_attention,
+    merge_sparse_mla_subset_with_sink,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     reference_attention_no_sink,
+    reference_sparse_mla_prefill,
 )
 
 _FP8_DIM = 448
@@ -158,3 +161,89 @@ def test_triton_fp8ds_global_slots_attention_chunk_matches_reference() -> None:
 
     torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_triton_indexed_bf16_prefill_chunks_match_reference() -> None:
+    torch.manual_seed(17)
+    q = torch.randn(5, 5, 16, device="cuda", dtype=torch.bfloat16)
+    q_active = q[:, :3]
+    kv = torch.randn(2, 7, 16, device="cuda", dtype=torch.bfloat16)
+    kv_flat = kv.reshape(-1, q.shape[-1])
+    combined_indices = torch.tensor(
+        [
+            [0, 3, -1, 5, 3, 1],
+            [4, -1, 2, 2, 1, 8],
+            [-1, -1, -1, -1, -1, -1],
+            [8, 0, 9, -1, 7, 4],
+            [13, 12, 0, 12, -1, 3],
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    combined_lens = torch.tensor([5, 4, 0, 6, 5], dtype=torch.int32, device="cuda")
+    sink = torch.tensor([-0.5, 1.0, 0.25], dtype=torch.float32, device="cuda")
+    scale = 0.375
+    output = torch.empty_like(q_active)
+
+    for token_start in (0, 2, 4):
+        token_end = min(token_start + 2, q.shape[0])
+        q_chunk = q[token_start:token_end]
+        indices_chunk = combined_indices[token_start:token_end]
+        lens_chunk = combined_lens[token_start:token_end]
+        max_score = torch.full(
+            (q_chunk.shape[0], q_active.shape[1]),
+            float("-inf"),
+            device="cuda",
+        )
+        denom = torch.zeros_like(max_score)
+        acc = torch.zeros(
+            q_chunk.shape[0],
+            q_active.shape[1],
+            q_chunk.shape[-1],
+            device="cuda",
+            dtype=torch.float32,
+        )
+        for index_start in (0, 3):
+            index_end = min(index_start + 3, combined_indices.shape[-1])
+            accumulate_indexed_sparse_mla_attention_chunk(
+                q=q_chunk,
+                kv_flat=kv_flat,
+                indices=indices_chunk[:, index_start:index_end],
+                lens=lens_chunk,
+                candidate_offset=index_start,
+                scale=scale,
+                max_score=max_score,
+                denom=denom,
+                acc=acc,
+            )
+        subset_output = torch.empty_like(acc)
+        subset_lse = torch.empty_like(max_score)
+        finish_gathered_sparse_mla_attention(
+            max_score=max_score,
+            denom=denom,
+            acc=acc,
+            output=subset_output,
+            lse=subset_lse,
+        )
+        merge_sparse_mla_subset_with_sink(
+            subset_output=subset_output,
+            subset_lse=subset_lse,
+            attn_sink=sink,
+            output=output[token_start:token_end],
+        )
+
+    expected = torch.empty_like(q_active)
+    reference_sparse_mla_prefill(
+        q=q_active,
+        kv=kv,
+        combined_indices=combined_indices,
+        combined_lens=combined_lens,
+        scale=scale,
+        attn_sink=sink,
+        output=expected,
+        topk_chunk_size=3,
+        query_chunk_size=2,
+    )
+
+    torch.testing.assert_close(output.float(), expected.float(), rtol=2e-2, atol=2e-2)
