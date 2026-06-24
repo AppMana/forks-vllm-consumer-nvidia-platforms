@@ -1,0 +1,100 @@
+# Runtime-only overlay for Ampere vLLM serving images.
+#
+# Use this when the underlying vLLM wheel/native extensions are already built
+# and only serving/runtime dependencies need to change. This avoids traversing
+# the source-build Dockerfile stages and therefore cannot invalidate csrc
+# compilation.
+
+ARG BASE_IMAGE=harbor.appmana.com/appmana/vllm-ampere:latest
+ARG CUDA_VERSION=13.0.2
+ARG PYTHON_VERSION=3.12
+
+FROM ${BASE_IMAGE}
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+ARG INSTALL_RAY=true
+ARG INSTALL_TRACING_TOOLS=true
+ARG INSTALL_USB4_RDMA_PROVIDER=false
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.1
+ARG NCCL_PACKAGE_VERSION=
+ARG REPLACE_TORCH_BUNDLED_NCCL=false
+
+RUN if [ "${INSTALL_RAY}" = "true" ]; then \
+      python3 -m pip install --no-cache-dir "ray>=2.10,<3"; \
+    fi
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    if [ -n "${NCCL_PACKAGE_VERSION}" ] || [ "${INSTALL_USB4_RDMA_PROVIDER}" = "true" ]; then \
+      set -eux; \
+      . /etc/os-release; \
+      rm -f /etc/apt/apt.conf.d/docker-clean; \
+      apt-get update -y; \
+      apt-get install -y --no-install-recommends --allow-change-held-packages ca-certificates curl; \
+      if [ -n "${NCCL_PACKAGE_VERSION}" ]; then \
+        apt-get install -y --no-install-recommends --allow-change-held-packages \
+          "libnccl2=${NCCL_PACKAGE_VERSION}" \
+          "libnccl-dev=${NCCL_PACKAGE_VERSION}"; \
+      fi; \
+      if [ "${INSTALL_USB4_RDMA_PROVIDER}" = "true" ]; then \
+        apt-get install -y --no-install-recommends --allow-change-held-packages \
+          ibverbs-utils \
+          libibverbs1 \
+          rdma-core; \
+        curl -fsSL -o /tmp/usb4-rdma-provider.deb \
+          "https://github.com/hellas-ai/thunderbolt-ibverbs/releases/download/v${USB4_RDMA_PROVIDER_VERSION}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
+        apt-get install -y --no-install-recommends /tmp/usb4-rdma-provider.deb; \
+        rm -f /tmp/usb4-rdma-provider.deb; \
+      fi; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
+RUN if [ "${REPLACE_TORCH_BUNDLED_NCCL}" = "true" ]; then \
+      set -eux; \
+      SYSTEM_NCCL="$(readlink -f /usr/lib/x86_64-linux-gnu/libnccl.so.2)"; \
+      TORCH_NCCL_DIR="$(python3 -c "import importlib.util, pathlib; spec = importlib.util.find_spec('nvidia.nccl'); assert spec and spec.submodule_search_locations; print(pathlib.Path(next(iter(spec.submodule_search_locations))) / 'lib')")"; \
+      test -f "${SYSTEM_NCCL}"; \
+      test -d "${TORCH_NCCL_DIR}"; \
+      mv "${TORCH_NCCL_DIR}/libnccl.so.2" "${TORCH_NCCL_DIR}/libnccl.so.2.bundled"; \
+      ln -s "${SYSTEM_NCCL}" "${TORCH_NCCL_DIR}/libnccl.so.2"; \
+    fi
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    if [ "${INSTALL_TRACING_TOOLS}" = "true" ] && ! command -v nsys >/dev/null 2>&1; then \
+      CUDA_VERSION_DASH=$(echo ${CUDA_VERSION} | cut -d. -f1,2 | tr '.' '-') && \
+      rm -f /etc/apt/apt.conf.d/docker-clean && \
+      apt-get update -y && \
+      apt-get install -y --no-install-recommends \
+        cuda-nsight-systems-${CUDA_VERSION_DASH} \
+        build-essential \
+        ca-certificates \
+        git \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+RUN if [ "${INSTALL_TRACING_TOOLS}" = "true" ] && [ ! -e /usr/local/lib/libnccl-profiler.so ]; then \
+      set -eux; \
+      NCCL_VER=$(python3 -c "import torch; print(torch.cuda.nccl.version())" 2>/dev/null | tr -d '() ' | awk -F, '{printf "%d.%d.%d\n", $1, $2, $3}') ; \
+      git clone --depth 1 --branch "v${NCCL_VER}-1" https://github.com/NVIDIA/nccl /tmp/nccl 2>/dev/null \
+        || git clone --depth 1 https://github.com/NVIDIA/nccl /tmp/nccl ; \
+      if [ ! -d /tmp/nccl/plugins/profiler/example ]; then \
+        rm -rf /tmp/nccl; \
+        git clone --depth 1 https://github.com/NVIDIA/nccl /tmp/nccl; \
+      fi; \
+      cd /tmp/nccl/plugins/profiler/example && \
+      make && \
+      install -m 0755 libnccl-profiler-example.so /usr/local/lib/libnccl-profiler.so && \
+      rm -rf /tmp/nccl; \
+    fi
+
+ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+
+# Python-only Ampere fork patches. Keep this overlay after dependency installs
+# so executor/runtime fixes can be shipped without rebuilding native vLLM
+# extensions. Copy the full Python tree so new modules such as quantization
+# methods cannot be omitted from a selective runtime patch list.
+COPY vllm/ /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/
+RUN rm -rf /vllm-workspace/vllm && \
+    ln -s /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm /vllm-workspace/vllm

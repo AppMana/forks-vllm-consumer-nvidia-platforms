@@ -1,0 +1,22 @@
+# NCCL-only overlay for live Ampere vLLM serving images.
+#
+# This intentionally does not copy vLLM source or reinstall Python packages.
+# Use it when the experiment must hold the live server code constant and only
+# change the NCCL runtime package.
+
+ARG BASE_IMAGE=harbor.appmana.com/appmana/vllm-ampere:latest
+ARG NCCL_PACKAGE_VERSION=2.30.4-1+cuda13.2
+
+FROM ${BASE_IMAGE}
+
+ARG NCCL_PACKAGE_VERSION
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    set -eux; \
+    rm -f /etc/apt/apt.conf.d/docker-clean; \
+    apt-get update -y; \
+    apt-get install -y --no-install-recommends --allow-change-held-packages \
+      "libnccl2=${NCCL_PACKAGE_VERSION}" \
+      "libnccl-dev=${NCCL_PACKAGE_VERSION}"; \
+    rm -rf /var/lib/apt/lists/*

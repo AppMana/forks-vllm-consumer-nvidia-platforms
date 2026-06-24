@@ -1,0 +1,13 @@
+# Minimal Python hotfix overlay for Ampere vLLM serving images.
+#
+# Use this for a narrowly scoped Python patch when the base image already
+# contains the desired wheel, package metadata, and native extensions.
+
+ARG BASE_IMAGE=harbor.appmana.com/appmana/vllm-ampere:latest
+ARG PYTHON_VERSION=3.12
+
+FROM ${BASE_IMAGE}
+
+ARG PYTHON_VERSION
+
+COPY vllm/ /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/
