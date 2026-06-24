@@ -24,6 +24,255 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
 
+_TOKEN_FP8_DIM = 448
+_TOKEN_BF16_DIM = 64  # elements (128 bytes)
+_TOKEN_SCALE_DIM = 8
+_QUANT_BLOCK_SIZE = 64
+_FP8_MAX = 448.0
+_TOKEN_DATA_SIZE = _TOKEN_FP8_DIM + _TOKEN_BF16_DIM * 2  # 576 bytes
+_N_REAL_QUANT_BLOCKS = 7  # 448 / 64
+
+
+def _supports_fp8e4nv_in_triton() -> bool:
+    """Triton's `tl.float8e4nv` cast / bitcast requires sm_89+."""
+    cap = current_platform.get_device_capability()
+    if cap is None:
+        return False
+    return (cap.major, cap.minor) >= (8, 9)
+
+
+def _quantize_and_insert_k_cache_torch(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Pure-torch fallback for `quantize_and_insert_k_cache` on sm_8x.
+
+    Mirrors `quantize_and_insert_k_kernel`'s UE8M0 block layout exactly so
+    the cache stays binary-compatible with the Triton dequant path that
+    runs on the same rank for matching reads.
+    """
+    valid = slot_mapping >= 0
+    if not valid.any():
+        return
+    k_valid = k[valid]
+    slots = slot_mapping[valid].to(torch.int64)
+
+    block_idx = slots // block_size
+    pos_in_block = slots % block_size
+    device = k_cache.device
+    # The Triton kernel writes via raw byte pointer math; the caller may
+    # hand us a 2D `(num_blocks, block_stride)` or 3D
+    # `(num_blocks, block_size, head_bytes)` cache. Use a flat-2D view for
+    # `index_put_` regardless. The view shares storage so writes land.
+    if k_cache.dim() != 2:
+        k_cache = k_cache.view(k_cache.shape[0], -1)
+
+    # ----- Quantize FP8 portion -----
+    blocks = (
+        k_valid[:, :_TOKEN_FP8_DIM]
+        .contiguous()
+        .view(-1, _N_REAL_QUANT_BLOCKS, _QUANT_BLOCK_SIZE)
+        .to(torch.float32)
+    )
+    block_max = blocks.abs().amax(dim=-1).clamp_min(1e-4)
+    raw_scale = block_max / _FP8_MAX
+    exponent = torch.ceil(torch.log2(raw_scale))
+    scale = torch.exp2(exponent)
+    x_quant = (blocks / scale.unsqueeze(-1)).clamp(-_FP8_MAX, _FP8_MAX).to(
+        torch.float8_e4m3fn
+    )
+    x_uint8 = x_quant.view(torch.uint8).contiguous().view(-1, _TOKEN_FP8_DIM)
+    encoded_scale = (exponent + 127.0).clamp(0, 255).to(torch.uint8)
+    pad = torch.zeros(
+        encoded_scale.shape[0],
+        _TOKEN_SCALE_DIM - _N_REAL_QUANT_BLOCKS,
+        dtype=torch.uint8,
+        device=device,
+    )
+    encoded_scale_padded = torch.cat([encoded_scale, pad], dim=1)
+
+    # ----- BF16 portion stays as-is -----
+    bf16_bytes = (
+        k_valid[:, _TOKEN_FP8_DIM:]
+        .contiguous()
+        .view(torch.uint8)
+        .view(-1, _TOKEN_BF16_DIM * 2)
+    )
+
+    # ----- Scatter into cache via per-row scatter (works regardless of stride) -----
+    fp8_col = (
+        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
+        + torch.arange(_TOKEN_FP8_DIM, device=device, dtype=torch.int64).unsqueeze(0)
+    )
+    bf16_col = (
+        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
+        + _TOKEN_FP8_DIM
+        + torch.arange(
+            _TOKEN_BF16_DIM * 2, device=device, dtype=torch.int64
+        ).unsqueeze(0)
+    )
+    scale_col = (
+        block_size * _TOKEN_DATA_SIZE
+        + pos_in_block.unsqueeze(1) * _TOKEN_SCALE_DIM
+        + torch.arange(
+            _TOKEN_SCALE_DIM, device=device, dtype=torch.int64
+        ).unsqueeze(0)
+    )
+    flat_block_fp8 = block_idx.unsqueeze(1).expand(-1, _TOKEN_FP8_DIM)
+    k_cache.index_put_((flat_block_fp8, fp8_col), x_uint8)
+    flat_block_bf16 = block_idx.unsqueeze(1).expand(-1, _TOKEN_BF16_DIM * 2)
+    k_cache.index_put_((flat_block_bf16, bf16_col), bf16_bytes)
+    flat_block_scale = block_idx.unsqueeze(1).expand(-1, _TOKEN_SCALE_DIM)
+    k_cache.index_put_((flat_block_scale, scale_col), encoded_scale_padded)
+
+
+def _gather_token_bytes(
+    k_cache: torch.Tensor,
+    block_idx: torch.Tensor,  # (N,) int64
+    pos_in_block: torch.Tensor,  # (N,) int64
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather (fp8_bytes, bf16_bytes, scale_bytes) for N tokens from cache.
+
+    `k_cache` may be 2D ``(num_blocks, block_stride)`` or 3D
+    ``(num_blocks, block_size, head_bytes)`` depending on the caller — the
+    Triton kernel works on raw byte pointer math either way. We flatten to
+    2D so per-row gather works regardless of input rank.
+
+    Returns:
+        fp8_bytes: (N, 448) uint8
+        bf16_bytes: (N, 128) uint8
+        scale_bytes: (N, 8) uint8
+    """
+    device = k_cache.device
+    if k_cache.dim() != 2:
+        k_cache = k_cache.reshape(k_cache.shape[0], -1)
+    valid_block = (block_idx >= 0) & (block_idx < k_cache.shape[0])
+    safe_block_idx = block_idx.clamp(0, max(k_cache.shape[0] - 1, 0))
+    selected = k_cache.index_select(0, safe_block_idx)  # (N, block_stride)
+
+    fp8_off = (
+        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
+        + torch.arange(_TOKEN_FP8_DIM, device=device, dtype=torch.int64).unsqueeze(0)
+    )
+    fp8_bytes = selected.gather(1, fp8_off)
+
+    bf16_off = (
+        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
+        + _TOKEN_FP8_DIM
+        + torch.arange(
+            _TOKEN_BF16_DIM * 2, device=device, dtype=torch.int64
+        ).unsqueeze(0)
+    )
+    bf16_bytes = selected.gather(1, bf16_off)
+
+    scale_off = (
+        block_size * _TOKEN_DATA_SIZE
+        + pos_in_block.unsqueeze(1) * _TOKEN_SCALE_DIM
+        + torch.arange(
+            _TOKEN_SCALE_DIM, device=device, dtype=torch.int64
+        ).unsqueeze(0)
+    )
+    scale_bytes = selected.gather(1, scale_off)
+    if not valid_block.all():
+        fp8_bytes = fp8_bytes.masked_fill(~valid_block.unsqueeze(1), 0)
+        bf16_bytes = bf16_bytes.masked_fill(~valid_block.unsqueeze(1), 0)
+        scale_bytes = scale_bytes.masked_fill(~valid_block.unsqueeze(1), 0)
+
+    return fp8_bytes, bf16_bytes, scale_bytes
+
+
+def _dequant_token_to_bf16(
+    fp8_bytes: torch.Tensor,
+    bf16_bytes: torch.Tensor,
+    scale_bytes: torch.Tensor,
+) -> torch.Tensor:
+    """Per-token UE8M0 dequant: returns (N, 512) bf16."""
+    n = fp8_bytes.shape[0]
+    # FP8 portion: bitcast uint8 -> float8_e4m3fn -> fp32, multiply per-block scale.
+    x_fp8 = fp8_bytes.contiguous().view(torch.float8_e4m3fn)
+    x_fp32 = x_fp8.to(torch.float32).view(n, _N_REAL_QUANT_BLOCKS, _QUANT_BLOCK_SIZE)
+    scale = torch.exp2(scale_bytes[:, :_N_REAL_QUANT_BLOCKS].to(torch.float32) - 127.0)
+    x_dequant = (x_fp32 * scale.unsqueeze(-1)).view(n, _TOKEN_FP8_DIM).to(torch.bfloat16)
+
+    # BF16 portion is uint8 bytes -> bf16 elements.
+    bf16_part = bf16_bytes.contiguous().view(torch.bfloat16).view(n, _TOKEN_BF16_DIM)
+    return torch.cat([x_dequant, bf16_part], dim=1)
+
+
+def _dequantize_and_gather_k_cache_torch(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    """Pure-torch fallback for `dequantize_and_gather_k_cache` on sm_8x."""
+    num_reqs = seq_lens.shape[0]
+    if gather_lens is None:
+        gather_lens = seq_lens
+    seq_lens_l = seq_lens.to(torch.int64)
+    gather_lens_l = gather_lens.to(torch.int64)
+    start_pos = seq_lens_l - gather_lens_l
+
+    # Per-request token positions.
+    for r in range(num_reqs):
+        gl = int(gather_lens_l[r].item())
+        if gl == 0:
+            continue
+        sp = int(start_pos[r].item())
+        positions = torch.arange(sp, sp + gl, device=block_table.device, dtype=torch.int64)
+        block_in_seq = positions // block_size
+        pos_in_block = positions % block_size
+        valid_block_in_seq = (block_in_seq >= 0) & (block_in_seq < block_table.shape[1])
+        safe_block_in_seq = block_in_seq.clamp(0, max(block_table.shape[1] - 1, 0))
+        physical_block_idx = block_table[r, safe_block_in_seq].to(torch.int64)
+        physical_block_idx = torch.where(
+            valid_block_in_seq,
+            physical_block_idx,
+            torch.full_like(physical_block_idx, -1),
+        )
+        fp8_bytes, bf16_bytes, scale_bytes = _gather_token_bytes(
+            k_cache, physical_block_idx, pos_in_block, block_size
+        )
+        decoded = _dequant_token_to_bf16(fp8_bytes, bf16_bytes, scale_bytes)
+        out[r, offset : offset + gl, :] = decoded
+
+
+def _dequantize_global_slots_k_cache_torch(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_ids: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Pure-torch fallback for `dequantize_global_slots_k_cache` on sm_8x."""
+    if slot_ids.dim() == 3:
+        assert slot_ids.shape[1] == 1
+        slot_ids = slot_ids[:, 0, :]
+    num_tokens, topk = slot_ids.shape
+    slots = slot_ids.reshape(-1).to(torch.int64)
+    valid = (slots >= 0) & (slots < k_cache.shape[0] * block_size)
+    token_ids = torch.arange(num_tokens, device=slot_ids.device)[:, None]
+    candidate_ids = torch.arange(topk, device=slot_ids.device)[None, :]
+    token_ids = token_ids.expand(num_tokens, topk).reshape(-1)
+    candidate_ids = candidate_ids.expand(num_tokens, topk).reshape(-1)
+    out[token_ids[~valid], candidate_ids[~valid]] = 0
+    if not valid.any():
+        return
+    valid_slots = slots[valid]
+    block_idx = valid_slots // block_size
+    pos_in_block = valid_slots % block_size
+    fp8_bytes, bf16_bytes, scale_bytes = _gather_token_bytes(
+        k_cache, block_idx, pos_in_block, block_size
+    )
+    decoded = _dequant_token_to_bf16(fp8_bytes, bf16_bytes, scale_bytes)
+    out[token_ids[valid], candidate_ids[valid]] = decoded
+
+
 @triton.jit
 def quantize_and_insert_k_kernel(
     # Input tensors
