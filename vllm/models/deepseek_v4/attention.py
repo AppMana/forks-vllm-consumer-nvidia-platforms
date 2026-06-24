@@ -777,6 +777,14 @@ class DeepseekV4Indexer(nn.Module):
         compressor = self.compressor
 
         def wq_b_and_q_quant():
+            # INT8 IMMA indexer query: emit a symmetric INT8 query (scale folded
+            # into indexer_weights) so the logits run as s8 x s8 integer-MMA.
+            # Gated on the INT8 indexer cache + APPMANA_DSV4_INDEXER_IMMA (both
+            # default off); lazy import avoids a base<->nvidia_sm86 import cycle.
+            from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+                indexer_imma_enabled,
+            )
+
             # ReplicatedLinear returns (output, bias); bias is None.
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
@@ -788,6 +796,7 @@ class DeepseekV4Indexer(nn.Module):
                 self.softmax_scale,
                 self.n_head**-0.5,
                 use_fp4=self.use_fp4_kv,
+                q_is_int8=indexer_imma_enabled() and not self.use_fp4_kv,
             )
 
         # compressor returns None and writes K to the indexer KV cache; the
