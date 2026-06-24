@@ -377,6 +377,78 @@ def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     assert output2.num_scheduled_tokens[requests[2].request_id] == 800 - 224 - 224
 
 
+def test_prefix_cache_shared_prefix_divergent_tails_progresses():
+    """Warm APC, then schedule concurrent requests sharing only the prefix."""
+    block_size = 16
+    shared_prefix_tokens = 7 * block_size
+    prompt_tokens = 8 * block_size
+    init_none_hash(sha256)
+    block_hasher = get_request_block_hasher(block_size, sha256)
+    sampling_params = SamplingParams(max_tokens=1)
+    sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
+
+    def make_request(request_id: str, token_ids: list[int]) -> Request:
+        return Request(
+            request_id=request_id,
+            prompt_token_ids=token_ids,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            block_hasher=block_hasher,
+        )
+
+    scheduler = create_scheduler(
+        max_num_seqs=6,
+        max_num_batched_tokens=1024,
+        max_model_len=prompt_tokens + 16,
+        enable_prefix_caching=True,
+        block_size=block_size,
+        pipeline_parallel_size=12,
+    )
+
+    warm = make_request("warm", [1] * prompt_tokens)
+    scheduler.add_request(warm)
+
+    warm_output = scheduler.schedule()
+    assert warm.request_id in warm_output.num_scheduled_tokens
+    assert warm_output.num_scheduled_tokens[warm.request_id] == prompt_tokens
+    scheduler.update_from_output(
+        warm_output,
+        ModelRunnerOutput(
+            req_ids=[warm.request_id],
+            req_id_to_index={warm.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert warm.is_finished()
+
+    requests = [
+        make_request(
+            str(i),
+            [1] * shared_prefix_tokens
+            + [1000 + i] * (prompt_tokens - shared_prefix_tokens),
+        )
+        for i in range(6)
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == len(requests)
+    assert len(scheduler.waiting) == 0
+    assert len(scheduler.running) == len(requests)
+
+    for request in requests:
+        # The first seven blocks should hit APC; the divergent tail block still
+        # needs prefill work.
+        assert request.num_computed_tokens == shared_prefix_tokens
+        assert output.num_scheduled_tokens[request.request_id] == (
+            prompt_tokens - shared_prefix_tokens
+        )
+
+
 def test_stop_via_update_from_output():
     """Test stopping behavior through update_from_output"""
     scheduler = create_scheduler(num_speculative_tokens=1)
