@@ -247,3 +247,64 @@ def test_triton_indexed_bf16_prefill_chunks_match_reference() -> None:
     )
 
     torch.testing.assert_close(output.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_decode_sparse_attention_triton_fused_kernel_matches_reference() -> None:
+    """The fused fp8 decode attention kernel (what nvidia_sm86 actually calls)
+    vs the pure-torch oracle. Swa-only (no compressed extra cache)."""
+    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        decode_sparse_attention_triton,
+    )
+
+    torch.manual_seed(11)
+    block_size = 4
+    num_blocks = 3
+    num_heads = 3
+    k_cache = torch.zeros(
+        num_blocks,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    expected_by_slot = {
+        slot: _write_fp8_ds_mla_token(k_cache, slot, block_size)
+        for slot in (0, 1, 3, 4, 7, 8)
+    }
+    swa_indices = torch.tensor(
+        [[0, 3, 8, 1, -1], [7, 4, 0, 8, 3]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    swa_lens = torch.tensor([4, 5], dtype=torch.int32, device="cuda")
+    q = torch.randn(2, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+    scale = 0.0625
+    out = torch.empty(2, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+
+    decode_sparse_attention_triton(
+        q=q,
+        swa_cache=k_cache,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        scale=scale,
+        attn_sink=None,
+        out=out,
+    )
+
+    topk = swa_indices.shape[1]
+    gathered = torch.zeros(2, topk, 512, device="cuda", dtype=torch.bfloat16)
+    for t in range(2):
+        for k in range(topk):
+            slot = int(swa_indices[t, k].item())
+            if slot >= 0:
+                gathered[t, k] = expected_by_slot[slot]
+    offsets = torch.arange(topk, device="cuda")
+    valid = (offsets[None, :] < swa_lens[:, None]) & (swa_indices >= 0)
+    expected_output, _ = reference_attention_no_sink(
+        q.unsqueeze(1), gathered, valid, scale
+    )
+
+    torch.testing.assert_close(
+        out.float(), expected_output.float(), rtol=2e-2, atol=2e-2
+    )
