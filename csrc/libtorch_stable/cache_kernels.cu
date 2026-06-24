@@ -556,7 +556,8 @@ __global__ void indexer_k_quant_and_cache_kernel(
     const int cache_block_size,                // cache block size
     const int64_t cache_block_stride,  // stride for each block in kv_cache
 
-    const bool use_ue8m0  // use ue8m0 scale format
+    const bool use_ue8m0,  // use ue8m0 scale format
+    const bool use_int8    // store symmetric INT8 instead of FP8 e4m3
 ) {
   constexpr int VEC_SIZE = 4;
   const int64_t token_idx = blockIdx.x;
@@ -589,7 +590,8 @@ __global__ void indexer_k_quant_and_cache_kernel(
 #endif
   }
 
-  float scale = fmaxf(amax, 1e-4) / kFp8ScaleDivisor;
+  float scale = use_int8 ? fmaxf(amax, 1e-4f) / 127.0f
+                         : fmaxf(amax, 1e-4) / kFp8ScaleDivisor;
 
   if (use_ue8m0) {
     scale = exp2f(ceilf(log2f(scale)));
@@ -598,8 +600,17 @@ __global__ void indexer_k_quant_and_cache_kernel(
   const int64_t dst_offset =
       block_idx * cache_block_stride + block_offset * head_dim + head_dim_idx;
   for (int i = 0; i < VEC_SIZE; i++) {
-    kv_cache[dst_offset + i] =
-        fp8::scaled_convert<cache_t, scalar_t, kv_dt>(k_val_ptr[i], scale);
+    if (use_int8) {
+      // Symmetric INT8: store the signed bit pattern in the uint8 cache slot;
+      // readers view the cache as int8. The per-token fp32 scale slot and
+      // layout are unchanged, so the byte-copy gather works as-is.
+      const float v = rintf(float(k_val_ptr[i]) / scale);
+      const int8_t q = static_cast<int8_t>(fmaxf(-127.0f, fminf(127.0f, v)));
+      kv_cache[dst_offset + i] = static_cast<cache_t>(static_cast<uint8_t>(q));
+    } else {
+      kv_cache[dst_offset + i] =
+          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(k_val_ptr[i], scale);
+    }
   }
   if (threadIdx.x == 0) {
     const int64_t dst_scale_idx =
@@ -1456,7 +1467,7 @@ void cp_gather_and_upconvert_fp8_kv_cache(
           reinterpret_cast<KV_T*>(k.data_ptr()),                              \
           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                    \
           slot_mapping.const_data_ptr<int64_t>(), head_dim, quant_block_size, \
-          cache_block_size, cache_block_stride, use_ue8m0);
+          cache_block_size, cache_block_stride, use_ue8m0, use_int8);
 
 void indexer_k_quant_and_cache(
     torch::stable::Tensor& k,         // [num_tokens, head_dim]
@@ -1469,6 +1480,11 @@ void indexer_k_quant_and_cache(
   int cache_block_size = kv_cache.size(1);
   int64_t cache_block_stride = kv_cache.stride(0);
   bool use_ue8m0 = scale_fmt == "ue8m0";
+  // scale_fmt "int8": symmetric per-token INT8 values (signed bit pattern in
+  // the uint8 cache) with plain fp32 absmax/127 scales. Gate-1 recall study
+  // (tools/ampere/dsv4_indexer_int8_recall.py): 99.48% mean top-512 recall
+  // vs the fp8 path on real tensors.
+  bool use_int8 = scale_fmt == "int8";
 
   STD_TORCH_CHECK(k.device() == kv_cache.device(),
                   "k and kv_cache must be on the same device");
