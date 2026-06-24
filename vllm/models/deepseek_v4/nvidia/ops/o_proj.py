@@ -60,11 +60,30 @@ def deep_gemm_fp8_o_proj(
         device=o.device,
         dtype=torch.bfloat16,
     )
-    fp8_einsum(
-        "bhr,hdr->bhd",
-        (o_fp8, o_scale),
-        (wo_a.weight, wo_a.weight_scale_inv),
-        z,
-        recipe=einsum_recipe,
-    )
+    # DeepGEMM fp8_einsum is Hopper/sm_100 only. On Ampere (sm_8x) and consumer
+    # Blackwell (sm_12x) use the software fp8 einsum (triton on sm_89+, torch
+    # fallback on sm_86), which computes the same "bhr,hdr->bhd" contraction.
+    cap = current_platform.get_device_capability()
+    if cap is not None and cap.major in (8, 12):
+        from vllm.models.deepseek_v4.common.ops.fp8_einsum import (
+            deepseek_v4_sm12x_fp8_einsum,
+        )
+        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+            _normalize_deepseek_v4_fp8_einsum_inputs,
+        )
+
+        # Reshape wo_a (2D -> [groups, out_rank, hidden]) + unpack scales, then
+        # run the software einsum (torch on sm_86, triton on sm_12x).
+        a, a_scale, b, b_scale = _normalize_deepseek_v4_fp8_einsum_inputs(
+            o_fp8, o_scale, wo_a.weight, wo_a.weight_scale_inv, z
+        )
+        deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, z)
+    else:
+        fp8_einsum(
+            "bhr,hdr->bhd",
+            (o_fp8, o_scale),
+            (wo_a.weight, wo_a.weight_scale_inv),
+            z,
+            recipe=einsum_recipe,
+        )
     return wo_b(z.flatten(1))

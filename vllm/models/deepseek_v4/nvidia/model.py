@@ -18,11 +18,11 @@ from vllm.distributed import (
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
-from vllm.model_executor.kernels.mhc.tilelang import (
-    hc_head_fused_kernel_tilelang,
-    mhc_fused_post_pre_tilelang,
-    mhc_post_tilelang,
-    mhc_pre_tilelang,
+from vllm.model_executor.layers.mhc import (
+    HCHeadOp,
+    MHCFusedPostPreOp,
+    MHCPostOp,
+    MHCPreOp,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -872,6 +872,36 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
+        # Lazy import registers the MHC custom ops without a top-level tilelang
+        # dependency. The ops self-dispatch tilelang (Hopper) / triton (sm_8x) /
+        # torch; norm is applied unfused (attn_norm/ffn_norm below) on every
+        # path, matching the amd backend.
+        import vllm.model_executor.layers.mhc  # noqa: F401
+
+        self.mhc_pre = MHCPreOp()
+        self.mhc_post = MHCPostOp()
+        self.mhc_fused_post_pre = MHCFusedPostPreOp()
+
+    def hc_pre(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        post_mix, res_mix, layer_input = self.mhc_pre(
+            residual=x,
+            fn=hc_fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=self.rms_norm_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=self.hc_post_alpha,
+            sinkhorn_repeat=self.hc_sinkhorn_iters,
+        )
+        return layer_input, post_mix, res_mix
+
     def forward(
         self,
         x: torch.Tensor,
@@ -881,26 +911,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        attn_norm_weight = self.attn_norm.weight.data
-        attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
             # Run standalone mhc_pre on first layer
             residual = x
-            post_mix, res_mix, x = mhc_pre_tilelang(
-                x,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                norm_weight=attn_norm_weight,
-                norm_eps=attn_norm_eps,
+            x, post_mix, res_mix = self.hc_pre(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
                 x,
                 residual,
                 post_mix,
@@ -913,18 +931,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
-                n_splits=1,
-                tile_n=1,
-                norm_weight=attn_norm_weight,
-                norm_eps=attn_norm_eps,
             )
 
-        # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
+        # Norm is applied unfused (the MHC ops above do not fold it).
+        x = self.attn_norm(x)
         x = self.attn(positions, x, None)
 
-        ffn_norm_weight = self.ffn_norm.weight.data
-        ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
             residual,
             post_mix,
@@ -937,12 +950,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_eps,
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
-            n_splits=1,
-            tile_n=1,
-            norm_weight=ffn_norm_weight,
-            norm_eps=ffn_norm_eps,
         )
 
+        x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
@@ -1044,6 +1054,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self._mtp_hidden_buffer = None
 
+        # MHC final-collapse ops; self-dispatch tilelang/triton/torch by
+        # platform + capability (see vllm.model_executor.layers.mhc).
+        self.mhc_post = MHCPostOp()
+        self.hc_head = HCHeadOp()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1114,7 +1129,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
             else:
-                hidden_states = mhc_post_tilelang(
+                hidden_states = self.mhc_post(
                     hidden_states, residual, post_mix, res_mix
                 )
 
@@ -1125,7 +1140,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head_fused_kernel_tilelang(
+        hidden_states = self.hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,
