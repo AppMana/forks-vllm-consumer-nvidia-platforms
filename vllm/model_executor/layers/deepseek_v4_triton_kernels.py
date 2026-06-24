@@ -81,7 +81,9 @@ def _view_packed_fp8_paged_mqa_kv_cache(
     return kv_values, kv_scale[..., :scale_elems]
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
+# seq_kv tracks the context length; pin it off divisibility-by-16 specialization
+# (same recompile-wedge class as _mqa_logits_workspace_kernel).
+@triton.jit(do_not_specialize=["num_tokens", "seq_kv"])
 def _sparse_attention_bf16_kernel(
     q_ptr,
     kv_ptr,
@@ -684,7 +686,9 @@ def deepseek_v4_fp8_einsum_triton(
     )
 
 
-@triton.jit(do_not_specialize=["num_q", "seq_len_kv"])
+# stride_lm is the context-dependent output row-stride; pin it off divisibility
+# specialization too (num_q/seq_len_kv already pinned).
+@triton.jit(do_not_specialize=["num_q", "seq_len_kv", "stride_lm"])
 def _fp8_mqa_logits_kernel(
     q_ptr,
     k_ptr,
@@ -1383,7 +1387,13 @@ def tf32_hc_prenorm_gemm_triton(
     )
 
 
-@triton.jit
+# do_not_specialize the context-varying runtime ints. Triton otherwise compiles a
+# separate kernel per divisibility-by-16 class of num_rows / seq_len_kv / the output
+# row-stride stride_lm; during decode the context grows by 1 token per step and keeps
+# crossing the ÷16 boundary, recompiling ~every 16 tokens. Stacked over a long
+# generation these ~165ms compiles wedge the whole PP chain (one rank pinned in
+# Triton launch, the rest blocked on the collective). Pinning them off compiles once.
+@triton.jit(do_not_specialize=["num_rows", "seq_len_kv", "stride_lm"])
 def _mqa_logits_workspace_kernel(
     q_ptr,
     k_ptr,

@@ -66,7 +66,15 @@ def test_mqa_logits_workspace_does_not_recompile_per_context():
     _call(64, 1024)
 
     offenders = []
-    for n in (2048, 4096, 8192, 16000):
+    # Include context lengths that are NOT multiples of 16. Triton specializes a
+    # kernel on the *divisibility-by-16* of its runtime int args (num_rows,
+    # seq_len_kv, the output row-stride), even when they are plain i32/i64 and not
+    # tl.constexpr. During decode the context grows by 1 token per step, so it
+    # constantly crosses the ÷16 boundary -> a fresh compile every ~16 tokens,
+    # which stacks into the multi-minute PP-chain wedge. A test that only probes
+    # ÷16 lengths (2048, 4096, ...) never leaves the "divisible" specialization
+    # and masks the bug. The fix is do_not_specialize on those args.
+    for n in (2048, 2049, 4096, 4097, 8192, 8193, 8208, 8209, 16000, 15999):
         first = _time_call(64, n)               # compiles here iff specializing
         cached = min(_time_call(64, n) for _ in range(2))  # same n -> cached
         if first - cached > _COMPILE_LATENCY_S:
