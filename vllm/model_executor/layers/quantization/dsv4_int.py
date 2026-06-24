@@ -20,6 +20,14 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from vllm.logger import init_logger as _dsv4_init_logger
+_dsv4_logger = _dsv4_init_logger(__name__)
+_DSV4_KERNEL_PATHS: dict = {}
+
+def _dsv4_log_path(path: str) -> None:
+    _DSV4_KERNEL_PATHS[path] = _DSV4_KERNEL_PATHS.get(path, 0) + 1
+    _dsv4_logger.info("DSV4KERNEL dense path=%s running_counts=%s", path, _DSV4_KERNEL_PATHS)
+
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
@@ -601,8 +609,10 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
             # DSV4 dense shapes. Triton stays as the fallback for layers
             # AllSpark cannot take (op unavailable, unaligned dims).
             if not self.force_dequant and self._try_process_allspark(layer):
+                _dsv4_log_path("allspark")
                 return
             if not self.force_dequant and self._try_process_triton_channel(layer):
+                _dsv4_log_path("triton_channel")
                 return
             weight = dequantize_allspark_uint8_w8a16(
                 layer.weight.data,
@@ -610,6 +620,7 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
             )
             replace_parameter(layer, "weight", weight.contiguous())
             layer._dsv4_int_dequanted = True
+            _dsv4_log_path("dequant_channel_bf16" + ("_wo_a" if self.force_dequant else ""))
             return
 
         weight = dequantize_int8_w8a16(
@@ -619,6 +630,7 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
         )
         replace_parameter(layer, "weight", weight.contiguous())
         layer._dsv4_int_dequanted = True
+        _dsv4_log_path("dequant_block_bf16")
 
     def _try_process_allspark(self, layer: torch.nn.Module) -> bool:
         if not layer.weight.is_cuda:
