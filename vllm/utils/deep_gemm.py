@@ -496,6 +496,104 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
+_SM120_MQA_LOGITS_MAX_SCORE_BYTES = 64 * 1024 * 1024
+
+
+def _fp8_mqa_logits_head_chunk_size(
+    seq_len: int,
+    seq_len_kv: int,
+    num_heads: int,
+) -> int:
+    # The SM120 torch path is used on long prefill paths where materializing
+    # [head_chunk, M, N] scores can otherwise allocate multiple GiB. Keep the
+    # transient score tensor bounded, while still using larger head chunks for
+    # short prompts where they are faster.
+    score_elems_per_head = max(1, seq_len * seq_len_kv)
+    max_heads = _SM120_MQA_LOGITS_MAX_SCORE_BYTES // (score_elems_per_head * 4)
+    return max(1, min(8, num_heads, max_heads))
+
+
+def _fp8_mqa_logits_k_chunk_size(
+    seq_len: int,
+    seq_len_kv: int,
+    head_chunk_size: int,
+) -> int:
+    score_elems_per_key = max(1, seq_len * head_chunk_size)
+    max_keys = _SM120_MQA_LOGITS_MAX_SCORE_BYTES // (score_elems_per_key * 4)
+    return max(1, min(seq_len_kv, max_keys))
+
+
+def _fp8_mqa_logits_torch(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    if q_scale is not None:
+        raise NotImplementedError("SM120 MQA logits torch path only supports FP8 Q")
+
+    k_values, k_scales = kv
+    k_f32 = k_values.to(torch.float32)
+    k_f32.mul_(k_scales.reshape(-1, 1).to(torch.float32))
+    k_t = k_f32.transpose(0, 1).contiguous()
+
+    seq_len, num_heads, _ = q_values.shape
+    seq_len_kv = k_f32.shape[0]
+    logits = torch.zeros(
+        (seq_len, seq_len_kv), device=q_values.device, dtype=torch.float32
+    )
+    head_chunk_size = _fp8_mqa_logits_head_chunk_size(seq_len, seq_len_kv, num_heads)
+
+    for head_start in range(0, num_heads, head_chunk_size):
+        head_end = min(head_start + head_chunk_size, num_heads)
+        q_chunk = q_values[:, head_start:head_end, :].to(torch.float32)
+        q_chunk = q_chunk.transpose(0, 1).contiguous()
+        head_weights = weights[:, head_start:head_end].transpose(0, 1).unsqueeze(-1)
+        k_chunk_size = _fp8_mqa_logits_k_chunk_size(
+            seq_len, seq_len_kv, head_end - head_start
+        )
+        for k_start in range(0, seq_len_kv, k_chunk_size):
+            k_end = min(k_start + k_chunk_size, seq_len_kv)
+            scores = torch.matmul(q_chunk, k_t[:, k_start:k_end])
+            scores.relu_()
+            scores.mul_(head_weights)
+            logits[:, k_start:k_end].add_(
+                scores[0] if scores.shape[0] == 1 else scores.sum(dim=0)
+            )
+
+    if clean_logits:
+        offsets = torch.arange(seq_len_kv, device=q_values.device)
+        valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+            offsets[None, :] < cu_seqlen_ke[:, None]
+        )
+        logits = logits.masked_fill(~valid, float("-inf"))
+
+    return logits
+
+
+def _fp8_mqa_logits_sm12x(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    if clean_logits and q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
+        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+            fp8_mqa_logits_triton,
+        )
+
+        return fp8_mqa_logits_triton(q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    return _fp8_mqa_logits_torch(
+        q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+    )
+
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -529,6 +627,15 @@ def fp8_fp4_mqa_logits(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
     _lazy_init()
+    # Ampere/Ada (sm_8x) and consumer Blackwell (sm_12x) route through the
+    # portable Triton/torch sm12x path — DeepGEMM is sm_90+/sm_100+ only.
+    if (
+        current_platform.is_device_capability_family(120)
+        or current_platform.is_device_capability_family(80)
+    ) and q[1] is None:
+        return _fp8_mqa_logits_sm12x(
+            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+        )
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
     return _fp8_fp4_mqa_logits_impl(

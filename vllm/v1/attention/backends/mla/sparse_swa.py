@@ -568,6 +568,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            # sm_8x (Ampere) uses the Triton sparse-MLA path, not FlashMLA, so
+            # there is no FlashMLA tile-scheduler metadata to allocate (and
+            # _flashmla_C is not compiled for sm_8x). Return the None sentinel.
+            or current_platform.is_device_capability_family(80)
         ):
             return out
         for layer_type in self._layer_types:

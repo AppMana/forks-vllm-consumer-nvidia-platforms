@@ -103,8 +103,8 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 extra_indices=None if topk_indices is None else topk_indices[rs],
                 extra_lens=None if topk_lens is None else topk_lens[rs],
             )
-        if output.shape[1] > self.num_heads:
-            output[:, self.num_heads :].zero_()
+        if output.shape[1] > self.n_local_heads:
+            output[:, self.n_local_heads :].zero_()
 
     def _forward_prefill(
         self,

@@ -810,6 +810,13 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
+    # sm_8x lacks fp8e4nv in Triton (and the cutedsl path needs `quack`, which
+    # is not installed on Ampere). Use the torch fallback there.
+    if not _supports_fp8e4nv_in_triton():
+        _dequantize_and_gather_k_cache_torch(
+            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        )
+        return
     if has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
