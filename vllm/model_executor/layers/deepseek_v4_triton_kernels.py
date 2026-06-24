@@ -813,7 +813,7 @@ def fp8_mqa_logits_triton(
     return logits
 
 
-@triton.jit(do_not_specialize=["num_rows", "logits_width"])
+@triton.jit(do_not_specialize=["logits_width", "num_rows", "token_start", "stride_lm"])
 def _fp8_paged_mqa_logits_kernel(
     q_ptr,
     kv_ptr,
@@ -1022,7 +1022,7 @@ def fp8_paged_mqa_logits_triton(
     return logits[:, :token_count]
 
 
-@triton.jit(do_not_specialize=["num_rows", "logits_width"])
+@triton.jit(do_not_specialize=["logits_width", "num_rows", "token_start", "stride_lm"])
 def _fp8_paged_mqa_logits_rowwise_kernel(
     q_ptr,
     kv_ptr,

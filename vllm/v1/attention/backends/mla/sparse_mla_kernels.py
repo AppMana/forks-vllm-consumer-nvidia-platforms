@@ -237,7 +237,7 @@ def merge_sparse_mla_subset_with_sink(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_output_t", "stride_slot_t"])
 def _build_combined_decode_valid_mask_kernel(
     output_ptr,
     slot_ids_ptr,
@@ -387,7 +387,7 @@ def matmul_sparse_mla_attention_with_sink(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_scores_t", "stride_scores_h", "stride_kv_t", "stride_valid_t"])
 def _finish_materialized_scores_with_sink_kernel(
     scores_ptr,
     kv_ptr,
@@ -469,7 +469,7 @@ def _finish_materialized_scores_with_sink_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_scores_t", "stride_scores_h", "stride_kv_t", "stride_valid_t"])
 def _finish_materialized_scores_with_sink_candidate_block_kernel(
     scores_ptr,
     kv_ptr,
@@ -558,7 +558,7 @@ def _finish_materialized_scores_with_sink_candidate_block_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_scores_t", "stride_scores_h", "stride_kv_t", "stride_valid_t"])
 def _finish_materialized_scores_with_sink_value_block_kernel(
     scores_ptr,
     kv_ptr,
@@ -755,7 +755,7 @@ def finish_materialized_sparse_mla_scores_with_sink(
         output[:, active_heads:].zero_()
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_kv_t", "stride_slot_t", "num_candidates", "candidate_offset"])
 def _accumulate_gathered_attention_chunk_kernel(
     q_ptr,
     kv_ptr,
@@ -909,7 +909,7 @@ def accumulate_gathered_sparse_mla_attention_chunk(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_kv_t", "stride_indices_t", "num_candidates", "candidate_offset"])
 def _accumulate_indexed_attention_chunk_kernel(
     q_ptr,
     kv_flat_ptr,
@@ -1052,7 +1052,7 @@ def accumulate_indexed_sparse_mla_attention_chunk(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_kv_t", "stride_indices_t", "candidate_offset"])
 def _accumulate_indexed_attention_chunk_multihead_kernel(
     q_ptr,
     kv_flat_ptr,
@@ -1234,7 +1234,7 @@ def accumulate_indexed_sparse_mla_attention_chunk_multihead(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_slot_t", "num_candidates", "candidate_offset"])
 def _accumulate_fp8ds_global_slots_attention_chunk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1418,7 +1418,7 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_slot_t", "num_candidates", "candidate_offset"])
 def _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1623,7 +1623,7 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_block_table_t", "num_candidates", "candidate_offset"])
 def _accumulate_fp8ds_paged_attention_chunk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1810,7 +1810,7 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_block_table_t", "num_candidates", "candidate_offset"])
 def _accumulate_fp8ds_paged_attention_chunk_multihead_kernel(
     q_ptr,
     k_cache_ptr,
@@ -2018,7 +2018,7 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_block_table_t"])
 def _fp8ds_paged_attention_with_sink_multihead_kernel(
     q_ptr,
     k_cache_ptr,
@@ -2225,7 +2225,7 @@ def fp8ds_paged_sparse_mla_attention_with_sink_multihead(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_slot_t", "stride_block_table_t"])
 def _fp8ds_global_paged_attention_with_sink_multihead_kernel(
     q_ptr,
     compressed_k_cache_ptr,
