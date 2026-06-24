@@ -600,6 +600,23 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    # Ampere/Ada (sm_8x) and SM12x: DeepGEMM's paged-MQA-logits kernel is
+    # Hopper-only, so route the FP8/INT8 indexer logits through the portable
+    # Triton kernel (FP8 inputs upcast to bf16; INT8 K-cache + s8 query handled
+    # inside via indexer_cache_is_int8()/q.dtype). q_scale is None for the
+    # FP8/INT8 indexer path; the FP4 path keeps the DeepGEMM impl below.
+    q_values, q_scale = q
+    if q_scale is None and (
+        current_platform.is_device_capability_family(80)
+        or current_platform.is_device_capability_family(120)
+    ):
+        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+            fp8_paged_mqa_logits_triton,
+        )
+
+        return fp8_paged_mqa_logits_triton(
+            q_values, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
