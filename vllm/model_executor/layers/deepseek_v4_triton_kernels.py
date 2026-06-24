@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton fallback kernels used by the local DeepSeek V4 path."""
 
+import os
+
 import torch
 
 from vllm.triton_utils import LOG2E, tl, triton
