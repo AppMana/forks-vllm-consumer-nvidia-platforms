@@ -69,6 +69,16 @@ def _quantize_mxfp4_pair(x_lo, x_hi):
 
 
 @triton.jit
+def _round_clamp_int8(v):
+    """Round-half-away-from-zero (portable, no libdevice), clamp to symmetric
+    INT8 [-127, 127], return int8. Matches torch.round/rintf closely enough for
+    the indexer's quantization recall."""
+    r = tl.where(v >= 0, tl.math.floor(v + 0.5), -tl.math.floor(-v + 0.5))
+    r = tl.minimum(tl.maximum(r, -127.0), 127.0)
+    return r.to(tl.int8)
+
+
+@triton.jit
 def _fused_indexer_q_rope_quant_kernel(
     pos_ptr,
     # Index Q RoPE
@@ -90,6 +100,7 @@ def _fused_indexer_q_rope_quant_kernel(
     index_weights_head_scale,
     index_weights_out_ptr,
     index_weights_out_stride,
+    QK_INT8: tl.constexpr = False,
 ):
     # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
     # + per_token_group_quant_fp8): GPT-J interleaved RoPE applied to the
@@ -130,27 +141,34 @@ def _fused_indexer_q_rope_quant_kernel(
         nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
         x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
         amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
-    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
-    index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+    if QK_INT8:
+        # Symmetric INT8 query for the s8 x s8 integer-MMA decode indexer.
+        # Plain absmax/127 (matches the prefill use_imma path in deep_gemm and the
+        # int8 K-cache writer's absmax scale); stored as int8 into an int8 tensor.
+        index_q_scale = tl.maximum(amax, 1e-4) / 127.0
+    else:
+        index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
+        index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
 
-    # Store quantized values to index_q_fp8
+    # Store quantized values to index_q (fp8 e4m3 bytes, or int8 when QK_INT8).
     fp8_base_ptr = (
         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
     )
     if INDEX_Q_NOPE_DIM > 0:
-        tl.store(
-            fp8_base_ptr + nope_offset,
-            fp8e4m3_encode_from_fp32(tl.div_rn(x_nope, index_q_scale)),
-        )
+        qn = tl.div_rn(x_nope, index_q_scale)
+        if QK_INT8:
+            tl.store(fp8_base_ptr + nope_offset, _round_clamp_int8(qn))
+        else:
+            tl.store(fp8_base_ptr + nope_offset, fp8e4m3_encode_from_fp32(qn))
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
-    tl.store(
-        fp8_rot_base + half_offset * 2,
-        fp8e4m3_encode_from_fp32(tl.div_rn(r_even, index_q_scale)),
-    )
-    tl.store(
-        fp8_rot_base + half_offset * 2 + 1,
-        fp8e4m3_encode_from_fp32(tl.div_rn(r_odd, index_q_scale)),
-    )
+    qe = tl.div_rn(r_even, index_q_scale)
+    qo = tl.div_rn(r_odd, index_q_scale)
+    if QK_INT8:
+        tl.store(fp8_rot_base + half_offset * 2, _round_clamp_int8(qe))
+        tl.store(fp8_rot_base + half_offset * 2 + 1, _round_clamp_int8(qo))
+    else:
+        tl.store(fp8_rot_base + half_offset * 2, fp8e4m3_encode_from_fp32(qe))
+        tl.store(fp8_rot_base + half_offset * 2 + 1, fp8e4m3_encode_from_fp32(qo))
 
     # FP8 weight-fold contract:
     #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
