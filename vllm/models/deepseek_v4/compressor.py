@@ -354,9 +354,16 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        # cutedsl needs `quack` (sm_90+); on sm_8x fall through to the Triton
-        # sparse kernel, which also handles head_dim == 512.
-        if current_platform.is_cuda() and self.head_dim == 512 and has_cutedsl():
+        # cutedsl needs `quack`, which is unavailable on Ampere (sm_8x) and
+        # consumer Blackwell (sm_12x); those route through the Triton sparse
+        # kernel, which also handles head_dim == 512. (has_cutedsl() is True
+        # even when quack is missing, so gate on capability instead.)
+        _cutedsl_ok = (
+            has_cutedsl()
+            and not current_platform.is_device_capability_family(80)
+            and not current_platform.is_device_capability_family(120)
+        )
+        if current_platform.is_cuda() and self.head_dim == 512 and _cutedsl_ok:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
