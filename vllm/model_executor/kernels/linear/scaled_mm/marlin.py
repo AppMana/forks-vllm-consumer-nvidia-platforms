@@ -78,9 +78,14 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         # Non-block: callers must pass weight in (K, N) layout.
 
         layer.input_scale = None
-        prepare_fp8_layer_for_marlin(
-            layer, self.size_k_first, input_dtype=self.marlin_input_dtype
-        )
+        # is_bmm layers (e.g. DeepSeek V4 wo_a) are consumed directly via
+        # `.weight` / `.weight_scale_inv` by a custom fp8 einsum kernel; their
+        # `apply()` is never called, so they must NOT be repacked into Marlin
+        # layout. Leave them in canonical (out, in) FP8 block-quant form.
+        if not getattr(layer, "is_bmm", False):
+            prepare_fp8_layer_for_marlin(
+                layer, self.size_k_first, input_dtype=self.marlin_input_dtype
+            )
         del layer.input_scale
 
     def apply_weights(
