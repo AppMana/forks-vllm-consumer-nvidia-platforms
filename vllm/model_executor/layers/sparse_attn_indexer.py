@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -377,6 +379,15 @@ def sparse_attn_indexer(
     if k is not None:
         k = k[:num_tokens]
 
+    # INT8 indexer cache mode (gate-1 recall 99.48% vs fp8 on real tensors;
+    # tools/ampere/dsv4_indexer_int8_recall.py). The writer stores symmetric
+    # INT8 bit patterns with plain fp32 absmax/127 scales; decode kernels branch
+    # on K_IS_INT8 and prefill consumers receive an int8-viewed gather, so their
+    # generic float conversions stay correct.
+    _indexer_int8 = (
+        os.environ.get("APPMANA_DSV4_INDEXER_CACHE_INT8", "0") == "1"
+        and not use_fp4_cache
+    )
     if not skip_k_cache_insert:
         # scale_fmt can be None, but the function expects str
         assert scale_fmt is not None
@@ -386,7 +397,7 @@ def sparse_attn_indexer(
             kv_cache,
             slot_mapping,
             quant_block_size,
-            scale_fmt,
+            "int8" if _indexer_int8 else scale_fmt,
         )
 
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
@@ -449,7 +460,9 @@ def sparse_attn_indexer(
                     k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
                 else:
                     q_slice_cast = q_slice
-                    k_quant_cast = k_quant
+                    k_quant_cast = (
+                        k_quant.view(torch.int8) if _indexer_int8 else k_quant
+                    )
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
                 if current_platform.is_xpu():
                     if q_scale_slice is not None:
