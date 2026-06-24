@@ -134,6 +134,17 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
 ):
     if use_cutedsl and not has_cutedsl():
         pytest.skip("cutedsl (cutlass) not installed")
+    if use_cutedsl:
+        # has_cutedsl() only checks for cutlass; the CuTe-DSL kernels also need
+        # the `quack` runtime, which is absent on Ampere boxes.
+        import importlib.util
+
+        if importlib.util.find_spec("quack") is None:
+            pytest.skip("cutedsl quack runtime not installed")
+    if use_fp4 and torch.cuda.get_device_capability() < (9, 0):
+        # MXFP4 query emits `cvt.e2m1x2`, which PTXAS rejects below sm_90.
+        # DSV4-on-Ampere uses int8/fp8 query, never MXFP4.
+        pytest.skip("MXFP4 query (cvt.e2m1x2) requires sm_90+")
 
     device = "cuda"
     torch.manual_seed(0)
