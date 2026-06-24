@@ -194,3 +194,60 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
         f"weights mismatch: max abs diff "
         f"{(weights_ref - weights_fused).abs().max().item()}"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 7, 32, 257])
+@torch.inference_mode()
+def test_fused_indexer_q_rope_quant_int8(num_tokens):
+    """INT8 integer-MMA query path (q_is_int8=True): the symmetric int8 q must
+    dequantize back to the RoPE'd query (within ~int8 ULP), and its per-(token,
+    head) scale must be folded into weights_out (NOT returned separately) exactly
+    like the fp8 path. A wrong scale here silently corrupts the indexer top-k."""
+    device = "cuda"
+    torch.manual_seed(0)
+    q = torch.randn(num_tokens, N_HEAD, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.randint(0, MAX_POS, (num_tokens,), dtype=torch.int64, device=device)
+    cos_sin_cache = torch.randn(MAX_POS, ROPE_DIM, dtype=torch.bfloat16, device=device)
+    # strictly-positive weights so the scale recovery (weights_out / base) is stable
+    weights = torch.rand(num_tokens, N_HEAD, dtype=torch.bfloat16, device=device) + 0.25
+    softmax_scale = HEAD_DIM**-0.5
+    head_scale = N_HEAD**-0.5
+
+    # Reference RoPE (matches the kernel's GPT-J interleaved tail rotation).
+    q_rot = q.clone()
+    ops.rotary_embedding(
+        positions, q_rot, None, HEAD_DIM, cos_sin_cache, False, HEAD_DIM - ROPE_DIM, False
+    )
+    q_rot_f32 = q_rot.to(torch.float32)
+
+    with mock.patch(
+        "vllm.models.deepseek_v4.common.ops.fused_indexer_q.has_cutedsl",
+        return_value=False,
+    ):
+        q_i8, weights_out = fused_indexer_q_rope_quant(
+            positions,
+            q.clone(),
+            cos_sin_cache,
+            weights,
+            softmax_scale,
+            head_scale,
+            use_fp4=False,
+            q_is_int8=True,
+        )
+
+    assert q_i8.dtype == torch.int8, f"expected int8 q, got {q_i8.dtype}"
+    assert q_i8.abs().max().item() <= 127
+
+    # Recover the per-(token, head) q scale folded into weights_out, then check the
+    # int8 query dequantizes back to the RoPE'd query.
+    base = weights.to(torch.float32) * softmax_scale * head_scale  # [T, H]
+    q_scale = weights_out / base.clamp(min=1e-30)  # implied scale [T, H]
+    q_deq = q_i8.to(torch.float32) * q_scale.unsqueeze(-1)
+    err = (q_deq - q_rot_f32).abs()
+    tol = 2.0 * q_scale.unsqueeze(-1).expand_as(err) + 1e-3  # ~2 int8 ULP
+    frac_ok = (err <= tol).float().mean().item()
+    assert frac_ok > 0.999, (
+        f"int8 query dequant mismatch: {frac_ok:.4f} within tol; "
+        f"max_err={err.max().item():.4g}, mean_scale={q_scale.mean().item():.4g}"
+    )

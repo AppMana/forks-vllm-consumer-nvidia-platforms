@@ -946,6 +946,10 @@ def fp8_paged_mqa_logits_triton(
     token_count: int | None = None,
 ) -> torch.Tensor:
     batch_size, next_n, num_heads, head_dim = q.size()
+    # The indexer query is symmetric INT8 (s8 x s8 integer-MMA) when the int8
+    # cache + APPMANA_DSV4_INDEXER_IMMA are on; fused_indexer_q emits an int8 q
+    # tensor and folds its scale into `weights`, so detect it by dtype here.
+    q_is_int8 = q.dtype == torch.int8
     if head_dim % 64 == 0 and num_heads % 4 == 0:
         return fp8_paged_mqa_logits_rowwise_triton(
             q,
@@ -956,6 +960,7 @@ def fp8_paged_mqa_logits_triton(
             max_model_len,
             token_start=token_start,
             token_count=token_count,
+            q_is_int8=q_is_int8,
         )
 
     kv_values, kv_scale = _view_packed_fp8_paged_mqa_kv_cache(kv_cache, head_dim)

@@ -2419,6 +2419,15 @@ class DeepseekV4Indexer(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         k = self.compressor(compressed_kv_score, positions, rotary_emb)
+        # INT8 integer-MMA indexer query on Ampere: when the int8 K cache +
+        # APPMANA_DSV4_INDEXER_IMMA are on (and not the MXFP4 path), emit a
+        # symmetric int8 query so the indexer logits run on s8 x s8 tensor cores
+        # instead of arithmetic fp8. Downstream (deep_gemm / paged + workspace
+        # logits kernels) detect int8 by q dtype.
+        from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+            indexer_imma_enabled,
+        )
+        q_is_int8 = indexer_imma_enabled() and not self.use_fp4_kv
         q_quant, weights = fused_indexer_q_rope_quant(
             positions,
             q,
@@ -2427,5 +2436,6 @@ class DeepseekV4Indexer(nn.Module):
             self.softmax_scale,
             self.n_head**-0.5,
             use_fp4=self.use_fp4_kv,
+            q_is_int8=q_is_int8,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)

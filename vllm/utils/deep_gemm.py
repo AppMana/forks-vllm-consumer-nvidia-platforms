@@ -459,14 +459,20 @@ def _fp8_mqa_logits_topk_torch(
         # [N, D] tensor (cublasLt NT int8 layout); k_values is already [N, D].
         k_rows_i8 = k_values.contiguous()
         k_post_scale = k_scales.reshape(-1).to(torch.float32)  # [N]
-        q_f32 = q_values.to(torch.float32)
-        q_qscale = q_f32.abs().amax(dim=2).clamp(min=1e-30) / 127.0  # [M, H]
-        q_i8 = (
-            torch.round(q_f32 / q_qscale.unsqueeze(-1))
-            .clamp(-127, 127)
-            .to(torch.int8)
-        )
-        weights = weights * q_qscale
+        if q_values.dtype == torch.int8:
+            # q already symmetric INT8 (fused_indexer_q emitted it with q_is_int8
+            # and folded its per-(token, head) scale into `weights`). Use directly
+            # — re-quantizing the int8 bytes would double-fold the scale.
+            q_i8 = q_values
+        else:
+            q_f32 = q_values.to(torch.float32)
+            q_qscale = q_f32.abs().amax(dim=2).clamp(min=1e-30) / 127.0  # [M, H]
+            q_i8 = (
+                torch.round(q_f32 / q_qscale.unsqueeze(-1))
+                .clamp(-127, 127)
+                .to(torch.int8)
+            )
+            weights = weights * q_qscale
         # cublasLt int8 GEMM needs 4-aligned dims; pad the token dim once.
         m_pad = (-q_i8.shape[0]) % 8
         if m_pad:
