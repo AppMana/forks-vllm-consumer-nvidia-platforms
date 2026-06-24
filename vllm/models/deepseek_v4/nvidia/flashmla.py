@@ -53,6 +53,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             o_lora_rank=self.o_lora_rank,
             einsum_recipe=self._einsum_recipe,
             tma_aligned_scales=self._tma_aligned_scales,
+            is_neox_style=bool(getattr(self.rotary_emb, "is_neox_style", False)),
         )
 
     @classmethod

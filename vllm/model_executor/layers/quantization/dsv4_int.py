@@ -935,7 +935,6 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
             sort_indices2=layer.w2_g_idx_sort_indices,
             workspace=layer.workspace,
             is_k_full=True,
-            inplace=not self.moe.disable_inplace,
             input_dtype=self.input_dtype,
             input_global_scale1=getattr(layer, "w13_input_global_scale", None),
             input_global_scale2=getattr(layer, "w2_input_global_scale", None),

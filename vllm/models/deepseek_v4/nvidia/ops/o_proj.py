@@ -6,8 +6,77 @@ import torch.nn as nn
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
+from vllm.model_executor.layers.rotary_embedding.common import (
+    rotate_gptj,
+    rotate_neox,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
+from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def deepseek_v4_inv_rope_woa(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a_weight: torch.Tensor,
+    out: torch.Tensor,
+    rope_head_dim: int,
+    n_local_groups: int,
+    o_lora_rank: int,
+    is_neox_style: bool,
+) -> None:
+    """Inverse-RoPE + BF16 wo_a einsum for the dsv4_int (INT8 wo_a) path.
+
+    The dsv4_int checkpoint stores wo_a as INT8 and dequantizes it once to
+    BF16 at load time (`_dsv4_int_dequanted`), so it must not go through the
+    FP8 einsum. Computes out = einsum("tgd,grd->tgr", inv_rope(o), wo_a).
+    """
+    head_size = o.shape[-1]
+    nope_dim = head_size - rope_head_dim
+    o_pass = o[..., :nope_dim] if nope_dim > 0 else None
+    o_rot = o[..., nope_dim:]
+
+    safe_positions = positions.clamp(0, cos_sin_cache.shape[0] - 1)
+    cos_sin = cos_sin_cache[safe_positions]
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    if is_neox_style:
+        cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
+        sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
+        rotate_fn = rotate_neox
+    else:
+        cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+        sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
+        rotate_fn = rotate_gptj
+    o_rot = (o_rot.float() * cos - rotate_fn(o_rot.float()) * sin).to(o.dtype)
+    o_ref = torch.cat((o_pass, o_rot), dim=-1) if o_pass is not None else o_rot
+    o_ref = o_ref.view(o.shape[0], n_local_groups, -1).to(torch.bfloat16)
+    wo_a = wo_a_weight.view(n_local_groups, o_lora_rank, o_ref.shape[-1]).to(
+        torch.bfloat16
+    )
+    out.copy_(torch.einsum("tgd,grd->tgr", o_ref, wo_a))
+
+
+def _deepseek_v4_inv_rope_woa_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a_weight: torch.Tensor,
+    out: torch.Tensor,
+    rope_head_dim: int,
+    n_local_groups: int,
+    o_lora_rank: int,
+    is_neox_style: bool,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_inv_rope_woa",
+    op_func=deepseek_v4_inv_rope_woa,
+    mutates_args=["out"],
+    fake_impl=_deepseek_v4_inv_rope_woa_fake,
+)
 
 
 def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -39,12 +108,34 @@ def deep_gemm_fp8_o_proj(
     o_lora_rank: int,
     einsum_recipe: tuple[int, int, int],
     tma_aligned_scales: bool,
+    is_neox_style: bool = False,
 ) -> torch.Tensor:
     """O projection: inverse RoPE + FP8 quant + einsum + wo_b.
 
     Shared by the FlashMLA and FlashInfer CUDA backends. ``einsum_recipe`` /
     ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
     """
+    # dsv4_int stores wo_a as INT8 and dequantizes it to BF16 once at load
+    # (`_dsv4_int_dequanted`); that path uses inverse-RoPE + a BF16 einsum, not
+    # the FP8 einsum (which asserts fp8 weights).
+    if getattr(wo_a, "_dsv4_int_dequanted", False):
+        z = torch.empty(
+            (o.shape[0], n_groups, o_lora_rank),
+            dtype=torch.bfloat16,
+            device=o.device,
+        )
+        torch.ops.vllm.deepseek_v4_inv_rope_woa(
+            o,
+            positions,
+            cos_sin_cache,
+            wo_a.weight,
+            z,
+            rope_dim,
+            n_groups,
+            o_lora_rank,
+            is_neox_style,
+        )
+        return wo_b(z.flatten(1))
     o_fp8, o_scale = fused_inv_rope_fp8_quant(
         o,
         positions,
