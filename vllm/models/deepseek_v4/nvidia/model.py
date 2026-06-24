@@ -1293,11 +1293,12 @@ def _get_deepseek_v4_scale_fmt(config) -> str:
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
-    if expert_dtype == "fp4":
-        # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
-        # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
-        # shared experts use Fp8LinearMethod's block scales, which
-        # register as ``weight_scale_inv``.
+    if expert_dtype in ("fp4", "int4"):
+        # MXFP4 experts use Mxfp4MoEMethod and the Ampere INT4 (Marlin) experts
+        # use Dsv4Int4MoEMethod; both register expert scales as
+        # ``w{1,2,3}_weight_scale`` (no _inv suffix), so the original
+        # ``.experts.N.w{123}.scale`` keys map there. FP8 linear and shared
+        # experts use block scales registered as ``weight_scale_inv``.
         scale_regex = {
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",

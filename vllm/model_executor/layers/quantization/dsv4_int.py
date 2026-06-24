@@ -30,7 +30,11 @@ def _dsv4_log_path(path: str) -> None:
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE, FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
+    FusedMoEMethodBase,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
@@ -43,7 +47,10 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
-from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -388,6 +395,7 @@ def dequantize_allspark_uint8_w8a16(
     return (signed * scale.to(torch.float32).reshape(-1, 1)).to(torch.bfloat16)
 
 
+@register_quantization_config("dsv4_int")
 class Dsv4IntConfig(QuantizationConfig):
     """Quantization config for AOT-requantized DeepSeek V4 INT checkpoints."""
 
@@ -467,7 +475,7 @@ class Dsv4IntConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             return Dsv4Int4MoEMethod(self, layer.moe_config)
         if isinstance(layer, LinearBase):
             if any(pattern in prefix for pattern in self.INT8_PARENT_PATTERNS):
@@ -478,6 +486,7 @@ class Dsv4IntConfig(QuantizationConfig):
         return None
 
 
+@register_quantization_config("dsv4_mxfp4_int8")
 class Dsv4Mxfp4Int8Config(Dsv4IntConfig):
     """DeepSeek V4 hybrid path: native MXFP4 routed experts + INT8 dense linears.
 
@@ -514,7 +523,7 @@ class Dsv4Mxfp4Int8Config(Dsv4IntConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             return Mxfp4MoEMethod(layer.moe_config)
         if isinstance(layer, LinearBase):
             if any(pattern in prefix for pattern in self.INT8_PARENT_PATTERNS):
