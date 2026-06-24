@@ -3,10 +3,13 @@
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadataBuilder
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
@@ -25,7 +28,15 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         dtype=torch.bfloat16,
         compress_ratio=4,
     )
-    vllm_config = create_vllm_config(max_model_len=1024)
+    vllm_config = create_vllm_config(
+        model_name="deepseek-ai/DeepSeek-V2-Lite-Chat",
+        max_model_len=1024,
+        hf_config_override={
+            "sliding_window": 128,
+            "index_topk": 4,
+            "compress_ratios": [4],
+        },
+    )
     builder = DeepseekV32IndexerMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
         layer_names=["dummy"],
@@ -90,3 +101,88 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         device=device,
     )
     torch.testing.assert_close(valid_slots, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_deepseek_v4_mtp_verifier_rows_stay_on_decode_metadata_path():
+    device = torch.device("cuda")
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    vllm_config = create_vllm_config(
+        model_name="deepseek-ai/DeepSeek-V2-Lite-Chat",
+        max_model_len=1024,
+        hf_config_override={
+            "sliding_window": 128,
+            "index_topk": 4,
+            "compress_ratios": [4],
+        },
+    )
+    vllm_config.speculative_config = SimpleNamespace(
+        num_speculative_tokens=1,
+        parallel_drafting=False,
+    )
+
+    indexer = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy_indexer"],
+        vllm_config=vllm_config,
+        device=device,
+    )
+    flashmla = FlashMLASparseMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy_mla"],
+        vllm_config=vllm_config,
+        device=device,
+    )
+    sparse_swa = DeepseekSparseSWAMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy_swa"],
+        vllm_config=vllm_config,
+        device=device,
+    )
+
+    assert indexer.reorder_batch_threshold == 2
+    assert flashmla.reorder_batch_threshold == 2
+    assert sparse_swa.decode_threshold == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_deepseek_v4_pp_mtp_forces_flattened_indexer_decode_metadata():
+    device = torch.device("cuda")
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        compress_ratio=128,
+        model_version="deepseek_v4",
+    )
+    vllm_config = create_vllm_config(
+        model_name="deepseek-ai/DeepSeek-V2-Lite-Chat",
+        max_model_len=1024,
+        hf_config_override={
+            "sliding_window": 128,
+            "index_topk": 4,
+            "compress_ratios": [128],
+        },
+    )
+    vllm_config.speculative_config = SimpleNamespace(
+        num_speculative_tokens=4,
+        parallel_drafting=False,
+    )
+    vllm_config.parallel_config.pipeline_parallel_size = 2
+
+    indexer = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy_indexer"],
+        vllm_config=vllm_config,
+        device=device,
+    )
+
+    assert indexer.use_flattening
