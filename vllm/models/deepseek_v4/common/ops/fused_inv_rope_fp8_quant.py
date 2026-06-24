@@ -224,6 +224,150 @@ def fused_inv_rope_fp8_quant(
     return fp8_buf.transpose(0, 1), scale_buf.transpose(0, 1)
 
 
+def _supports_fp8e4nv_in_triton() -> bool:
+    """Triton's `tl.float8e4nv` cast requires sm_89+ (Ada/Hopper/Blackwell).
+    On sm_8x (Ampere) the Triton compiler refuses with::
+
+        ValueError: type fp8e4nv not supported in this architecture.
+        Supported fp8 dtypes: ('fp8e4b15', 'fp8e5')
+
+    Fall back to a torch-only implementation that uses
+    ``torch.float8_e4m3fn`` (PyTorch ships a software-emulated cast on
+    Ampere — bit-correct, slower than the native instruction).
+    """
+    if not current_platform.is_cuda():
+        return True  # ROCm / XPU keep the existing path; only sm_8x falls back
+    cap = current_platform.get_device_capability()
+    if cap is None:
+        return True
+    return cap.major != 8
+
+
+def _fused_inv_rope_fp8_quant_torch(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    heads_per_group: int,
+    quant_group_size: int,
+    chunks_per_head: int,
+    rope_start: int,
+    half_rope: int,
+    tma_aligned_scales: bool,
+    fp8_max: float,
+    tma_aligned_T: int,
+    num_tokens: int,
+    n_groups: int,
+    d: int,
+    scale_inner: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-torch fallback for sm_8x (no native fp8e4nv cast).
+
+    Mirrors `_fused_inv_rope_fp8_quant_per_head` step-for-step:
+      1. Inverse RoPE on the trailing rope_dim elements of each head.
+      2. Block absmax over `quant_group_size` chunks, scale = 2^ceil(log2(amax/fp8_max)).
+      3. Cast clamped (x / scale) to torch.float8_e4m3fn.
+      4. Pack scales: TMA-aligned UE8M0 bytes -> int32 (tma_aligned_scales=True),
+         or per-block fp32 (tma_aligned_scales=False).
+
+    Layout matches the Triton kernel: fp8_buf (n_groups, T, d),
+    scale_buf with stride (scale_inner * tma_aligned_T, 1, tma_aligned_T).
+    """
+    head_dim = chunks_per_head * quant_group_size
+    rope_dim = half_rope * 2
+    nope_dim = head_dim - rope_dim
+    assert rope_start == nope_dim % quant_group_size
+
+    num_heads = o.shape[1]
+    assert num_heads == n_groups * heads_per_group
+    assert o.shape[-1] == head_dim
+
+    # 1. Inverse RoPE on the rope_dim trailing elements.
+    safe_positions = positions.clamp(0, cos_sin_cache.shape[0] - 1)
+    cos_sin = cos_sin_cache[safe_positions].to(torch.float32)
+    cos = cos_sin[:, :half_rope]
+    sin = cos_sin[:, half_rope:]
+    o_f32 = o.to(torch.float32)
+    nope = o_f32[..., :nope_dim]
+    rope = o_f32[..., nope_dim:]
+    r_even = rope[..., 0::2]
+    r_odd = rope[..., 1::2]
+    cos_b = cos[:, None, :]
+    sin_b = sin[:, None, :]
+    new_even = r_even * cos_b + r_odd * sin_b
+    new_odd = -r_even * sin_b + r_odd * cos_b
+    rope_rotated = torch.empty_like(rope)
+    rope_rotated[..., 0::2] = new_even
+    rope_rotated[..., 1::2] = new_odd
+    x = torch.cat([nope, rope_rotated], dim=-1)
+    # x: (T, num_heads, head_dim) fp32
+
+    # 2. Block-scaled absmax. Group head_dim into chunks_per_head blocks.
+    x_g = x.view(num_tokens, n_groups, heads_per_group, chunks_per_head, quant_group_size)
+    absmax = x_g.abs().amax(dim=-1).clamp_min(1e-10)  # (T, G, H_g, chunks)
+    scale_raw = absmax / fp8_max
+    log2_scale = torch.ceil(torch.log2(scale_raw))
+    scale = torch.pow(2.0, log2_scale).to(torch.float32)  # power-of-2 fp32 scale
+
+    # 3. Clamp + scale + cast.
+    scale_e = scale.unsqueeze(-1).expand_as(x_g)
+    x_q = (x_g / scale_e).clamp(-fp8_max, fp8_max)
+    fp8_grouped = x_q.to(torch.float8_e4m3fn)  # software cast on Ampere
+    # (T, G, H_g, chunks, qgroup) -> (T, G, H_g * head_dim) -> (G, T, d)
+    fp8_buf = fp8_grouped.view(num_tokens, n_groups, d).transpose(0, 1).contiguous()
+
+    # 4. Pack scales. The kernel writes scale_buf with stride layout:
+    #    (scale_inner * tma_aligned_T, 1, tma_aligned_T) — this is "scale-major"
+    #    along the token axis. We allocate the same flat buffer, fill it via
+    #    the same as_strided, and write into the (G, T, scale_inner) view.
+    scale_buf_dtype = torch.int32 if tma_aligned_scales else torch.float32
+    scale_buf_flat = torch.empty(
+        n_groups * scale_inner * tma_aligned_T,
+        dtype=scale_buf_dtype,
+        device=o.device,
+    )
+    scale_buf = scale_buf_flat.as_strided(
+        (n_groups, num_tokens, scale_inner),
+        (scale_inner * tma_aligned_T, 1, tma_aligned_T),
+    )
+
+    # scale shape: (T, G, H_g, chunks). Need to lay out as (G, T, scale_inner)
+    # with scale_inner = packed_sf_k or num_scale_blocks.
+    if tma_aligned_scales:
+        # UE8M0 packed: extract biased fp32 exponent byte, pack 4 per int32.
+        scale_bits = scale.view(torch.int32)
+        ue8m0 = (scale_bits >> 23) & 0xFF  # (T, G, H_g, chunks) int32
+        # Per (token, head_in_group), pack `chunks_per_head` ue8m0 bytes into
+        # ceil(chunks_per_head / 4) int32 words. The kernel stores these at
+        # `scale_addr = scale_ptr + g*sg + pid_token + head_in_group*ssk`,
+        # which means scale_inner = packed_sf_k * heads_per_group only when
+        # chunks_per_head == 4 — see the kernel for the exact layout.
+        # In the typical V4 config (chunks_per_head=4), each head produces
+        # exactly one int32 packed word per (token, head_in_group).
+        assert chunks_per_head == 4, (
+            f"torch fallback only validated for chunks_per_head=4 "
+            f"(got {chunks_per_head}). Other shapes need explicit packing."
+        )
+        packed = (
+            ue8m0[..., 0]
+            | (ue8m0[..., 1] << 8)
+            | (ue8m0[..., 2] << 16)
+            | (ue8m0[..., 3] << 24)
+        )  # (T, G, H_g)
+        # Layout into (G, T, heads_per_group) with the kernel's stride.
+        for g in range(n_groups):
+            for h in range(heads_per_group):
+                scale_buf[g, :, h] = packed[:, g, h]
+    else:
+        # Per-chunk fp32. scale_inner = heads_per_group * chunks_per_head.
+        # Kernel writes scale[g, pid_token, qb_indices] where
+        # qb_indices = head_in_group * chunks_per_head + arange(chunks_per_head).
+        scale_per_token = scale.transpose(0, 1).reshape(n_groups, num_tokens, scale_inner)
+        scale_buf.copy_(scale_per_token)
+
+    return fp8_buf, scale_buf
+
+
+
 def _fused_inv_rope_fp8_quant_kernel_impl(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -241,6 +385,24 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
     d: int,
     scale_inner: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not _supports_fp8e4nv_in_triton():
+        return _fused_inv_rope_fp8_quant_torch(
+            o,
+            positions,
+            cos_sin_cache,
+            heads_per_group,
+            quant_group_size,
+            chunks_per_head,
+            rope_start,
+            half_rope,
+            tma_aligned_scales,
+            fp8_max,
+            tma_aligned_T,
+            num_tokens,
+            n_groups,
+            d,
+            scale_inner,
+        )
     fp8_buf = torch.empty(
         (n_groups, num_tokens, d),
         dtype=torch.float8_e4m3fn,
