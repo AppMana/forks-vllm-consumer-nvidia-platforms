@@ -7,6 +7,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
+from .fp8e4m3_arith import fp8e4m3_encode_from_fp32
+
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
 
@@ -68,6 +70,16 @@ def _quantize_mxfp4_pair(x_lo, x_hi):
 
 
 @triton.jit
+def _round_clamp_int8(v):
+    """Round-half-away-from-zero (portable, no libdevice), clamp to symmetric
+    INT8 [-127, 127], return int8. Matches torch.round/rintf closely enough for
+    the indexer's quantization recall."""
+    r = tl.where(v >= 0, tl.math.floor(v + 0.5), -tl.math.floor(-v + 0.5))
+    r = tl.minimum(tl.maximum(r, -127.0), 127.0)
+    return r.to(tl.int8)
+
+
+@triton.jit
 def _fused_indexer_q_rope_quant_kernel(
     pos_ptr,
     # Index Q RoPE
@@ -78,7 +90,7 @@ def _fused_indexer_q_rope_quant_kernel(
     index_q_cos_sin_stride,
     INDEX_Q_HALF_ROT_DIM: tl.constexpr,
     # Index Q Quantize
-    index_q_fp8_ptr,
+    index_q_fp8_ptr,  # uint8 view of the float8 output tensor on sm_8x
     index_q_fp8_stride0,
     index_q_fp8_stride1,
     INDEX_Q_HEAD_DIM: tl.constexpr,
@@ -91,6 +103,7 @@ def _fused_indexer_q_rope_quant_kernel(
     index_weights_out_stride,
     FP8_MAX: tl.constexpr = 448.0,
     USE_FNUZ: tl.constexpr = False,
+    QK_INT8: tl.constexpr = False,
 ):
     # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
     # + per_token_group_quant_fp8): GPT-J interleaved RoPE applied to the
@@ -131,29 +144,43 @@ def _fused_indexer_q_rope_quant_kernel(
         nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
         x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
         amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
-    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
-    index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+    if QK_INT8:
+        # Symmetric INT8 query for the s8 x s8 integer-MMA decode indexer.
+        # Plain absmax/127 (matches the prefill use_imma path in deep_gemm and the
+        # int8 K-cache writer's absmax scale); stored as int8 into an int8 tensor.
+        index_q_scale = tl.maximum(amax, 1e-4) / 127.0
+    else:
+        index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
+        index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
 
-    # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
-    # (e4m3fn) elsewhere -- matches the K cache.
+    # Store quantized values to index_q: int8 (QK_INT8); FNUZ (e4m3fnuz) via a
+    # hardware tl.float8e4b8 cast on gfx942; OCP e4m3fn via the fp8e4m3_arith
+    # software encoder (sm_8x/Ampere has no working tl.float8e4nv cast in
+    # Triton, so this path is used instead of a direct .to(tl.float8e4nv)).
     fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
     fp8_base_ptr = (
         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
     )
     if INDEX_Q_NOPE_DIM > 0:
-        tl.store(
-            fp8_base_ptr + nope_offset,
-            tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
-        )
+        qn = tl.div_rn(x_nope, index_q_scale)
+        if QK_INT8:
+            tl.store(fp8_base_ptr + nope_offset, _round_clamp_int8(qn))
+        elif USE_FNUZ:
+            tl.store(fp8_base_ptr + nope_offset, qn.to(fp8_dtype))
+        else:
+            tl.store(fp8_base_ptr + nope_offset, fp8e4m3_encode_from_fp32(qn))
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
-    tl.store(
-        fp8_rot_base + half_offset * 2,
-        tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
-    )
-    tl.store(
-        fp8_rot_base + half_offset * 2 + 1,
-        tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
-    )
+    qe = tl.div_rn(r_even, index_q_scale)
+    qo = tl.div_rn(r_odd, index_q_scale)
+    if QK_INT8:
+        tl.store(fp8_rot_base + half_offset * 2, _round_clamp_int8(qe))
+        tl.store(fp8_rot_base + half_offset * 2 + 1, _round_clamp_int8(qo))
+    elif USE_FNUZ:
+        tl.store(fp8_rot_base + half_offset * 2, qe.to(fp8_dtype))
+        tl.store(fp8_rot_base + half_offset * 2 + 1, qo.to(fp8_dtype))
+    else:
+        tl.store(fp8_rot_base + half_offset * 2, fp8e4m3_encode_from_fp32(qe))
+        tl.store(fp8_rot_base + half_offset * 2 + 1, fp8e4m3_encode_from_fp32(qo))
 
     # FP8 weight-fold contract:
     #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
@@ -286,6 +313,88 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     )
 
 
+def _supports_fp8e4nv_in_triton() -> bool:
+    """Same gate as fused_inv_rope_fp8_quant — Triton's tl.float8e4nv requires
+    sm_89+. Fall back to torch on sm_8x (Ampere)."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return True
+    cap = current_platform.get_device_capability()
+    if cap is None:
+        return True
+    return cap.major != 8
+
+
+def _fused_indexer_q_rope_fp8_torch(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-torch fallback mirroring `_fused_indexer_q_rope_quant_kernel`.
+
+    Steps:
+      1. Apply forward RoPE (interleaved GPT-J style) to the trailing
+         rope_dim elements of each head's query.
+      2. Compute per-token-per-head q_scale = ceil(log2(amax/448))-rounded
+         power-of-2 over the entire head_dim.
+      3. Cast (q / q_scale) to torch.float8_e4m3fn (software cast on sm_8x).
+      4. Fold q_scale * softmax_scale * head_scale into index_weights_out.
+
+    Returns (index_q_fp8, index_weights_out) matching the kernel contract.
+    """
+    num_tokens, num_index_q_heads, index_q_head_dim = index_q.shape
+    rope_half = index_q_cos_sin_cache.shape[-1] // 2
+    rope_dim = rope_half * 2
+    nope_dim = index_q_head_dim - rope_dim
+
+    safe_positions = positions.clamp(0, index_q_cos_sin_cache.shape[0] - 1)
+    cos_sin = index_q_cos_sin_cache[safe_positions].to(torch.float32)
+    cos = cos_sin[:, :rope_half]  # (T, rope_half)
+    sin = cos_sin[:, rope_half:]
+
+    q_f32 = index_q.to(torch.float32)
+    q_nope = q_f32[..., :nope_dim]
+    q_rope = q_f32[..., nope_dim:]
+    # The Triton kernel uses fwd RoPE (rope_q): pair (even, odd) -> (cos*even - sin*odd, cos*odd + sin*even).
+    # Match the fp32 → bf16 → fp32 round-trip used by the Triton path so the
+    # ue8m0 absmax matches bit-for-bit.
+    x_even = q_rope[..., 0::2].to(torch.bfloat16).to(torch.float32)
+    x_odd = q_rope[..., 1::2].to(torch.bfloat16).to(torch.float32)
+    cos_b = cos[:, None, :]
+    sin_b = sin[:, None, :]
+    r_even = x_even * cos_b - x_odd * sin_b
+    r_odd = x_odd * cos_b + x_even * sin_b
+    r_even_bf16 = r_even.to(torch.bfloat16).to(torch.float32)
+    r_odd_bf16 = r_odd.to(torch.bfloat16).to(torch.float32)
+    rope_rotated = torch.empty_like(q_rope)
+    rope_rotated[..., 0::2] = r_even_bf16
+    rope_rotated[..., 1::2] = r_odd_bf16
+    q_full = (
+        torch.cat([q_nope, rope_rotated], dim=-1) if nope_dim > 0 else rope_rotated
+    )
+
+    # Per-token-per-head amax over full head_dim.
+    fp8_max = 448.0
+    amax = q_full.abs().amax(dim=-1).clamp_min(1e-4)  # (T, H)
+    scale_raw = amax / fp8_max
+    log2_scale = torch.log2(scale_raw).ceil()
+    q_scale = torch.pow(2.0, log2_scale).to(torch.float32)  # (T, H)
+
+    q_scaled = q_full / q_scale.unsqueeze(-1)
+    q_clamped = q_scaled.clamp(-fp8_max, fp8_max)
+    index_q_fp8 = q_clamped.to(torch.float8_e4m3fn)
+
+    weights_f32 = index_weights.to(torch.float32)
+    index_weights_out = (
+        weights_f32 * q_scale * index_weights_softmax_scale * index_weights_head_scale
+    )
+    return index_q_fp8, index_weights_out
+
+
 def fused_indexer_q_rope_quant(
     positions: torch.Tensor,
     index_q: torch.Tensor,
@@ -295,6 +404,7 @@ def fused_indexer_q_rope_quant(
     index_weights_softmax_scale: float,
     index_weights_head_scale: float,
     use_fp4: bool = False,
+    q_is_int8: bool = False,
 ) -> tuple[
     torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     torch.Tensor,
@@ -403,11 +513,41 @@ def fused_indexer_q_rope_quant(
             index_q_scale.view(torch.int32).squeeze(-1),
         ), index_weights_out
 
+    if q_is_int8:
+        # INT8 integer-MMA query for the s8 x s8 indexer on Ampere. Output is a
+        # symmetric INT8 tensor (NOT fp8); the per-(token, head) q scale is folded
+        # into index_weights_out identically to the fp8 path. cuTeDSL/fp8 fast
+        # paths are fp8-only, so always use the Triton kernel here.
+        index_q_int8 = torch.empty_like(index_q, dtype=torch.int8)
+        _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
+            positions,
+            index_q,
+            index_q.stride(0),
+            index_q.stride(1),
+            index_q_cos_sin_cache,
+            index_q_cos_sin_cache.stride(0),
+            index_q_cos_sin_cache.shape[-1] // 2,
+            index_q_int8,
+            index_q_int8.stride(0),
+            index_q_int8.stride(1),
+            index_q_head_dim,
+            index_weights,
+            index_weights.stride(0),
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            index_weights_out,
+            index_weights_out.stride(0),
+            QK_INT8=True,
+            num_warps=1,
+        )
+        return index_q_int8, index_weights_out
+
     fp8_dtype = current_platform.fp8_dtype()
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
     fp8_max = 224.0 if use_fnuz else 448.0
     index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
-    if has_cutedsl():
+
+    if _supports_fp8e4nv_in_triton() and has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             fused_indexer_q_rope_quant_fp8_cutedsl,
@@ -423,7 +563,11 @@ def fused_indexer_q_rope_quant(
             index_q_fp8,
             index_weights_out,
         )
-    else:
+        return index_q_fp8, index_weights_out
+
+    if use_fnuz:
+        # AMD gfx942: Triton has a native tl.float8e4b8 hardware cast, so the
+        # kernel writes directly into index_q_fp8 (no uint8 view needed).
         _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
             positions,
             index_q,
@@ -443,7 +587,35 @@ def fused_indexer_q_rope_quant(
             index_weights_out,
             index_weights_out.stride(0),
             FP8_MAX=fp8_max,
-            USE_FNUZ=use_fnuz,
+            USE_FNUZ=True,
             num_warps=1,  # TODO: Tune this
         )
+        return index_q_fp8, index_weights_out
+
+    # OCP e4m3fn on sm_8x (Ampere) / non-cutedsl NVIDIA: the Triton kernel
+    # stores E4M3 bytes using the arithmetic encoder from fp8e4m3_arith
+    # (tl.float8e4nv casts are broken on sm_8x), so pass a uint8 view.
+    index_q_fp8_u8 = index_q_fp8.view(torch.uint8)
+    _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
+        positions,
+        index_q,
+        index_q.stride(0),
+        index_q.stride(1),
+        index_q_cos_sin_cache,
+        index_q_cos_sin_cache.stride(0),
+        index_q_cos_sin_cache.shape[-1] // 2,
+        index_q_fp8_u8,
+        index_q_fp8_u8.stride(0),
+        index_q_fp8_u8.stride(1),
+        index_q_head_dim,
+        index_weights,
+        index_weights.stride(0),
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        index_weights_out,
+        index_weights_out.stride(0),
+        FP8_MAX=fp8_max,
+        USE_FNUZ=False,
+        num_warps=1,  # TODO: Tune this
+    )
     return index_q_fp8, index_weights_out
