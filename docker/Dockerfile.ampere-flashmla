@@ -1,0 +1,18 @@
+# FlashMLA-Ampere overlay: bakes the cp39-abi3 / torch-stable flash_mla wheel
+# (bf16 sm_86 FlashMLA decode + torch.ops.flash_mla.*) and the int8 Triton MLA
+# decode benchmark tool into a vllm-ampere serving image. The wheel is
+# manylinux_2_28 (glibc 2.28) so it loads on the jammy base.
+#
+#   docker build -f docker/Dockerfile.ampere-flashmla \
+#     --build-arg BASE_IMAGE=harbor.appmana.com/appmana/vllm-ampere:<tag> \
+#     -t harbor.appmana.com/appmana/vllm-ampere:<tag>-flashmla <context-with-wheel>
+
+ARG BASE_IMAGE=harbor.appmana.com/appmana/vllm-ampere:latest
+FROM ${BASE_IMAGE}
+
+COPY flash_mla-*.whl /tmp/flashmla/
+RUN python3 -m pip install --no-deps /tmp/flashmla/flash_mla-*.whl \
+    && rm -rf /tmp/flashmla \
+    && python3 -c "import torch, flash_mla_cuda; assert hasattr(torch.ops.flash_mla, 'fwd_kvcache_mla'); print('flash_mla baked in OK')"
+
+COPY int8_triton_mla_decode.py /opt/flashmla/int8_triton_mla_decode.py
