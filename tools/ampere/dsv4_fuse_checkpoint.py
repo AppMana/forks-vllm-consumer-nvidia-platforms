@@ -85,6 +85,28 @@ def main() -> int:
 
     out: dict[str, torch.Tensor] = {}
 
+    # ---- streaming shard writer (bounds RAM to ~one shard) ----
+    parts: list[tuple[str, list[str]]] = []  # (temp filename, keys)
+    pending: dict[str, torch.Tensor] = {}
+    pending_bytes = 0
+
+    def _flush_part() -> None:
+        nonlocal pending, pending_bytes
+        if not pending:
+            return
+        tmp = f"model-part-{len(parts):05d}.safetensors"
+        save_file(pending, str(dst / tmp), metadata={"format": "pt"})
+        parts.append((tmp, list(pending)))
+        pending, pending_bytes = {}, 0
+
+    def stage(d: dict[str, torch.Tensor]) -> None:
+        nonlocal pending_bytes
+        for k, t in d.items():
+            pending[k] = t
+            pending_bytes += t.numel() * t.element_size()
+            if pending_bytes > _SHARD_BYTES:
+                _flush_part()
+
     # ---- per-layer fusion ----
     for L in range(n_layers):
         p = f"layers.{L}"
@@ -123,10 +145,17 @@ def main() -> int:
             [get(f"{ap_}.wq_a.scale"), get(f"{ap_}.wkv.scale")], dim=0
         ).contiguous()
 
+        # flush this layer's tensors to the streaming shard buffer, free RAM
+        stage(out)
+        out.clear()
+        # drop shard handles so the OS can reclaim mmap'd pages between layers
+        handles.clear()
+        print(f"  layer {L}: staged ({len(parts)} shards flushed so far)", flush=True)
+
     # ---- pass-through everything else (renaming .scale -> .weight_scale_inv) ----
     fused_consumed = re.compile(
-        r"\.ffn\.experts\.\d+\.w[123](\.scale)?$"
-        r"|\.ffn\.shared_experts\.w[123](\.scale)?$"
+        r"\.ffn\.experts\.\d+\.w[123](\.weight|\.scale)$"
+        r"|\.ffn\.shared_experts\.w[123](\.weight|\.scale)$"
         r"|\.attn\.(wq_a|wkv)(\.weight|\.scale)$"
     )
     for name in index:
@@ -141,41 +170,25 @@ def main() -> int:
             out[_scale_out(name)] = get(name)
         else:
             out[name] = get(name)
+        if len(out) >= 64:  # bound the pass-through staging too
+            stage(out)
+            out.clear()
+            handles.clear()
+    stage(out)
+    out.clear()
+    _flush_part()  # final partial shard
 
-    print(f"fused -> {len(out)} output tensors; sharding + writing to {dst}")
-
-    # ---- shard + index ----
+    # ---- finalize: rename temp parts to the -of- convention + build index ----
+    n_shards = len(parts)
     weight_map: dict[str, str] = {}
-    shard: dict[str, torch.Tensor] = {}
-    shard_bytes = 0
-    shard_idx = 1
-    shards_total: list[dict[str, torch.Tensor]] = []
-    ordered = sorted(out.keys())
-    # compute number of shards first for the of-XXXXX naming
-    sizes = {n: out[n].numel() * out[n].element_size() for n in ordered}
-    n_shards = max(1, sum(sizes.values()) // _SHARD_BYTES + 1)
-
-    def shard_name(i: int) -> str:
-        return f"model-{i:05d}-of-{n_shards:05d}.safetensors"
-
-    for name in ordered:
-        if shard_bytes + sizes[name] > _SHARD_BYTES and shard:
-            save_file(shard, str(dst / shard_name(shard_idx)),
-                      metadata={"format": "pt"})
-            for k in shard:
-                weight_map[k] = shard_name(shard_idx)
-            shard, shard_bytes = {}, 0
-            shard_idx += 1
-        shard[name] = out[name]
-        shard_bytes += sizes[name]
-    if shard:
-        save_file(shard, str(dst / shard_name(shard_idx)),
-                  metadata={"format": "pt"})
-        for k in shard:
-            weight_map[k] = shard_name(shard_idx)
-    # the actual shard count may differ from the estimate; rename if needed
-    actual = sorted({v for v in weight_map.values()})
-    total_size = sum((dst / s).stat().st_size for s in actual)
+    total_size = 0
+    for i, (tmp, keys) in enumerate(parts, start=1):
+        final = f"model-{i:05d}-of-{n_shards:05d}.safetensors"
+        (dst / tmp).rename(dst / final)
+        for k in keys:
+            weight_map[k] = final
+        total_size += (dst / final).stat().st_size
+    print(f"fused -> {len(weight_map)} tensors across {n_shards} shards")
     json.dump(
         {"metadata": {"total_size": total_size}, "weight_map": weight_map},
         open(dst / "model.safetensors.index.json", "w"),
@@ -206,7 +219,7 @@ def main() -> int:
         if (src / fn).exists():
             shutil.copy(src / fn, dst / fn)
 
-    print(f"DONE: {len(weight_map)} tensors across {len(actual)} shards, "
+    print(f"DONE: {len(weight_map)} tensors across {n_shards} shards, "
           f"{total_size/1e9:.1f} GB at {dst}")
     return 0
 
