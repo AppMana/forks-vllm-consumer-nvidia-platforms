@@ -55,6 +55,8 @@ def main() -> int:
     ap.add_argument("--drop-mtp", action="store_true", default=True)
     ap.add_argument("--keep-mtp", dest="drop_mtp", action="store_false")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--max-layers", type=int, default=None,
+                    help="(test) only fuse the first N layers + set config to N")
     args = ap.parse_args()
 
     src, dst = args.src, args.dst
@@ -62,6 +64,9 @@ def main() -> int:
     index = json.load(open(src / "model.safetensors.index.json"))["weight_map"]
     cfg = json.load(open(src / "config.json"))
     n_layers = cfg["num_hidden_layers"]
+    if args.max_layers is not None:
+        n_layers = min(n_layers, args.max_layers)
+        cfg["num_hidden_layers"] = n_layers
     n_experts = cfg["n_routed_experts"]
     print(f"layers={n_layers} experts={n_experts} src_keys={len(index)}")
 
@@ -127,6 +132,9 @@ def main() -> int:
     for name in index:
         if args.drop_mtp and name.startswith("mtp."):
             continue
+        lm = _LAYER_RE.match(name)
+        if lm is not None and int(lm.group(1)) >= n_layers:
+            continue  # layer beyond --max-layers
         if fused_consumed.search(name):
             continue  # already fused above
         if name.endswith(".scale"):
