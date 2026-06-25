@@ -1,4 +1,53 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+# AppMana vLLM — DeepSeek-V4 on Ampere (`appmana/vllm-ampere`)
+
+This is AppMana's fork of vLLM that serves **DeepSeek-V4-Flash** on **RTX 3090 / A5000
+(sm_86, Ampere)** GPUs across a **12-node Thunderbolt pipeline-parallel chain** (PP=12,
+1 GPU/node). `appmana/vllm-ampere` and `main` are the canonical branch; the pre-rebase
+history is preserved on `*-prerebase`. It is a careful re-implementation of our Ampere/
+int-quant work on top of a fresh `upstream/main` rebase (so it keeps upstream's correct
+pipelined `PPHandler`, not the fork's old per-token `torch.cuda.synchronize`).
+
+**Checkpoint (weights):** [`appmana/deepseek-v4-int4mse-int8`](https://huggingface.co/appmana/deepseek-v4-int4mse-int8)
+— routed experts as **INT4 W4A16 Marlin** (group 32, MSE scales), FP8 dense linears as
+**INT8 W8A16 AllSpark** (channelwise biased uint8), int8 sparse-MLA indexer K-cache;
+`quant_method=dsv4_int`. Produced by `tools/ampere/dsv4_requant_checkpoint.py` from the
+base FP8/MXFP4 release. The model loads it directly (per-expert + separate-projection
+names; fused at load by the stacked/expert mappings — do **not** pre-fuse).
+
+### What's in this fork (sm_86 + chain serving)
+
+- **`nvidia_sm86/` attention backend** — capability-selected at `major == 8`; all-Triton
+  sparse-MLA decode/prefill + indexer (no FlashMLA `_flashmla_C`, no cutedsl/quack; fp8
+  via a software `fp8e4m3_arith` codec since native `tl.float8e4nv` needs sm_89+).
+- **`dsv4_int` quant** — INT4 Marlin experts + INT8 AllSpark dense + INT8 IMMA indexer.
+- **MHC pipeline-parallel fix** (`models/deepseek_v4/nvidia/model.py`) — DeepSeek-V4 carries
+  a 4-tensor head-compression stream `(hidden, residual, post_mix, res_mix)` between
+  decoder layers. Upstream only passed `hidden_states` across a PP boundary and ran
+  `mhc_post` (the final collapse) on every rank, corrupting the residual stream (PP=N ≠
+  PP=1). Now all four cross the boundary via the existing **async** `isend/irecv_tensor_dict`
+  path and `mhc_post` runs only on the last rank → PP=N is token-identical to PP=1.
+- **`VLLM_RAY_WORKER_IP_ORDER`** (`v1/executor/ray_utils.py`, `envs.py`) — re-ported from
+  fork commit `ccf544b3c` (dropped in the rebase). Binds vLLM PP ranks to the chain-index
+  IP order injected by the `tb-chain-webhook`. Without it `RayExecutorV2` ranks were
+  scrambled vs the per-rank shard materialization (pod ordinal == chain index), so every
+  worker loaded the **wrong layers' shards → uninitialized weights → NaN logits**. This
+  was the production NaN root cause.
+
+### Deploy
+
+Built via `docker/docker-bake.hcl` + `Dockerfile.ampere-*`; python-only changes ship as a
+fast `Dockerfile.ampere-python-hotfix` overlay (no CUDA recompile). Served on the cluster
+through the LWS at `appmana-cluster/.../inference/lws-vllm-deepseek-v4.yaml` (GitOps). The
+`tb-chain-webhook` injects `NCCL_SOCKET_IFNAME` + `VLLM_RAY_WORKER_IP_ORDER`; the leader/
+worker commands materialize each rank's shards by pod ordinal.
+
+**Measured (single-user, server-side Prometheus):** ~**26.7 tok/s** decode, **~175 ms TTFT**
+on the int4mse-int8 checkpoint over the 12-node chain.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
