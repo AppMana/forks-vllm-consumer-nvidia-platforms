@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Union
 
 import numpy as np
 
+import vllm.envs as envs
 import vllm.platforms
 from vllm.config import ParallelConfig
 from vllm.distributed import get_pp_group
@@ -432,6 +433,42 @@ def get_bundles_sorted_by_node(
             bundle_to_node_id.append((bundle_idx, node_id, node_id_to_ip[node_id]))
 
     driver_node = ray.get_runtime_context().get_node_id()
+
+    # Topology-aware rank ordering (ported from fork commit ccf544b3c, dropped
+    # in the upstream rebase). The tb-chain webhook injects VLLM_RAY_WORKER_IP_ORDER
+    # = chain-node InternalIPs in chain-index order, giving exact rank->node
+    # binding so vLLM PP ranks match the rank-local model shard materialization.
+    # Without this, vLLM falls back to driver-first-by-node-id ordering, which
+    # scrambles PP ranks vs the materialize -> wrong shards -> uninitialized
+    # weights -> NaN.
+    worker_ip_order = [
+        ip.strip() for ip in envs.VLLM_RAY_WORKER_IP_ORDER.split(",") if ip.strip()
+    ]
+    if worker_ip_order:
+        ip_to_order = {ip: order for order, ip in enumerate(worker_ip_order)}
+        missing_ips = sorted(
+            node_ip for _, _, node_ip in bundle_to_node_id if node_ip not in ip_to_order
+        )
+        if not missing_ips and len(ip_to_order) == len(worker_ip_order):
+            logger.info(
+                "Sorting Ray placement-group bundles by "
+                "VLLM_RAY_WORKER_IP_ORDER: %s",
+                sorted(
+                    (bundle_idx, node_ip, ip_to_order[node_ip])
+                    for bundle_idx, _, node_ip in bundle_to_node_id
+                ),
+            )
+            bundle_to_node_id.sort(key=lambda item: ip_to_order[item[2]])
+            return bundle_to_node_id
+        logger.warning(
+            "Ignoring VLLM_RAY_WORKER_IP_ORDER for Ray bundle ordering; "
+            "missing_ips=%s duplicate_or_invalid_order=%s configured_order=%s "
+            "bundle_ips=%s",
+            missing_ips,
+            len(ip_to_order) != len(worker_ip_order),
+            worker_ip_order,
+            sorted(node_ip for _, _, node_ip in bundle_to_node_id),
+        )
 
     def _sort_key(item):
         _, node_id, _ = item

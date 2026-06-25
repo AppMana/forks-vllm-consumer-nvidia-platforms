@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
+    VLLM_RAY_WORKER_IP_ORDER: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
@@ -1336,6 +1337,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which indices are used for the Ray bundle, for every worker.
     # Format: comma-separated list of integers, e.g. "0,1,2,3"
     "VLLM_RAY_BUNDLE_INDICES": lambda: os.getenv("VLLM_RAY_BUNDLE_INDICES", ""),
+    # IP order for Ray workers. If set, Ray placement-group GPU bundles are
+    # sorted by this topology-aware IP order before assigning vLLM PP ranks.
+    # Injected by the tb-chain webhook as chain-node IPs in chain-index order.
+    "VLLM_RAY_WORKER_IP_ORDER": lambda: os.getenv("VLLM_RAY_WORKER_IP_ORDER", ""),
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.
     "VLLM_CUDART_SO_PATH": lambda: os.getenv("VLLM_CUDART_SO_PATH", None),
