@@ -468,7 +468,22 @@ def quantize_and_insert_k_cache(
     )
 
 
-@triton.jit
+# Triton specializes a separate JIT variant per pointer/stride ALIGNMENT class
+# (16-byte-aligned vs not). During prefill the gather output buffer and the cache /
+# index pointers take varying alignments, so without this pin Triton recompiles a new
+# variant per request — pinning one PP rank in compilation while the chain blocks on the
+# collective (the "rank stuck at 100%, others 0%" wedge). Ported from pre-rebase 0565d010e.
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "out_ptr",
+        "out_stride0",
+        "out_stride1",
+        "k_cache_ptr",
+        "seq_lens_ptr",
+        "block_table_ptr",
+        "gather_lens_ptr",
+    ]
+)
 def _dequantize_and_gather_k_kernel(
     out_ptr,
     out_stride0,
@@ -981,7 +996,9 @@ def combine_topk_swa_indices(
     return combined_indices, combined_lens
 
 
-@triton.jit
+# M (query rows) and N (combined index width) vary per prefill chunk; pin them off
+# int specialization so this runs one compiled variant. Ported from pre-rebase.
+@triton.jit(do_not_specialize=["M", "N"])
 def _combine_topk_swa_indices_kernel(
     combined_indices_ptr,
     combined_indices_stride,
