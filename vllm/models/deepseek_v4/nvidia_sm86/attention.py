@@ -21,6 +21,9 @@ casts (WS6), so no override is needed. INT8 FP8 tensor cores are absent on
 Ampere; the Triton kernels upcast FP8 inputs to bf16 internally.
 """
 
+import functools
+import os
+
 import torch
 
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
@@ -35,6 +38,21 @@ from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
 from vllm.v1.worker.workspace import current_workspace_manager
+
+try:
+    from flash_mla import flash_sparse_mla_decode
+except Exception:  # pragma: no cover - kernel not built in this env
+    flash_sparse_mla_decode = None
+
+
+@functools.lru_cache(maxsize=1)
+def _flash_mla_decode_enabled() -> bool:
+    """Use the precompiled Ampere CUDA sparse-MLA decode kernel (flash_mla) when
+    importable. Default on; set APPMANA_DSV4_FLASH_MLA_DECODE=0 to force the Triton
+    fallback (e.g. for A/B comparison)."""
+    if flash_sparse_mla_decode is None:
+        return False
+    return os.environ.get("APPMANA_DSV4_FLASH_MLA_DECODE", "1") != "0"
 
 
 class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
@@ -85,24 +103,47 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         swa_k_cache = self.swa_cache_layer.kv_cache
 
-        # ----- per-row Triton decode (validated; correct for any T) -----
         # q arrives padded to self.padded_heads as (num_decode_tokens, H, D);
         # the FP8 caches are consumed directly (dequantized inside the kernel).
         q_rows = q[:, 0] if q.dim() == 4 else q
-        for row in range(num_decode_tokens):
-            rs = slice(row, row + 1)
-            decode_sparse_attention_triton(
-                q=q_rows[rs],
+
+        if _flash_mla_decode_enabled():
+            # Precompiled Ampere CUDA sparse-MLA decode: one launch for ALL decode
+            # tokens (the Triton path below loops per row), ~4.4x faster, and no Triton
+            # JIT/recompile (it is a .so), so it needs no warmup. Matches the Triton
+            # kernel to ~1e-6 (test_sm86_flash_mla_decode_parity). Falls back to Triton
+            # if the kernel is unavailable.
+            extra_idx = None
+            if topk_indices is not None:
+                extra_idx = topk_indices.reshape(num_decode_tokens, -1)
+            out = flash_sparse_mla_decode(
+                q=q_rows,
                 swa_cache=swa_k_cache,
-                swa_indices=swa_indices[rs],
-                swa_lens=swa_lens[rs],
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
                 scale=self.scale,
                 attn_sink=self.attn_sink,
-                out=output[rs],
                 extra_cache=None if swa_only else kv_cache,
-                extra_indices=None if topk_indices is None else topk_indices[rs],
-                extra_lens=None if topk_lens is None else topk_lens[rs],
+                extra_indices=extra_idx,
+                extra_lens=None if topk_lens is None else topk_lens,
             )
+            output[:num_decode_tokens].copy_(out)
+        else:
+            # ----- per-row Triton decode (validated; correct for any T) -----
+            for row in range(num_decode_tokens):
+                rs = slice(row, row + 1)
+                decode_sparse_attention_triton(
+                    q=q_rows[rs],
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_indices[rs],
+                    swa_lens=swa_lens[rs],
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    out=output[rs],
+                    extra_cache=None if swa_only else kv_cache,
+                    extra_indices=None if topk_indices is None else topk_indices[rs],
+                    extra_lens=None if topk_lens is None else topk_lens[rs],
+                )
         if output.shape[1] > self.n_local_heads:
             output[:, self.n_local_heads :].zero_()
 

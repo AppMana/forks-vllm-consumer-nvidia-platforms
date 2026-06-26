@@ -23,16 +23,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
-    {
-        "FLASHMLA_SPARSE_DSV4",
-        "FLASHINFER_MLA_SPARSE_DSV4",
-        "ROCM_FLASHMLA_SPARSE_DSV4",
-        "DEEPSEEK_SPARSE_SWA",
-    }
-)
 _FLASHINFER_MLA_SPARSE_BACKENDS = frozenset({"FLASHINFER_MLA_SPARSE_SM120"})
-_DEEPSEEK_V4_FLASHINFER_MLA_SPARSE_BACKENDS = frozenset({"FLASHINFER_MLA_SPARSE_DSV4"})
 
 _FLASHINFER_SM120_SPARSE_MLA_DECODE_LABELS = {
     "FLASHINFER_MLA_SPARSE_SM120": "DSv3.2",
@@ -50,15 +41,6 @@ def _attention_backend_name(backend: object) -> str | None:
         return get_name()
     except NotImplementedError:
         return None
-
-
-def _has_deepseek_v4_sparse_mla_backend(runner: "GPUModelRunner") -> bool:
-    for groups in getattr(runner, "attn_groups", []) or ():
-        for group in groups:
-            name = _attention_backend_name(getattr(group, "backend", None))
-            if name in _DEEPSEEK_V4_SPARSE_MLA_BACKENDS:
-                return True
-    return False
 
 
 def _flashinfer_sparse_mla_decode_label(
@@ -197,15 +179,6 @@ def _flashinfer_sparse_mla_decode_autotune(
     )
 
 
-def _deepseek_v4_sparse_mla_decode_autotune(
-    worker: "Worker",
-    num_tokens: int,
-) -> bool:
-    return _run_flashinfer_sparse_mla_decode_autotune(
-        worker, num_tokens, _DEEPSEEK_V4_FLASHINFER_MLA_SPARSE_BACKENDS
-    )
-
-
 def flashinfer_sparse_mla_decode_autotune_warmup(worker: "Worker") -> None:
     """Autotune generic FlashInfer sparse MLA decode when selected."""
     runner = worker.model_runner
@@ -219,37 +192,11 @@ def flashinfer_sparse_mla_decode_autotune_warmup(worker: "Worker") -> None:
     _flashinfer_sparse_mla_decode_autotune(worker, mixed_tokens)
 
 
-def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
-    """Warm DSv4 sparse-MLA mixed prefill+decode attention."""
-    runner = worker.model_runner
-    if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
-        return
-
-    max_tokens = worker.scheduler_config.max_num_batched_tokens
-    mixed_tokens = _clamp_warmup_tokens(_SPARSE_MLA_MIXED_WARMUP_TOKENS, max_tokens)
-    if mixed_tokens <= 0:
-        return
-
-    logger.info(
-        "Warming up DeepSeek V4 sparse MLA attention for mixed tokens=%s.",
-        mixed_tokens,
-    )
-    mixed_warmup_done = _deepseek_v4_sparse_mla_decode_autotune(worker, mixed_tokens)
-    if not mixed_warmup_done:
-        if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
-            v2_runner = cast("V2GPUModelRunner", runner)
-            run_mixed_prefill_decode_warmup(
-                v2_runner,
-                worker.execute_model,
-                worker.sample_tokens,
-                mixed_tokens,
-                req_id_prefix="_sparse_mla_v2_warmup",
-            )
-        else:
-            runner._dummy_run(
-                num_tokens=mixed_tokens,
-                skip_eplb=True,
-                is_profile=True,
-                force_attention=True,
-                create_mixed_batch=True,
-            )
+# NOTE: deepseek_v4_sparse_mla_attention_warmup was removed. It drove
+# worker.execute_model (a lockstep pipeline-parallel collective) from a per-rank
+# warmup whose entry gates (KV-block availability, backend presence on a given PP
+# rank) can resolve differently across the PP group, mismatching the number of
+# execute_model collectives across ranks and deadlocking the chain. On Ampere the
+# DSv4 sparse-MLA decode is now the precompiled flash_mla CUDA kernel (no Triton
+# JIT, no warmup needed); the remaining sparse prefill/indexer Triton kernels are
+# pinned off recompile via do_not_specialize and JIT once on first request.
