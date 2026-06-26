@@ -14,6 +14,11 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 
+# Device capability is constant per process. Compute it once at import so the
+# o_proj forward references a Python constant instead of calling the (C-level,
+# Dynamo-untraceable) current_platform.get_device_capability() inside the graph.
+_DSV4_DEVICE_CAP = current_platform.get_device_capability()
+
 
 def deepseek_v4_inv_rope_woa(
     o: torch.Tensor,
@@ -87,7 +92,7 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
 
     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
     """
-    cap = current_platform.get_device_capability()
+    cap = _DSV4_DEVICE_CAP
     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
     einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
     tma_aligned_scales = cap.major >= 10
@@ -154,7 +159,7 @@ def deep_gemm_fp8_o_proj(
     # DeepGEMM fp8_einsum is Hopper/sm_100 only. On Ampere (sm_8x) and consumer
     # Blackwell (sm_12x) use the software fp8 einsum (triton on sm_89+, torch
     # fallback on sm_86), which computes the same "bhr,hdr->bhd" contraction.
-    cap = current_platform.get_device_capability()
+    cap = _DSV4_DEVICE_CAP
     if cap is not None and cap.major in (8, 12):
         from vllm.models.deepseek_v4.common.ops.fp8_einsum import (
             deepseek_v4_sm12x_fp8_einsum,
