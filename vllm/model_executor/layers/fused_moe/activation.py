@@ -138,11 +138,8 @@ def apply_moe_activation(
     # Activations with gated multiplication (gate × activation(up))
     if activation == MoEActivation.SILU:
         if clamp_limit is not None:
-            from vllm.model_executor.layers.activation import (
-                silu_and_mul_with_clamp_cuda,
-            )
-
-            silu_and_mul_with_clamp_cuda(output, input, clamp_limit)
+            # Fused silu(clamp(gate)) * clamp(up); equivalent to swiglu_limit_func.
+            torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, 1.0, 0.0)
         else:
             torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:
@@ -154,9 +151,7 @@ def apply_moe_activation(
     elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
         # SwiGLU-OAI on packed w13 (gate = first half, up = second half).
         assert clamp_limit is not None, "SWIGLUOAI_UNINTERLEAVE requires clamp_limit"
-        from vllm.model_executor.layers.activation import silu_and_mul_with_clamp_cuda
-
-        silu_and_mul_with_clamp_cuda(output, input, clamp_limit, alpha, beta)
+        torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, alpha, beta)
     elif activation == MoEActivation.SWIGLUSTEP:
         from vllm.model_executor.layers.activation import swiglustep_and_mul_triton
 
