@@ -10,6 +10,11 @@ FROM ${BASE_IMAGE}
 
 ARG PYTHON_VERSION
 
-COPY vllm/ /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/
+COPY vllm/ /tmp/vllm-python-hotfix/vllm/
+RUN find /tmp/vllm-python-hotfix/vllm \
+        \( -name '*.so' -o -name '*.abi3.so' -o -name '*.pyd' \) -delete && \
+    cp -a /tmp/vllm-python-hotfix/vllm/. \
+        /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/ && \
+    rm -rf /tmp/vllm-python-hotfix
 RUN rm -rf /vllm-workspace/vllm && \
     ln -s /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm /vllm-workspace/vllm
