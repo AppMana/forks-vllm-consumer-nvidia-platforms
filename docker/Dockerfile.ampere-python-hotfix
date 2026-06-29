@@ -11,3 +11,5 @@ FROM ${BASE_IMAGE}
 ARG PYTHON_VERSION
 
 COPY vllm/ /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/
+RUN rm -rf /vllm-workspace/vllm && \
+    ln -s /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm /vllm-workspace/vllm
