@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+import vllm.platforms
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
@@ -53,3 +54,35 @@ def test_gpu_write(device):
     assert cpu_tensor[0, 0] == 2
     assert cpu_tensor[2, 3] == 4
     assert cpu_tensor[4, 5] == -2
+
+
+def test_cuda_uva_imports_kernels_before_op_lookup(monkeypatch):
+    class FakePlatform:
+
+        device_name = "cuda"
+
+        def __init__(self):
+            self.imported = False
+
+        def is_xpu(self):
+            return False
+
+        def is_cuda_alike(self):
+            return True
+
+        def import_kernels(self):
+            self.imported = True
+            monkeypatch.setattr(torch.ops._C, "get_cuda_view_from_cpu_tensor",
+                                lambda tensor: tensor,
+                                raising=False)
+
+    fake_platform = FakePlatform()
+    monkeypatch.setattr(vllm.platforms, "current_platform", fake_platform)
+    monkeypatch.delattr(torch.ops._C,
+                        "get_cuda_view_from_cpu_tensor",
+                        raising=False)
+
+    cpu_tensor = torch.empty(1)
+
+    assert get_accelerator_view_from_cpu_tensor(cpu_tensor) is cpu_tensor
+    assert fake_platform.imported

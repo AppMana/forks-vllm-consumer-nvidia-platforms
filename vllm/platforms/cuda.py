@@ -20,6 +20,7 @@ from torch.distributed.distributed_c10d import is_nccl_available
 from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
+import vllm._C  # noqa
 import vllm._C_stable_libtorch  # noqa
 
 with contextlib.suppress(ImportError):
@@ -215,7 +216,11 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def import_kernels(cls) -> None:
-        """Import CUDA kernel extensions (_C_stable_libtorch, optional _qutlass_C)."""
+        """Import CUDA kernel extensions."""
+        try:
+            import vllm._C  # noqa: F401
+        except ImportError as e:
+            logger.warning_once("Failed to import from vllm._C: %r", e)
         try:
             import vllm._C_stable_libtorch  # noqa: F401
         except ImportError as e:
