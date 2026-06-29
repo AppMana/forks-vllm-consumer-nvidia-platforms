@@ -104,6 +104,40 @@ def _split_tensor_dict(
     return metadata_list, tensor_list
 
 
+def _select_recv_tensor(
+    key: str,
+    metadata: TensorMetadata,
+    recv_tensor_dict: dict[str, torch.Tensor] | None,
+) -> torch.Tensor:
+    if recv_tensor_dict is None or key not in recv_tensor_dict:
+        return torch.empty(metadata.size, dtype=metadata.dtype, device=metadata.device)
+
+    tensor = recv_tensor_dict[key]
+    if tensor.dtype != metadata.dtype:
+        raise ValueError(
+            f"Preallocated recv tensor for {key!r} has dtype {tensor.dtype}, "
+            f"expected {metadata.dtype}"
+        )
+    if tensor.device.type != metadata.device:
+        raise ValueError(
+            f"Preallocated recv tensor for {key!r} is on {tensor.device.type}, "
+            f"expected {metadata.device}"
+        )
+    if tensor.shape == metadata.size:
+        return tensor
+
+    expected = torch.Size(metadata.size)
+    if tensor.ndim != len(expected) or any(
+        have < need for have, need in zip(tensor.shape, expected)
+    ):
+        raise ValueError(
+            f"Preallocated recv tensor for {key!r} has shape {tuple(tensor.shape)}, "
+            f"cannot hold incoming shape {tuple(expected)}"
+        )
+    slices = tuple(slice(0, size) for size in expected)
+    return tensor[slices]
+
+
 _group_name_counter: dict[str, int] = {}
 
 
@@ -1076,6 +1110,7 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        recv_tensor_dict: dict[str, torch.Tensor] | None = None,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -1112,8 +1147,10 @@ class GroupCoordinator:
 
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                full_tensor = torch.empty(
-                    value.size, dtype=value.dtype, device=value.device
+                full_tensor = _select_recv_tensor(
+                    key,
+                    value,
+                    recv_tensor_dict,
                 )
                 if full_tensor.numel() == 0:
                     tensor_dict[key] = full_tensor

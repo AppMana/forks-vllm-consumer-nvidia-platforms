@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
-import os
-
 import torch
 
 import vllm.envs as envs
@@ -39,6 +37,23 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH = 4096
+SM120_SHORT_ROW_TOPK_MAX_WIDTH = 8192
+
+
+def _should_use_sm120_short_row_topk_decode(
+    topk_tokens: int,
+    logits_width: int,
+    num_rows: int,
+    is_cuda_sm120: bool,
+) -> bool:
+    if not is_cuda_sm120 or topk_tokens != 512:
+        return False
+    if logits_width <= SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH:
+        return True
+    return num_rows >= 16 and logits_width <= SM120_SHORT_ROW_TOPK_MAX_WIDTH
+
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
@@ -384,10 +399,11 @@ def sparse_attn_indexer(
     # INT8 bit patterns with plain fp32 absmax/127 scales; decode kernels branch
     # on K_IS_INT8 and prefill consumers receive an int8-viewed gather, so their
     # generic float conversions stay correct.
-    _indexer_int8 = (
-        os.environ.get("APPMANA_DSV4_INDEXER_CACHE_INT8", "0") == "1"
-        and not use_fp4_cache
+    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        indexer_cache_is_int8,
     )
+
+    _indexer_int8 = indexer_cache_is_int8() and not use_fp4_cache
     if not skip_k_cache_insert:
         # scale_fmt can be None, but the function expects str
         assert scale_fmt is not None

@@ -117,6 +117,18 @@ from vllm.v1.worker.utils import KVBlockZeroer
 logger = init_logger(__name__)
 
 
+def _copy_or_reuse_pp_intermediate_tensor(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    dst_slice = dst[:num_tokens]
+    src_slice = src[:num_tokens]
+    if dst_slice.data_ptr() == src_slice.data_ptr():
+        return dst_slice
+    return dst_slice.copy_(src_slice)
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -1274,7 +1286,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             new_tensors = {
                 k: v[:n]
                 if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
+                else _copy_or_reuse_pp_intermediate_tensor(
+                    v, intermediate_tensors.tensors[k], n
+                )
                 for k, v in self.intermediate_tensors.tensors.items()
             }
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)

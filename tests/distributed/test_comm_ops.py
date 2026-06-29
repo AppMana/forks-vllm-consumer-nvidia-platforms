@@ -278,6 +278,40 @@ def test_irecv_tensor_dict_send_allgather_postprocess_binds_keys(
     torch.testing.assert_close(td["b"], torch.ones(4, dtype=torch.int32))
 
 
+def test_irecv_tensor_dict_can_use_preallocated_recv_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preallocated = torch.empty(4, dtype=torch.int32, device="cpu")
+
+    def fake_irecv(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        assert t.data_ptr() == preallocated.data_ptr()
+        t.fill_(7)
+        return _DummyWork()
+
+    def fail_empty(*args: Any, **kwargs: Any) -> torch.Tensor:
+        raise AssertionError("irecv_tensor_dict allocated instead of reusing buffer")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "irecv", fake_irecv)
+
+    g = _make_group_for_unit_test(rank_in_group=1, world_size=2)
+    g.recv_object = lambda src=None: [  # type: ignore[method-assign]
+        ("hidden_states", TensorMetadata("cpu", torch.int32, torch.Size([4])))
+    ]
+
+    monkeypatch.setattr(torch, "empty", fail_empty)
+    td, handles, postprocess = g.irecv_tensor_dict(
+        recv_tensor_dict={"hidden_states": preallocated},
+    )
+
+    assert td is not None
+    assert td["hidden_states"].data_ptr() == preallocated.data_ptr()
+    assert len(handles) == 1
+    assert postprocess == []
+    handles[0].wait()
+    torch.testing.assert_close(preallocated, torch.full((4,), 7, dtype=torch.int32))
+
+
 def test_async_intermediate_tensors_lazy_wait() -> None:
     work = _DummyWork()
     post_calls = {"n": 0}

@@ -998,10 +998,18 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
+            recv_tensor_dict = None
+            if (
+                self.use_v2_model_runner
+                and not all_gather_tensors
+                and self.model_runner.intermediate_tensors is not None
+            ):
+                recv_tensor_dict = self.model_runner.intermediate_tensors.tensors
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
                     all_gather_tensors=all_gather_tensors,
+                    recv_tensor_dict=recv_tensor_dict,
                 )
             )
             assert tensor_dict is not None

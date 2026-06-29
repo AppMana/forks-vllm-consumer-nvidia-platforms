@@ -23,10 +23,38 @@ import torch.nn.functional as F
 from vllm.logger import init_logger as _dsv4_init_logger
 _dsv4_logger = _dsv4_init_logger(__name__)
 _DSV4_KERNEL_PATHS: dict = {}
+_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE = False
+_APPMANA_EXPERIMENTAL_IMMA_CONFIG_KEY = (
+    "__experimental_enable_imma_from_https://github.com/appMana/forks-vllm-ampere"
+)
 
 def _dsv4_log_path(path: str) -> None:
     _DSV4_KERNEL_PATHS[path] = _DSV4_KERNEL_PATHS.get(path, 0) + 1
     _dsv4_logger.info("DSV4KERNEL dense path=%s running_counts=%s", path, _DSV4_KERNEL_PATHS)
+
+
+def dsv4_int4_experts_int8_dense_active() -> bool:
+    return _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE
+
+
+def _mark_dsv4_int4_experts_int8_dense_active(
+    config_groups: dict[str, Any],
+    *,
+    indexer_imma: bool = False,
+) -> None:
+    global _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE
+    experts = config_groups.get("experts_w4a16", {})
+    experts_weights = experts.get("weights", {})
+    linears = config_groups.get("linears_w8a16", {})
+    linear_weights = linears.get("weights", {})
+    has_int4_experts_int8_dense = (
+        experts_weights.get("num_bits") == 4
+        and experts_weights.get("type") == "int"
+        and linear_weights.get("num_bits") == 8
+        and linear_weights.get("type") == "int"
+    )
+    if indexer_imma and has_int4_experts_int8_dense:
+        _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE = True
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention import Attention
@@ -419,10 +447,16 @@ class Dsv4IntConfig(QuantizationConfig):
         self,
         config_groups: dict[str, Any] | None = None,
         ignore_patterns: list[str] | None = None,
+        appmana_experimental_indexer_imma: bool = False,
     ) -> None:
         super().__init__()
         self.config_groups = config_groups or {}
         self.ignore_patterns = ignore_patterns or []
+        self.appmana_experimental_indexer_imma = appmana_experimental_indexer_imma
+        _mark_dsv4_int4_experts_int8_dense_active(
+            self.config_groups,
+            indexer_imma=self.appmana_experimental_indexer_imma,
+        )
         linears = self.config_groups.get("linears_w8a16", {})
         weights = linears.get("weights", {})
         self.int8_weight_strategy = weights.get("strategy", "block")
@@ -459,6 +493,9 @@ class Dsv4IntConfig(QuantizationConfig):
         return cls(
             config_groups=config.get("config_groups", {}),
             ignore_patterns=config.get("ignore", []),
+            appmana_experimental_indexer_imma=config.get(
+                _APPMANA_EXPERIMENTAL_IMMA_CONFIG_KEY, False
+            ),
         )
 
     @classmethod

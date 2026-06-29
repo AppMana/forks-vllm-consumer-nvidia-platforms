@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton fallback kernels used by the local DeepSeek V4 path."""
 
-import os
-
 import torch
 
 from vllm.triton_utils import LOG2E, tl, triton
@@ -21,21 +19,27 @@ FP8_DS_MLA_TOKEN_BYTES = 576
 def indexer_imma_enabled() -> bool:
     """True when the indexer logits run as int8 integer MMA (q quantized to
     symmetric INT8 with its scale folded into weights by the caller; requires
-    the INT8 indexer cache). Driven by APPMANA_DSV4_INDEXER_IMMA."""
-    return (
-        os.environ.get("APPMANA_DSV4_INDEXER_IMMA", "0") == "1"
-        and indexer_cache_is_int8()
-    )
+    the INT8 indexer cache). Enabled by the AppMana experimental checkpoint
+    config field."""
+    return _dsv4_int_indexer_auto_enabled() and indexer_cache_is_int8()
 
 
 def indexer_cache_is_int8() -> bool:
     """True when the indexer K cache stores symmetric INT8 (scale_fmt "int8"
-    in indexer_k_quant_and_cache) instead of FP8 e4m3. Driven by
-    APPMANA_DSV4_INDEXER_CACHE_INT8=1; gate-1 recall study:
+    in indexer_k_quant_and_cache) instead of FP8 e4m3. Enabled by the AppMana
+    experimental checkpoint config field. Gate-1 recall study:
     tools/ampere/dsv4_indexer_int8_recall.py."""
-    import os
+    return _dsv4_int_indexer_auto_enabled()
 
-    return os.environ.get("APPMANA_DSV4_INDEXER_CACHE_INT8", "0") == "1"
+
+def _dsv4_int_indexer_auto_enabled() -> bool:
+    try:
+        from vllm.model_executor.layers.quantization.dsv4_int import (
+            dsv4_int4_experts_int8_dense_active,
+        )
+    except Exception:
+        return False
+    return dsv4_int4_experts_int8_dense_active()
 
 
 def _view_packed_fp8_paged_mqa_kv_cache(
@@ -947,7 +951,7 @@ def fp8_paged_mqa_logits_triton(
 ) -> torch.Tensor:
     batch_size, next_n, num_heads, head_dim = q.size()
     # The indexer query is symmetric INT8 (s8 x s8 integer-MMA) when the int8
-    # cache + APPMANA_DSV4_INDEXER_IMMA are on; fused_indexer_q emits an int8 q
+    # cache + checkpoint-enabled IMMA are on; fused_indexer_q emits an int8 q
     # tensor and folds its scale into `weights`, so detect it by dtype here.
     q_is_int8 = q.dtype == torch.int8
     if head_dim % 64 == 0 and num_heads % 4 == 0:

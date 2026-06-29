@@ -779,8 +779,8 @@ class DeepseekV4Indexer(nn.Module):
         def wq_b_and_q_quant():
             # INT8 IMMA indexer query: emit a symmetric INT8 query (scale folded
             # into indexer_weights) so the logits run as s8 x s8 integer-MMA.
-            # Gated on the INT8 indexer cache + APPMANA_DSV4_INDEXER_IMMA (both
-            # default off); lazy import avoids a base<->nvidia_sm86 import cycle.
+            # Gated on the INT8 indexer cache + checkpoint-enabled IMMA path;
+            # lazy import avoids a base<->nvidia_sm86 import cycle.
             from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
                 indexer_imma_enabled,
             )

@@ -583,11 +583,27 @@ def _fp8_mqa_logits_sm12x(
     clean_logits: bool,
 ) -> torch.Tensor:
     q_values, q_scale = q
-    if clean_logits and q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
+    if q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
         from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
             fp8_mqa_logits_triton,
+            indexer_imma_enabled,
+            mqa_logits_workspace_triton,
         )
 
+        qk_int8 = (
+            q_values.dtype == torch.int8
+            and kv[0].dtype == torch.int8
+            and indexer_imma_enabled()
+        )
+        if not clean_logits or qk_int8:
+            return mqa_logits_workspace_triton(
+                q_values,
+                kv,
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                qk_int8=qk_int8,
+            )
         return fp8_mqa_logits_triton(q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
     return _fp8_mqa_logits_torch(
         q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
