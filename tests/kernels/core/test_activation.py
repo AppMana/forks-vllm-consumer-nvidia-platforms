@@ -19,6 +19,7 @@ from vllm.model_executor.layers.activation import (
     SiluAndMulWithClamp,
     SwigluOAIAndMul,
     SwigluStepAndMul,
+    _silu_and_mul_with_clamp_supports_alpha_beta,
     swiglustep_and_mul_triton,
 )
 from vllm.utils.torch_utils import set_random_seed
@@ -118,6 +119,23 @@ def test_act_and_mul(
 
 
 SWIGLU_LIMITS = [3.0, 7.0, 15.0]
+
+
+def test_silu_and_mul_with_clamp_schema_detection() -> None:
+    class FakeSchema:
+        def __init__(self, num_args: int) -> None:
+            self.arguments = [object()] * num_args
+
+    class FakeDefault:
+        def __init__(self, num_args: int) -> None:
+            self._schema = FakeSchema(num_args)
+
+    class FakeOp:
+        def __init__(self, num_args: int) -> None:
+            self.default = FakeDefault(num_args)
+
+    assert not _silu_and_mul_with_clamp_supports_alpha_beta(FakeOp(3))
+    assert _silu_and_mul_with_clamp_supports_alpha_beta(FakeOp(5))
 
 
 @pytest.mark.parametrize("swiglu_limit", SWIGLU_LIMITS)

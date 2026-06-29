@@ -23,6 +23,40 @@ from vllm.utils.collection_utils import LazyDict
 logger = init_logger(__name__)
 
 
+def _silu_and_mul_with_clamp_supports_alpha_beta(
+    op: object | None = None,
+) -> bool:
+    if op is None:
+        op = torch.ops._C.silu_and_mul_with_clamp
+    try:
+        schema = op.default._schema  # type: ignore[attr-defined]
+        return len(schema.arguments) >= 5
+    except AttributeError:
+        return True
+
+
+def silu_and_mul_with_clamp_cuda(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    limit: float,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> None:
+    op = torch.ops._C.silu_and_mul_with_clamp
+    if _silu_and_mul_with_clamp_supports_alpha_beta(op):
+        op(output, input, limit, alpha, beta)
+        return
+
+    if alpha == 1.0 and beta == 0.0:
+        op(output, input, limit)
+        return
+
+    d = input.shape[-1] // 2
+    gate = torch.clamp(input[..., :d], max=limit)
+    up = torch.clamp(input[..., d:], min=-limit, max=limit)
+    output.copy_(gate * torch.sigmoid(alpha * gate) * (up + beta))
+
+
 @triton.jit
 def _swiglustep_and_mul_kernel(
     o_ptr,
@@ -197,7 +231,9 @@ class SiluAndMulWithClamp(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
+        silu_and_mul_with_clamp_cuda(
+            out, x, self.swiglu_limit, self.alpha, self.beta
+        )
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
