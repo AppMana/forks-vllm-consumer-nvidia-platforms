@@ -45,7 +45,7 @@ def test_sm120_short_row_topk_decode_selector(
 
 
 def test_dsv4_int_checkpoint_auto_enables_int8_indexer_imma(monkeypatch) -> None:
-    Dsv4IntConfig.from_config(
+    quant_config = Dsv4IntConfig.from_config(
         {
             "quant_method": "dsv4_int",
             "config_groups": {
@@ -62,6 +62,7 @@ def test_dsv4_int_checkpoint_auto_enables_int8_indexer_imma(monkeypatch) -> None
 
     assert dsv4_sm86.indexer_cache_is_int8()
     assert dsv4_sm86.indexer_imma_enabled()
+    assert quant_config.expert_input_dtype is torch.int8
 
 
 def test_fp8_mqa_logits_uses_fused_imma_workspace_on_auto_int8(

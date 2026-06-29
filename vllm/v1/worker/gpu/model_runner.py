@@ -122,8 +122,9 @@ def _copy_or_reuse_pp_intermediate_tensor(
     src: torch.Tensor,
     num_tokens: int,
 ) -> torch.Tensor:
-    dst_slice = dst[:num_tokens]
-    src_slice = src[:num_tokens]
+    n = min(num_tokens, src.shape[0])
+    dst_slice = dst[:n]
+    src_slice = src[:n]
     if dst_slice.data_ptr() == src_slice.data_ptr():
         return dst_slice
     return dst_slice.copy_(src_slice)

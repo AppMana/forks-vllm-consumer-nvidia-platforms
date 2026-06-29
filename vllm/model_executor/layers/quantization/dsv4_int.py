@@ -37,23 +37,22 @@ def dsv4_int4_experts_int8_dense_active() -> bool:
     return _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE
 
 
-def _mark_dsv4_int4_experts_int8_dense_active(
-    config_groups: dict[str, Any],
-    *,
-    indexer_imma: bool = False,
-) -> None:
-    global _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE
+def _has_int4_experts_int8_dense(config_groups: dict[str, Any]) -> bool:
     experts = config_groups.get("experts_w4a16", {})
     experts_weights = experts.get("weights", {})
     linears = config_groups.get("linears_w8a16", {})
     linear_weights = linears.get("weights", {})
-    has_int4_experts_int8_dense = (
+    return (
         experts_weights.get("num_bits") == 4
         and experts_weights.get("type") == "int"
         and linear_weights.get("num_bits") == 8
         and linear_weights.get("type") == "int"
     )
-    if indexer_imma and has_int4_experts_int8_dense:
+
+
+def _mark_dsv4_int4_experts_int8_dense_active(active: bool) -> None:
+    global _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE
+    if active:
         _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE = True
 
 from vllm import _custom_ops as ops
@@ -453,9 +452,15 @@ class Dsv4IntConfig(QuantizationConfig):
         self.config_groups = config_groups or {}
         self.ignore_patterns = ignore_patterns or []
         self.appmana_experimental_indexer_imma = appmana_experimental_indexer_imma
+        self.appmana_experimental_int8_runtime = (
+            appmana_experimental_indexer_imma
+            and _has_int4_experts_int8_dense(self.config_groups)
+        )
         _mark_dsv4_int4_experts_int8_dense_active(
-            self.config_groups,
-            indexer_imma=self.appmana_experimental_indexer_imma,
+            self.appmana_experimental_int8_runtime
+        )
+        self.expert_input_dtype = (
+            torch.int8 if self.appmana_experimental_int8_runtime else None
         )
         linears = self.config_groups.get("linears_w8a16", {})
         weights = linears.get("weights", {})
@@ -752,11 +757,10 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         self.num_experts = 0
         self.hidden_size = 0
         self.intermediate_size = 0
-        # W4A8: VLLM_MARLIN_INPUT_DTYPE=int8 routes the expert GEMMs through
-        # the sm80 s8 integer-MMA Marlin kernels (2x FP16 peak on GA102;
-        # 20-25% prefill GEMM win in the 2026-06-10 A5000 matrix). Unset env
-        # keeps the W4A16 behavior bit-for-bit.
-        self.input_dtype = get_marlin_input_dtype()
+        # The AppMana INT4-expert/INT8-dense checkpoint uses Marlin's int8
+        # input path. Other configs keep upstream Marlin env-controlled
+        # behavior.
+        self.input_dtype = quant_config.expert_input_dtype or get_marlin_input_dtype()
 
     def create_weights(
         self,
