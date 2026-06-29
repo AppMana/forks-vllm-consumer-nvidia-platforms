@@ -706,6 +706,7 @@ RUN apt-get update -y \
 
 # Install CUDA development tools for runtime JIT compilation
 # (FlashInfer, DeepGEMM, EP kernels all require compilation at runtime)
+ARG NCCL_PACKAGE_VERSION=
 RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
     CUDA_VERSION_SHORT=$(echo $CUDA_VERSION | cut -d. -f1,2) && \
     apt-get update -y && \
@@ -724,7 +725,11 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
     # https://github.com/vllm-project/vllm/blob/1336a1ea244fa8bfd7e72751cabbdb5b68a0c11a/vllm/distributed/device_communicators/pynccl_allocator.py#L22
     # NCCL packages don't use the cuda-MAJOR-MINOR naming convention,
     # so we pin the version to match our CUDA version
-    NCCL_VER=$(apt-cache madison libnccl-dev | grep "+cuda${CUDA_VERSION_SHORT}" | head -1 | awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}') && \
+    if [ -n "${NCCL_PACKAGE_VERSION}" ]; then \
+        NCCL_VER="${NCCL_PACKAGE_VERSION}"; \
+    else \
+        NCCL_VER=$(apt-cache madison libnccl-dev | grep "+cuda${CUDA_VERSION_SHORT}" | head -1 | awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}'); \
+    fi && \
     apt-get install -y --no-install-recommends --allow-change-held-packages libnccl-dev=${NCCL_VER} libnccl2=${NCCL_VER} && \
     rm -rf /var/lib/apt/lists/*
 
@@ -868,6 +873,7 @@ ARG PIP_KEYRING_PROVIDER UV_KEYRING_PROVIDER
 
 # We can specify the standard or nightly build of PyTorch
 ARG PYTORCH_NIGHTLY
+ARG REPLACE_TORCH_BUNDLED_NCCL=false
 
 # Install vLLM wheel first, so that torch etc will be installed.
 # Check whether to install torch nightly instead of release for this build.
@@ -890,6 +896,18 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+    fi
+
+RUN if [ "${REPLACE_TORCH_BUNDLED_NCCL}" = "true" ]; then \
+      set -eux; \
+      SYSTEM_NCCL="$(readlink -f /usr/lib/x86_64-linux-gnu/libnccl.so.2)"; \
+      TORCH_NCCL_DIR="$(python3 -c "import importlib.util, pathlib; spec = importlib.util.find_spec('nvidia.nccl'); assert spec and spec.submodule_search_locations; print(pathlib.Path(next(iter(spec.submodule_search_locations))) / 'lib')")"; \
+      test -f "${SYSTEM_NCCL}"; \
+      test -d "${TORCH_NCCL_DIR}"; \
+      if [ -e "${TORCH_NCCL_DIR}/libnccl.so.2" ] && [ ! -L "${TORCH_NCCL_DIR}/libnccl.so.2" ]; then \
+        mv "${TORCH_NCCL_DIR}/libnccl.so.2" "${TORCH_NCCL_DIR}/libnccl.so.2.bundled"; \
+      fi; \
+      ln -sf "${SYSTEM_NCCL}" "${TORCH_NCCL_DIR}/libnccl.so.2"; \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -1016,6 +1034,8 @@ FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG CUDA_VERSION
+ARG LMCACHE_GIT_REF=90c2b295
+ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-5a9c44cc752f36228b24adb8382ee8b8d52e9499/flash_mla-1.0.0%2B5a9c44c-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
@@ -1051,8 +1071,15 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             # clean up -dev packages, keep runtime libraries
             rm -rf /var/lib/apt/lists/* \
         ); \
+        uv pip install --system --no-deps --no-build-isolation --force-reinstall \
+            "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}"; \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
         uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
+    fi
+
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ -n "${FLASHMLA_WHEEL_URL}" ]; then \
+        uv pip install --system --no-deps "${FLASHMLA_WHEEL_URL}"; \
     fi
 
 # Optional override: install mooncake-transfer-engine from a URL instead of the

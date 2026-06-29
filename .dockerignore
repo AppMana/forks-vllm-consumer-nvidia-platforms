@@ -1,3 +1,12 @@
 **/__pycache__
 **/*.pyc
 **/*.so
+.venv/
+.deps/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+cmake-build*/
+rust/target/
+vllm.egg-info/
