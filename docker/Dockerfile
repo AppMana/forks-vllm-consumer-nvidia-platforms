@@ -1178,6 +1178,9 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
 
 RUN python3 - <<'PY'
 import importlib
+import importlib.metadata
+import pathlib
+import sysconfig
 
 for name in (
     "ray",
@@ -1185,11 +1188,12 @@ for name in (
     "vllm._C_stable_libtorch",
     "vllm._moe_C_stable_libtorch",
     "lmcache",
-    "flash_mla",
 ):
     importlib.import_module(name)
 
-if importlib.util.find_spec("flash_mla_cuda") is None:
+importlib.metadata.version("flash-mla")
+site_packages = pathlib.Path(sysconfig.get_paths()["purelib"])
+if not any(site_packages.glob("flash_mla_cuda*.so")):
     raise ModuleNotFoundError("flash_mla_cuda")
 PY
 
