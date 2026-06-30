@@ -1186,9 +1186,11 @@ for name in (
     "vllm._moe_C_stable_libtorch",
     "lmcache",
     "flash_mla",
-    "flash_mla_cuda",
 ):
     importlib.import_module(name)
+
+if importlib.util.find_spec("flash_mla_cuda") is None:
+    raise ModuleNotFoundError("flash_mla_cuda")
 PY
 
 ENV VLLM_USAGE_SOURCE production-docker-image
