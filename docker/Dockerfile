@@ -1114,8 +1114,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             # clean up -dev packages, keep runtime libraries
             rm -rf /var/lib/apt/lists/* \
         ); \
+        apt-get update -y && \
+        apt-get install -y --no-install-recommends git && \
         uv pip install --system --no-deps --no-build-isolation --force-reinstall \
             "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}"; \
+        apt-get purge -y git && \
+        apt-get autoremove -y && \
         rm -rf /var/lib/apt/lists/*; \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
         uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
