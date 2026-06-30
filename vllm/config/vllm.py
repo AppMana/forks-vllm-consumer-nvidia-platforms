@@ -1113,6 +1113,7 @@ class VllmConfig:
         if (
             self.model_config is not None
             and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
+            and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
             and any(
                 a
                 in (

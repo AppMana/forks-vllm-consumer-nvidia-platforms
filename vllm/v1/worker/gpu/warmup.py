@@ -9,8 +9,10 @@ import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
-from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.v1.attention.backends.mla.indexer import (
+    warmup_prefill_chunk_metadata_kernel,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -149,6 +151,43 @@ def run_mixed_prefill_decode_warmup(
     finally:
         model_runner.kv_connector.set_disabled(False)
     return True
+
+
+def warmup_long_prefill_kernels(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+) -> None:
+    """Warm kernels that only appear in long chunked-prefill batches."""
+    if model_runner.is_pooling_model:
+        return
+
+    device = getattr(model_runner, "device", None)
+    if isinstance(device, torch.device):
+        # DeepSeek V4 indexer compresses context 4:1. Warming this directly
+        # avoids first-request JIT even when a PP rank has no long prefill work.
+        warmup_prefill_chunk_metadata_kernel(device, compress_ratio=4)
+
+    max_tokens = model_runner.scheduler_config.max_num_batched_tokens
+    token_sizes = sorted({16, max_tokens})
+    warmed_sizes: list[int] = []
+    for num_tokens in token_sizes:
+        if num_tokens < 3:
+            continue
+        if run_mixed_prefill_decode_warmup(
+            model_runner,
+            worker_execute_model,
+            worker_sample_tokens,
+            num_tokens,
+            req_id_prefix=f"_v2_long_prefill_warmup_{num_tokens}",
+        ):
+            warmed_sizes.append(num_tokens)
+
+    if warmed_sizes:
+        logger.info(
+            "V2 long prefill kernel warmup completed with scheduled tokens: %s.",
+            warmed_sizes,
+        )
 
 
 @torch.inference_mode()
@@ -315,4 +354,7 @@ def warmup_kernels(
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
+    warmup_long_prefill_kernels(
+        model_runner, worker_execute_model, worker_sample_tokens
+    )
     torch.accelerator.synchronize()

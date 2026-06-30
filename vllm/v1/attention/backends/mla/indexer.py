@@ -33,6 +33,8 @@ from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
 
+_PREFILL_CHUNK_METADATA_KERNEL_WARMUPS: set[tuple[int, int]] = set()
+
 
 @triton.jit
 def _prepare_uniform_decode_kernel(
@@ -865,7 +867,57 @@ def build_prefill_chunk_metadata(
     )
 
 
-@triton.jit
+def warmup_prefill_chunk_metadata_kernel(
+    device: torch.device,
+    *,
+    compress_ratio: int,
+) -> None:
+    """JIT the sparse-indexer prefill chunk metadata kernel for this device."""
+    if device.type != "cuda":
+        return
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    key = (device_index, compress_ratio)
+    if key in _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS:
+        return
+
+    num_reqs = 1
+    query_len = 128
+    compressed_seq_len = cdiv(query_len, compress_ratio)
+    query_start_loc = torch.tensor([0, query_len], dtype=torch.int32, device=device)
+    uncompressed_seq_lens = torch.tensor(
+        [query_len], dtype=torch.int32, device=device
+    )
+    cu_compressed_seq_lens = torch.tensor(
+        [0, compressed_seq_len], dtype=torch.int32, device=device
+    )
+    token_to_seq = torch.empty(compressed_seq_len, dtype=torch.int32, device=device)
+    cu_compressed_seq_len_ks = torch.empty(
+        query_len, dtype=torch.int32, device=device
+    )
+    cu_compressed_seq_len_ke = torch.empty(
+        query_len, dtype=torch.int32, device=device
+    )
+
+    _build_prefill_chunk_metadata_kernel[(num_reqs,)](
+        query_start_loc,
+        uncompressed_seq_lens,
+        cu_compressed_seq_lens,
+        token_to_seq,
+        cu_compressed_seq_len_ks,
+        cu_compressed_seq_len_ke,
+        0,
+        query_len,
+        BLOCK_SIZE=1024,
+        COMPRESS_RATIO=compress_ratio,
+    )
+    torch.accelerator.synchronize()
+    _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS.add(key)
+
+
+@triton.jit(do_not_specialize=["query_slice_start", "query_slice_stop"])
 def _build_prefill_chunk_metadata_kernel(
     # Inputs
     query_start_loc_ptr,

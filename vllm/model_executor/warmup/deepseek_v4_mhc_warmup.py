@@ -81,11 +81,11 @@ def _select_mhc_warmup_token_sizes(
 
 def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:
     for module in model.modules():
-        if module.__class__.__name__ != "DeepseekV4DecoderLayer":
-            continue
         if all(
             hasattr(module, attr)
             for attr in (
+                "hidden_size",
+                "hc_mult",
                 "hc_pre",
                 "hc_post",
                 "hc_attn_fn",
@@ -102,11 +102,15 @@ def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:
 
 def _find_deepseek_v4_model(model: torch.nn.Module) -> torch.nn.Module | None:
     for module in model.modules():
-        if module.__class__.__name__ != "DeepseekV4Model":
-            continue
         if all(
             hasattr(module, attr)
-            for attr in ("hc_head_fn", "hc_head_scale", "hc_head_base")
+            for attr in (
+                "config",
+                "hc_mult",
+                "hc_head_fn",
+                "hc_head_scale",
+                "hc_head_base",
+            )
         ):
             return module
     return None
