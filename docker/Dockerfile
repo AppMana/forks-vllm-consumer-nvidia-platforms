@@ -1118,10 +1118,20 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \
+    set -e; \
+    CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-'); \
+    BUILD_PKGS="libcusparse-dev-${CUDA_VERSION_DASH} \
+                libcublas-dev-${CUDA_VERSION_DASH} \
+                libcusolver-dev-${CUDA_VERSION_DASH}"; \
     if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
+        apt-get update -y && \
+        apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
         CUDA_HOME=/usr/local/cuda \
         uv pip install --system --no-deps --no-build-isolation --force-reinstall \
-            "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}"; \
+            "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}" && \
+        apt-get purge -y ${BUILD_PKGS} && \
+        apt-get autoremove -y && \
+        rm -rf /var/lib/apt/lists/*; \
     fi
 
 RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
