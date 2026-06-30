@@ -412,6 +412,8 @@ ARG nvcc_threads=8
 ENV NVCC_THREADS=$nvcc_threads
 
 ARG USE_SCCACHE
+ARG SCCACHE_DOWNLOAD_URL
+ARG SCCACHE_VERSION=v0.16.0
 ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
@@ -452,20 +454,25 @@ RUN --mount=type=cache,target=/opt/uv/cache \
           linux/amd64) SCCACHE_ARCH="x86_64" ;; \
           *) echo "Unsupported TARGETPLATFORM for sccache: ${TARGETPLATFORM}" >&2; exit 1 ;; \
         esac \
-        && export SCCACHE_DOWNLOAD_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
+        && export SCCACHE_DOWNLOAD_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
         && curl -L -o sccache.tar.gz ${SCCACHE_DOWNLOAD_URL} \
         && tar -xzf sccache.tar.gz \
-        && sudo mv sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
-        && rm -rf sccache.tar.gz sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl \
+        && sudo mv sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
+        && rm -rf sccache.tar.gz sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl \
         && mkdir -p /workspace/tmp /workspace/tmp/sccache \
         && if [ -n "${SCCACHE_ENDPOINT}" ] ; then export SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} ; fi \
         && export SCCACHE_BUCKET=${SCCACHE_BUCKET_NAME} \
         && export SCCACHE_REGION=${SCCACHE_REGION_NAME} \
         && export SCCACHE_S3_NO_CREDENTIALS=${SCCACHE_S3_NO_CREDENTIALS} \
-        && export SCCACHE_RECACHE=${SCCACHE_RECACHE} \
+        && if [ "${SCCACHE_RECACHE}" = "1" ]; then export SCCACHE_RECACHE=1; else unset SCCACHE_RECACHE; fi \
         && export SCCACHE_DIR=/workspace/tmp/sccache \
         && export SCCACHE_SERVER_UDS=/workspace/tmp/sccache/sccache.sock \
         && export SCCACHE_IDLE_TIMEOUT=0 \
+        && export SCCACHE_BASEDIRS=/workspace:/workspace/tmp \
+        && export CMAKE_C_COMPILER_LAUNCHER=sccache \
+        && export CMAKE_CXX_COMPILER_LAUNCHER=sccache \
+        && export CMAKE_CUDA_COMPILER_LAUNCHER=sccache \
+        && export CMAKE_HIP_COMPILER_LAUNCHER=sccache \
         && export TMPDIR=/workspace/tmp \
         && export CMAKE_BUILD_TYPE=Release \
         && export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" \
@@ -475,7 +482,15 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) \
         && (sccache --stop-server >/dev/null 2>&1 || true) \
         && sccache --start-server \
+        && sccache --zero-stats \
+        && sccache --version \
+        && printf 'extern "C" __global__ void probe(float* x) { x[threadIdx.x] = x[threadIdx.x] + 1.0f; }\n' > /workspace/tmp/sccache_probe.cu \
+        && sccache /usr/local/cuda/bin/nvcc -arch=sm_86 -c /workspace/tmp/sccache_probe.cu -o /workspace/tmp/sccache_probe.1.o \
+        && rm -f /workspace/tmp/sccache_probe.1.o \
+        && sccache /usr/local/cuda/bin/nvcc -arch=sm_86 -c /workspace/tmp/sccache_probe.cu -o /workspace/tmp/sccache_probe.2.o \
         && sccache --show-stats \
+        && sccache --show-stats | grep -Eq 'Cache hits[[:space:]]+1|Cache hits[[:space:]]+[2-9][0-9]*' \
+        && sccache --zero-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
         && sccache --show-stats \
         && sccache --stop-server; \
@@ -1061,6 +1076,7 @@ FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG CUDA_VERSION
+ARG LMCACHE_GIT_REF=cd51f3a15766e326f92998c072264a5a6caa4efe
 ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-5a9c44cc752f36228b24adb8382ee8b8d52e9499/flash_mla-1.0.0%2B5a9c44c-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
@@ -1079,7 +1095,6 @@ ENV UV_HTTP_TIMEOUT=500
 ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=lmcache,source=.,target=/tmp/lmcache-src,ro \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
     set -e; \
     CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
@@ -1100,7 +1115,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             rm -rf /var/lib/apt/lists/* \
         ); \
         uv pip install --system --no-deps --no-build-isolation --force-reinstall \
-            /tmp/lmcache-src; \
+            "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}"; \
         rm -rf /var/lib/apt/lists/*; \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
         uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
