@@ -1097,31 +1097,42 @@ ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
     set -e; \
-    CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
     CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-'); \
-    CUDA_HOME=/usr/local/cuda; \
-    # lmcache requires explicit specifying CUDA_HOME
     BUILD_PKGS="libcusparse-dev-${CUDA_VERSION_DASH} \
                 libcublas-dev-${CUDA_VERSION_DASH} \
                 libcusolver-dev-${CUDA_VERSION_DASH}"; \
     if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         uv pip install --system -r /tmp/kv_connectors.txt --no-build || ( \
-            # if the above fails, install from source
             apt-get update -y && \
             apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
             uv pip install --system -r /tmp/kv_connectors.txt --no-build-isolation && \
             apt-get purge -y ${BUILD_PKGS} && \
-            # clean up -dev packages, keep runtime libraries
             rm -rf /var/lib/apt/lists/* \
         ); \
+    fi
+
+RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         apt-get update -y && \
         apt-get install -y --no-install-recommends git && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
+        CUDA_HOME=/usr/local/cuda \
         uv pip install --system --no-deps --no-build-isolation --force-reinstall \
             "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}"; \
+    fi
+
+RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         apt-get purge -y git && \
         apt-get autoremove -y && \
         rm -rf /var/lib/apt/lists/*; \
-        # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
+    fi
+
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
+        CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
         uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
     fi
 
