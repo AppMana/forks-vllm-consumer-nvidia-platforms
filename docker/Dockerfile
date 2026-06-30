@@ -1184,16 +1184,23 @@ import sysconfig
 
 for name in (
     "ray",
-    "vllm",
-    "vllm._C_stable_libtorch",
-    "vllm._moe_C_stable_libtorch",
     "lmcache",
 ):
     importlib.import_module(name)
 
-importlib.metadata.version("flash-mla")
-site_packages = pathlib.Path(sysconfig.get_paths()["purelib"])
-if not any(site_packages.glob("flash_mla_cuda*.so")):
+for dist in ("vllm", "flash-mla"):
+    importlib.metadata.version(dist)
+
+site_paths = {
+    pathlib.Path(sysconfig.get_paths()["purelib"]),
+    pathlib.Path(sysconfig.get_paths()["platlib"]),
+}
+if not any(path.glob("vllm/_C_stable_libtorch*.so") for path in site_paths):
+    raise ModuleNotFoundError("vllm._C_stable_libtorch")
+if not any(path.glob("vllm/_moe_C_stable_libtorch*.so") for path in site_paths):
+    raise ModuleNotFoundError("vllm._moe_C_stable_libtorch")
+
+if not any(path.glob("flash_mla_cuda*.so") for path in site_paths):
     raise ModuleNotFoundError("flash_mla_cuda")
 PY
 
