@@ -1061,7 +1061,6 @@ FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG CUDA_VERSION
-ARG LMCACHE_GIT_REF=36828faf
 ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-5a9c44cc752f36228b24adb8382ee8b8d52e9499/flash_mla-1.0.0%2B5a9c44c-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
@@ -1080,6 +1079,7 @@ ENV UV_HTTP_TIMEOUT=500
 ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=bind,from=lmcache,source=.,target=/tmp/lmcache-src,ro \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
     set -e; \
     CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
@@ -1099,12 +1099,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             # clean up -dev packages, keep runtime libraries
             rm -rf /var/lib/apt/lists/* \
         ); \
-        apt-get update -y; \
-        apt-get install -y --no-install-recommends git; \
         uv pip install --system --no-deps --no-build-isolation --force-reinstall \
-            "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}"; \
-        apt-get purge -y git; \
-        apt-get autoremove -y; \
+            /tmp/lmcache-src; \
         rm -rf /var/lib/apt/lists/*; \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
         uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \

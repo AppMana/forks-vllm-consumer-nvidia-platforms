@@ -42,10 +42,22 @@ sccache_s3_no_credentials="${SCCACHE_S3_NO_CREDENTIALS:-0}"
 sccache_recache="${SCCACHE_RECACHE:-0}"
 skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"
 install_kv_connectors="${INSTALL_KV_CONNECTORS:-false}"
+lmcache_source_dir="${LMCACHE_SOURCE_DIR:-$(cd "${repo_root}/.." && pwd)/forks-lmcache}"
 
 secret_args=()
 cache_args=()
+context_args=()
 aws_credentials_file=""
+
+if [[ "${install_kv_connectors}" == "true" ]]; then
+  if [[ ! -d "${lmcache_source_dir}/lmcache" ]]; then
+    echo "INSTALL_KV_CONNECTORS=true but LMCACHE_SOURCE_DIR does not point to an LMCache checkout: ${lmcache_source_dir}" >&2
+    exit 1
+  fi
+  context_args+=(--build-context "lmcache=${lmcache_source_dir}")
+else
+  context_args+=(--build-context "lmcache=${repo_root}")
+fi
 
 if [[ "${use_sccache}" == "1" ]]; then
   if [[ -n "${SCCACHE_AWS_CREDENTIALS_FILE:-}" ]]; then
@@ -106,5 +118,6 @@ docker buildx build "${repo_root}" \
   --build-arg "VLLM_BUILD_COMMIT=${commit}" \
   --build-arg "VLLM_IMAGE_TAG=${tag}" \
   "${secret_args[@]}" \
+  "${context_args[@]}" \
   "${cache_args[@]}" \
   "$@"
