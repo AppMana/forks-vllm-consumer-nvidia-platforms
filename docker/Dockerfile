@@ -1090,6 +1090,9 @@ ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 # Reference: https://github.com/astral-sh/uv/pull/1694
 ENV UV_HTTP_TIMEOUT=500
 
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system "ray>=2.10,<3"
+
 # install kv_connectors if requested
 # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
 ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
