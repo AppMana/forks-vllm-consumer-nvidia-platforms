@@ -92,9 +92,6 @@ ARG PYTORCH_CUDA_INDEX_BASE_URL=https://download.pytorch.org/whl
 ARG PIP_KEYRING_PROVIDER=disabled
 ARG UV_KEYRING_PROVIDER=${PIP_KEYRING_PROVIDER}
 
-# Flag enables built-in KV-connector dependency libs into docker images
-ARG INSTALL_KV_CONNECTORS=false
-
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
@@ -1074,7 +1071,6 @@ RUN mv vllm src/vllm
 # base openai image with additional requirements, for any subsequent openai-style images
 FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
-ARG INSTALL_KV_CONNECTORS=false
 ARG CUDA_VERSION
 ARG LMCACHE_GIT_REF=cd51f3a15766e326f92998c072264a5a6caa4efe
 ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-5a9c44cc752f36228b24adb8382ee8b8d52e9499/flash_mla-1.0.0%2B5a9c44c-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
@@ -1090,7 +1086,7 @@ ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 # Reference: https://github.com/astral-sh/uv/pull/1694
 ENV UV_HTTP_TIMEOUT=500
 
-# install kv_connectors if requested
+# install kv_connectors
 # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
 ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
@@ -1101,21 +1097,17 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     BUILD_PKGS="libcusparse-dev-${CUDA_VERSION_DASH} \
                 libcublas-dev-${CUDA_VERSION_DASH} \
                 libcusolver-dev-${CUDA_VERSION_DASH}"; \
-    if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
-        uv pip install --system -r /tmp/kv_connectors.txt --no-build || ( \
-            apt-get update -y && \
-            apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
-            uv pip install --system -r /tmp/kv_connectors.txt --no-build-isolation && \
-            apt-get purge -y ${BUILD_PKGS} && \
-            rm -rf /var/lib/apt/lists/* \
-        ); \
-    fi
-
-RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
+    uv pip install --system -r /tmp/kv_connectors.txt --no-build || ( \
         apt-get update -y && \
-        apt-get install -y --no-install-recommends git && \
-        rm -rf /var/lib/apt/lists/*; \
-    fi
+        apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
+        uv pip install --system -r /tmp/kv_connectors.txt --no-build-isolation && \
+        apt-get purge -y ${BUILD_PKGS} && \
+        rm -rf /var/lib/apt/lists/* \
+    )
+
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/opt/uv/cache \
     set -e; \
@@ -1123,28 +1115,22 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     BUILD_PKGS="libcusparse-dev-${CUDA_VERSION_DASH} \
                 libcublas-dev-${CUDA_VERSION_DASH} \
                 libcusolver-dev-${CUDA_VERSION_DASH}"; \
-    if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
-        apt-get update -y && \
-        apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
-        CUDA_HOME=/usr/local/cuda \
-        uv pip install --system --no-deps --no-build-isolation --force-reinstall \
-            "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}" && \
-        apt-get purge -y ${BUILD_PKGS} && \
-        apt-get autoremove -y && \
-        rm -rf /var/lib/apt/lists/*; \
-    fi
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
+    CUDA_HOME=/usr/local/cuda \
+    uv pip install --system --no-deps --no-build-isolation --force-reinstall \
+        "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}" && \
+    apt-get purge -y ${BUILD_PKGS} && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
-        apt-get purge -y git && \
-        apt-get autoremove -y && \
-        rm -rf /var/lib/apt/lists/*; \
-    fi
+RUN apt-get purge -y git && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
-        CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
-        uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
-    fi
+    CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
+    uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}
 
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ -n "${FLASHMLA_WHEEL_URL}" ]; then \
@@ -1157,19 +1143,17 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # floor must be <= the FINAL_BASE_IMAGE's glibc.
 ARG MOONCAKE_WHEEL_AARCH64
 ARG MOONCAKE_WHEEL_X86_64
-RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
-        if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-            WHEEL="${MOONCAKE_WHEEL_AARCH64}"; \
-        else \
-            WHEEL="${MOONCAKE_WHEEL_X86_64}"; \
-        fi && \
-        if [ -n "${WHEEL}" ]; then \
-            uv pip install --system "${WHEEL}" && \
-            CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
-            if [ ! -f /usr/local/cuda/lib64/libcudart.so ] && \
-               [ -f "/usr/local/cuda/lib64/libcudart.so.${CUDA_MAJOR}" ]; then \
-                ln -s "libcudart.so.${CUDA_MAJOR}" /usr/local/cuda/lib64/libcudart.so; \
-            fi; \
+RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        WHEEL="${MOONCAKE_WHEEL_AARCH64}"; \
+    else \
+        WHEEL="${MOONCAKE_WHEEL_X86_64}"; \
+    fi && \
+    if [ -n "${WHEEL}" ]; then \
+        uv pip install --system "${WHEEL}" && \
+        CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
+        if [ ! -f /usr/local/cuda/lib64/libcudart.so ] && \
+           [ -f "/usr/local/cuda/lib64/libcudart.so.${CUDA_MAJOR}" ]; then \
+            ln -s "libcudart.so.${CUDA_MAJOR}" /usr/local/cuda/lib64/libcudart.so; \
         fi; \
     fi
 
