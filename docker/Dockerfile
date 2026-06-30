@@ -40,6 +40,8 @@ ARG UBUNTU_VERSION=22.04
 ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 # Using cuda base image with minimal dependencies necessary for JIT compilation (FlashInfer, DeepGEMM, EP kernels)
 ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
+ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
+ARG APPMANA_NCCL_GIT_REF=b8fabdc5145fab760c1a9acce2892ac6077b1679
 
 # OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
 # Python bootstrap. Set to "manylinux" alongside a manylinux build base such
@@ -641,6 +643,28 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
 
 #################### WHEEL BUILD IMAGE ####################
 
+#################### APPMANA NCCL BUILD IMAGE ####################
+FROM ${BUILD_BASE_IMAGE} AS appmana-nccl-build
+ARG APPMANA_NCCL_GIT_REPO
+ARG APPMANA_NCCL_GIT_REF
+
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        git \
+        libibverbs-dev \
+        python3 \
+        python-is-python3 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN git clone "${APPMANA_NCCL_GIT_REPO}" /nccl-src && \
+    cd /nccl-src && \
+    git checkout "${APPMANA_NCCL_GIT_REF}" && \
+    make -j"$(nproc)" src.build CUDA_HOME=/usr/local/cuda \
+        NVCC_GENCODE="-gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_86,code=compute_86" && \
+    test -f build/lib/libnccl.so.2.30.7
+
 #################### DEV IMAGE ####################
 FROM base AS dev
 
@@ -774,6 +798,15 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
     fi && \
     apt-get install -y --no-install-recommends --allow-change-held-packages libnccl-dev=${NCCL_VER} libnccl2=${NCCL_VER} && \
     rm -rf /var/lib/apt/lists/*
+
+COPY --from=appmana-nccl-build /nccl-src/build/lib/libnccl.so.2.30.7 /usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7
+RUN set -eux; \
+    cd /usr/lib/x86_64-linux-gnu; \
+    rm -f libnccl.so.2 libnccl.so; \
+    ln -sf libnccl.so.2.30.7 libnccl.so.2; \
+    ln -sf libnccl.so.2 libnccl.so; \
+    ldconfig; \
+    test "$(readlink -f libnccl.so.2)" = "/usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7"
 
 # Install uv for faster pip installs
 RUN python3 -m pip install uv
@@ -915,7 +948,7 @@ ARG PIP_KEYRING_PROVIDER UV_KEYRING_PROVIDER
 
 # We can specify the standard or nightly build of PyTorch
 ARG PYTORCH_NIGHTLY
-ARG REPLACE_TORCH_BUNDLED_NCCL=false
+ARG REPLACE_TORCH_BUNDLED_NCCL=true
 
 # Install vLLM wheel first, so that torch etc will be installed.
 # Check whether to install torch nightly instead of release for this build.

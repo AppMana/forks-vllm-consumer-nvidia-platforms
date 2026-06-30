@@ -31,7 +31,7 @@ if ! docker buildx inspect "${builder}" >/dev/null 2>&1; then
 fi
 
 max_jobs="${MAX_JOBS:-8}"
-nvcc_threads="${NVCC_THREADS:-1}"
+nvcc_threads="${NVCC_THREADS:-4}"
 torch_arch_list="${TORCH_CUDA_ARCH_LIST:-8.6}"
 flashinfer_download_cubin="${FLASHINFER_DOWNLOAD_CUBIN:-0}"
 use_sccache="${USE_SCCACHE:-0}"
@@ -43,6 +43,8 @@ sccache_recache="${SCCACHE_RECACHE:-0}"
 skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"
 install_kv_connectors="${INSTALL_KV_CONNECTORS:-false}"
 lmcache_git_ref="${LMCACHE_GIT_REF:-cd51f3a15766e326f92998c072264a5a6caa4efe}"
+appmana_nccl_git_repo="${APPMANA_NCCL_GIT_REPO:-https://github.com/AppMana/forks-nccl-rdma-routing.git}"
+appmana_nccl_git_ref="${APPMANA_NCCL_GIT_REF:-b8fabdc5145fab760c1a9acce2892ac6077b1679}"
 
 secret_args=()
 cache_args=()
@@ -105,6 +107,8 @@ docker buildx build "${repo_root}" \
   --build-arg "VLLM_SKIP_FLASH_ATTN_BUILD=${skip_flash_attn_build}" \
   --build-arg "INSTALL_KV_CONNECTORS=${install_kv_connectors}" \
   --build-arg "LMCACHE_GIT_REF=${lmcache_git_ref}" \
+  --build-arg "APPMANA_NCCL_GIT_REPO=${appmana_nccl_git_repo}" \
+  --build-arg "APPMANA_NCCL_GIT_REF=${appmana_nccl_git_ref}" \
   --build-arg "VLLM_BUILD_COMMIT=${commit}" \
   --build-arg "VLLM_IMAGE_TAG=${tag}" \
   "${secret_args[@]}" \
