@@ -1176,6 +1176,21 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         fi; \
     fi
 
+RUN python3 - <<'PY'
+import importlib
+
+for name in (
+    "ray",
+    "vllm",
+    "vllm._C_stable_libtorch",
+    "vllm._moe_C_stable_libtorch",
+    "lmcache",
+    "flash_mla",
+    "flash_mla_cuda",
+):
+    importlib.import_module(name)
+PY
+
 ENV VLLM_USAGE_SOURCE production-docker-image
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
