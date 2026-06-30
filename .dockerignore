@@ -8,6 +8,8 @@
 build/
 dist/
 docker/
+!docker/entrypoints/
+!docker/entrypoints/**
 cmake-build*/
 rust/target/
 vllm.egg-info/
