@@ -41,6 +41,7 @@ sccache_region="${SCCACHE_REGION_NAME:-us-west-2}"
 sccache_s3_no_credentials="${SCCACHE_S3_NO_CREDENTIALS:-0}"
 sccache_recache="${SCCACHE_RECACHE:-0}"
 skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"
+install_kv_connectors="${INSTALL_KV_CONNECTORS:-false}"
 lmcache_git_ref="${LMCACHE_GIT_REF:-cd51f3a15766e326f92998c072264a5a6caa4efe}"
 
 secret_args=()
@@ -102,6 +103,7 @@ docker buildx build "${repo_root}" \
   --build-arg "SCCACHE_S3_NO_CREDENTIALS=${sccache_s3_no_credentials}" \
   --build-arg "SCCACHE_RECACHE=${sccache_recache}" \
   --build-arg "VLLM_SKIP_FLASH_ATTN_BUILD=${skip_flash_attn_build}" \
+  --build-arg "INSTALL_KV_CONNECTORS=${install_kv_connectors}" \
   --build-arg "LMCACHE_GIT_REF=${lmcache_git_ref}" \
   --build-arg "VLLM_BUILD_COMMIT=${commit}" \
   --build-arg "VLLM_IMAGE_TAG=${tag}" \
