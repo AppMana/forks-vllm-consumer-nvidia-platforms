@@ -9,7 +9,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 
 _MHC_PRE_NUM_SPLIT_BUCKETS = (1, 2, 4, 8, 16, 32)
-_MHC_PRE_FUSE_TRITON_MAX_TOKENS = 2048
 
 
 def _bucket_mhc_pre_num_split(split_k: int) -> int:
@@ -408,19 +407,6 @@ def _mhc_pre_fuse_triton(
     num_splits, num_tokens, hc_mult3 = gemm_out_mul.shape
     hc = residual_flat.shape[1]
     hidden = residual_flat.shape[2]
-    if num_tokens > _MHC_PRE_FUSE_TRITON_MAX_TOKENS:
-        return _mhc_pre_fuse_from_gemm_torch(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            residual_flat,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-        )
     post_mix = torch.empty(num_tokens, hc, dtype=torch.float32, device=residual_flat.device)
     comb_mix = torch.empty(num_tokens, hc, hc, dtype=torch.float32, device=residual_flat.device)
     layer_input = torch.empty(

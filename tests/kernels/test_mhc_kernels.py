@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import importlib
+
 import pytest
 import torch
 
@@ -14,6 +16,7 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE = current_platform.device_type
+mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
 
 
 def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
@@ -157,6 +160,114 @@ def test_mhc_pre_fuse_large_token_torch_path_matches_reference():
     )
 
     expected = (expected[0].squeeze(-1), expected[1], expected[2])
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+
+
+@pytest.mark.parametrize("concurrency", [1, 2, 4])
+def test_mhc_pre_fuse_large_token_uses_triton_kernel(monkeypatch, concurrency):
+    num_tokens, hidden_size, hc_mult, num_splits = 2049 * concurrency, 8, 4, 2
+    hc_mult3 = hc_mult * (hc_mult + 2)
+    gemm_out_mul = torch.empty((num_splits, num_tokens, hc_mult3), dtype=torch.float32)
+    gemm_out_sqrsum = torch.empty((num_splits, num_tokens), dtype=torch.float32)
+    hc_scale = torch.empty((3,), dtype=torch.float32)
+    hc_base = torch.empty((hc_mult3,), dtype=torch.float32)
+    residual = torch.empty((num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16)
+
+    def fail_fallback(*args, **kwargs):
+        raise AssertionError("large-token MHC pre-fuse must not use torch fallback")
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            assert grid == (num_tokens, 1)
+
+            def launch(*args, **kwargs):
+                post_mix, comb_mix, layer_input = args[5], args[6], args[7]
+                post_mix.zero_()
+                comb_mix.zero_()
+                layer_input.zero_()
+
+            return launch
+
+    monkeypatch.setattr(mhc_triton, "_mhc_pre_fuse_from_gemm_torch", fail_fallback)
+    monkeypatch.setattr(mhc_triton, "_mhc_pre_fuse_triton_kernel", FakeKernel())
+
+    post_mix, comb_mix, layer_input = mhc_triton._mhc_pre_fuse_triton(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        1e-6,
+        1e-6,
+        1e-6,
+        1.0,
+        4,
+    )
+
+    assert post_mix.shape == (num_tokens, hc_mult)
+    assert comb_mix.shape == (num_tokens, hc_mult, hc_mult)
+    assert layer_input.shape == (num_tokens, hidden_size)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("concurrency", [1, 2, 4])
+def test_mhc_pre_fuse_large_token_triton_matches_torch_reference(concurrency):
+    set_random_seed(0)
+    device = torch.device("cuda")
+    num_tokens, hidden_size, hc_mult, num_splits = 2049 * concurrency, 8, 4, 2
+    hc_mult3 = hc_mult * (hc_mult + 2)
+    rms_eps = hc_pre_eps = hc_sinkhorn_eps = 1e-6
+    hc_post_alpha = 1.0
+    sinkhorn_repeat = 4
+
+    residual = torch.randn(
+        (num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16, device=device
+    )
+    hc_scale = torch.randn((3,), dtype=torch.float32, device=device) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32, device=device) * 0.1
+    fn = torch.randn(
+        (hc_mult3, hc_mult * hidden_size), dtype=torch.float32, device=device
+    ) * 1e-4
+
+    x = residual.flatten(1).float()
+    gemm_out_mul = torch.empty(
+        (num_splits, num_tokens, hc_mult3), dtype=torch.float32, device=device
+    )
+    gemm_out_sqrsum = torch.empty(
+        (num_splits, num_tokens), dtype=torch.float32, device=device
+    )
+    for split in range(num_splits):
+        start = split * (hc_mult * hidden_size) // num_splits
+        end = (split + 1) * (hc_mult * hidden_size) // num_splits
+        gemm_out_mul[split] = x[:, start:end] @ fn[:, start:end].T
+        gemm_out_sqrsum[split] = x[:, start:end].square().sum(dim=-1)
+
+    actual = mhc_triton._mhc_pre_fuse_triton(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+    )
+    expected = mhc_triton._mhc_pre_fuse_from_gemm_torch(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+    )
+
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(actual_tensor, expected_tensor)
 
