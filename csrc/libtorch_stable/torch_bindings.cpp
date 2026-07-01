@@ -446,6 +446,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
       "Tensor fp8_scale, Tensor q_fp8_scale_inv, float eps, "
       "int cache_block_size) -> ()");
+  ops.def(
+      "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache("
+      "Tensor! out, Tensor k_cache, Tensor seq_lens, Tensor? gather_lens, "
+      "Tensor block_table, int block_size, int offset) -> ()");
 
 #ifndef USE_ROCM
   ops.def(
@@ -672,6 +676,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl(
       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
       TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert));
+  ops.impl("deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache",
+           TORCH_BOX(&deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache));
 #ifndef USE_ROCM
   ops.impl("minimax_allreduce_rms_qk", TORCH_BOX(&minimax_allreduce_rms_qk));
 #endif

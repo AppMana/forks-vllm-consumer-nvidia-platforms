@@ -41,6 +41,7 @@
 #include "cuda_compat.h"
 #include "dispatch_utils.h"
 #include "type_convert.cuh"
+#include "quantization/w8a8/fp8/nvidia/quant_utils.cuh"
 
 #ifndef USE_ROCM
   #include <cuda_fp8.h>
@@ -939,6 +940,79 @@ static void launchFullCacheKernel(
 }  // namespace deepseek_v4_fused_ops
 }  // namespace vllm
 
+namespace {
+
+constexpr int kDSV4Fp8Dim = 448;
+constexpr int kDSV4Bf16Dim = 64;
+constexpr int kDSV4HeadDim = 512;
+constexpr int kDSV4QuantBlock = 64;
+constexpr int kDSV4TokenDataBytes = kDSV4Fp8Dim + kDSV4Bf16Dim * 2;
+constexpr int kDSV4ScaleBytes = 8;
+
+__global__ void deepseekV4Fp8DsMlaGatherKernel(
+    __nv_bfloat16* __restrict__ out, uint8_t const* __restrict__ k_cache,
+    int32_t const* __restrict__ seq_lens,
+    int32_t const* __restrict__ gather_lens,
+    int32_t const* __restrict__ block_table, int const num_reqs,
+    int64_t const block_table_stride0, int64_t const block_table_stride1,
+    int const max_gather_len, int const block_size, int const offset,
+    int64_t const out_stride0, int64_t const out_stride1,
+    int64_t const out_stride2, int64_t const cache_block_stride) {
+  int const req_id = static_cast<int>(blockIdx.x);
+  int const token_id = static_cast<int>(blockIdx.y);
+  if (req_id >= num_reqs) {
+    return;
+  }
+  int const gather_len =
+      gather_lens == nullptr ? seq_lens[req_id] : gather_lens[req_id];
+  if (token_id >= gather_len || token_id >= max_gather_len) {
+    return;
+  }
+
+  int const start_pos = seq_lens[req_id] - gather_len;
+  int const logical_pos = start_pos + token_id;
+  int const block_in_seq = logical_pos / block_size;
+  int const pos_in_block = logical_pos - block_in_seq * block_size;
+  int32_t const physical_block =
+      block_table[req_id * block_table_stride0 +
+                  block_in_seq * block_table_stride1];
+  if (physical_block < 0) {
+    for (int dim = threadIdx.x; dim < kDSV4HeadDim; dim += blockDim.x) {
+      out[req_id * out_stride0 + (offset + token_id) * out_stride1 +
+          dim * out_stride2] = __float2bfloat16(0.0f);
+    }
+    return;
+  }
+
+  uint8_t const* token_base =
+      k_cache + static_cast<int64_t>(physical_block) * cache_block_stride +
+      static_cast<int64_t>(pos_in_block) * kDSV4TokenDataBytes;
+  uint8_t const* scale_base =
+      k_cache + static_cast<int64_t>(physical_block) * cache_block_stride +
+      static_cast<int64_t>(block_size) * kDSV4TokenDataBytes +
+      static_cast<int64_t>(pos_in_block) * kDSV4ScaleBytes;
+  int64_t const out_base =
+      static_cast<int64_t>(req_id) * out_stride0 +
+      static_cast<int64_t>(offset + token_id) * out_stride1;
+
+  for (int dim = threadIdx.x; dim < kDSV4Fp8Dim; dim += blockDim.x) {
+    int const qblock = dim / kDSV4QuantBlock;
+    float const scale = exp2f(static_cast<float>(scale_base[qblock]) - 127.0f);
+    out[out_base + static_cast<int64_t>(dim) * out_stride2] =
+        vllm::fp8::scaled_vec_conversion<__nv_bfloat16, uint8_t>(
+            token_base[dim], scale, __NV_E4M3);
+  }
+  for (int dim = kDSV4Fp8Dim + threadIdx.x; dim < kDSV4HeadDim;
+       dim += blockDim.x) {
+    uint16_t const raw = reinterpret_cast<uint16_t const*>(
+        token_base + kDSV4Fp8Dim)[dim - kDSV4Fp8Dim];
+    out[out_base + static_cast<int64_t>(dim) * out_stride2] =
+        *reinterpret_cast<__nv_bfloat16 const*>(&raw);
+  }
+}
+
+}  // namespace
+
 // ────────────────────────────────────────────────────────────────────────────
 // Torch op wrapper
 // ────────────────────────────────────────────────────────────────────────────
@@ -1185,4 +1259,70 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
             "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
             stream);
       });
+}
+
+void deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache(
+    torch::stable::Tensor& out, torch::stable::Tensor const& k_cache,
+    torch::stable::Tensor const& seq_lens,
+    std::optional<torch::stable::Tensor> gather_lens,
+    torch::stable::Tensor const& block_table, int64_t block_size,
+    int64_t offset) {
+  using torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(out.device().is_cuda() && k_cache.device().is_cuda() &&
+                      seq_lens.device().is_cuda() &&
+                      block_table.device().is_cuda(),
+                  "all tensors must be CUDA");
+  STD_TORCH_CHECK(out.scalar_type() == ScalarType::BFloat16,
+                  "out must be bfloat16");
+  STD_TORCH_CHECK(k_cache.scalar_type() == ScalarType::Byte,
+                  "k_cache must be uint8");
+  STD_TORCH_CHECK(seq_lens.scalar_type() == ScalarType::Int,
+                  "seq_lens must be int32");
+  STD_TORCH_CHECK(block_table.scalar_type() == ScalarType::Int,
+                  "block_table must be int32");
+  STD_TORCH_CHECK(out.dim() == 3 && out.size(2) == kDSV4HeadDim,
+                  "out shape must be [num_reqs, max_tokens, 512]");
+  STD_TORCH_CHECK(k_cache.dim() == 2 || k_cache.dim() == 3,
+                  "k_cache must be 2D or 3D uint8");
+  STD_TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must be 1D");
+  STD_TORCH_CHECK(block_table.dim() == 2, "block_table must be 2D");
+  STD_TORCH_CHECK(out.size(0) == seq_lens.size(0) &&
+                      block_table.size(0) == seq_lens.size(0),
+                  "batch dimensions must match");
+  STD_TORCH_CHECK(block_size > 0, "block_size must be positive");
+  STD_TORCH_CHECK(offset >= 0 && offset <= out.size(1),
+                  "offset out of bounds");
+  if (gather_lens.has_value()) {
+    STD_TORCH_CHECK(gather_lens->device().is_cuda() &&
+                        gather_lens->scalar_type() == ScalarType::Int &&
+                        gather_lens->dim() == 1 &&
+                        gather_lens->size(0) == seq_lens.size(0),
+                    "gather_lens must be int32 CUDA [num_reqs]");
+  }
+
+  int const num_reqs = static_cast<int>(seq_lens.size(0));
+  int const max_gather_len = static_cast<int>(out.size(1) - offset);
+  if (num_reqs == 0 || max_gather_len <= 0) {
+    return;
+  }
+  int64_t const cache_block_stride = k_cache.stride(0);
+  STD_TORCH_CHECK(cache_block_stride >=
+                      block_size * kDSV4TokenDataBytes +
+                          block_size * kDSV4ScaleBytes,
+                  "k_cache block stride is too small for fp8_ds_mla layout");
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      out.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(out.get_device_index());
+  dim3 const grid(num_reqs, max_gather_len);
+  dim3 const block(256);
+  deepseekV4Fp8DsMlaGatherKernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
+      reinterpret_cast<uint8_t const*>(k_cache.const_data_ptr()),
+      seq_lens.const_data_ptr<int32_t>(),
+      gather_lens.has_value() ? gather_lens->const_data_ptr<int32_t>() : nullptr,
+      block_table.const_data_ptr<int32_t>(), num_reqs, block_table.stride(0),
+      block_table.stride(1), max_gather_len, static_cast<int>(block_size),
+      static_cast<int>(offset), out.stride(0), out.stride(1), out.stride(2),
+      cache_block_stride);
 }

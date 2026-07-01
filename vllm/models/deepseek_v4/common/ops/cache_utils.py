@@ -429,6 +429,9 @@ def quantize_and_insert_k_cache(
     )
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
+    if not use_fnuz and not _supports_fp8e4nv_in_triton():
+        _quantize_and_insert_k_cache_torch(k, k_cache, slot_mapping, block_size)
+        return
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
     # padding. Always use slot_mapping.shape[0] as the token count.
@@ -826,8 +829,17 @@ def dequantize_and_gather_k_cache(
     writes FNUZ on gfx942 and OCP on gfx950).
     """
     # sm_8x lacks fp8e4nv in Triton (and the cutedsl path needs `quack`, which
-    # is not installed on Ampere). Use the torch fallback there.
+    # is not installed on Ampere). Prefer the native CUDA gather/dequant op when
+    # the Ampere build provides it, then fall back to the torch reference.
     if not _supports_fp8e4nv_in_triton():
+        native_op = getattr(
+            torch.ops._C, "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache", None
+        )
+        if native_op is not None:
+            native_op(
+                out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+            )
+            return
         _dequantize_and_gather_k_cache_torch(
             out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
         )

@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    dequantize_and_gather_k_cache,
     _dequantize_and_gather_k_cache_torch,
     _dequantize_global_slots_k_cache_torch,
     _quantize_and_insert_k_cache_torch,
@@ -177,3 +178,76 @@ def test_dispatch_skips_triton_on_ampere() -> None:
     if (cap[0], cap[1]) >= (8, 9):
         pytest.skip("requires sm_8x (Ampere, sm_8.0–8.6)")
     assert _supports_fp8e4nv_in_triton() is False
+
+
+def test_ampere_dispatch_uses_native_dequant_gather(monkeypatch) -> None:
+    """Ampere should use the native fp8_ds_mla gather before the torch fallback."""
+    called = False
+
+    def fake_native(out, k_cache, seq_lens, gather_lens, block_table, block_size, offset):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        torch.ops._C,
+        "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache",
+        fake_native,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.common.ops.cache_utils._supports_fp8e4nv_in_triton",
+        lambda: False,
+    )
+
+    out = torch.empty(1, 1, 512, dtype=torch.bfloat16, device="cuda")
+    k_cache = _make_empty_k_cache(1, 64)
+    seq_lens = torch.tensor([0], dtype=torch.int32, device="cuda")
+    block_table = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
+    dequantize_and_gather_k_cache(out, k_cache, seq_lens, None, block_table, 64, 0)
+    assert called
+
+
+def test_native_dequant_gather_matches_torch_fallback() -> None:
+    native_op = getattr(
+        torch.ops._C, "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache", None
+    )
+    if native_op is None:
+        pytest.skip("native fp8_ds_mla dequant gather op is not built")
+
+    block_size = 64
+    num_blocks = 8
+    seq_lens_host = [65, 17]
+    gather_lens_host = [33, 9]
+    max_gather_len = max(gather_lens_host)
+    torch.manual_seed(3)
+    k = torch.randn(sum(seq_lens_host), 512, dtype=torch.bfloat16, device="cuda")
+    k_cache = _make_empty_k_cache(num_blocks, block_size)
+
+    block_table = torch.tensor([[0, 2], [5, -1]], dtype=torch.int32, device="cuda")
+    slot_mapping = torch.empty(k.size(0), dtype=torch.int64, device="cuda")
+    start = 0
+    for req_id, seq_len in enumerate(seq_lens_host):
+        logical_pos = torch.arange(seq_len, dtype=torch.int64, device="cuda")
+        block_idx = block_table[req_id, logical_pos // block_size].to(torch.int64)
+        slot_mapping[start : start + seq_len] = block_idx * block_size + (
+            logical_pos % block_size
+        )
+        start += seq_len
+    _quantize_and_insert_k_cache_torch(k, k_cache, slot_mapping, block_size)
+
+    seq_lens = torch.tensor(seq_lens_host, dtype=torch.int32, device="cuda")
+    gather_lens = torch.tensor(gather_lens_host, dtype=torch.int32, device="cuda")
+    ref = torch.empty(2, max_gather_len + 2, 512, dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty_like(ref)
+    _dequantize_and_gather_k_cache_torch(
+        ref, k_cache, seq_lens, gather_lens, block_table, block_size, offset=1
+    )
+    native_op(actual, k_cache, seq_lens, gather_lens, block_table, block_size, 1)
+    torch.cuda.synchronize()
+    for req_id, gather_len in enumerate(gather_lens_host):
+        torch.testing.assert_close(
+            actual[req_id, 1 : 1 + gather_len],
+            ref[req_id, 1 : 1 + gather_len],
+            rtol=0,
+            atol=0,
+        )
