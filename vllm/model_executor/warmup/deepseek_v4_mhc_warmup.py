@@ -146,6 +146,24 @@ def _warmup_layer_mhc(
             )
             layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
 
+            fused_post_pre = getattr(layer, "hc_fused_post_pre", None)
+            if fused_post_pre is not None:
+                fused_post_pre(
+                    layer_input,
+                    residual_slice,
+                    post_mix,
+                    comb_mix,
+                    fn,
+                    scale,
+                    base,
+                    layer.rms_norm_eps,
+                    layer.hc_eps,
+                    layer.hc_sinkhorn_eps,
+                    layer.hc_post_mult_value,
+                    layer.hc_sinkhorn_repeat,
+                    1,
+                )
+
 
 def _warmup_hc_head(
     model: torch.nn.Module,
