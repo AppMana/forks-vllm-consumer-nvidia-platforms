@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import types
+
 import torch
 
-from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import _warmup_layer_mhc
+from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
+    _find_first_mhc_layer,
+    _warmup_layer_mhc,
+)
 
 
 class FakeMHCLayer(torch.nn.Module):
@@ -12,9 +17,8 @@ class FakeMHCLayer(torch.nn.Module):
         self.hc_mult = 2
         self.rms_norm_eps = 1e-6
         self.hc_eps = 1e-6
-        self.hc_sinkhorn_eps = 1e-6
-        self.hc_post_mult_value = 1.0
-        self.hc_sinkhorn_repeat = 2
+        self.hc_post_alpha = 1.0
+        self.hc_sinkhorn_iters = 2
         self.hc_attn_fn = torch.empty(8, 16, dtype=torch.float32)
         self.hc_attn_scale = torch.empty(3, dtype=torch.float32)
         self.hc_attn_base = torch.empty(8, dtype=torch.float32)
@@ -22,7 +26,6 @@ class FakeMHCLayer(torch.nn.Module):
         self.hc_ffn_scale = torch.empty(3, dtype=torch.float32)
         self.hc_ffn_base = torch.empty(8, dtype=torch.float32)
         self.pre_calls: list[tuple[int, torch.Tensor]] = []
-        self.post_calls: list[int] = []
         self.fused_calls: list[tuple[int, torch.Tensor, int]] = []
 
     def hc_pre(
@@ -43,18 +46,7 @@ class FakeMHCLayer(torch.nn.Module):
         )
         return layer_input, post_mix, comb_mix
 
-    def hc_post(
-        self,
-        layer_input: torch.Tensor,
-        residual: torch.Tensor,
-        post_mix: torch.Tensor,
-        comb_mix: torch.Tensor,
-    ) -> torch.Tensor:
-        del layer_input, post_mix, comb_mix
-        self.post_calls.append(residual.shape[0])
-        return torch.empty_like(residual)
-
-    def hc_fused_post_pre(
+    def mhc_fused_post_pre(
         self,
         layer_input: torch.Tensor,
         residual: torch.Tensor,
@@ -66,16 +58,16 @@ class FakeMHCLayer(torch.nn.Module):
         rms_norm_eps: float,
         hc_eps: float,
         hc_sinkhorn_eps: float,
-        hc_post_mult_value: float,
-        hc_sinkhorn_repeat: int,
+        hc_post_alpha: float,
+        hc_sinkhorn_iters: int,
         n_splits: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         del layer_input, post_mix, comb_mix, scale, base
         assert rms_norm_eps == self.rms_norm_eps
         assert hc_eps == self.hc_eps
-        assert hc_sinkhorn_eps == self.hc_sinkhorn_eps
-        assert hc_post_mult_value == self.hc_post_mult_value
-        assert hc_sinkhorn_repeat == self.hc_sinkhorn_repeat
+        assert hc_sinkhorn_eps == self.hc_eps
+        assert hc_post_alpha == self.hc_post_alpha
+        assert hc_sinkhorn_iters == self.hc_sinkhorn_iters
         self.fused_calls.append((residual.shape[0], fn, n_splits))
         return (
             torch.empty_like(residual),
@@ -94,7 +86,6 @@ def test_mhc_warmup_exercises_fused_post_pre() -> None:
 
     expected_sizes = [1, 1, 2, 2, 4, 4]
     assert [size for size, _ in layer.pre_calls] == expected_sizes
-    assert layer.post_calls == expected_sizes
     assert [size for size, _, _ in layer.fused_calls] == expected_sizes
     assert [n_splits for _, _, n_splits in layer.fused_calls] == [1] * 6
     expected_fns = [
@@ -111,3 +102,11 @@ def test_mhc_warmup_exercises_fused_post_pre() -> None:
             [fn for _, fn, _ in layer.fused_calls], expected_fns
         )
     )
+
+
+def test_mhc_layer_discovery_matches_live_deepseek_v4_layer_shape() -> None:
+    model = torch.nn.Module()
+    model.config = types.SimpleNamespace(model_type="deepseek_v4")
+    model.layer = FakeMHCLayer()
+
+    assert _find_first_mhc_layer(model) is model.layer

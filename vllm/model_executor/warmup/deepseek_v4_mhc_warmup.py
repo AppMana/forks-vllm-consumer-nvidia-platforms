@@ -87,7 +87,7 @@ def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:
                 "hidden_size",
                 "hc_mult",
                 "hc_pre",
-                "hc_post",
+                "mhc_fused_post_pre",
                 "hc_attn_fn",
                 "hc_attn_scale",
                 "hc_attn_base",
@@ -144,9 +144,8 @@ def _warmup_layer_mhc(
                 scale,
                 base,
             )
-            layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
 
-            fused_post_pre = getattr(layer, "hc_fused_post_pre", None)
+            fused_post_pre = getattr(layer, "mhc_fused_post_pre", None)
             if fused_post_pre is not None:
                 fused_post_pre(
                     layer_input,
@@ -158,9 +157,9 @@ def _warmup_layer_mhc(
                     base,
                     layer.rms_norm_eps,
                     layer.hc_eps,
-                    layer.hc_sinkhorn_eps,
-                    layer.hc_post_mult_value,
-                    layer.hc_sinkhorn_repeat,
+                    layer.hc_eps,
+                    layer.hc_post_alpha,
+                    layer.hc_sinkhorn_iters,
                     1,
                 )
 
