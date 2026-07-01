@@ -829,8 +829,9 @@ def dequantize_and_gather_k_cache(
     writes FNUZ on gfx942 and OCP on gfx950).
     """
     # sm_8x lacks fp8e4nv in Triton (and the cutedsl path needs `quack`, which
-    # is not installed on Ampere). Prefer the native CUDA gather/dequant op when
-    # the Ampere build provides it, then fall back to the torch reference.
+    # is not installed on Ampere). The Ampere image must provide the native CUDA
+    # gather/dequant op; do not silently fall back to the torch reference in
+    # serving because long-context prefill becomes pathologically slow.
     if not _supports_fp8e4nv_in_triton():
         native_op = getattr(
             torch.ops._C, "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache", None
@@ -840,10 +841,12 @@ def dequantize_and_gather_k_cache(
                 out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
             )
             return
-        _dequantize_and_gather_k_cache_torch(
-            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        raise RuntimeError(
+            "Missing torch.ops._C.deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache "
+            "native CUDA op. Rebuild vLLM native extensions with the DSv4 Ampere "
+            "cache gather implementation; the torch fallback is intentionally "
+            "disabled for sm_8x serving."
         )
-        return
     if has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (

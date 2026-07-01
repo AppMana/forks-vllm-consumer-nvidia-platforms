@@ -1223,18 +1223,30 @@ for name in (
 
 for dist in ("vllm", "flash-mla"):
     importlib.metadata.version(dist)
+flash_mla = importlib.import_module("flash_mla")
+if not hasattr(flash_mla, "flash_sparse_mla_prefill"):
+    raise AttributeError("flash_mla.flash_sparse_mla_prefill")
 
 site_paths = {
     pathlib.Path(sysconfig.get_paths()["purelib"]),
     pathlib.Path(sysconfig.get_paths()["platlib"]),
 }
-if not any(path.glob("vllm/_C_stable_libtorch*.so") for path in site_paths):
+stable_libtorch = [
+    so
+    for path in site_paths
+    for so in path.glob("vllm/_C_stable_libtorch*.so")
+]
+if not stable_libtorch:
     raise ModuleNotFoundError("vllm._C_stable_libtorch")
 if not any(path.glob("vllm/_moe_C_stable_libtorch*.so") for path in site_paths):
     raise ModuleNotFoundError("vllm._moe_C_stable_libtorch")
 
 if not any(path.glob("flash_mla_cuda*.so") for path in site_paths):
     raise ModuleNotFoundError("flash_mla_cuda")
+
+op_name = b"deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache"
+if not any(op_name in so.read_bytes() for so in stable_libtorch):
+    raise AttributeError(op_name.decode())
 PY
 
 ENV VLLM_USAGE_SOURCE production-docker-image

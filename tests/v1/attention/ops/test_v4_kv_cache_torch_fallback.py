@@ -173,7 +173,7 @@ def test_round_trip_with_padded_cache_stride() -> None:
 
 
 def test_dispatch_skips_triton_on_ampere() -> None:
-    """Confirm the gate routes Ampere to the torch fallback."""
+    """Confirm the gate routes Ampere away from unsupported Triton fp8e4nv."""
     cap = torch.cuda.get_device_capability()
     if (cap[0], cap[1]) >= (8, 9):
         pytest.skip("requires sm_8x (Ampere, sm_8.0–8.6)")
@@ -181,7 +181,7 @@ def test_dispatch_skips_triton_on_ampere() -> None:
 
 
 def test_ampere_dispatch_uses_native_dequant_gather(monkeypatch) -> None:
-    """Ampere should use the native fp8_ds_mla gather before the torch fallback."""
+    """Ampere should use the native fp8_ds_mla gather op."""
     called = False
 
     def fake_native(out, k_cache, seq_lens, gather_lens, block_table, block_size, offset):
@@ -205,6 +205,27 @@ def test_ampere_dispatch_uses_native_dequant_gather(monkeypatch) -> None:
     block_table = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
     dequantize_and_gather_k_cache(out, k_cache, seq_lens, None, block_table, 64, 0)
     assert called
+
+
+def test_ampere_dispatch_requires_native_dequant_gather(monkeypatch) -> None:
+    """Ampere must fail loudly instead of falling back to slow torch gather."""
+    monkeypatch.setattr(
+        torch.ops._C,
+        "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.common.ops.cache_utils._supports_fp8e4nv_in_triton",
+        lambda: False,
+    )
+
+    out = torch.empty(1, 1, 512, dtype=torch.bfloat16, device="cuda")
+    k_cache = _make_empty_k_cache(1, 64)
+    seq_lens = torch.tensor([0], dtype=torch.int32, device="cuda")
+    block_table = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="Missing torch.ops._C.*dequantize"):
+        dequantize_and_gather_k_cache(out, k_cache, seq_lens, None, block_table, 64, 0)
 
 
 def test_native_dequant_gather_matches_torch_fallback() -> None:

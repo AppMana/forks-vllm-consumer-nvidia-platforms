@@ -12,15 +12,13 @@ sparse-attention kernel calls:
   dependency (imported at module top, no fallback): a missing kernel fails loudly
   at startup rather than silently degrading. Matches the Triton reference to ~1e-6
   (``test_sm86_flash_mla_decode_parity``).
-- prefill: ``sparse_attention_triton`` over the gathered bf16 KV.
+- prefill: the precompiled ``flash_mla.flash_sparse_mla_prefill`` CUDA kernel
+  over paged fp8_ds_mla KV caches and sparse slot ids.
 
-We deliberately do NOT use the native ``ampere_flashmla`` decode tail: that
-kernel is sized for sm_80 (A100, 164 KB smem) and overflows sm_86's 100 KB
-per-SM shared-memory cap (see pzhao-eng/FlashMLA#9). The Triton path is the
-smem-frugal route that fits sm_86. ``_o_proj`` is inherited from the FlashMLA
-layer; on sm_86 its fp8 einsum / inv-rope ops fall back to the torch software
-casts (WS6), so no override is needed. INT8 FP8 tensor cores are absent on
-Ampere; the Triton kernels upcast FP8 inputs to bf16 internally.
+``_o_proj`` is inherited from the FlashMLA layer; on sm_86 its fp8 einsum /
+inv-rope ops fall back to the torch software casts (WS6), so no override is
+needed. INT8 FP8 tensor cores are absent on Ampere; indexer kernels upcast FP8
+inputs to bf16 internally unless the checkpoint enables the INT8 IMMA indexer.
 """
 
 import torch
@@ -29,23 +27,17 @@ import torch
 # CUDA kernel. No try/except, no env gate, no Triton fallback — if the kernel is not
 # present the import fails loudly at startup (we never want a silent degrade to the
 # slower per-row Triton path).
-from flash_mla import flash_sparse_mla_decode
+from flash_mla import flash_sparse_mla_decode, flash_sparse_mla_prefill
 
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
-    combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
-    dequantize_and_gather_k_cache,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
-from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
-    sparse_attention_triton,
-)
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
-from vllm.v1.worker.workspace import current_workspace_manager
 
 
 class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
-    """DeepSeek-V4 sparse-MLA on Ampere via portable Triton kernels."""
+    """DeepSeek-V4 sparse-MLA on Ampere via the sm86 FlashMLA CUDA kernels."""
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -133,15 +125,8 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
-        seq_lens = swa_metadata.prefill_seq_lens
-        gather_lens = swa_metadata.prefill_gather_lens
-        assert seq_lens is not None
-        assert gather_lens is not None
-
         query_start_loc_cpu = swa_metadata.query_start_loc_cpu
-        query_start_loc = swa_metadata.query_start_loc
         assert query_start_loc_cpu is not None
-        assert query_start_loc is not None
         prefill_token_base = query_start_loc_cpu[num_decodes]
 
         if not swa_only:
@@ -152,46 +137,44 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
             else:
                 assert attn_metadata is not None
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
-            top_k = topk_indices.shape[-1]
         else:
-            assert self.topk_indices_buffer is not None
-            topk_indices = self.topk_indices_buffer[num_decode_tokens:]
-            top_k = 0
-        chunk_plan = swa_metadata.get_prefill_chunk_plan(
-            compress_ratio=self.compress_ratio,
-            prefill_chunk_size=self.PREFILL_CHUNK_SIZE,
-        )
-        assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
-        workspace_manager = current_workspace_manager()
-        for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
-            chunk_size = chunk_end - chunk_start
-            kv = workspace_manager.get_simultaneous(
-                ((chunk_size, chunk_M, q.shape[-1]), torch.bfloat16),
-            )[0]
-            if not swa_only:
-                assert attn_metadata is not None
-                block_table = attn_metadata.block_table[num_decodes:]
-                dequantize_and_gather_k_cache(
-                    kv[:chunk_size],
-                    compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                    gather_lens=None,
-                    block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
-                    offset=0,
-                )
+            topk_indices = None
 
-            swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                swa_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
-                block_table=swa_block_table[chunk_start:chunk_end],
-                block_size=swa_metadata.block_size,
-                offset=chunk_N,
+        extra_sparse_indices = None
+        extra_sparse_lens = None
+        if not swa_only:
+            assert attn_metadata is not None
+            if compressed_k_cache is None:
+                raise RuntimeError(
+                    "Compressed sparse MLA prefill requires compressed KV cache."
+                )
+            block_size = attn_metadata.block_size // self.compress_ratio
+            prefill_token_slice = slice(
+                num_decode_tokens, num_decode_tokens + num_prefill_tokens
+            )
+            assert topk_indices is not None
+            extra_sparse_indices, extra_sparse_lens = (
+                compute_global_topk_indices_and_lens(
+                    topk_indices,
+                    swa_metadata.token_to_req_indices[prefill_token_slice],
+                    attn_metadata.block_table,
+                    block_size,
+                    swa_metadata.is_valid_token[prefill_token_slice],
+                )
             )
 
+        assert swa_metadata.prefill_swa_indices is not None
+        assert swa_metadata.prefill_swa_lens is not None
+
+        num_chunks = (
+            swa_metadata.num_prefills + self.PREFILL_CHUNK_SIZE - 1
+        ) // self.PREFILL_CHUNK_SIZE
+        assert num_chunks > 0, "prefill chunk plan must be non-empty"
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
+            chunk_end = min(
+                chunk_start + self.PREFILL_CHUNK_SIZE, swa_metadata.num_prefills
+            )
             query_start = (
                 query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
             )
@@ -199,25 +182,25 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            combined_indices, combined_lens = combine_topk_swa_indices(
-                topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
-                self.window_size,
-                self.compress_ratio,
-                top_k,
-                chunk_M,
-                chunk_N,
-            )
-            sparse_attention_triton(
+            out = flash_sparse_mla_prefill(
                 q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                lengths=combined_lens,
+                swa_cache=swa_k_cache,
+                swa_indices=swa_metadata.prefill_swa_indices[query_start:query_end],
+                swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
                 scale=self.scale,
                 attn_sink=self.attn_sink,
-                out=output[query_start:query_end],
+                extra_cache=None if swa_only else compressed_k_cache,
+                extra_indices=(
+                    None
+                    if extra_sparse_indices is None
+                    else extra_sparse_indices[query_start:query_end]
+                ),
+                extra_lens=(
+                    None
+                    if extra_sparse_lens is None
+                    else extra_sparse_lens[query_start:query_end]
+                ),
             )
+            output[query_start:query_end].copy_(out)
+            if output.shape[1] > self.n_local_heads:
+                output[query_start:query_end, self.n_local_heads :].zero_()
