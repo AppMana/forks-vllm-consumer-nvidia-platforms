@@ -147,6 +147,18 @@ def run_mixed_prefill_decode_warmup(
         with context:
             worker_execute_model(mixed_output)
             worker_sample_tokens(None)
+
+        # Async PP defers sampled-token postprocessing by one pipeline depth.
+        # Drain those slots before finishing the synthetic requests so the
+        # deferred post_update path is JIT-warmed while request state is valid.
+        pp_size = getattr(
+            getattr(model_runner, "parallel_config", None),
+            "pipeline_parallel_size",
+            1,
+        )
+        for _ in range(max(0, pp_size)):
+            worker_execute_model(SchedulerOutput.make_empty())
+
         worker_execute_model(cleanup_output)
     finally:
         model_runner.kv_connector.set_disabled(False)
