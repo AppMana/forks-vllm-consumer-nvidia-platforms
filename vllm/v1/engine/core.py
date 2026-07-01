@@ -545,40 +545,51 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
-            if self.is_ec_consumer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
-
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
+            if (
+                scheduler_output.total_num_scheduled_tokens == 0
+                and scheduler_output.kv_connector_metadata is None
+                and scheduler_output.ec_connector_metadata is None
+                and batch_queue
+            ):
+                # PP can have live requests whose next local work is already
+                # queued downstream. Do not enqueue a no-forward placeholder
+                # into the batch queue; drain a completed queue item instead.
+                pass
             else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
                     )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
-                else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                if self.is_ec_consumer:
+                    model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
-                ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
-                    return None, model_executed
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required (no requests scheduled).
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                else:
+                    if not scheduler_output.pending_structured_output_tokens:
+                        # We aren't waiting for any tokens, get any grammar output
+                        # and sample immediately.
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        # We need to defer sampling until we have processed the
+                        # model output from the prior step.
+                        deferred_scheduler_output = scheduler_output
+
+                if not deferred_scheduler_output:
+                    # Add this step's future to the queue.
+                    batch_queue.appendleft((future, scheduler_output, exec_future))
+                    if len(batch_queue) < self.batch_queue_size and (
+                        model_executed or self.scheduler.has_requests()
+                    ):
+                        # Don't block on next worker response unless the queue is
+                        # full or there are no more requests to schedule.
+                        return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -629,7 +640,10 @@ class EngineCore:
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
-        return engine_core_outputs, model_executed
+        return (
+            engine_core_outputs,
+            scheduler_output.total_num_scheduled_tokens > 0,
+        )
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():

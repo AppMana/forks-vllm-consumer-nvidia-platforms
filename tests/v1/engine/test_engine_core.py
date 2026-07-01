@@ -4,6 +4,8 @@
 import copy
 import time
 import uuid
+from collections import deque
+from contextlib import nullcontext
 from concurrent.futures import Future, ThreadPoolExecutor
 from unittest.mock import PropertyMock, patch
 
@@ -23,6 +25,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
@@ -60,6 +63,71 @@ def make_request() -> EngineCoreRequest:
         cache_salt=None,
         data_parallel_rank=None,
     )
+
+
+def test_batch_queue_drains_instead_of_submitting_empty_scheduler_turn():
+    """PP batch queues must not enqueue no-forward turns.
+
+    A zero-token schedule can occur while requests are alive but their next
+    local work is already queued downstream. Submitting that empty turn leaves a
+    no-forward item in the queue and can wedge PP decode.
+    """
+
+    completed_future: Future[object] = Future()
+    completed_future.set_result(object())
+    completed_exec_future: Future[object] = Future()
+    completed_exec_future.set_result(object())
+
+    completed_scheduler_output = SchedulerOutput.make_empty()
+    completed_scheduler_output.total_num_scheduled_tokens = 1
+    empty_scheduler_output = SchedulerOutput.make_empty()
+
+    class FakeScheduler:
+        def __init__(self):
+            self.update_calls = 0
+
+        def has_requests(self):
+            return True
+
+        def schedule(self, defer_prefills=False):
+            return empty_scheduler_output
+
+        def update_from_output(self, scheduler_output, model_output):
+            self.update_calls += 1
+            assert scheduler_output is completed_scheduler_output
+            return {0: "drained"}
+
+    class FakeExecutor:
+        def __init__(self):
+            self.execute_calls = 0
+
+        def execute_model(self, scheduler_output, non_block=False):
+            self.execute_calls += 1
+            future: Future[object] = Future()
+            future.set_result(object())
+            return future
+
+    engine_core = EngineCore.__new__(EngineCore)
+    engine_core.batch_queue_size = 2
+    engine_core.batch_queue = deque(
+        [(completed_future, completed_scheduler_output, completed_exec_future)],
+        maxlen=2,
+    )
+    engine_core.scheduler = FakeScheduler()
+    engine_core.model_executor = FakeExecutor()
+    engine_core.is_ec_consumer = True
+    engine_core.is_pooling_model = False
+    engine_core._should_throttle_prefills = lambda: False
+    engine_core.log_error_detail = lambda scheduler_output: nullcontext()
+    engine_core.log_iteration_details = lambda scheduler_output: nullcontext()
+    engine_core._process_aborts_queue = lambda: None
+
+    outputs, model_executed = engine_core.step_with_batch_queue()
+
+    assert outputs == {0: "drained"}
+    assert model_executed is True
+    assert engine_core.model_executor.execute_calls == 0
+    assert len(engine_core.batch_queue) == 0
 
 
 @create_new_process_for_each_test()
