@@ -8,6 +8,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
 )
+from vllm.model_executor.kernels.mhc.triton import _mhc_pre_fuse_from_gemm_torch
 from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -94,6 +95,70 @@ def hc_head_ref(
     pre_mix = torch.nn.functional.linear(residual_norm, fn)
     pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
     return torch.sum(pre_mix.unsqueeze(-1) * residual.float(), dim=-2).bfloat16()
+
+
+def test_mhc_pre_fuse_large_token_torch_path_matches_reference():
+    set_random_seed(0)
+    num_tokens, hidden_size, hc_mult, num_splits = 17, 128, 4, 3
+
+    residual = torch.randn(
+        (num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16
+    )
+    hc_mult3 = hc_mult * (hc_mult + 2)
+    fn = torch.randn(
+        (hc_mult3, hc_mult * hidden_size), dtype=torch.float32
+    ) * 1e-4
+    hc_scale = torch.randn((3,), dtype=torch.float32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float32) * 0.1
+    rms_eps = hc_pre_eps = hc_sinkhorn_eps = 1e-6
+    hc_post_alpha = 1.0
+    sinkhorn_repeat = 4
+
+    residual_flat = residual.reshape(num_tokens, hc_mult, hidden_size)
+    x = residual_flat.flatten(1).float()
+    expected_mul = x @ fn.T
+    expected_sqrsum = x.square().sum(dim=-1)
+
+    gemm_out_mul = torch.zeros(
+        (num_splits, num_tokens, hc_mult3), dtype=torch.float32
+    )
+    gemm_out_sqrsum = torch.zeros((num_splits, num_tokens), dtype=torch.float32)
+    for split in range(num_splits):
+        start = split * (hc_mult * hidden_size) // num_splits
+        end = (split + 1) * (hc_mult * hidden_size) // num_splits
+        gemm_out_mul[split] = x[:, start:end] @ fn[:, start:end].T
+        gemm_out_sqrsum[split] = x[:, start:end].square().sum(dim=-1)
+
+    torch.testing.assert_close(gemm_out_mul.sum(0), expected_mul)
+    torch.testing.assert_close(gemm_out_sqrsum.sum(0), expected_sqrsum)
+
+    actual = _mhc_pre_fuse_from_gemm_torch(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_flat,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+    )
+    expected = mhc_pre_ref(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_alpha,
+        sinkhorn_repeat,
+    )
+
+    expected = (expected[0].squeeze(-1), expected[1], expected[2])
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
 
 
 @pytest.mark.skipif(

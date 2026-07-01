@@ -9,6 +9,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 
 _MHC_PRE_NUM_SPLIT_BUCKETS = (1, 2, 4, 8, 16, 32)
+_MHC_PRE_FUSE_TRITON_MAX_TOKENS = 2048
 
 
 def _bucket_mhc_pre_num_split(split_k: int) -> int:
@@ -407,6 +408,19 @@ def _mhc_pre_fuse_triton(
     num_splits, num_tokens, hc_mult3 = gemm_out_mul.shape
     hc = residual_flat.shape[1]
     hidden = residual_flat.shape[2]
+    if num_tokens > _MHC_PRE_FUSE_TRITON_MAX_TOKENS:
+        return _mhc_pre_fuse_from_gemm_torch(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_flat,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
     post_mix = torch.empty(num_tokens, hc, dtype=torch.float32, device=residual_flat.device)
     comb_mix = torch.empty(num_tokens, hc, hc, dtype=torch.float32, device=residual_flat.device)
     layer_input = torch.empty(
@@ -456,6 +470,50 @@ def _mhc_pre_fuse_triton(
         BLOCK_H=block_h,
         num_warps=4,
     )
+    return post_mix, comb_mix, layer_input
+
+
+def _mhc_pre_fuse_from_gemm_torch(
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual_flat: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_splits, num_tokens, hc_mult3 = gemm_out_mul.shape
+    del num_splits
+    hc = residual_flat.shape[1]
+    hidden = residual_flat.shape[2]
+    assert hc_mult3 == hc * (hc + 2)
+
+    mixes = gemm_out_mul.sum(dim=0)
+    sqrsum = gemm_out_sqrsum.sum(dim=0)
+    mixes = mixes * torch.rsqrt(sqrsum.unsqueeze(-1) / (hc * hidden) + rms_eps)
+
+    pre_mix = torch.sigmoid(mixes[:, :hc] * hc_scale[0] + hc_base[:hc])
+    pre_mix = pre_mix + hc_pre_eps
+
+    post_mix = torch.sigmoid(
+        mixes[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
+    )
+    post_mix = post_mix * hc_post_mult_value
+
+    comb_mix = mixes[:, 2 * hc :].view(num_tokens, hc, hc)
+    comb_mix = comb_mix * hc_scale[2] + hc_base[2 * hc :].view(1, hc, hc)
+    comb_mix = torch.softmax(comb_mix, dim=-1) + hc_sinkhorn_eps
+    comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_repeat - 1):
+        comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+
+    layer_input = (
+        pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32)
+    ).sum(dim=1).to(torch.bfloat16)
     return post_mix, comb_mix, layer_input
 
 
