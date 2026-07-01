@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 image_repo="${IMAGE_REPO:-harbor.appmana.com/appmana/vllm-ampere}"
 commit="${COMMIT:-$(git -C "${repo_root}" rev-parse --short=9 HEAD)}"
+build_commit="${VLLM_BUILD_COMMIT:-$(git -C "${repo_root}" rev-parse HEAD)}"
 tag="${TAG:-${image_repo}:${commit}}"
 cache_ref="${CACHE_REF:-${image_repo}:buildcache}"
 builder="${BUILDER:-buildkit-linux}"
@@ -45,6 +46,7 @@ install_kv_connectors="${INSTALL_KV_CONNECTORS:-true}"
 lmcache_git_ref="${LMCACHE_GIT_REF:-cd51f3a15766e326f92998c072264a5a6caa4efe}"
 appmana_nccl_git_repo="${APPMANA_NCCL_GIT_REPO:-https://github.com/AppMana/forks-nccl-rdma-routing.git}"
 appmana_nccl_git_ref="${APPMANA_NCCL_GIT_REF:-b8fabdc5145fab760c1a9acce2892ac6077b1679}"
+vllm_source_repo="${VLLM_SOURCE_REPO:-https://github.com/AppMana/forks-vllm-ampere}"
 
 secret_args=()
 cache_args=()
@@ -109,7 +111,8 @@ docker buildx build "${repo_root}" \
   --build-arg "LMCACHE_GIT_REF=${lmcache_git_ref}" \
   --build-arg "APPMANA_NCCL_GIT_REPO=${appmana_nccl_git_repo}" \
   --build-arg "APPMANA_NCCL_GIT_REF=${appmana_nccl_git_ref}" \
-  --build-arg "VLLM_BUILD_COMMIT=${commit}" \
+  --build-arg "VLLM_BUILD_COMMIT=${build_commit}" \
+  --build-arg "VLLM_SOURCE_REPO=${vllm_source_repo}" \
   --build-arg "VLLM_IMAGE_TAG=${tag}" \
   "${secret_args[@]}" \
   "${cache_args[@]}" \

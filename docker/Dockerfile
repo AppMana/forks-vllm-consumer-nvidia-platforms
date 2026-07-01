@@ -1115,6 +1115,9 @@ ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
+ARG VLLM_SOURCE_REPO=https://github.com/AppMana/forks-vllm-ampere
+ARG APPMANA_NCCL_GIT_REPO
+ARG APPMANA_NCCL_GIT_REF
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1254,14 +1257,19 @@ ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
     VLLM_BUILD_URL=${VLLM_BUILD_URL:-} \
     VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG:-local/vllm-openai:dev}
-LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
+LABEL org.opencontainers.image.source="${VLLM_SOURCE_REPO}" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
       org.opencontainers.image.url="${VLLM_BUILD_URL}" \
       ai.vllm.build.commit="${VLLM_BUILD_COMMIT}" \
       ai.vllm.build.pipeline="${VLLM_BUILD_PIPELINE}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
-      ai.vllm.image.tag="${VLLM_IMAGE_TAG}"
+      ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
+      ai.vllm.source.repo="${VLLM_SOURCE_REPO}" \
+      ai.appmana.lmcache.ref="${LMCACHE_GIT_REF}" \
+      ai.appmana.flashmla.wheel="${FLASHMLA_WHEEL_URL}" \
+      ai.appmana.nccl.repo="${APPMANA_NCCL_GIT_REPO}" \
+      ai.appmana.nccl.ref="${APPMANA_NCCL_GIT_REF}"
 
 # define sagemaker first, so it is not default from `docker build`
 FROM vllm-openai-base AS vllm-sagemaker
