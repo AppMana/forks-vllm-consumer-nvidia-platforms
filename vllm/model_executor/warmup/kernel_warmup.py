@@ -33,6 +33,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 8192
+
 
 def kernel_warmup(worker: "Worker"):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
@@ -52,12 +54,7 @@ def kernel_warmup(worker: "Worker"):
 
     # Run next so input-prep kernels JIT against pristine runner state.
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
-    # NOTE: the DSv4 sparse-MLA mixed-batch warmup (deepseek_v4_sparse_mla_attention_warmup)
-    # was removed: it drove worker.execute_model (a lockstep PP collective) from a per-rank
-    # warmup whose entry gates can disagree across PP ranks, mismatching collective counts and
-    # deadlocking the chain. On Ampere the sparse-MLA decode is now the precompiled flash_mla
-    # .so (no Triton JIT, no warmup needed); the remaining sparse prefill/indexer Triton kernels
-    # JIT once on first request and are pinned off recompile via do_not_specialize.
+    _deepseek_v4_sparse_mla_prefill_warmup(worker)
 
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
@@ -112,6 +109,45 @@ def kernel_warmup(worker: "Worker"):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+
+def _is_deepseek_v4_worker(worker: "Worker") -> bool:
+    architectures = getattr(worker.model_config.hf_config, "architectures", None) or ()
+    return any("DeepseekV4" in arch or "DeepSeekV4" in arch for arch in architectures)
+
+
+def _deepseek_v4_sparse_mla_prefill_warmup(worker: "Worker") -> None:
+    """Warm DSv4 sparse-prefill Triton kernels without PP tensor transport."""
+    if not _is_deepseek_v4_worker(worker):
+        return
+
+    runner = worker.model_runner
+    max_tokens = worker.scheduler_config.max_num_batched_tokens
+    if runner is None or max_tokens <= 0:
+        return
+
+    prefill_tokens = max(
+        1, min(max_tokens, _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS)
+    )
+    logger.info(
+        "Warming DeepSeek V4 sparse-MLA prefill Triton kernels with %d tokens.",
+        prefill_tokens,
+    )
+
+    common_kwargs = dict(
+        num_tokens=prefill_tokens,
+        skip_eplb=True,
+        is_profile=True,
+        force_attention=True,
+    )
+    runner._dummy_run(**common_kwargs, create_single_prefill=True)
+    runner._dummy_run(
+        **common_kwargs,
+        create_single_prefill=True,
+        profile_seq_lens=prefill_tokens * 2,
+    )
+    if worker.scheduler_config.max_num_seqs > 1:
+        runner._dummy_run(**common_kwargs)
 
 
 # TODO: remove once FlashInfer upstream fixes the persistent file cache
