@@ -26,6 +26,13 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
+def _is_deepseek_v4_model_runner(model_runner: GPUModelRunner) -> bool:
+    model_config = getattr(model_runner, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return any("DeepseekV4" in arch or "DeepSeekV4" in arch for arch in architectures)
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -178,6 +185,13 @@ def warmup_long_prefill_kernels(
         # DeepSeek V4 indexer compresses context 4:1. Warming this directly
         # avoids first-request JIT even when a PP rank has no long prefill work.
         warmup_prefill_chunk_metadata_kernel(device, compress_ratio=4)
+
+    if _is_deepseek_v4_model_runner(model_runner):
+        logger.info(
+            "Skipping DeepSeek V4 full-model long-prefill warmup; direct sparse "
+            "MLA prefill warmups cover the Triton specializations."
+        )
+        return
 
     max_tokens = model_runner.scheduler_config.max_num_batched_tokens
     token_sizes = sorted({16, max_tokens})
