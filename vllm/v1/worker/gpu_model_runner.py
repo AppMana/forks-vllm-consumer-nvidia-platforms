@@ -5700,6 +5700,7 @@ class GPUModelRunner(
         skip_eplb: bool = False,
         is_profile: bool = False,
         create_mixed_batch: bool = False,
+        create_single_prefill: bool = False,
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
@@ -5725,6 +5726,9 @@ class GPUModelRunner(
             is_profile: If True, this is a profile run.
             create_mixed_batch: If True, create a mixed batch with both decode
                 (1 token) and prefill (multiple tokens) requests.
+            create_single_prefill: If True, create one prefill request with all
+                scheduled tokens. Used by attention warmups to cover the
+                single-request prefill path.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             num_active_loras: Number of distinct active LoRAs to capture for.
                 LoRA is activated when num_active_loras > 0.
@@ -5764,6 +5768,7 @@ class GPUModelRunner(
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
+            assert not create_single_prefill
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
@@ -5775,6 +5780,11 @@ class GPUModelRunner(
             num_scheduled_tokens_list = [1] * num_decode_tokens + [num_prefill_tokens]
             # Note: Overriding max_query_len to be the prefill tokens
             max_query_len = num_prefill_tokens
+        elif create_single_prefill:
+            assert not uniform_decode
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
+            max_query_len = num_tokens
         elif uniform_decode:
             assert not create_mixed_batch
             num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))

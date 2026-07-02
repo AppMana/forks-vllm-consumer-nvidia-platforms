@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.attention.backends.mla.indexer import (
     warmup_prefill_chunk_metadata_kernel,
