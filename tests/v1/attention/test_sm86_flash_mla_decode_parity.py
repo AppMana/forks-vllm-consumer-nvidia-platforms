@@ -14,12 +14,8 @@ import pytest
 import torch
 
 flash_mla = pytest.importorskip("flash_mla")
-from flash_mla import flash_sparse_mla_decode  # noqa: E402
+from flash_mla import flash_sparse_mla_decode, flash_sparse_mla_prefill  # noqa: E402
 
-from vllm.models.deepseek_v4.nvidia_sm86 import attention as sm86_attention  # noqa: E402
-from vllm.models.deepseek_v4.nvidia_sm86.attention import (  # noqa: E402
-    DeepseekV4TritonSM86Attention,
-)
 from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (  # noqa: E402
     decode_sparse_attention_triton,
 )
@@ -91,59 +87,47 @@ def test_flash_mla_decode_matches_triton(topk: int, num_tokens: int) -> None:
     assert cd < 8e-5, f"flash_mla vs Triton cos_diff={cd:.2e} (topk={topk} num_tokens={num_tokens})"
 
 
-def test_sm86_prefill_dispatches_flash_mla_prefill(monkeypatch) -> None:
-    captured = {}
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 8,
+    reason="flash_mla sparse-MLA prefill requires Ampere (sm_8x)",
+)
+def test_flash_mla_prefill_rejects_or_matches_real_swa_metadata_shape() -> None:
+    """Real vLLM SWA metadata is [T, 1, window], not the 2-D fake used above."""
+    torch.manual_seed(11)
+    dev = "cuda"
+    T, H, topk = 4, 64, 16
+    block_size = 32
+    scale = 1.0 / math.sqrt(_HEAD_DIM)
+    num_slots = topk + 64
+    nb = (num_slots + block_size - 1) // block_size
+    cache = torch.zeros(nb, block_size, _TOKEN_DATA_SIZE + _SCALE_DIM, dtype=torch.uint8, device=dev)
+    for slot in range(num_slots):
+        _write_fp8_ds_mla_token(cache, slot, block_size)
 
-    def fake_flash_sparse_mla_prefill(**kwargs):
-        captured.update(kwargs)
-        return kwargs["q"] + 1
-
-    monkeypatch.setattr(
-        sm86_attention, "flash_sparse_mla_prefill", fake_flash_sparse_mla_prefill
+    q = torch.randn(T, H, _HEAD_DIM, device=dev, dtype=torch.bfloat16)
+    idx_2d = torch.stack(
+        [torch.randperm(num_slots, device=dev)[:topk].to(torch.int32) for _ in range(T)]
     )
+    idx_real = idx_2d.unsqueeze(1)
+    lens = torch.full((T,), topk, dtype=torch.int32, device=dev)
+    sink = torch.randn(H, device=dev, dtype=torch.float32) * 0.1
 
-    q = torch.zeros(3, 2, _HEAD_DIM, dtype=torch.bfloat16)
-    output = torch.empty_like(q)
-    swa_indices = torch.arange(12, dtype=torch.int32).reshape(3, 4)
-    swa_lens = torch.tensor([1, 2, 3], dtype=torch.int32)
-    metadata = type(
-        "Meta",
-        (),
-        {
-            "num_prefill_tokens": 3,
-            "num_prefills": 1,
-            "num_decodes": 0,
-            "num_decode_tokens": 0,
-            "query_start_loc_cpu": torch.tensor([0, 3], dtype=torch.int32),
-            "prefill_swa_indices": swa_indices,
-            "prefill_swa_lens": swa_lens,
-        },
-    )()
-    self = type(
-        "Attn",
-        (),
-        {
-            "PREFILL_CHUNK_SIZE": 4,
-            "compress_ratio": 4,
-            "scale": 0.5,
-            "attn_sink": torch.zeros(2, dtype=torch.float32),
-            "n_local_heads": 2,
-        },
-    )()
-
-    DeepseekV4TritonSM86Attention._forward_prefill(
-        self,
+    expected = flash_sparse_mla_prefill(
         q=q,
-        positions=torch.arange(3),
-        compressed_k_cache=None,
-        swa_k_cache=torch.empty(1, 4, 584, dtype=torch.uint8),
-        output=output,
-        attn_metadata=None,
-        swa_metadata=metadata,
+        swa_cache=cache,
+        swa_indices=idx_2d,
+        swa_lens=lens,
+        scale=scale,
+        attn_sink=sink,
+    )
+    actual = flash_sparse_mla_prefill(
+        q=q,
+        swa_cache=cache,
+        swa_indices=idx_real,
+        swa_lens=lens,
+        scale=scale,
+        attn_sink=sink,
     )
 
-    assert torch.equal(captured["q"], q)
-    assert torch.equal(captured["swa_indices"], swa_indices)
-    assert torch.equal(captured["swa_lens"], swa_lens)
-    assert captured["extra_cache"] is None
-    assert torch.equal(output, q + 1)
+    cd = _cos_diff(actual.float(), expected.float())
+    assert cd < 8e-5, f"real vLLM [T,1,W] SWA metadata shape changed FlashMLA prefill output: cos_diff={cd:.2e}"
