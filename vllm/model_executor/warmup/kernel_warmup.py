@@ -34,6 +34,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 8192
+_DEEPSEEK_V4_MLA_HEAD_DIM = 512
+_DEEPSEEK_V4_SYNTHETIC_TOPK = 512
+_DEEPSEEK_V4_SYNTHETIC_WINDOW = 128
 
 
 def kernel_warmup(worker: "Worker"):
@@ -117,13 +120,18 @@ def _is_deepseek_v4_worker(worker: "Worker") -> bool:
 
 
 def _deepseek_v4_sparse_mla_prefill_warmup(worker: "Worker") -> None:
-    """Warm DSv4 sparse-prefill Triton kernels without PP tensor transport."""
+    """Warm DSv4 sparse-prefill kernels without PP tensor transport.
+
+    Do not drive this through GPUModelRunner._dummy_run: on PP rank 0 that
+    executes a real model prefill before startup and can leave a CUDA kernel
+    outstanding while graph capture starts. Warm the kernels directly with a
+    bounded synthetic row instead.
+    """
     if not _is_deepseek_v4_worker(worker):
         return
 
-    runner = worker.model_runner
     max_tokens = worker.scheduler_config.max_num_batched_tokens
-    if runner is None or max_tokens <= 0:
+    if worker.model_runner is None or max_tokens <= 0:
         return
 
     prefill_tokens = max(
@@ -134,20 +142,93 @@ def _deepseek_v4_sparse_mla_prefill_warmup(worker: "Worker") -> None:
         prefill_tokens,
     )
 
-    common_kwargs = dict(
-        num_tokens=prefill_tokens,
-        skip_eplb=True,
-        is_profile=True,
-        force_attention=True,
+    _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker)
+
+
+def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        combine_topk_swa_indices,
+        dequantize_and_gather_k_cache,
     )
-    runner._dummy_run(**common_kwargs, create_single_prefill=True)
-    runner._dummy_run(
-        **common_kwargs,
-        create_single_prefill=True,
-        profile_seq_lens=prefill_tokens * 2,
+    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        sparse_attention_triton,
     )
-    if worker.scheduler_config.max_num_seqs > 1:
-        runner._dummy_run(**common_kwargs)
+
+    device = worker.model_runner.device
+    hf_config = worker.model_config.hf_config
+    tp_size = max(1, int(worker.parallel_config.tensor_parallel_size))
+    num_heads = int(getattr(hf_config, "num_attention_heads", 128)) // tp_size
+    num_heads = max(1, num_heads)
+    block_size = 64
+    token_bytes = 576
+    topk = int(getattr(hf_config, "index_topk", _DEEPSEEK_V4_SYNTHETIC_TOPK))
+    topk = max(1, topk)
+    window = int(getattr(hf_config, "sliding_window", _DEEPSEEK_V4_SYNTHETIC_WINDOW))
+    window = max(1, window)
+    width = topk + window
+
+    # Native Ampere gather/dequant path over the fp8_ds_mla uint8 cache layout.
+    gathered = torch.empty(
+        (1, 1, _DEEPSEEK_V4_MLA_HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.zeros((1, block_size, token_bytes), dtype=torch.uint8, device=device)
+    seq_lens = torch.tensor([1], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([1], dtype=torch.int32, device=device)
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    dequantize_and_gather_k_cache(
+        gathered,
+        k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        offset=0,
+    )
+    torch.cuda.synchronize(device)
+
+    # Combined C4A/C128A top-k + SWA index path. Use a single late-position row
+    # so both the top-k and SWA portions are active while the launch stays small.
+    topk_indices = torch.arange(topk, dtype=torch.int32, device=device).view(1, topk)
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    context_len = max(topk * 4, window)
+    seq_lens = torch.tensor([context_len], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([window], dtype=torch.int32, device=device)
+    indices, lengths = combine_topk_swa_indices(
+        topk_indices,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        window_size=window,
+        compress_ratio=4,
+        topk=topk,
+        M=width,
+        N=topk,
+    )
+    torch.cuda.synchronize(device)
+
+    # Sparse attention proper: one query row, real local head count, full
+    # top-k+SWA width. num_tokens is pinned off specialization in the Triton JIT,
+    # while num_heads and index width are the expensive specializations to warm.
+    q = torch.zeros(
+        (1, num_heads, _DEEPSEEK_V4_MLA_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv = torch.zeros(
+        (width, 1, _DEEPSEEK_V4_MLA_HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
+    out = torch.empty_like(q)
+    sink = torch.zeros((num_heads,), dtype=torch.float32, device=device)
+    sparse_attention_triton(
+        q=q,
+        kv=kv,
+        indices=indices.unsqueeze(1),
+        lengths=lengths,
+        scale=1.0,
+        attn_sink=sink,
+        out=out,
+    )
+    torch.cuda.synchronize(device)
 
 
 # TODO: remove once FlashInfer upstream fixes the persistent file cache
