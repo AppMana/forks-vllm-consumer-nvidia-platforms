@@ -18,9 +18,13 @@ names; fused at load by the stacked/expert mappings — do **not** pre-fuse).
 
 ### What's in this fork (sm_86 + chain serving)
 
-- **`nvidia_sm86/` attention backend** — capability-selected at `major == 8`; all-Triton
-  sparse-MLA decode/prefill + indexer (no FlashMLA `_flashmla_C`, no cutedsl/quack; fp8
-  via a software `fp8e4m3_arith` codec since native `tl.float8e4nv` needs sm_89+).
+- **`nvidia_sm86/` attention backend** — capability-selected at `major == 8`;
+  FlashMLA CUDA sparse-MLA decode, gathered bf16 Triton sparse-MLA prefill,
+  and the AppMana INT8 IMMA indexer path. The prefill path intentionally stays
+  on Triton: a direct paged-cache FlashMLA prefill experiment misread vLLM's
+  real `[T, 1, window]` SWA index tensor as top-k width `1`, and after fixing
+  that shape handling the current FlashMLA prefill kernel was still slower than
+  the materialized bf16 Triton prefill kernel on RTX A5000.
 - **`dsv4_int` quant** — INT4 Marlin experts + INT8 AllSpark dense + INT8 IMMA indexer.
 - **MHC pipeline-parallel fix** (`models/deepseek_v4/nvidia/model.py`) — DeepSeek-V4 carries
   a 4-tensor head-compression stream `(hidden, residual, post_mix, res_mix)` between
@@ -45,6 +49,34 @@ worker commands materialize each rank's shards by pod ordinal.
 
 **Measured (single-user, server-side Prometheus):** ~**26.7 tok/s** decode, **~175 ms TTFT**
 on the int4mse-int8 checkpoint over the 12-node chain.
+
+### sm86 Sparse MLA Kernel Notes
+
+The known-good Ampere serving path is hybrid:
+
+| Stage | Kernel path | Notes |
+| --- | --- | --- |
+| Decode sparse MLA | `flash_mla.flash_sparse_mla_decode` from `AppMana/forks-flash-mla-ampere-dsv4` | One CUDA launch for the decode batch; local parity against Triton is ~1e-6 cosine difference. |
+| Prefill sparse MLA | vLLM `sparse_attention_triton` over gathered bf16 KV | Uses `dequantize_and_gather_k_cache` and `combine_topk_swa_indices`; this is the stable path for chunked prefill. |
+
+Real-tensor A5000 microbenchmarks with fp8_ds_mla cache tensors, 64 heads,
+top-k 512:
+
+| Case | FlashMLA | Triton | Result |
+| --- | ---: | ---: | --- |
+| Decode T=1 | 0.045 ms | 0.233 ms | FlashMLA 5.23x faster |
+| Decode T=4 | 0.142 ms | 0.225 ms | FlashMLA 1.59x faster |
+| Prefill T=64 | 1.949 ms | 0.492 ms | Triton 3.96x faster |
+| Prefill T=256 | 7.722 ms | 2.113 ms | Triton 3.65x faster |
+| Prefill T=1024 | 30.388 ms | 8.285 ms | Triton 3.67x faster |
+
+The failed FlashMLA prefill integration was introduced by `31ab06a7b9`
+(`Wire sm86 FlashMLA prefill`). It replaced the gathered bf16 Triton prefill
+with direct paged-cache FlashMLA prefill. A RED test using real vLLM SWA
+metadata shape `[T, 1, window]` reproduced the bug (`cos_diff=1.92e-03` vs the
+same indices as 2-D). `flash_mla` now normalizes `[T, 1, W]` sparse-index
+tensors to `[T, W]`, but vLLM still routes sm86 prefill through Triton because
+that is both correct and faster for the measured prefill sizes.
 
 ---
 
