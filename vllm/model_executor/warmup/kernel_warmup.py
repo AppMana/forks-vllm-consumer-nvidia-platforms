@@ -35,6 +35,12 @@ logger = init_logger(__name__)
 
 _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 8192
 _DEEPSEEK_V4_MLA_HEAD_DIM = 512
+_DEEPSEEK_V4_FP8_DS_MLA_TOKEN_DATA_BYTES = 576
+_DEEPSEEK_V4_FP8_DS_MLA_SCALE_BYTES = 8
+_DEEPSEEK_V4_FP8_DS_MLA_PAGE_TOKEN_BYTES = (
+    _DEEPSEEK_V4_FP8_DS_MLA_TOKEN_DATA_BYTES
+    + _DEEPSEEK_V4_FP8_DS_MLA_SCALE_BYTES
+)
 _DEEPSEEK_V4_SYNTHETIC_TOPK = 512
 _DEEPSEEK_V4_SYNTHETIC_WINDOW = 128
 
@@ -160,7 +166,6 @@ def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
     num_heads = int(getattr(hf_config, "num_attention_heads", 128)) // tp_size
     num_heads = max(1, num_heads)
     block_size = 64
-    token_bytes = 576
     topk = int(getattr(hf_config, "index_topk", _DEEPSEEK_V4_SYNTHETIC_TOPK))
     topk = max(1, topk)
     window = int(getattr(hf_config, "sliding_window", _DEEPSEEK_V4_SYNTHETIC_WINDOW))
@@ -168,10 +173,15 @@ def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
     width = topk + window
 
     # Native Ampere gather/dequant path over the fp8_ds_mla uint8 cache layout.
+    # Each page stores all token payloads first, then 8 scale bytes per token.
     gathered = torch.empty(
         (1, 1, _DEEPSEEK_V4_MLA_HEAD_DIM), dtype=torch.bfloat16, device=device
     )
-    k_cache = torch.zeros((1, block_size, token_bytes), dtype=torch.uint8, device=device)
+    k_cache = torch.zeros(
+        (1, block_size, _DEEPSEEK_V4_FP8_DS_MLA_PAGE_TOKEN_BYTES),
+        dtype=torch.uint8,
+        device=device,
+    )
     seq_lens = torch.tensor([1], dtype=torch.int32, device=device)
     gather_lens = torch.tensor([1], dtype=torch.int32, device=device)
     block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)

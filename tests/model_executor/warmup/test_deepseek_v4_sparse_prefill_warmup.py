@@ -42,3 +42,14 @@ def test_deepseek_v4_sparse_prefill_warmup_skips_other_models():
     kernel_warmup._deepseek_v4_sparse_mla_prefill_warmup(worker)
 
     worker.model_runner._dummy_run.assert_not_called()
+
+
+def test_deepseek_v4_fp8_ds_mla_warmup_cache_stride_matches_native_layout():
+    block_size = 64
+
+    assert kernel_warmup._DEEPSEEK_V4_FP8_DS_MLA_PAGE_TOKEN_BYTES == 584
+    assert (
+        block_size * kernel_warmup._DEEPSEEK_V4_FP8_DS_MLA_PAGE_TOKEN_BYTES
+        == block_size * kernel_warmup._DEEPSEEK_V4_FP8_DS_MLA_TOKEN_DATA_BYTES
+        + block_size * kernel_warmup._DEEPSEEK_V4_FP8_DS_MLA_SCALE_BYTES
+    )
