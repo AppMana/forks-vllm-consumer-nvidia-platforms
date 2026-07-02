@@ -4,9 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from vllm.model_executor.warmup.kernel_warmup import (
-    _deepseek_v4_sparse_mla_prefill_warmup,
-)
+import vllm.model_executor.warmup.kernel_warmup as kernel_warmup
 
 
 def _worker(architectures: list[str], max_tokens: int = 256, max_seqs: int = 6):
@@ -19,42 +17,28 @@ def _worker(architectures: list[str], max_tokens: int = 256, max_seqs: int = 6):
             max_num_seqs=max_seqs,
         ),
         model_runner=SimpleNamespace(_dummy_run=Mock()),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
 
 
-def test_deepseek_v4_sparse_prefill_warmup_covers_prefill_shapes():
+def test_deepseek_v4_sparse_prefill_warmup_uses_direct_kernel_warmup(monkeypatch):
     worker = _worker(["DeepseekV4ForCausalLM"])
+    direct_warmup = Mock()
+    monkeypatch.setattr(
+        kernel_warmup,
+        "_deepseek_v4_sparse_mla_prefill_kernel_warmup",
+        direct_warmup,
+    )
 
-    _deepseek_v4_sparse_mla_prefill_warmup(worker)
+    kernel_warmup._deepseek_v4_sparse_mla_prefill_warmup(worker)
 
-    calls = worker.model_runner._dummy_run.call_args_list
-    assert len(calls) == 3
-    assert calls[0].kwargs == {
-        "num_tokens": 256,
-        "skip_eplb": True,
-        "is_profile": True,
-        "force_attention": True,
-        "create_single_prefill": True,
-    }
-    assert calls[1].kwargs == {
-        "num_tokens": 256,
-        "skip_eplb": True,
-        "is_profile": True,
-        "force_attention": True,
-        "create_single_prefill": True,
-        "profile_seq_lens": 512,
-    }
-    assert calls[2].kwargs == {
-        "num_tokens": 256,
-        "skip_eplb": True,
-        "is_profile": True,
-        "force_attention": True,
-    }
+    direct_warmup.assert_called_once_with(worker)
+    worker.model_runner._dummy_run.assert_not_called()
 
 
 def test_deepseek_v4_sparse_prefill_warmup_skips_other_models():
     worker = _worker(["LlamaForCausalLM"])
 
-    _deepseek_v4_sparse_mla_prefill_warmup(worker)
+    kernel_warmup._deepseek_v4_sparse_mla_prefill_warmup(worker)
 
     worker.model_runner._dummy_run.assert_not_called()
