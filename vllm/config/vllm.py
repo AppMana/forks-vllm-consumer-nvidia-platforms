@@ -490,6 +490,17 @@ class VllmConfig:
 
     @property
     def max_concurrent_batches(self) -> int:
+        override = envs.VLLM_PP_MAX_CONCURRENT_BATCHES
+        if override is not None:
+            if override < 1:
+                raise ValueError("VLLM_PP_MAX_CONCURRENT_BATCHES must be >= 1")
+            logger.warning(
+                "Overriding PP max concurrent batches to %d via "
+                "VLLM_PP_MAX_CONCURRENT_BATCHES.",
+                override,
+            )
+            return override
+
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size

@@ -10,6 +10,7 @@ focusing on executor initialization, RPC calls, and distributed execution.
 import multiprocessing
 import os
 import socket
+from types import SimpleNamespace
 
 from tests.utils import multi_gpu_test
 from vllm.config import VllmConfig
@@ -327,6 +328,30 @@ def test_multiproc_executor_properties():
     finally:
         # Clean up
         executor.shutdown()
+
+
+def test_pp_max_concurrent_batches_env_override(monkeypatch):
+    """The PP batch queue can be capped without constructing workers."""
+    vllm_config = VllmConfig()
+    vllm_config.parallel_config = SimpleNamespace(pipeline_parallel_size=12)
+    vllm_config.scheduler_config = SimpleNamespace(async_scheduling=False)
+
+    monkeypatch.setenv("VLLM_PP_MAX_CONCURRENT_BATCHES", "2")
+    assert vllm_config.max_concurrent_batches == 2
+
+
+def test_pp_max_concurrent_batches_env_override_rejects_zero(monkeypatch):
+    vllm_config = VllmConfig()
+    vllm_config.parallel_config = SimpleNamespace(pipeline_parallel_size=12)
+    vllm_config.scheduler_config = SimpleNamespace(async_scheduling=False)
+
+    monkeypatch.setenv("VLLM_PP_MAX_CONCURRENT_BATCHES", "0")
+    try:
+        _ = vllm_config.max_concurrent_batches
+    except ValueError as exc:
+        assert "VLLM_PP_MAX_CONCURRENT_BATCHES must be >= 1" in str(exc)
+    else:
+        raise AssertionError("expected invalid PP batch queue cap to fail")
 
 
 @multi_gpu_test(num_gpus=4)
