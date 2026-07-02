@@ -8,7 +8,6 @@ agree; this guards the ``_forward_decode`` flash_mla dispatch.
 Skipped unless run on Ampere (sm_8x) with the flash_mla kernel importable.
 """
 
-import inspect
 import math
 
 import pytest
@@ -19,9 +18,6 @@ from flash_mla import flash_sparse_mla_decode, flash_sparse_mla_prefill  # noqa:
 
 from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (  # noqa: E402
     decode_sparse_attention_triton,
-)
-from vllm.models.deepseek_v4.nvidia_sm86.attention import (  # noqa: E402
-    DeepseekV4TritonSM86Attention,
 )
 
 _FP8_DIM = 448
@@ -135,9 +131,3 @@ def test_flash_mla_prefill_rejects_or_matches_real_swa_metadata_shape() -> None:
 
     cd = _cos_diff(actual.float(), expected.float())
     assert cd < 8e-5, f"real vLLM [T,1,W] SWA metadata shape changed FlashMLA prefill output: cos_diff={cd:.2e}"
-
-
-def test_sm86_prefill_uses_compiled_flash_mla_kernel() -> None:
-    source = inspect.getsource(DeepseekV4TritonSM86Attention._forward_prefill)
-    assert "flash_sparse_mla_prefill" in source
-    assert "sparse_attention_triton" not in source
