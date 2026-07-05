@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdint>
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
@@ -679,14 +680,23 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
   const int64_t src_inblock_offset = src_block_offset + cache_inblock_offset;
   const int64_t dst_inblock_offset = token_idx * token_stride + head_idx;
 
-  // The workspace allocator can hand out byte views with valid but not
-  // necessarily 16-byte-aligned storage offsets. Copy the 16-byte lane as
-  // scalar bytes so ragged/chunked prefill does not fault on an aligned float4
-  // load/store assumption.
+  const char* src_ptr = kv_cache + src_inblock_offset;
+  char* dst_ptr = dst_k + dst_inblock_offset;
+  const bool full_lane = head_idx + VEC_SIZE <= head_dim;
+  const bool aligned =
+      ((reinterpret_cast<uintptr_t>(src_ptr) |
+        reinterpret_cast<uintptr_t>(dst_ptr)) &
+       (alignof(float4) - 1)) == 0;
+
+  if (full_lane && aligned) {
+    *reinterpret_cast<float4*>(dst_ptr) =
+        *reinterpret_cast<const float4*>(src_ptr);
+  } else {
 #pragma unroll
-  for (int i = 0; i < VEC_SIZE; i++) {
-    if (head_idx + i < head_dim) {
-      dst_k[dst_inblock_offset + i] = kv_cache[src_inblock_offset + i];
+    for (int i = 0; i < VEC_SIZE; i++) {
+      if (head_idx + i < head_dim) {
+        dst_ptr[i] = src_ptr[i];
+      }
     }
   }
   if (threadIdx.x == 0) {
