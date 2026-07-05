@@ -156,17 +156,24 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Invalid compress ratio: {compress_ratio}")
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # fp8_ds_mla is the UE8M0 paged layout and needs 576B alignment. Plain
-        # full-cache rows share state pages with contiguous KV pages, so padding
-        # would break page matching.
+        # Packed byte layouts need row-size alignment. Plain full-cache rows
+        # share state pages with contiguous KV pages, so padding would break
+        # page matching.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        uses_int8_ds_mla_layout = (
+            vllm_config.cache_config.cache_dtype == "int8_ds_mla"
+        )
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            alignment=576 if uses_fp8_ds_mla_layout else None,
+            cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            alignment=576
+            if uses_fp8_ds_mla_layout
+            else (516 if uses_int8_ds_mla_layout else None),
+            model_version="deepseek_v4",
         )
 
     def forward(self): ...
@@ -251,13 +258,19 @@ class DeepseekCompressor(nn.Module):
             vllm_config.compilation_config.static_forward_context
         )
 
+        self._int8_ds_mla = vllm_config.cache_config.cache_dtype == "int8_ds_mla"
         if self.head_dim == 512:
             assert not use_fp4_cache, (
                 "MXFP4 cache is only supported for indexer (head=128)"
             )
-            self._quant_block = 64
-            self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
-            self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
+            if self._int8_ds_mla:
+                self._quant_block = 512
+                self._token_stride = 516
+                self._scale_dim = 4
+            else:
+                self._quant_block = 64
+                self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
+                self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
         elif self.head_dim == 128:
             if use_fp4_cache:
                 self._quant_block = MXFP4_BLOCK_SIZE
@@ -341,8 +354,8 @@ class DeepseekCompressor(nn.Module):
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
 
-        # Plain-row V4 reads a contiguous bf16 / per-tensor fp8 cache row; the
-        # fp8_ds_mla path uses the UE8M0 paged uint8 layout.
+        # Plain-row V4 reads a contiguous bf16 / per-tensor fp8 cache row.
+        # Packed byte layouts use their own paged uint8 writers.
         store_full_kv = self.head_dim == 512 and kv_cache.dtype != torch.uint8
         store_full_fp8 = kv_cache.dtype == torch.float8_e4m3fn
         fp8_scale = (
@@ -405,5 +418,6 @@ class DeepseekCompressor(nn.Module):
             quant_block=self._quant_block,
             token_stride=self._token_stride,
             scale_dim=self._scale_dim,
+            int8_ds_mla=self._int8_ds_mla and self.head_dim == 512,
             **extra_kwargs,
         )

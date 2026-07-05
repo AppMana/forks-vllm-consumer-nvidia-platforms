@@ -34,6 +34,190 @@ _QUANT_BLOCK_SIZE = 64
 _FP8_MAX = 448.0
 _TOKEN_DATA_SIZE = _TOKEN_FP8_DIM + _TOKEN_BF16_DIM * 2  # 576 bytes
 _N_REAL_QUANT_BLOCKS = 7  # 448 / 64
+_INT8_DS_MLA_DIM = 512
+_INT8_DS_MLA_SCALE_BYTES = 4
+_INT8_DS_MLA_TOKEN_BYTES = _INT8_DS_MLA_DIM + _INT8_DS_MLA_SCALE_BYTES
+
+
+def _flatten_int8_ds_mla_cache(k_cache: torch.Tensor) -> torch.Tensor:
+    if k_cache.dim() == 2:
+        return k_cache
+    return k_cache.view(k_cache.shape[0], -1)
+
+
+def _int8_ds_mla_quantize_rows(k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    k_fp32 = k.to(torch.float32)
+    scale = (k_fp32.abs().amax(dim=-1) / 127.0).clamp_min(1.0e-12)
+    q = torch.round(k_fp32 / scale.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
+    return q, scale.to(torch.float32)
+
+
+def quantize_and_insert_int8_ds_mla_cache(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int = 64,
+) -> None:
+    """Quantize bf16 DSv4 MLA rows to signed int8 + one fp32 row scale.
+
+    Layout per token: 512 signed-int8 bytes followed by one little-endian fp32
+    scale. The backing tensor is uint8 so it can share vLLM's byte cache path.
+    """
+    assert k.dim() == 2 and k.shape[1] == _INT8_DS_MLA_DIM, (
+        f"K must be [num_tokens, 512], got {k.shape}"
+    )
+    assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
+    assert k_cache.dtype == torch.uint8, f"K cache must be uint8, got {k_cache.dtype}"
+
+    valid = slot_mapping >= 0
+    if not valid.any():
+        return
+
+    k_valid = k[valid]
+    slots = slot_mapping[valid].to(torch.int64)
+    block_idx = slots // block_size
+    pos_in_block = slots % block_size
+    flat_cache = _flatten_int8_ds_mla_cache(k_cache)
+    device = k_cache.device
+
+    q_i8, scale = _int8_ds_mla_quantize_rows(k_valid)
+    q_u8 = q_i8.contiguous().view(torch.uint8)
+    scale_u8 = scale.contiguous().view(torch.uint8).view(-1, _INT8_DS_MLA_SCALE_BYTES)
+
+    data_cols = (
+        pos_in_block.unsqueeze(1) * _INT8_DS_MLA_TOKEN_BYTES
+        + torch.arange(_INT8_DS_MLA_DIM, device=device, dtype=torch.int64).unsqueeze(0)
+    )
+    scale_cols = (
+        pos_in_block.unsqueeze(1) * _INT8_DS_MLA_TOKEN_BYTES
+        + _INT8_DS_MLA_DIM
+        + torch.arange(
+            _INT8_DS_MLA_SCALE_BYTES, device=device, dtype=torch.int64
+        ).unsqueeze(0)
+    )
+    flat_data_blocks = block_idx.unsqueeze(1).expand(-1, _INT8_DS_MLA_DIM)
+    flat_scale_blocks = block_idx.unsqueeze(1).expand(-1, _INT8_DS_MLA_SCALE_BYTES)
+    flat_cache.index_put_((flat_data_blocks, data_cols), q_u8)
+    flat_cache.index_put_((flat_scale_blocks, scale_cols), scale_u8)
+
+
+def get_int8_ds_mla_cache_views(
+    k_cache: torch.Tensor,
+    block_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(int8_rows, fp32_scales)`` views for an int8_ds_mla cache."""
+    assert k_cache.dtype == torch.uint8, f"K cache must be uint8, got {k_cache.dtype}"
+    if k_cache.dim() == 3:
+        rows = k_cache
+    else:
+        rows = k_cache[:, : block_size * _INT8_DS_MLA_TOKEN_BYTES].view(
+            k_cache.shape[0], block_size, _INT8_DS_MLA_TOKEN_BYTES
+        )
+    data = rows[..., :_INT8_DS_MLA_DIM].view(torch.int8)
+    scales = (
+        rows[..., _INT8_DS_MLA_DIM : _INT8_DS_MLA_TOKEN_BYTES]
+        .view(torch.float32)
+        .squeeze(-1)
+    )
+    return data, scales
+
+
+def dequantize_global_slots_int8_ds_mla_cache(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_ids: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Dequantize int8_ds_mla cache rows addressed by physical global slot ids."""
+    if slot_ids.dim() == 3:
+        assert slot_ids.shape[1] == 1
+        slot_ids = slot_ids[:, 0, :]
+    assert slot_ids.dim() == 2, (
+        f"slot_ids must be [num_tokens, topk], got {slot_ids.shape}"
+    )
+    assert out.shape[:2] == slot_ids.shape
+    assert out.shape[-1] == _INT8_DS_MLA_DIM
+    assert out.dtype == torch.bfloat16
+    assert k_cache.dtype == torch.uint8
+
+    flat_cache = _flatten_int8_ds_mla_cache(k_cache)
+    num_tokens, topk = slot_ids.shape
+    slots = slot_ids.reshape(-1).to(torch.int64)
+    valid = (slots >= 0) & (slots < k_cache.shape[0] * block_size)
+    token_ids = torch.arange(num_tokens, device=slot_ids.device)[:, None]
+    candidate_ids = torch.arange(topk, device=slot_ids.device)[None, :]
+    token_ids = token_ids.expand(num_tokens, topk).reshape(-1)
+    candidate_ids = candidate_ids.expand(num_tokens, topk).reshape(-1)
+    out[token_ids[~valid], candidate_ids[~valid]] = 0
+    if not valid.any():
+        return
+
+    valid_slots = slots[valid]
+    block_idx = valid_slots // block_size
+    pos_in_block = valid_slots % block_size
+    selected = flat_cache.index_select(0, block_idx)
+    device = k_cache.device
+    data_cols = (
+        pos_in_block.unsqueeze(1) * _INT8_DS_MLA_TOKEN_BYTES
+        + torch.arange(_INT8_DS_MLA_DIM, device=device, dtype=torch.int64).unsqueeze(0)
+    )
+    scale_cols = (
+        pos_in_block.unsqueeze(1) * _INT8_DS_MLA_TOKEN_BYTES
+        + _INT8_DS_MLA_DIM
+        + torch.arange(
+            _INT8_DS_MLA_SCALE_BYTES, device=device, dtype=torch.int64
+        ).unsqueeze(0)
+    )
+    q = selected.gather(1, data_cols).contiguous().view(torch.int8).to(torch.float32)
+    scale = (
+        selected.gather(1, scale_cols)
+        .contiguous()
+        .view(torch.float32)
+        .view(-1, 1)
+    )
+    out[token_ids[valid], candidate_ids[valid]] = (q * scale).to(torch.bfloat16)
+
+
+def dequantize_and_gather_int8_ds_mla_cache(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    """Gather int8_ds_mla rows by block table and dequantize to bf16."""
+    if gather_lens is None:
+        gather_lens = seq_lens
+    seq_lens_l = seq_lens.to(torch.int64)
+    gather_lens_l = gather_lens.to(torch.int64)
+    start_pos = seq_lens_l - gather_lens_l
+
+    for r in range(seq_lens.shape[0]):
+        gl = int(gather_lens_l[r].item())
+        if gl == 0:
+            continue
+        sp = int(start_pos[r].item())
+        positions = torch.arange(
+            sp, sp + gl, device=block_table.device, dtype=torch.int64
+        )
+        block_in_seq = positions // block_size
+        pos_in_block = positions % block_size
+        valid_block_in_seq = (block_in_seq >= 0) & (block_in_seq < block_table.shape[1])
+        safe_block_in_seq = block_in_seq.clamp(0, max(block_table.shape[1] - 1, 0))
+        physical_block_idx = block_table[r, safe_block_in_seq].to(torch.int64)
+        slots = torch.where(
+            valid_block_in_seq,
+            physical_block_idx * block_size + pos_in_block,
+            torch.full_like(physical_block_idx, -1),
+        )
+        dequantize_global_slots_int8_ds_mla_cache(
+            out[r : r + 1, offset : offset + gl],
+            k_cache,
+            slots.view(1, gl),
+            block_size,
+        )
 
 
 def _supports_fp8e4nv_in_triton() -> bool:
