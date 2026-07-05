@@ -108,10 +108,22 @@ def test_fp8_mqa_logits_uses_fused_imma_workspace_on_auto_int8(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_mqa_logits_workspace_accepts_unaligned_workspace_views() -> None:
+@pytest.mark.parametrize(
+    ("num_rows", "num_heads", "head_dim", "seq_len"),
+    [
+        (17, 64, 512, 1032),
+        (1024, 64, 128, 1280),
+        (1024, 64, 128, 1032),
+    ],
+)
+def test_mqa_logits_workspace_accepts_unaligned_workspace_views(
+    num_rows: int,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_rows, num_heads, head_dim, seq_len = 17, 64, 512, 1032
 
     q_base = torch.empty(
         (num_rows + 1, num_heads, head_dim + 1),
@@ -129,9 +141,21 @@ def test_mqa_logits_workspace_accepts_unaligned_workspace_views() -> None:
         .to(torch.float8_e4m3fn)
     )
 
-    k_base = torch.empty((seq_len + 1, head_dim + 1), device=device, dtype=torch.int8)
+    k_base = torch.empty(
+        (seq_len + 1, head_dim + 1),
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
     k = k_base[1:, :head_dim]
-    k.copy_(torch.randint(-32, 32, (seq_len, head_dim), device=device, dtype=torch.int8))
+    k.copy_(
+        torch.randn(
+            (seq_len, head_dim),
+            device=device,
+            dtype=torch.float32,
+        )
+        .clamp(-4, 4)
+        .to(torch.float8_e4m3fn)
+    )
 
     scale_base = torch.empty((seq_len + 1, 1), device=device, dtype=torch.float32)
     scales = scale_base[1:, 0]
