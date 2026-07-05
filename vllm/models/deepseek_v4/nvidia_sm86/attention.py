@@ -26,19 +26,24 @@ import torch
 # CUDA kernel. No try/except, no env gate, no Triton fallback — if the kernel is not
 # present the import fails loudly at startup (we never want a silent degrade to the
 # slower per-row Triton path).
-from flash_mla import flash_sparse_mla_decode
+from flash_mla import flash_sparse_mla_decode, sparse_int8_mla_decode
 
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
+    dequantize_and_gather_int8_ds_mla_cache,
     dequantize_and_gather_k_cache,
+    get_int8_ds_mla_cache_views,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
     sparse_attention_triton,
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
+from vllm.logger import init_logger
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
@@ -93,23 +98,66 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         # the FP8 caches are consumed directly (dequantized inside the kernel).
         q_rows = q[:, 0] if q.dim() == 4 else q
 
-        # Precompiled Ampere CUDA sparse-MLA decode: ONE launch for all decode tokens
-        # (the old Triton path looped per row), ~4.4x faster, no Triton JIT/recompile.
-        # Matches the Triton reference to ~1e-6 (test_sm86_flash_mla_decode_parity).
         extra_idx = None
         if topk_indices is not None:
             extra_idx = topk_indices.reshape(num_decode_tokens, -1)
-        out = flash_sparse_mla_decode(
-            q=q_rows,
-            swa_cache=swa_k_cache,
-            swa_indices=swa_indices,
-            swa_lens=swa_lens,
-            scale=self.scale,
-            attn_sink=self.attn_sink,
-            extra_cache=None if swa_only else kv_cache,
-            extra_indices=extra_idx,
-            extra_lens=None if topk_lens is None else topk_lens,
-        )
+        if self.kv_cache_dtype == "int8_ds_mla":
+            logger.info_once(
+                "DeepSeek-V4 sm86 attention decode selected: "
+                "cache=int8_ds_mla backend=triton_int8_imma_sparse_mla "
+                "tokens=%d heads=%d swa_topk=%d extra_topk=%d",
+                num_decode_tokens,
+                q_rows.shape[1],
+                swa_indices.shape[-1],
+                0 if extra_idx is None else extra_idx.shape[-1],
+            )
+            swa_i8, swa_scale = get_int8_ds_mla_cache_views(
+                swa_k_cache, swa_metadata.block_size
+            )
+            extra_i8 = extra_scale = None
+            if not swa_only:
+                assert kv_cache is not None
+                assert attn_metadata is not None
+                extra_i8, extra_scale = get_int8_ds_mla_cache_views(
+                    kv_cache, attn_metadata.block_size // self.compress_ratio
+                )
+            out = sparse_int8_mla_decode(
+                q=q_rows,
+                swa_cache=swa_i8,
+                swa_scale=swa_scale,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_cache=extra_i8,
+                extra_scale=extra_scale,
+                extra_indices=extra_idx,
+                extra_lens=None if topk_lens is None else topk_lens,
+            )
+        else:
+            # Precompiled Ampere CUDA sparse-MLA decode: ONE launch for all decode
+            # tokens. It consumes the fp8_ds_mla cache layout directly.
+            logger.info_once(
+                "DeepSeek-V4 sm86 attention decode selected: "
+                "cache=%s backend=flashmla_cuda_sparse_mla_decode "
+                "tokens=%d heads=%d swa_topk=%d extra_topk=%d",
+                self.kv_cache_dtype,
+                num_decode_tokens,
+                q_rows.shape[1],
+                swa_indices.shape[-1],
+                0 if extra_idx is None else extra_idx.shape[-1],
+            )
+            out = flash_sparse_mla_decode(
+                q=q_rows,
+                swa_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_cache=None if swa_only else kv_cache,
+                extra_indices=extra_idx,
+                extra_lens=None if topk_lens is None else topk_lens,
+            )
         output[:num_decode_tokens].copy_(out)
         if output.shape[1] > self.n_local_heads:
             output[:, self.n_local_heads :].zero_()
@@ -168,7 +216,23 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
             if not swa_only:
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
-                dequantize_and_gather_k_cache(
+                dequantize_gather = (
+                    dequantize_and_gather_int8_ds_mla_cache
+                    if self.kv_cache_dtype == "int8_ds_mla"
+                    else dequantize_and_gather_k_cache
+                )
+                logger.info_once(
+                    "DeepSeek-V4 sm86 attention prefill selected: "
+                    "cache=%s dequant_gather=%s sparse_backend=triton_bf16 "
+                    "chunk_size=%d chunk_M=%d chunk_N=%d heads=%d",
+                    self.kv_cache_dtype,
+                    dequantize_gather.__name__,
+                    chunk_size,
+                    chunk_M,
+                    chunk_N,
+                    q.shape[1],
+                )
+                dequantize_gather(
                     kv[:chunk_size],
                     compressed_k_cache,
                     seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
@@ -179,7 +243,12 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 )
 
             swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
+            dequantize_gather = (
+                dequantize_and_gather_int8_ds_mla_cache
+                if self.kv_cache_dtype == "int8_ds_mla"
+                else dequantize_and_gather_k_cache
+            )
+            dequantize_gather(
                 kv[:chunk_size],
                 swa_k_cache,
                 seq_lens=seq_lens[chunk_start:chunk_end],

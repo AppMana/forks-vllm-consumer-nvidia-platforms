@@ -386,6 +386,12 @@ class MLAAttentionSpec(FullAttentionSpec):
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             return self.block_size * 656
+        if (
+            self.model_version == "deepseek_v4"
+            and self.cache_dtype_str == "int8_ds_mla"
+        ):
+            # 512 signed-int8 row bytes + one fp32 row scale.
+            return self.storage_block_size * 516
         if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             head_dim = self.head_size // 2
         else:
@@ -570,6 +576,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             # per token. FlashInfer's contiguous bf16/fp8 cache falls through to
             # the element-size formula below.
             return self.storage_block_size * 584
+        if (
+            self.model_version == "deepseek_v4"
+            and self.cache_dtype_str == "int8_ds_mla"
+        ):
+            # 512 signed-int8 row bytes + one fp32 row scale.
+            return self.storage_block_size * 516
         assert self.model_version in (None, "deepseek_v4"), (
             f"Unsupported model version: {self.model_version}"
         )

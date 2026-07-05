@@ -48,6 +48,7 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "fp8_ds_mla",
+        "int8_ds_mla",
         "fp8",  # alias for fp8_ds_mla
     ]
 
@@ -106,6 +107,9 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
             # DeepseekV4 main MLA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             # head_size passed in is the semantic head_dim (512).
             return (num_blocks, block_size, 584)
+        if cache_dtype_str == "int8_ds_mla":
+            # Experimental AppMana layout: 512 signed-int8 row bytes + one fp32 scale.
+            return (num_blocks, block_size, 516)
         else:
             return (num_blocks, block_size, head_size)
 

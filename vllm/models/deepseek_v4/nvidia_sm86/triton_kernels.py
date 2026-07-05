@@ -4,10 +4,13 @@
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import LOG2E, tl, triton
 from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
     fp8e4m3_decode_to_fp32,
 )
+
+logger = init_logger(__name__)
 
 DEEPSEEK_V4_MLA_HEAD_DIM = 512
 FP8_DS_MLA_FP8_DIM = 448
@@ -213,7 +216,18 @@ def sparse_attention_triton(
     assert kv.shape[-1] == head_dim
     assert out.shape[-1] == head_dim
 
-    grid = (num_tokens, triton.cdiv(num_heads, 8))
+    logger.info_once(
+        "DeepSeek-V4 sm86 sparse MLA prefill dispatch: backend=triton_bf16 "
+        "BLOCK_H=32 BLOCK_N=16 tokens=%d heads=%d head_dim=%d kv_rows=%d "
+        "index_width=%d has_sink=%s",
+        num_tokens,
+        num_heads,
+        head_dim,
+        kv.shape[0],
+        indices.shape[-1],
+        attn_sink is not None,
+    )
+    grid = (num_tokens, triton.cdiv(num_heads, 32))
     _sparse_attention_bf16_kernel[grid](
         q,
         kv,
@@ -236,7 +250,7 @@ def sparse_attention_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        BLOCK_H=8,
+        BLOCK_H=32,
         BLOCK_N=16,
         BLOCK_D=DEEPSEEK_V4_MLA_HEAD_DIM,
         HAS_SINK=attn_sink is not None,
@@ -463,7 +477,19 @@ def decode_sparse_attention_triton(
     assert extra_cache is not None
     assert extra_indices is not None
     assert extra_lens is not None
-    grid = (num_tokens, triton.cdiv(num_heads, 8))
+    logger.info_once(
+        "DeepSeek-V4 sm86 sparse MLA decode dispatch: backend=triton_fp8 "
+        "BLOCK_H=16 BLOCK_N=16 tokens=%d heads=%d head_dim=%d "
+        "swa_topk=%d extra_topk=%d has_extra=%s has_sink=%s",
+        num_tokens,
+        num_heads,
+        head_dim,
+        swa_indices.shape[-1],
+        extra_indices.shape[-1] if has_extra else 0,
+        has_extra,
+        attn_sink is not None,
+    )
+    grid = (num_tokens, triton.cdiv(num_heads, 16))
     _decode_sparse_attention_fp8_kernel[grid](
         q,
         swa_cache,
@@ -499,7 +525,7 @@ def decode_sparse_attention_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        BLOCK_H=8,
+        BLOCK_H=16,
         BLOCK_N=16,
         BLOCK_D=DEEPSEEK_V4_MLA_HEAD_DIM,
         FP8_DIM=FP8_DS_MLA_FP8_DIM,
@@ -954,6 +980,19 @@ def fp8_paged_mqa_logits_triton(
     # cache + checkpoint-enabled IMMA are on; fused_indexer_q emits an int8 q
     # tensor and folds its scale into `weights`, so detect it by dtype here.
     q_is_int8 = q.dtype == torch.int8
+    logger.info_once(
+        "DeepSeek-V4 sm86 indexer dispatch: backend=triton_paged_mqa "
+        "q_dtype=%s kv_cache_int8=%s qk_int8=%s rows=%d heads=%d "
+        "head_dim=%d token_start=%d token_count=%s",
+        q.dtype,
+        indexer_cache_is_int8(),
+        q_is_int8,
+        batch_size * next_n,
+        num_heads,
+        head_dim,
+        token_start,
+        token_count if token_count is not None else "max",
+    )
     if head_dim % 64 == 0 and num_heads % 4 == 0:
         return fp8_paged_mqa_logits_rowwise_triton(
             q,

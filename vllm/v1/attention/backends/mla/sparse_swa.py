@@ -74,14 +74,15 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         # determines the SWA block size of 64 tokens per block.
         # TODO(yifan): make SWA block size automatically determined and configurable.
         self.block_size = 64
-        # uint8: fp8_ds_mla UE8M0 paged layout. bfloat16 / float8_e4m3fn:
+        # uint8: fp8_ds_mla / int8_ds_mla paged layouts. bfloat16 / float8_e4m3fn:
         # contiguous full-cache layout.
         assert self.dtype in (torch.uint8, torch.bfloat16, torch.float8_e4m3fn)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # fp8_ds_mla's UE8M0 paged layout needs 576B alignment; contiguous
+        # Packed byte layouts need row-size alignment; contiguous
         # bf16/fp8 cache uses the natural element-size page.
         uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == "fp8_ds_mla"
+        uses_int8_ds_mla_layout = self.cache_config.cache_dtype == "int8_ds_mla"
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -89,7 +90,9 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
-            alignment=576 if uses_fp8_ds_mla_layout else None,
+            alignment=576
+            if uses_fp8_ds_mla_layout
+            else (516 if uses_int8_ds_mla_layout else None),
             model_version="deepseek_v4",
         )
 
@@ -139,6 +142,8 @@ class DeepseekSparseSWABackend(AttentionBackend):
             # DeepseekV4 SWA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             # head_size passed in is the semantic head_dim (512).
             return (num_blocks, block_size, 584)
+        if cache_dtype_str == "int8_ds_mla":
+            return (num_blocks, block_size, 516)
         else:
             return (num_blocks, block_size, head_size)
 
