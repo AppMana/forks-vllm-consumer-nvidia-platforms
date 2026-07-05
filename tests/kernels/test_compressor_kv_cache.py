@@ -388,6 +388,44 @@ def test_indexer_gather_accepts_upper_bound_output():
     assert torch.all(dst_scale[valid_tokens:] == sentinel)
 
 
+def test_indexer_gather_accepts_unaligned_dst_workspace():
+    """Gather must not assume 16-byte-aligned workspace slices."""
+
+    head_dim = 128
+    quant_block_size = 128
+    cache_stride = head_dim + head_dim * 4 // quant_block_size
+    num_tokens = 17
+    block_size = 16
+    num_blocks = 3
+    device = "cuda"
+
+    k = torch.randn(num_tokens, head_dim, dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(
+        num_blocks, block_size, cache_stride, dtype=torch.uint8, device=device
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    ops.indexer_k_quant_and_cache(k, kv_cache, slot_mapping, quant_block_size, "ue8m0")
+
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
+    cu_seq_lens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+
+    dst_storage = torch.empty(
+        num_tokens * head_dim + 1, dtype=torch.uint8, device=device
+    )
+    dst_k = dst_storage[1:].view(num_tokens, head_dim)
+    dst_scale = torch.empty(num_tokens, 4, dtype=torch.uint8, device=device)
+
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
+    )
+    torch.accelerator.synchronize()
+
+    assert dst_k.data_ptr() % 16 != 0
+    assert torch.isfinite(dst_k.float()).all()
+
+
 # ── Test D: DeepseekV4 attention with values at different magnitudes ───────────
 
 

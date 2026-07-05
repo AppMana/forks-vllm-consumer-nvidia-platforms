@@ -679,9 +679,16 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
   const int64_t src_inblock_offset = src_block_offset + cache_inblock_offset;
   const int64_t dst_inblock_offset = token_idx * token_stride + head_idx;
 
-  reinterpret_cast<float4*>(dst_k)[dst_inblock_offset / VEC_SIZE] =
-      reinterpret_cast<const float4*>(kv_cache)[src_inblock_offset / VEC_SIZE];
-  ;
+  // The workspace allocator can hand out byte views with valid but not
+  // necessarily 16-byte-aligned storage offsets. Copy the 16-byte lane as
+  // scalar bytes so ragged/chunked prefill does not fault on an aligned float4
+  // load/store assumption.
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; i++) {
+    if (head_idx + i < head_dim) {
+      dst_k[dst_inblock_offset + i] = kv_cache[src_inblock_offset + i];
+    }
+  }
   if (threadIdx.x == 0) {
     const int64_t src_scale_offset =
         src_block_offset + cache_block_size * head_dim +
