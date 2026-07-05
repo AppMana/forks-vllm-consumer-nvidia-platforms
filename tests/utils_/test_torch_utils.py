@@ -4,9 +4,12 @@ import pytest
 import torch
 
 from vllm.utils.torch_utils import (
+    STR_DTYPE_TO_TORCH_DTYPE,
     common_broadcastable_dtype,
     current_stream,
+    get_kv_cache_torch_dtype,
     is_lossless_cast,
+    is_quantized_kv_cache,
 )
 
 
@@ -114,3 +117,9 @@ def test_current_stream_multithread():
     )
 
     _test_stream_thread(main_dedicated_stream)
+
+
+def test_int8_ds_mla_cache_dtype_maps_to_uint8() -> None:
+    assert STR_DTYPE_TO_TORCH_DTYPE["int8_ds_mla"] is torch.uint8
+    assert get_kv_cache_torch_dtype("int8_ds_mla") is torch.uint8
+    assert is_quantized_kv_cache("int8_ds_mla")
