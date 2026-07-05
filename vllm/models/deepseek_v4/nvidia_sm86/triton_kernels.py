@@ -845,7 +845,24 @@ def fp8_mqa_logits_triton(
     return logits
 
 
-@triton.jit(do_not_specialize=["logits_width", "num_rows", "token_start", "stride_lm"])
+@triton.jit(
+    do_not_specialize=[
+        "logits_width",
+        "num_rows",
+        "token_start",
+        "stride_lm",
+        "stride_ln",
+    ],
+    do_not_specialize_on_alignment=[
+        "q_ptr",
+        "kv_ptr",
+        "scale_ptr",
+        "weights_ptr",
+        "context_lens_ptr",
+        "block_tables_ptr",
+        "logits_ptr",
+    ],
+)
 def _fp8_paged_mqa_logits_kernel(
     q_ptr,
     kv_ptr,
@@ -879,7 +896,7 @@ def _fp8_paged_mqa_logits_kernel(
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
     stride_lm: tl.int64,
-    stride_ln: tl.constexpr,
+    stride_ln: tl.int64,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -1072,7 +1089,24 @@ def fp8_paged_mqa_logits_triton(
     return logits[:, :token_count]
 
 
-@triton.jit(do_not_specialize=["logits_width", "num_rows", "token_start", "stride_lm"])
+@triton.jit(
+    do_not_specialize=[
+        "logits_width",
+        "num_rows",
+        "token_start",
+        "stride_lm",
+        "stride_ln",
+    ],
+    do_not_specialize_on_alignment=[
+        "q_ptr",
+        "kv_ptr",
+        "scale_ptr",
+        "weights_ptr",
+        "context_lens_ptr",
+        "block_tables_ptr",
+        "logits_ptr",
+    ],
+)
 def _fp8_paged_mqa_logits_rowwise_kernel(
     q_ptr,
     kv_ptr,
@@ -1106,7 +1140,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
     stride_lm: tl.int64,
-    stride_ln: tl.constexpr,
+    stride_ln: tl.int64,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,

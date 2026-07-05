@@ -153,3 +153,98 @@ def test_mqa_logits_workspace_accepts_unaligned_workspace_views() -> None:
 
     assert out.shape == (num_rows, seq_len)
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_paged_mqa_logits_accepts_unaligned_runtime_views() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch_size, next_n, num_heads, head_dim = 2, 3, 64, 512
+    num_blocks, block_size = 8, 16
+    scale_bytes = torch.float32.itemsize
+    token_bytes = head_dim + scale_bytes
+
+    q_storage = torch.empty(
+        batch_size * next_n * num_heads * head_dim + 1,
+        device=device,
+        dtype=torch.uint8,
+    )
+    q = q_storage[1:].view(torch.float8_e4m3fn).view(
+        batch_size, next_n, num_heads, head_dim
+    )
+    q.copy_(
+        torch.randn(q.shape, device=device, dtype=torch.float32)
+        .clamp(-4, 4)
+        .to(torch.float8_e4m3fn)
+    )
+
+    fused = torch.empty(
+        (num_blocks, block_size, token_bytes),
+        device=device,
+        dtype=torch.uint8,
+    )
+    fused_blocks = fused.view(num_blocks, -1)
+    value_end = block_size * head_dim
+    scale_end = value_end + block_size * scale_bytes
+    fused_blocks[:, :value_end] = torch.randint(
+        0,
+        255,
+        (num_blocks, value_end),
+        device=device,
+        dtype=torch.uint8,
+    )
+    scales = torch.full(
+        (num_blocks, block_size, 1),
+        0.01,
+        device=device,
+        dtype=torch.float32,
+    )
+    fused_blocks[:, value_end:scale_end] = scales.view(torch.uint8).reshape(
+        num_blocks,
+        -1,
+    )
+    kv_cache = fused
+
+    weights_storage = torch.empty(
+        batch_size * next_n * num_heads + 1,
+        device=device,
+        dtype=torch.float32,
+    )
+    weights = weights_storage[1:].view(batch_size * next_n, num_heads)
+    weights.copy_(torch.rand_like(weights))
+
+    context_storage = torch.empty(
+        batch_size * next_n + 1,
+        device=device,
+        dtype=torch.int32,
+    )
+    context_lens = context_storage[1:].view(batch_size, next_n)
+    context_lens.fill_(num_blocks * block_size)
+
+    block_tables_storage = torch.empty(
+        batch_size * num_blocks + 1,
+        device=device,
+        dtype=torch.int32,
+    )
+    block_tables = block_tables_storage[1:].view(batch_size, num_blocks)
+    block_tables.copy_(
+        torch.arange(num_blocks, device=device, dtype=torch.int32).expand(
+            batch_size,
+            -1,
+        )
+    )
+
+    out = dsv4_sm86.fp8_paged_mqa_logits_triton(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len=num_blocks * block_size,
+        token_start=1,
+        token_count=113,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == (batch_size * next_n, 113)
+    assert torch.isfinite(out).all()
