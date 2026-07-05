@@ -1068,7 +1068,7 @@ ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG CUDA_VERSION
 ARG LMCACHE_GIT_REF=cd51f3a15766e326f92998c072264a5a6caa4efe
-ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-5a9c44cc752f36228b24adb8382ee8b8d52e9499/flash_mla-1.0.0%2B5a9c44c-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
+ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-14cb23da1f2e1fb976c6be230020cc02d967c00b/flash_mla-1.0.0%2B14cb23d-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
@@ -1187,6 +1187,8 @@ for dist in ("vllm", "flash-mla"):
 flash_mla = importlib.import_module("flash_mla")
 if not hasattr(flash_mla, "flash_sparse_mla_prefill"):
     raise AttributeError("flash_mla.flash_sparse_mla_prefill")
+if not hasattr(flash_mla, "sparse_int8_mla_decode"):
+    raise AttributeError("flash_mla.sparse_int8_mla_decode")
 
 site_paths = {
     pathlib.Path(sysconfig.get_paths()["purelib"]),
