@@ -105,3 +105,51 @@ def test_fp8_mqa_logits_uses_fused_imma_workspace_on_auto_int8(
     )
 
     torch.testing.assert_close(actual, torch.full((2, 5), 3.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mqa_logits_workspace_accepts_unaligned_workspace_views() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_rows, num_heads, head_dim, seq_len = 17, 64, 512, 1032
+
+    q_base = torch.empty(
+        (num_rows + 1, num_heads, head_dim + 1),
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    q = q_base[1:, :, :head_dim]
+    q.copy_(
+        torch.randn(
+            (num_rows, num_heads, head_dim),
+            device=device,
+            dtype=torch.float32,
+        )
+        .clamp(-4, 4)
+        .to(torch.float8_e4m3fn)
+    )
+
+    k_base = torch.empty((seq_len + 1, head_dim + 1), device=device, dtype=torch.int8)
+    k = k_base[1:, :head_dim]
+    k.copy_(torch.randint(-32, 32, (seq_len, head_dim), device=device, dtype=torch.int8))
+
+    scale_base = torch.empty((seq_len + 1, 1), device=device, dtype=torch.float32)
+    scales = scale_base[1:, 0]
+    scales.copy_(torch.rand((seq_len,), device=device, dtype=torch.float32) * 0.02 + 0.001)
+
+    weights = torch.rand((num_rows, num_heads), device=device, dtype=torch.float32)
+    ks = torch.zeros((num_rows,), device=device, dtype=torch.int32)
+    ke = torch.full((num_rows,), seq_len, device=device, dtype=torch.int32)
+
+    out = dsv4_sm86.mqa_logits_workspace_triton(
+        q,
+        (k, scales),
+        weights,
+        ks,
+        ke,
+        qk_int8=False,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == (num_rows, seq_len)
+    assert torch.isfinite(out).all()

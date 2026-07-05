@@ -1443,7 +1443,18 @@ def tf32_hc_prenorm_gemm_triton(
 # crossing the ÷16 boundary, recompiling ~every 16 tokens. Stacked over a long
 # generation these ~165ms compiles wedge the whole PP chain (one rank pinned in
 # Triton launch, the rest blocked on the collective). Pinning them off compiles once.
-@triton.jit(do_not_specialize=["num_rows", "seq_len_kv", "stride_lm"])
+@triton.jit(
+    do_not_specialize=["num_rows", "seq_len_kv", "stride_lm", "stride_ln"],
+    do_not_specialize_on_alignment=[
+        "q_ptr",
+        "k_ptr",
+        "k_scale_ptr",
+        "weights_ptr",
+        "ks_ptr",
+        "ke_ptr",
+        "logits_ptr",
+    ],
+)
 def _mqa_logits_workspace_kernel(
     q_ptr,
     k_ptr,
@@ -1464,7 +1475,7 @@ def _mqa_logits_workspace_kernel(
     stride_wm: tl.constexpr,
     stride_wh: tl.constexpr,
     stride_lm: tl.int64,
-    stride_ln: tl.constexpr,
+    stride_ln: tl.int64,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
