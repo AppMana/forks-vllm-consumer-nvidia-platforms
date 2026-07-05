@@ -180,6 +180,67 @@ def test_mqa_logits_workspace_accepts_unaligned_workspace_views(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sparse_attention_bf16_accepts_unaligned_runtime_views() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, num_heads, head_dim = 3, 64, 512
+    kv_rows, index_width = 1032, 1792
+
+    q_storage = torch.empty(
+        num_tokens * num_heads * head_dim + 1,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    q = q_storage[1:].view(num_tokens, num_heads, head_dim)
+    q.copy_(torch.randn(q.shape, device=device, dtype=torch.float32).to(torch.bfloat16))
+
+    kv_storage = torch.empty(
+        kv_rows * head_dim + 1,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv = kv_storage[1:].view(kv_rows, head_dim)
+    kv.copy_(torch.randn(kv.shape, device=device, dtype=torch.float32).to(torch.bfloat16))
+
+    indices_storage = torch.empty(
+        num_tokens * index_width + 1,
+        device=device,
+        dtype=torch.int32,
+    )
+    indices = indices_storage[1:].view(num_tokens, index_width)
+    indices.copy_(
+        torch.arange(index_width, device=device, dtype=torch.int32)
+        .remainder(kv_rows)
+        .expand(num_tokens, -1)
+    )
+
+    lengths = torch.full((num_tokens,), 17, device=device, dtype=torch.int32)
+    sink_storage = torch.empty(num_heads + 1, device=device, dtype=torch.float32)
+    sink = sink_storage[1:]
+    sink.zero_()
+
+    out_storage = torch.empty(
+        num_tokens * num_heads * head_dim + 1,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    out = out_storage[1:].view(num_tokens, num_heads, head_dim)
+
+    dsv4_sm86.sparse_attention_triton(
+        q,
+        kv,
+        indices,
+        lengths,
+        scale=1.0 / head_dim**0.5,
+        attn_sink=sink,
+        out=out,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_paged_mqa_logits_accepts_unaligned_runtime_views() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
