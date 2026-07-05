@@ -90,9 +90,34 @@ def _view_packed_fp8_paged_mqa_kv_cache(
     return kv_values, kv_scale[..., :scale_elems]
 
 
-# seq_kv tracks the context length; pin it off divisibility-by-16 specialization
-# (same recompile-wedge class as _mqa_logits_workspace_kernel).
-@triton.jit(do_not_specialize=["num_tokens", "seq_kv"])
+# Runtime dimensions and strides in this path come from scheduler chunking and
+# gathered KV views. Keep them out of Triton's value/alignment specialization;
+# otherwise it may emit variants with invalid divisibility assumptions for
+# non-16 chunk widths such as kv_rows=1032.
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "seq_kv",
+        "stride_qt",
+        "stride_qh",
+        "stride_qd",
+        "stride_kv_t",
+        "stride_kv_d",
+        "stride_indices_t",
+        "stride_indices_k",
+        "stride_out_t",
+        "stride_out_h",
+        "stride_out_d",
+    ],
+    do_not_specialize_on_alignment=[
+        "q_ptr",
+        "kv_ptr",
+        "indices_ptr",
+        "lengths_ptr",
+        "sink_ptr",
+        "out_ptr",
+    ],
+)
 def _sparse_attention_bf16_kernel(
     q_ptr,
     kv_ptr,
@@ -105,16 +130,16 @@ def _sparse_attention_bf16_kernel(
     seq_kv: tl.int32,
     index_topk: tl.constexpr,
     sm_scale_log2: tl.constexpr,
-    stride_qt: tl.constexpr,
-    stride_qh: tl.constexpr,
-    stride_qd: tl.constexpr,
-    stride_kv_t: tl.constexpr,
-    stride_kv_d: tl.constexpr,
-    stride_indices_t: tl.constexpr,
-    stride_indices_k: tl.constexpr,
-    stride_out_t: tl.constexpr,
-    stride_out_h: tl.constexpr,
-    stride_out_d: tl.constexpr,
+    stride_qt: tl.int64,
+    stride_qh: tl.int64,
+    stride_qd: tl.int64,
+    stride_kv_t: tl.int64,
+    stride_kv_d: tl.int64,
+    stride_indices_t: tl.int64,
+    stride_indices_k: tl.int64,
+    stride_out_t: tl.int64,
+    stride_out_h: tl.int64,
+    stride_out_d: tl.int64,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -259,7 +284,38 @@ def sparse_attention_triton(
     )
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "swa_stride_block_bytes",
+        "extra_stride_block_bytes",
+        "stride_qt",
+        "stride_qh",
+        "stride_qd",
+        "stride_swa_indices_t",
+        "stride_swa_indices_k",
+        "stride_extra_indices_t",
+        "stride_extra_indices_k",
+        "stride_out_t",
+        "stride_out_h",
+        "stride_out_d",
+    ],
+    do_not_specialize_on_alignment=[
+        "q_ptr",
+        "swa_cache_fp8_ptr",
+        "swa_cache_bf16_ptr",
+        "swa_cache_u8_ptr",
+        "swa_indices_ptr",
+        "swa_lens_ptr",
+        "extra_cache_fp8_ptr",
+        "extra_cache_bf16_ptr",
+        "extra_cache_u8_ptr",
+        "extra_indices_ptr",
+        "extra_lens_ptr",
+        "sink_ptr",
+        "out_ptr",
+    ],
+)
 def _decode_sparse_attention_fp8_kernel(
     q_ptr,
     swa_cache_fp8_ptr,
@@ -282,19 +338,19 @@ def _decode_sparse_attention_fp8_kernel(
     extra_num_blocks: tl.constexpr,
     swa_block_size: tl.constexpr,
     extra_block_size: tl.constexpr,
-    swa_stride_block_bytes: tl.constexpr,
-    extra_stride_block_bytes: tl.constexpr,
+    swa_stride_block_bytes: tl.int64,
+    extra_stride_block_bytes: tl.int64,
     sm_scale_log2: tl.constexpr,
-    stride_qt: tl.constexpr,
-    stride_qh: tl.constexpr,
-    stride_qd: tl.constexpr,
-    stride_swa_indices_t: tl.constexpr,
-    stride_swa_indices_k: tl.constexpr,
-    stride_extra_indices_t: tl.constexpr,
-    stride_extra_indices_k: tl.constexpr,
-    stride_out_t: tl.constexpr,
-    stride_out_h: tl.constexpr,
-    stride_out_d: tl.constexpr,
+    stride_qt: tl.int64,
+    stride_qh: tl.int64,
+    stride_qd: tl.int64,
+    stride_swa_indices_t: tl.int64,
+    stride_swa_indices_k: tl.int64,
+    stride_extra_indices_t: tl.int64,
+    stride_extra_indices_k: tl.int64,
+    stride_out_t: tl.int64,
+    stride_out_h: tl.int64,
+    stride_out_d: tl.int64,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
