@@ -52,6 +52,55 @@ def _int8_ds_mla_quantize_rows(k: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return q, scale.to(torch.float32)
 
 
+@triton.jit(
+    do_not_specialize=["num_tokens", "cache_block_size", "block_stride"],
+    do_not_specialize_on_alignment=["k_ptr", "slot_mapping_ptr", "k_cache_ptr"],
+)
+def _quantize_and_insert_int8_ds_mla_cache_kernel(
+    k_ptr,
+    slot_mapping_ptr,
+    k_cache_ptr,
+    num_tokens,
+    input_dim: tl.constexpr,
+    cache_block_size,
+    token_stride: tl.constexpr,
+    block_stride,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= num_tokens:
+        return
+
+    slot_idx = tl.load(slot_mapping_ptr + pid)
+    if slot_idx < 0:
+        return
+
+    offsets = tl.arange(0, BLOCK)
+    x = tl.load(k_ptr + pid * input_dim + offsets, mask=offsets < input_dim, other=0.0)
+    x = x.to(tl.bfloat16).to(tl.float32)
+
+    absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1.0e-12)
+    row_scale = absmax / 127.0
+    scaled = x / row_scale
+    rounded = scaled + tl.where(scaled >= 0.0, 0.5, -0.5)
+    q_i8 = tl.maximum(tl.minimum(rounded, 127.0), -127.0).to(tl.int8)
+
+    block_idx = slot_idx // cache_block_size
+    pos_in_block = slot_idx % cache_block_size
+    token_ptr = (
+        k_cache_ptr
+        + block_idx.to(tl.int64) * block_stride
+        + pos_in_block * token_stride
+    )
+    tl.store(
+        token_ptr + offsets,
+        q_i8.to(tl.uint8, bitcast=True),
+        mask=offsets < input_dim,
+    )
+    scale_ptr = (token_ptr + input_dim).to(tl.pointer_type(tl.float32))
+    tl.store(scale_ptr, row_scale)
+
+
 def quantize_and_insert_int8_ds_mla_cache(
     k: torch.Tensor,
     k_cache: torch.Tensor,
@@ -69,36 +118,19 @@ def quantize_and_insert_int8_ds_mla_cache(
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert k_cache.dtype == torch.uint8, f"K cache must be uint8, got {k_cache.dtype}"
 
-    valid = slot_mapping >= 0
-    if not valid.any():
-        return
-
-    k_valid = k[valid]
-    slots = slot_mapping[valid].to(torch.int64)
-    block_idx = slots // block_size
-    pos_in_block = slots % block_size
     flat_cache = _flatten_int8_ds_mla_cache(k_cache)
-    device = k_cache.device
-
-    q_i8, scale = _int8_ds_mla_quantize_rows(k_valid)
-    q_u8 = q_i8.contiguous().view(torch.uint8)
-    scale_u8 = scale.contiguous().view(torch.uint8).view(-1, _INT8_DS_MLA_SCALE_BYTES)
-
-    data_cols = (
-        pos_in_block.unsqueeze(1) * _INT8_DS_MLA_TOKEN_BYTES
-        + torch.arange(_INT8_DS_MLA_DIM, device=device, dtype=torch.int64).unsqueeze(0)
+    num_tokens = slot_mapping.shape[0]
+    _quantize_and_insert_int8_ds_mla_cache_kernel[(num_tokens,)](
+        k,
+        slot_mapping,
+        flat_cache,
+        num_tokens,
+        input_dim=_INT8_DS_MLA_DIM,
+        cache_block_size=block_size,
+        token_stride=_INT8_DS_MLA_TOKEN_BYTES,
+        block_stride=flat_cache.stride(0),
+        BLOCK=triton.next_power_of_2(_INT8_DS_MLA_DIM),
     )
-    scale_cols = (
-        pos_in_block.unsqueeze(1) * _INT8_DS_MLA_TOKEN_BYTES
-        + _INT8_DS_MLA_DIM
-        + torch.arange(
-            _INT8_DS_MLA_SCALE_BYTES, device=device, dtype=torch.int64
-        ).unsqueeze(0)
-    )
-    flat_data_blocks = block_idx.unsqueeze(1).expand(-1, _INT8_DS_MLA_DIM)
-    flat_scale_blocks = block_idx.unsqueeze(1).expand(-1, _INT8_DS_MLA_SCALE_BYTES)
-    flat_cache.index_put_((flat_data_blocks, data_cols), q_u8)
-    flat_cache.index_put_((flat_scale_blocks, scale_cols), scale_u8)
 
 
 def get_int8_ds_mla_cache_views(
