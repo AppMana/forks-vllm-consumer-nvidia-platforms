@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from safetensors.torch import save_file
 
 from tools.ampere.dsv4_checkpoint_audit import classify_tensor, matched_scale_name
 from tools.ampere.dsv4_requant_checkpoint import convert_checkpoint
+import vllm.model_executor.layers.quantization.dsv4_int as dsv4_int_module
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import get_quantization_config
@@ -36,6 +38,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
     marlin_moe_permute_scales,
 )
+from vllm.model_executor.model_loader.weight_utils import get_quant_config
 from vllm.models.deepseek_v4.nvidia.model import (
     _get_deepseek_v4_scale_fmt,
     _make_deepseek_v4_weights_mapper,
@@ -96,6 +99,50 @@ def test_dsv4_int_quantization_config_registered():
     )
     assert hybrid_cfg.get_name() == "dsv4_mxfp4_int8"
     assert hybrid_cfg.int8_weight_strategy == "channel"
+
+
+def test_dsv4_int_top_level_imma_config_enables_runtime(monkeypatch):
+    monkeypatch.setattr(
+        dsv4_int_module,
+        "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE",
+        False,
+    )
+    quantization_config = {
+        "quant_method": "dsv4_int",
+        "config_groups": {
+            "experts_w4a16": {
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                }
+            },
+            "linears_w8a16": {
+                "weights": {
+                    "num_bits": 8,
+                    "type": "int",
+                    "symmetric": True,
+                    "strategy": "channel",
+                }
+            },
+        },
+    }
+    hf_config = SimpleNamespace(quantization_config=quantization_config)
+    setattr(
+        hf_config,
+        dsv4_int_module._APPMANA_EXPERIMENTAL_IMMA_CONFIG_KEY,
+        True,
+    )
+    model_config = SimpleNamespace(
+        quantization="dsv4_int",
+        hf_config=hf_config,
+        hf_overrides={},
+        quantization_config=None,
+    )
+
+    cfg = get_quant_config(model_config, SimpleNamespace())
+
+    assert cfg.appmana_experimental_int8_runtime
+    assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
 
 
 def test_deepseek_v4_nvidia_scale_fmt_defaults_for_dsv4_int():
