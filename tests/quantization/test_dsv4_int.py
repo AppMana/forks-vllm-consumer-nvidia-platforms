@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -142,6 +143,42 @@ def test_dsv4_int_top_level_imma_config_enables_runtime(monkeypatch):
     cfg = get_quant_config(model_config, SimpleNamespace())
 
     assert cfg.appmana_experimental_int8_runtime
+    assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
+
+
+def test_dsv4_int_pickle_restores_imma_runtime_gate(monkeypatch):
+    cfg = Dsv4IntConfig.from_config(
+        {
+            "quant_method": "dsv4_int",
+            dsv4_int_module._APPMANA_EXPERIMENTAL_IMMA_CONFIG_KEY: True,
+            "config_groups": {
+                "experts_w4a16": {
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "int",
+                    }
+                },
+                "linears_w8a16": {
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "symmetric": True,
+                    }
+                },
+            },
+        }
+    )
+    assert cfg.appmana_experimental_int8_runtime
+    payload = pickle.dumps(cfg)
+    monkeypatch.setattr(
+        dsv4_int_module,
+        "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE",
+        False,
+    )
+
+    restored = pickle.loads(payload)
+
+    assert restored.appmana_experimental_int8_runtime
     assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
 
 
