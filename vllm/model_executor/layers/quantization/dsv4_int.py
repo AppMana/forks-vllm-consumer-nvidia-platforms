@@ -477,6 +477,12 @@ class Dsv4IntConfig(QuantizationConfig):
         )
         self.activation_scheme = "dynamic"
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        _mark_dsv4_int4_experts_int8_dense_active(
+            self.appmana_experimental_int8_runtime
+        )
+
     @classmethod
     def get_name(cls) -> QuantizationMethods:
         return "dsv4_int"
