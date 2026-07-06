@@ -788,14 +788,14 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     if device_capability is not None and device_capability.major == 12:
         return DeepseekV4FlashInferSM120Attention
     if device_capability is not None and device_capability.major == 8:
-        # Ampere (sm_8x): FlashMLA/FlashInfer FP8 decode kernels need sm_90+;
-        # use the portable all-Triton sparse-MLA path (FP8 upcast to bf16).
+        # Ampere (sm_8x): use the DSv4-specific sm86 path. It may mix native
+        # FlashMLA decode with Triton prefill/indexer depending on cache dtype.
         # Lazy import: nvidia_sm86 imports this module's siblings.
         from vllm.models.deepseek_v4.nvidia_sm86.attention import (
-            DeepseekV4TritonSM86Attention,
+            DeepseekV4SM86Attention,
         )
 
-        return DeepseekV4TritonSM86Attention
+        return DeepseekV4SM86Attention
     return DeepseekV4FlashMLAAttention
 
 
