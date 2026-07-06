@@ -64,6 +64,10 @@ from vllm.model_executor.layers.quantization.torchao import torchao_version_at_l
 
 logger = init_logger(__name__)
 
+_APPMANA_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY = (
+    "__experimental_enable_imma_from_https://github.com/appMana/forks-vllm-ampere"
+)
+
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
 # lock files in the temp directory will be automatically deleted when the
@@ -277,6 +281,20 @@ def get_quant_config(
         # quant config: the checkpoint determines `quant_cls`, and the user's
         # QuantizationConfigArgs is consulted by individual quant methods
         # (e.g. for activation overrides via the MXFP4 oracle).
+        if (
+            model_config.quantization == "dsv4_int"
+            and _APPMANA_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY not in hf_quant_config
+        ):
+            appmana_imma = getattr(
+                model_config.hf_config,
+                _APPMANA_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY,
+                None,
+            )
+            if appmana_imma is not None:
+                hf_quant_config = dict(hf_quant_config)
+                hf_quant_config[_APPMANA_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY] = (
+                    appmana_imma
+                )
 
         # For modelopt_mixed, config.json's quantization_config may or may
         # not contain the per-layer quantized_layers map.  Newer checkpoints
