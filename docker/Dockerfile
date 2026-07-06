@@ -1229,8 +1229,8 @@ for dist in ("vllm", "flash-mla"):
 flash_mla = importlib.import_module("flash_mla")
 if not hasattr(flash_mla, "flash_sparse_mla_prefill"):
     raise AttributeError("flash_mla.flash_sparse_mla_prefill")
-if not hasattr(flash_mla, "sparse_int8_mla_decode"):
-    raise AttributeError("flash_mla.sparse_int8_mla_decode")
+if not hasattr(flash_mla, "triton_sparse_int8_mla_decode"):
+    raise AttributeError("flash_mla.triton_sparse_int8_mla_decode")
 
 site_paths = {
     pathlib.Path(sysconfig.get_paths()["purelib"]),
