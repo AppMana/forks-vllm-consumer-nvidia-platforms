@@ -16,7 +16,8 @@ ARG PYTHON_VERSION
 ARG INSTALL_RAY=true
 ARG INSTALL_TRACING_TOOLS=true
 ARG INSTALL_USB4_RDMA_PROVIDER=false
-ARG USB4_RDMA_PROVIDER_VERSION=0.2.1
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.20
+ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG NCCL_PACKAGE_VERSION=
 ARG REPLACE_TORCH_BUNDLED_NCCL=false
 
@@ -43,8 +44,11 @@ RUN --mount=type=cache,target=/var/cache/apt \
           libibverbs1 \
           rdma-core; \
         curl -fsSL -o /tmp/usb4-rdma-provider.deb \
-          "https://github.com/hellas-ai/thunderbolt-ibverbs/releases/download/v${USB4_RDMA_PROVIDER_VERSION}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
-        apt-get install -y --no-install-recommends /tmp/usb4-rdma-provider.deb; \
+          "${APPMANA_THUNDERBOLT_RELEASE_REPO}/releases/download/v${USB4_RDMA_PROVIDER_VERSION}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
+        apt-get install -y --no-install-recommends --allow-change-held-packages \
+          /tmp/usb4-rdma-provider.deb; \
+        dpkg-query -W -f='${Package} ${Version}\n' usb4-rdma-provider; \
+        test -e /usr/lib/x86_64-linux-gnu/libibverbs/libusb4_rdma-rdmav34.so; \
         rm -f /tmp/usb4-rdma-provider.deb; \
       fi; \
       rm -rf /var/lib/apt/lists/*; \
