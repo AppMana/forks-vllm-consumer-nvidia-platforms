@@ -47,6 +47,7 @@ lmcache_git_ref="${LMCACHE_GIT_REF:-cd51f3a15766e326f92998c072264a5a6caa4efe}"
 appmana_nccl_git_repo="${APPMANA_NCCL_GIT_REPO:-https://github.com/AppMana/forks-nccl-rdma-routing.git}"
 appmana_nccl_git_ref="${APPMANA_NCCL_GIT_REF:-b8fabdc5145fab760c1a9acce2892ac6077b1679}"
 vllm_source_repo="${VLLM_SOURCE_REPO:-https://github.com/AppMana/forks-vllm-ampere}"
+flashmla_wheel_url="${FLASHMLA_WHEEL_URL:-}"
 
 secret_args=()
 cache_args=()
@@ -109,6 +110,7 @@ docker buildx build "${repo_root}" \
   --build-arg "VLLM_SKIP_FLASH_ATTN_BUILD=${skip_flash_attn_build}" \
   --build-arg "INSTALL_KV_CONNECTORS=${install_kv_connectors}" \
   --build-arg "LMCACHE_GIT_REF=${lmcache_git_ref}" \
+  --build-arg "FLASHMLA_WHEEL_URL=${flashmla_wheel_url}" \
   --build-arg "APPMANA_NCCL_GIT_REPO=${appmana_nccl_git_repo}" \
   --build-arg "APPMANA_NCCL_GIT_REF=${appmana_nccl_git_ref}" \
   --build-arg "VLLM_BUILD_COMMIT=${build_commit}" \
