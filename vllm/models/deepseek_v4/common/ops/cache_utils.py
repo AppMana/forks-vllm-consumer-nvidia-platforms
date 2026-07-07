@@ -1032,6 +1032,7 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
     use_fnuz: bool = False,
+    cache_dtype: str | None = None,
 ) -> None:
     """Dequantize and gather a paged DSv4 K cache.
 
@@ -1040,6 +1041,12 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
+    if cache_dtype == "int8_ds_mla":
+        dequantize_and_gather_int8_ds_mla_cache(
+            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        )
+        return
+
     # sm_8x lacks fp8e4nv in Triton (and the cutedsl path needs `quack`, which
     # is not installed on Ampere). Use the torch fallback there.
     if not _supports_fp8e4nv_in_triton():

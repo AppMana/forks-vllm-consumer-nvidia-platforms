@@ -71,9 +71,15 @@ def _resolve_dsv4_kv_cache_dtype(
     Both layouts are paged; they differ in the per-token block format. The
     ``fp8_ds_mla`` format is UE8M0 block-scaled fp8 packed as ``uint8`` (the
     canonical ``fp8_ds_mla`` string is written back onto ``cache_config`` so the
-    page-size specs pick the 576B per-token slot). Plain-row backends store each
-    token's KV row in its element dtype: bf16 or per-tensor FP8 E4M3.
+    page-size specs pick the 576B per-token slot). ``int8_ds_mla`` is signed
+    int8 rows plus fp32 row scales packed in a ``uint8`` backing tensor. Plain
+    row backends store each token's KV row in its element dtype: bf16 or
+    per-tensor FP8 E4M3.
     """
+    if kv_cache_dtype == "int8_ds_mla":
+        logger.info_once("Using DeepSeek's int8_ds_mla KV cache format.")
+        return kv_cache_dtype, torch.uint8
+
     if use_fp8_ds_mla_layout:
         # fp8_ds_mla block format: UE8M0 block-scaled fp8 packed as uint8.
         assert kv_cache_dtype.startswith("fp8"), (
@@ -164,6 +170,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
 
+        self.config = config
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
