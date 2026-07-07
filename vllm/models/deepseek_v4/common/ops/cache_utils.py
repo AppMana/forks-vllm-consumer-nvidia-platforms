@@ -262,8 +262,8 @@ def dequantize_and_gather_int8_ds_mla_cache(
     """Gather int8_ds_mla rows by block table and dequantize to bf16."""
     if gather_lens is None:
         gather_lens = seq_lens
-    seq_lens_l = seq_lens.to(torch.int64)
-    gather_lens_l = gather_lens.to(torch.int64)
+    seq_lens_l = seq_lens.detach().to(device="cpu", dtype=torch.int64)
+    gather_lens_l = gather_lens.detach().to(device="cpu", dtype=torch.int64)
     start_pos = seq_lens_l - gather_lens_l
 
     for r in range(seq_lens.shape[0]):
