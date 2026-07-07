@@ -1110,7 +1110,7 @@ ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG CUDA_VERSION
 ARG LMCACHE_GIT_REF=cd51f3a15766e326f92998c072264a5a6caa4efe
-ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-14cb23da1f2e1fb976c6be230020cc02d967c00b/flash_mla-1.0.0%2B14cb23d-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
+ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-52f4fd50ee10e0fe8881dca5790d1d658ea6fdf6/flash_mla-1.0.0%2B52f4fd5-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
