@@ -4,13 +4,10 @@
 
 import torch
 
-from vllm.logger import init_logger
 from vllm.triton_utils import LOG2E, tl, triton
 from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
     fp8e4m3_decode_to_fp32,
 )
-
-logger = init_logger(__name__)
 
 DEEPSEEK_V4_MLA_HEAD_DIM = 512
 FP8_DS_MLA_FP8_DIM = 448
@@ -90,34 +87,9 @@ def _view_packed_fp8_paged_mqa_kv_cache(
     return kv_values, kv_scale[..., :scale_elems]
 
 
-# Runtime dimensions and strides in this path come from scheduler chunking and
-# gathered KV views. Keep them out of Triton's value/alignment specialization;
-# otherwise it may emit variants with invalid divisibility assumptions for
-# non-16 chunk widths such as kv_rows=1032.
-@triton.jit(
-    do_not_specialize=[
-        "num_tokens",
-        "seq_kv",
-        "stride_qt",
-        "stride_qh",
-        "stride_qd",
-        "stride_kv_t",
-        "stride_kv_d",
-        "stride_indices_t",
-        "stride_indices_k",
-        "stride_out_t",
-        "stride_out_h",
-        "stride_out_d",
-    ],
-    do_not_specialize_on_alignment=[
-        "q_ptr",
-        "kv_ptr",
-        "indices_ptr",
-        "lengths_ptr",
-        "sink_ptr",
-        "out_ptr",
-    ],
-)
+# seq_kv tracks the context length; pin it off divisibility-by-16 specialization
+# (same recompile-wedge class as _mqa_logits_workspace_kernel).
+@triton.jit(do_not_specialize=["num_tokens", "seq_kv"])
 def _sparse_attention_bf16_kernel(
     q_ptr,
     kv_ptr,
@@ -130,16 +102,16 @@ def _sparse_attention_bf16_kernel(
     seq_kv: tl.int32,
     index_topk: tl.constexpr,
     sm_scale_log2: tl.constexpr,
-    stride_qt: tl.int64,
-    stride_qh: tl.int64,
-    stride_qd: tl.int64,
-    stride_kv_t: tl.int64,
-    stride_kv_d: tl.int64,
-    stride_indices_t: tl.int64,
-    stride_indices_k: tl.int64,
-    stride_out_t: tl.int64,
-    stride_out_h: tl.int64,
-    stride_out_d: tl.int64,
+    stride_qt: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kv_t: tl.constexpr,
+    stride_kv_d: tl.constexpr,
+    stride_indices_t: tl.constexpr,
+    stride_indices_k: tl.constexpr,
+    stride_out_t: tl.constexpr,
+    stride_out_h: tl.constexpr,
+    stride_out_d: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -241,18 +213,7 @@ def sparse_attention_triton(
     assert kv.shape[-1] == head_dim
     assert out.shape[-1] == head_dim
 
-    logger.info_once(
-        "DeepSeek-V4 sm86 sparse MLA prefill dispatch: backend=triton_bf16 "
-        "BLOCK_H=32 BLOCK_N=16 tokens=%d heads=%d head_dim=%d kv_rows=%d "
-        "index_width=%d has_sink=%s",
-        num_tokens,
-        num_heads,
-        head_dim,
-        kv.shape[0],
-        indices.shape[-1],
-        attn_sink is not None,
-    )
-    grid = (num_tokens, triton.cdiv(num_heads, 32))
+    grid = (num_tokens, triton.cdiv(num_heads, 8))
     _sparse_attention_bf16_kernel[grid](
         q,
         kv,
@@ -275,7 +236,7 @@ def sparse_attention_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        BLOCK_H=32,
+        BLOCK_H=8,
         BLOCK_N=16,
         BLOCK_D=DEEPSEEK_V4_MLA_HEAD_DIM,
         HAS_SINK=attn_sink is not None,
@@ -284,38 +245,7 @@ def sparse_attention_triton(
     )
 
 
-@triton.jit(
-    do_not_specialize=[
-        "num_tokens",
-        "swa_stride_block_bytes",
-        "extra_stride_block_bytes",
-        "stride_qt",
-        "stride_qh",
-        "stride_qd",
-        "stride_swa_indices_t",
-        "stride_swa_indices_k",
-        "stride_extra_indices_t",
-        "stride_extra_indices_k",
-        "stride_out_t",
-        "stride_out_h",
-        "stride_out_d",
-    ],
-    do_not_specialize_on_alignment=[
-        "q_ptr",
-        "swa_cache_fp8_ptr",
-        "swa_cache_bf16_ptr",
-        "swa_cache_u8_ptr",
-        "swa_indices_ptr",
-        "swa_lens_ptr",
-        "extra_cache_fp8_ptr",
-        "extra_cache_bf16_ptr",
-        "extra_cache_u8_ptr",
-        "extra_indices_ptr",
-        "extra_lens_ptr",
-        "sink_ptr",
-        "out_ptr",
-    ],
-)
+@triton.jit(do_not_specialize=["num_tokens"])
 def _decode_sparse_attention_fp8_kernel(
     q_ptr,
     swa_cache_fp8_ptr,
@@ -338,19 +268,19 @@ def _decode_sparse_attention_fp8_kernel(
     extra_num_blocks: tl.constexpr,
     swa_block_size: tl.constexpr,
     extra_block_size: tl.constexpr,
-    swa_stride_block_bytes: tl.int64,
-    extra_stride_block_bytes: tl.int64,
+    swa_stride_block_bytes: tl.constexpr,
+    extra_stride_block_bytes: tl.constexpr,
     sm_scale_log2: tl.constexpr,
-    stride_qt: tl.int64,
-    stride_qh: tl.int64,
-    stride_qd: tl.int64,
-    stride_swa_indices_t: tl.int64,
-    stride_swa_indices_k: tl.int64,
-    stride_extra_indices_t: tl.int64,
-    stride_extra_indices_k: tl.int64,
-    stride_out_t: tl.int64,
-    stride_out_h: tl.int64,
-    stride_out_d: tl.int64,
+    stride_qt: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_swa_indices_t: tl.constexpr,
+    stride_swa_indices_k: tl.constexpr,
+    stride_extra_indices_t: tl.constexpr,
+    stride_extra_indices_k: tl.constexpr,
+    stride_out_t: tl.constexpr,
+    stride_out_h: tl.constexpr,
+    stride_out_d: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -533,19 +463,7 @@ def decode_sparse_attention_triton(
     assert extra_cache is not None
     assert extra_indices is not None
     assert extra_lens is not None
-    logger.info_once(
-        "DeepSeek-V4 sm86 sparse MLA decode dispatch: backend=triton_fp8 "
-        "BLOCK_H=16 BLOCK_N=16 tokens=%d heads=%d head_dim=%d "
-        "swa_topk=%d extra_topk=%d has_extra=%s has_sink=%s",
-        num_tokens,
-        num_heads,
-        head_dim,
-        swa_indices.shape[-1],
-        extra_indices.shape[-1] if has_extra else 0,
-        has_extra,
-        attn_sink is not None,
-    )
-    grid = (num_tokens, triton.cdiv(num_heads, 16))
+    grid = (num_tokens, triton.cdiv(num_heads, 8))
     _decode_sparse_attention_fp8_kernel[grid](
         q,
         swa_cache,
@@ -581,7 +499,7 @@ def decode_sparse_attention_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        BLOCK_H=16,
+        BLOCK_H=8,
         BLOCK_N=16,
         BLOCK_D=DEEPSEEK_V4_MLA_HEAD_DIM,
         FP8_DIM=FP8_DS_MLA_FP8_DIM,
@@ -901,24 +819,7 @@ def fp8_mqa_logits_triton(
     return logits
 
 
-@triton.jit(
-    do_not_specialize=[
-        "logits_width",
-        "num_rows",
-        "token_start",
-        "stride_lm",
-        "stride_ln",
-    ],
-    do_not_specialize_on_alignment=[
-        "q_ptr",
-        "kv_ptr",
-        "scale_ptr",
-        "weights_ptr",
-        "context_lens_ptr",
-        "block_tables_ptr",
-        "logits_ptr",
-    ],
-)
+@triton.jit(do_not_specialize=["logits_width", "num_rows", "token_start", "stride_lm"])
 def _fp8_paged_mqa_logits_kernel(
     q_ptr,
     kv_ptr,
@@ -952,7 +853,7 @@ def _fp8_paged_mqa_logits_kernel(
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
     stride_lm: tl.int64,
-    stride_ln: tl.int64,
+    stride_ln: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -1053,19 +954,6 @@ def fp8_paged_mqa_logits_triton(
     # cache + checkpoint-enabled IMMA are on; fused_indexer_q emits an int8 q
     # tensor and folds its scale into `weights`, so detect it by dtype here.
     q_is_int8 = q.dtype == torch.int8
-    logger.info_once(
-        "DeepSeek-V4 sm86 indexer dispatch: backend=triton_paged_mqa "
-        "q_dtype=%s kv_cache_int8=%s qk_int8=%s rows=%d heads=%d "
-        "head_dim=%d token_start=%d token_count=%s",
-        q.dtype,
-        indexer_cache_is_int8(),
-        q_is_int8,
-        batch_size * next_n,
-        num_heads,
-        head_dim,
-        token_start,
-        token_count if token_count is not None else "max",
-    )
     if head_dim % 64 == 0 and num_heads % 4 == 0:
         return fp8_paged_mqa_logits_rowwise_triton(
             q,
@@ -1145,24 +1033,7 @@ def fp8_paged_mqa_logits_triton(
     return logits[:, :token_count]
 
 
-@triton.jit(
-    do_not_specialize=[
-        "logits_width",
-        "num_rows",
-        "token_start",
-        "stride_lm",
-        "stride_ln",
-    ],
-    do_not_specialize_on_alignment=[
-        "q_ptr",
-        "kv_ptr",
-        "scale_ptr",
-        "weights_ptr",
-        "context_lens_ptr",
-        "block_tables_ptr",
-        "logits_ptr",
-    ],
-)
+@triton.jit(do_not_specialize=["logits_width", "num_rows", "token_start", "stride_lm"])
 def _fp8_paged_mqa_logits_rowwise_kernel(
     q_ptr,
     kv_ptr,
@@ -1196,7 +1067,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
     stride_lm: tl.int64,
-    stride_ln: tl.int64,
+    stride_ln: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -1533,30 +1404,7 @@ def tf32_hc_prenorm_gemm_triton(
 # crossing the ÷16 boundary, recompiling ~every 16 tokens. Stacked over a long
 # generation these ~165ms compiles wedge the whole PP chain (one rank pinned in
 # Triton launch, the rest blocked on the collective). Pinning them off compiles once.
-@triton.jit(
-    do_not_specialize=[
-        "num_rows",
-        "seq_len_kv",
-        "stride_qm",
-        "stride_qh",
-        "stride_qd",
-        "stride_kn",
-        "stride_kd",
-        "stride_wm",
-        "stride_wh",
-        "stride_lm",
-        "stride_ln",
-    ],
-    do_not_specialize_on_alignment=[
-        "q_ptr",
-        "k_ptr",
-        "k_scale_ptr",
-        "weights_ptr",
-        "ks_ptr",
-        "ke_ptr",
-        "logits_ptr",
-    ],
-)
+@triton.jit(do_not_specialize=["num_rows", "seq_len_kv", "stride_lm"])
 def _mqa_logits_workspace_kernel(
     q_ptr,
     k_ptr,
@@ -1569,15 +1417,15 @@ def _mqa_logits_workspace_kernel(
     seq_len_kv,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    stride_qm: tl.int64,
-    stride_qh: tl.int64,
-    stride_qd: tl.int64,
-    stride_kn: tl.int64,
-    stride_kd: tl.int64,
-    stride_wm: tl.int64,
-    stride_wh: tl.int64,
+    stride_qm: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_wh: tl.constexpr,
     stride_lm: tl.int64,
-    stride_ln: tl.int64,
+    stride_ln: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,

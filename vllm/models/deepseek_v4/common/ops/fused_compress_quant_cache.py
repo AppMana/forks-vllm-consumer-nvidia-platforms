@@ -52,7 +52,6 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
-    int8_ds_mla: bool = False,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -102,7 +101,6 @@ def compress_norm_rope_store_triton(
         QUANT_BLOCK=quant_block,
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
-        INT8_DS_MLA=int8_ds_mla,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         num_warps=num_warps,
         **pdl_kwargs,
@@ -146,7 +144,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     QUANT_BLOCK: tl.constexpr,  # 64 for DeepseekV4
     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
-    INT8_DS_MLA: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
@@ -238,42 +235,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM  # 448
     HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2  # 32
 
-    # Register-based GPT-J RoPE in fp32.
-    NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
-    NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
-
-    pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
-    even, odd = tl.split(pair_2d)  # each [NUM_PAIRS] fp32
-
-    pair_idx = tl.arange(0, NUM_PAIRS)
-    rope_pair_local = pair_idx - NOPE_PAIRS
-    is_rope_pair = rope_pair_local >= 0
-    cs_idx = tl.maximum(rope_pair_local, 0)
-
-    compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
-    cache_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
-    cos_v = tl.load(cache_base + cs_idx, mask=is_rope_pair, other=1.0)
-    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0)
-
-    new_even = even * cos_v - odd * sin_v
-    new_odd = odd * cos_v + even * sin_v
-    result = tl.interleave(new_even, new_odd)  # [TRITON_BLOCK_SIZE] fp32
-
-    if INT8_DS_MLA:
-        tl.static_assert(HEAD_SIZE == 512)
-        tl.static_assert(TOKEN_STRIDE == 516)
-        tl.static_assert(SCALE_DIM == 4)
-        result_bf16 = result.to(tl.bfloat16).to(tl.float32)
-        absmax = tl.maximum(tl.max(tl.abs(result_bf16), axis=0), 1.0e-12)
-        row_scale = absmax / 127.0
-        scaled = result_bf16 / row_scale
-        rounded = scaled + tl.where(scaled >= 0.0, 0.5, -0.5)
-        q_i8 = tl.maximum(tl.minimum(rounded, 127.0), -127.0).to(tl.int8)
-        tl.store(fp8_ptr + block, q_i8.to(tl.uint8, bitcast=True), mask=mask)
-        row_scale_ptr = (fp8_ptr + HEAD_SIZE).to(tl.pointer_type(tl.float32))
-        tl.store(row_scale_ptr, row_scale)
-        return
-
     # FP8 UE8M0 quant: cast fp32 → bf16 → fp32 before quant to match reference.
     N_QUANT_BLOCKS: tl.constexpr = TRITON_BLOCK_SIZE // QUANT_BLOCK
     N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK  # 7
@@ -306,6 +267,27 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         mask=scale_idx < N_NOPE_BLOCKS,
     )
     tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+
+    # Register-based GPT-J RoPE in fp32.
+    NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
+    NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
+
+    pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)  # each [NUM_PAIRS] fp32
+
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair_local = pair_idx - NOPE_PAIRS
+    is_rope_pair = rope_pair_local >= 0
+    cs_idx = tl.maximum(rope_pair_local, 0)
+
+    compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
+    cache_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
+    cos_v = tl.load(cache_base + cs_idx, mask=is_rope_pair, other=1.0)
+    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0)
+
+    new_even = even * cos_v - odd * sin_v
+    new_odd = odd * cos_v + even * sin_v
+    result = tl.interleave(new_even, new_odd)  # [TRITON_BLOCK_SIZE] fp32
 
     # Store rotated rope portion as bf16 into the cache's bf16 area.
     bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
@@ -351,7 +333,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     QUANT_BLOCK: tl.constexpr,  # 128 for indexer
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
-    INT8_DS_MLA: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
@@ -528,7 +509,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     QUANT_BLOCK: tl.constexpr,  # 32 for MXFP4
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
-    INT8_DS_MLA: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
