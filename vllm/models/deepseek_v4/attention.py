@@ -483,7 +483,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=aux_streams is not None,
+                enable=aux_streams is not None
+                and hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
