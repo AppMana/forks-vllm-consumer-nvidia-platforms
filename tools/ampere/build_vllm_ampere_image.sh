@@ -110,7 +110,7 @@ docker buildx build "${repo_root}" \
   --build-arg "VLLM_SKIP_FLASH_ATTN_BUILD=${skip_flash_attn_build}" \
   --build-arg "INSTALL_KV_CONNECTORS=${install_kv_connectors}" \
   --build-arg "LMCACHE_GIT_REF=${lmcache_git_ref}" \
-  --build-arg "FLASHMLA_WHEEL_URL=${flashmla_wheel_url}" \
+  ${flashmla_wheel_url:+--build-arg "FLASHMLA_WHEEL_URL=${flashmla_wheel_url}"} \
   --build-arg "APPMANA_NCCL_GIT_REPO=${appmana_nccl_git_repo}" \
   --build-arg "APPMANA_NCCL_GIT_REF=${appmana_nccl_git_ref}" \
   --build-arg "VLLM_BUILD_COMMIT=${build_commit}" \
