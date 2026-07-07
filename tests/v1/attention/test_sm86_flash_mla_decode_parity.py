@@ -21,7 +21,7 @@ from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (  # noqa: E402
     decode_sparse_attention_triton,
 )
 from vllm.models.deepseek_v4.nvidia_sm86.attention import (  # noqa: E402
-    DeepseekV4TritonSM86Attention,
+    DeepseekV4SM86Attention,
 )
 
 _FP8_DIM = 448
@@ -93,6 +93,84 @@ def test_flash_mla_decode_matches_triton(topk: int, num_tokens: int) -> None:
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 8,
+    reason="flash_mla sparse-MLA decode requires Ampere (sm_8x)",
+)
+def test_flash_mla_decode_matches_triton_with_extra_cache() -> None:
+    torch.manual_seed(13)
+    dev = "cuda"
+    num_tokens, H, block_size = 1, 64, 32
+    swa_topk, extra_topk = 128, 1664
+    scale = 1.0 / math.sqrt(_HEAD_DIM)
+
+    swa_slots = swa_topk + 64
+    extra_slots = extra_topk + 256
+    swa_cache = torch.zeros(
+        (swa_slots + block_size - 1) // block_size,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device=dev,
+    )
+    extra_cache = torch.zeros(
+        (extra_slots + block_size - 1) // block_size,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device=dev,
+    )
+    for slot in range(swa_slots):
+        _write_fp8_ds_mla_token(swa_cache, slot, block_size)
+    for slot in range(extra_slots):
+        _write_fp8_ds_mla_token(extra_cache, slot, block_size)
+
+    q = torch.randn(num_tokens, H, _HEAD_DIM, device=dev, dtype=torch.bfloat16)
+    swa_lens = torch.full((num_tokens,), swa_topk, dtype=torch.int32, device=dev)
+    extra_lens = torch.full((num_tokens,), extra_topk, dtype=torch.int32, device=dev)
+    swa_idx = torch.stack(
+        [
+            torch.randperm(swa_slots, device=dev)[:swa_topk].to(torch.int32)
+            for _ in range(num_tokens)
+        ]
+    )
+    extra_idx = torch.stack(
+        [
+            torch.randperm(extra_slots, device=dev)[:extra_topk].to(torch.int32)
+            for _ in range(num_tokens)
+        ]
+    )
+    sink = torch.randn(H, device=dev, dtype=torch.float32) * 0.1
+
+    flash_out = flash_sparse_mla_decode(
+        q=q,
+        swa_cache=swa_cache,
+        swa_indices=swa_idx,
+        swa_lens=swa_lens,
+        scale=scale,
+        attn_sink=sink,
+        extra_cache=extra_cache,
+        extra_indices=extra_idx,
+        extra_lens=extra_lens,
+    )
+    tri_out = torch.empty_like(q)
+    decode_sparse_attention_triton(
+        q=q,
+        swa_cache=swa_cache,
+        swa_indices=swa_idx,
+        swa_lens=swa_lens,
+        scale=scale,
+        attn_sink=sink,
+        out=tri_out,
+        extra_cache=extra_cache,
+        extra_indices=extra_idx,
+        extra_lens=extra_lens,
+    )
+
+    cd = _cos_diff(flash_out.float(), tri_out.float())
+    assert cd < 8e-5, f"flash_mla vs Triton extra-cache cos_diff={cd:.2e}"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 8,
     reason="flash_mla sparse-MLA prefill requires Ampere (sm_8x)",
 )
 def test_flash_mla_prefill_rejects_or_matches_real_swa_metadata_shape() -> None:
@@ -138,6 +216,6 @@ def test_flash_mla_prefill_rejects_or_matches_real_swa_metadata_shape() -> None:
 
 
 def test_sm86_prefill_uses_triton_attention() -> None:
-    source = inspect.getsource(DeepseekV4TritonSM86Attention._forward_prefill)
+    source = inspect.getsource(DeepseekV4SM86Attention._forward_prefill)
     assert "sparse_attention_triton" in source
     assert "flash_sparse_mla_prefill" not in source
