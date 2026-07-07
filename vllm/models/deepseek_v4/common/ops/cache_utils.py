@@ -164,6 +164,55 @@ def _has_int8_ds_mla_cache_layout(k_cache: torch.Tensor, block_size: int) -> boo
     return False
 
 
+@triton.jit(
+    do_not_specialize=["num_slots", "block_size", "cache_block_stride"],
+    do_not_specialize_on_alignment=["out_ptr", "k_cache_ptr", "slot_ids_ptr"],
+)
+def _dequantize_global_slots_int8_ds_mla_cache_kernel(
+    out_ptr,
+    k_cache_ptr,
+    slot_ids_ptr,
+    num_slots,
+    max_slots,
+    block_size,
+    cache_block_stride,
+    out_stride0,
+    out_stride1,
+    out_stride2,
+    topk: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row >= num_slots:
+        return
+
+    token_id = row // topk
+    candidate_id = row - token_id * topk
+    slot = tl.load(slot_ids_ptr + row)
+    offsets = tl.arange(0, BLOCK)
+    out_base = (
+        out_ptr
+        + token_id * out_stride0
+        + candidate_id * out_stride1
+        + offsets * out_stride2
+    )
+
+    valid = (slot >= 0) & (slot < max_slots)
+    block_idx = slot // block_size
+    pos_in_block = slot - block_idx * block_size
+    cache_base = (
+        k_cache_ptr
+        + block_idx.to(tl.int64) * cache_block_stride
+        + pos_in_block * 516
+    )
+    q_u8 = tl.load(cache_base + offsets, mask=valid, other=0)
+    q = q_u8.to(tl.int8, bitcast=True).to(tl.float32)
+    scale = tl.load((cache_base + 512).to(tl.pointer_type(tl.float32)),
+                    mask=valid,
+                    other=0.0)
+    tl.store(out_base, (q * scale).to(tl.bfloat16), mask=valid & (offsets < 512))
+
+
 def dequantize_global_slots_int8_ds_mla_cache(
     out: torch.Tensor,
     k_cache: torch.Tensor,
@@ -184,40 +233,21 @@ def dequantize_global_slots_int8_ds_mla_cache(
 
     flat_cache = _flatten_int8_ds_mla_cache(k_cache)
     num_tokens, topk = slot_ids.shape
-    slots = slot_ids.reshape(-1).to(torch.int64)
-    valid = (slots >= 0) & (slots < k_cache.shape[0] * block_size)
-    token_ids = torch.arange(num_tokens, device=slot_ids.device)[:, None]
-    candidate_ids = torch.arange(topk, device=slot_ids.device)[None, :]
-    token_ids = token_ids.expand(num_tokens, topk).reshape(-1)
-    candidate_ids = candidate_ids.expand(num_tokens, topk).reshape(-1)
-    out[token_ids[~valid], candidate_ids[~valid]] = 0
-    if not valid.any():
-        return
-
-    valid_slots = slots[valid]
-    block_idx = valid_slots // block_size
-    pos_in_block = valid_slots % block_size
-    selected = flat_cache.index_select(0, block_idx)
-    device = k_cache.device
-    data_cols = (
-        pos_in_block.unsqueeze(1) * _INT8_DS_MLA_TOKEN_BYTES
-        + torch.arange(_INT8_DS_MLA_DIM, device=device, dtype=torch.int64).unsqueeze(0)
+    slots = slot_ids.reshape(-1).to(torch.int64).contiguous()
+    _dequantize_global_slots_int8_ds_mla_cache_kernel[(num_tokens * topk,)](
+        out,
+        flat_cache,
+        slots,
+        num_tokens * topk,
+        k_cache.shape[0] * block_size,
+        block_size,
+        flat_cache.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        topk=topk,
+        BLOCK=triton.next_power_of_2(_INT8_DS_MLA_DIM),
     )
-    scale_cols = (
-        pos_in_block.unsqueeze(1) * _INT8_DS_MLA_TOKEN_BYTES
-        + _INT8_DS_MLA_DIM
-        + torch.arange(
-            _INT8_DS_MLA_SCALE_BYTES, device=device, dtype=torch.int64
-        ).unsqueeze(0)
-    )
-    q = selected.gather(1, data_cols).contiguous().view(torch.int8).to(torch.float32)
-    scale = (
-        selected.gather(1, scale_cols)
-        .contiguous()
-        .view(torch.float32)
-        .view(-1, 1)
-    )
-    out[token_ids[valid], candidate_ids[valid]] = (q * scale).to(torch.bfloat16)
 
 
 def dequantize_and_gather_int8_ds_mla_cache(
