@@ -112,7 +112,19 @@ def compress_norm_rope_store_triton(
 # =============================================================================
 # DeepseekV4 Attention path (head=512, nope=448 FP8 + rope=64 bf16)
 # =============================================================================
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "state_cache_ptr",
+        "token_to_req_indices_ptr",
+        "positions_ptr",
+        "slot_mapping_ptr",
+        "block_table_ptr",
+        "rms_norm_weight_ptr",
+        "cos_sin_cache_ptr",
+        "k_cache_ptr",
+        "kv_slot_mapping_ptr",
+    ],
+)
 def _fused_kv_compress_norm_rope_insert_sparse_attn(
     # ── state cache (compressor internal state) ──
     state_cache_ptr,
