@@ -140,6 +140,44 @@ def test_int8_ds_mla_gather_dequant() -> None:
     )
 
 
+def test_int8_ds_mla_gather_dequant_prefill_shape() -> None:
+    device = _device()
+    if device.type != "cuda":
+        return
+
+    block_size = 64
+    num_blocks = 40
+    num_tokens = num_blocks * block_size
+    k = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device=device)
+    k_cache = torch.zeros(num_blocks, block_size, 516, dtype=torch.uint8, device=device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    quantize_and_insert_int8_ds_mla_cache(k, k_cache, slot_mapping, block_size)
+
+    out = torch.empty(2, 1152, 512, dtype=torch.bfloat16, device=device)
+    seq_lens = torch.tensor([1536, 2560], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([512, 1024], dtype=torch.int32, device=device)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).view(1, -1)
+    block_table = block_table.repeat(2, 1)
+    dequantize_and_gather_int8_ds_mla_cache(
+        out,
+        k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        offset=128,
+    )
+    torch.cuda.synchronize()
+
+    expected = _expected_int8_dequant(k)
+    torch.testing.assert_close(
+        out[0, 128:640], expected[1024:1536], rtol=0, atol=_INT8_DS_MLA_ATOL
+    )
+    torch.testing.assert_close(
+        out[1, 128:1152], expected[1536:2560], rtol=0, atol=_INT8_DS_MLA_ATOL
+    )
+
+
 def test_generic_gather_dispatches_int8_ds_mla() -> None:
     device = _device()
     block_size = 4
