@@ -450,15 +450,29 @@ def get_bundles_sorted_by_node(
             node_ip for _, _, node_ip in bundle_to_node_id if node_ip not in ip_to_order
         )
         if not missing_ips and len(ip_to_order) == len(worker_ip_order):
-            logger.info(
-                "Sorting Ray placement-group bundles by "
-                "VLLM_RAY_WORKER_IP_ORDER: %s",
-                sorted(
-                    (bundle_idx, node_ip, ip_to_order[node_ip])
-                    for bundle_idx, _, node_ip in bundle_to_node_id
-                ),
-            )
             bundle_to_node_id.sort(key=lambda item: ip_to_order[item[2]])
+            final_ip_order = [node_ip for _, _, node_ip in bundle_to_node_id]
+            expected_ip_order = worker_ip_order[:len(final_ip_order)]
+            if final_ip_order != expected_ip_order:
+                raise RuntimeError(
+                    "Ray placement-group bundle order does not match "
+                    "VLLM_RAY_WORKER_IP_ORDER after sorting: "
+                    f"final_ip_order={final_ip_order} "
+                    f"expected_ip_order={expected_ip_order} "
+                    f"bundle_to_node_id={bundle_to_node_id}"
+                )
+            logger.info(
+                "Ray placement-group rank mapping from "
+                "VLLM_RAY_WORKER_IP_ORDER: %s",
+                [
+                    {
+                        "rank": rank,
+                        "bundle_idx": bundle_idx,
+                        "node_ip": node_ip,
+                    }
+                    for rank, (bundle_idx, _, node_ip) in enumerate(bundle_to_node_id)
+                ],
+            )
             return bundle_to_node_id
         logger.warning(
             "Ignoring VLLM_RAY_WORKER_IP_ORDER for Ray bundle ordering; "

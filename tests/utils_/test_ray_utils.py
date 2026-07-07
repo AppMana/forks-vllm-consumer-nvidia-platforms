@@ -98,3 +98,41 @@ def test_get_bundles_sorted_by_node(bundles_to_node_id, bundle_specs, expected):
         result = get_bundles_sorted_by_node(mock_pg)
 
     assert result == expected
+
+
+def test_get_bundles_sorted_by_configured_worker_ip_order():
+    mock_pg = MagicMock()
+    mock_pg.bundle_specs = [{"GPU": 1}] * 3
+
+    mock_ctx = MagicMock()
+    mock_ctx.get_node_id.return_value = NODE_A
+
+    bundles_to_node_id = {
+        0: NODE_B,
+        1: NODE_C,
+        2: NODE_A,
+    }
+
+    with (
+        patch(
+            "vllm.v1.executor.ray_utils.placement_group_table",
+            return_value={"bundles_to_node_id": bundles_to_node_id},
+        ),
+        patch("vllm.v1.executor.ray_utils.ray") as mock_ray,
+        patch("vllm.v1.executor.ray_utils.current_platform") as mock_platform,
+        patch(
+            "vllm.v1.executor.ray_utils.envs.VLLM_RAY_WORKER_IP_ORDER",
+            f"{IP_A},{IP_B},{IP_C}",
+        ),
+    ):
+        mock_ray.get_runtime_context.return_value = mock_ctx
+        mock_ray.nodes.return_value = MOCK_RAY_NODES
+        mock_platform.ray_device_key = "GPU"
+
+        result = get_bundles_sorted_by_node(mock_pg)
+
+    assert result == [
+        (2, NODE_A, IP_A),
+        (0, NODE_B, IP_B),
+        (1, NODE_C, IP_C),
+    ]
