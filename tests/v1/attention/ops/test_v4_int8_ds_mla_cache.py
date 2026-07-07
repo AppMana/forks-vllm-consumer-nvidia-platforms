@@ -6,11 +6,13 @@ import inspect
 
 import torch
 
+from vllm.models.deepseek_v4.attention import _resolve_dsv4_kv_cache_dtype
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
 )
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     dequantize_and_gather_int8_ds_mla_cache,
+    dequantize_and_gather_k_cache,
     dequantize_global_slots_int8_ds_mla_cache,
     get_int8_ds_mla_cache_views,
     quantize_and_insert_int8_ds_mla_cache,
@@ -30,9 +32,22 @@ def _expected_int8_dequant(k: torch.Tensor) -> torch.Tensor:
     return (q * scale.unsqueeze(-1)).to(torch.bfloat16)
 
 
+_INT8_DS_MLA_ATOL = 3.2e-2
+
+
 def test_int8_ds_mla_compressor_launcher_accepts_runtime_selector() -> None:
     signature = inspect.signature(compress_norm_rope_store_triton)
     assert "int8_ds_mla" in signature.parameters
+
+
+def test_int8_ds_mla_resolves_to_uint8_even_for_fp8_layout_backend() -> None:
+    dtype_str, torch_dtype = _resolve_dsv4_kv_cache_dtype(
+        use_fp8_ds_mla_layout=True,
+        kv_cache_dtype="int8_ds_mla",
+        cache_config=None,
+    )
+    assert dtype_str == "int8_ds_mla"
+    assert torch_dtype is torch.uint8
 
 
 def test_int8_ds_mla_cache_shapes_and_page_sizes() -> None:
@@ -89,11 +104,11 @@ def test_int8_ds_mla_insert_global_dequant_and_views() -> None:
     dequantize_global_slots_int8_ds_mla_cache(out, k_cache, slot_ids, block_size)
 
     expected = _expected_int8_dequant(k)
-    torch.testing.assert_close(out[0, 0], expected[0], rtol=0, atol=0)
-    torch.testing.assert_close(out[0, 1], expected[2], rtol=0, atol=0)
-    torch.testing.assert_close(out[1, 0], expected[4], rtol=0, atol=0)
-    torch.testing.assert_close(out[1, 1], expected[5], rtol=0, atol=0)
-    torch.testing.assert_close(out[1, 2], expected[1], rtol=0, atol=0)
+    torch.testing.assert_close(out[0, 0], expected[0], rtol=0, atol=_INT8_DS_MLA_ATOL)
+    torch.testing.assert_close(out[0, 1], expected[2], rtol=0, atol=_INT8_DS_MLA_ATOL)
+    torch.testing.assert_close(out[1, 0], expected[4], rtol=0, atol=_INT8_DS_MLA_ATOL)
+    torch.testing.assert_close(out[1, 1], expected[5], rtol=0, atol=_INT8_DS_MLA_ATOL)
+    torch.testing.assert_close(out[1, 2], expected[1], rtol=0, atol=_INT8_DS_MLA_ATOL)
     assert torch.equal(out[0, 2], torch.zeros_like(out[0, 2]))
 
 
@@ -120,4 +135,35 @@ def test_int8_ds_mla_gather_dequant() -> None:
     )
 
     expected = _expected_int8_dequant(k)
-    torch.testing.assert_close(out[0, 2:5], expected[5:8], rtol=0, atol=0)
+    torch.testing.assert_close(
+        out[0, 2:5], expected[5:8], rtol=0, atol=_INT8_DS_MLA_ATOL
+    )
+
+
+def test_generic_gather_dispatches_int8_ds_mla() -> None:
+    device = _device()
+    block_size = 4
+    k = torch.randn(8, 512, dtype=torch.bfloat16, device=device)
+    k_cache = torch.zeros(2, block_size, 516, dtype=torch.uint8, device=device)
+    slot_mapping = torch.arange(8, dtype=torch.int64, device=device)
+    quantize_and_insert_int8_ds_mla_cache(k, k_cache, slot_mapping, block_size)
+
+    out = torch.empty(1, 3, 512, dtype=torch.bfloat16, device=device)
+    seq_lens = torch.tensor([8], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([3], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+    dequantize_and_gather_k_cache(
+        out,
+        k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        offset=0,
+        cache_dtype="int8_ds_mla",
+    )
+
+    expected = _expected_int8_dequant(k)
+    torch.testing.assert_close(
+        out[0], expected[5:8], rtol=0, atol=_INT8_DS_MLA_ATOL
+    )

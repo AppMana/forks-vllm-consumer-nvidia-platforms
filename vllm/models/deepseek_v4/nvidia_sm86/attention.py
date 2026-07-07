@@ -25,27 +25,74 @@ Ampere; the Triton kernels upcast FP8 inputs to bf16 internally.
 
 import torch
 
-# HARD dependency: the Ampere sm_86 sparse-MLA decode runs the precompiled flash_mla
-# CUDA kernel. No try/except, no env gate, no Triton fallback — if the kernel is not
-# present the import fails loudly at startup (we never want a silent degrade to the
-# slower per-row Triton path).
-from flash_mla import flash_sparse_mla_decode
+# HARD dependencies: Ampere sm_86 sparse-MLA decode runs through explicit
+# flash_mla symbols. No try/except, no env gate, no silent fallback.
+from flash_mla import flash_sparse_mla_decode, triton_sparse_int8_mla_decode
 
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    get_int8_ds_mla_cache_views,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
     sparse_attention_triton,
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
+from vllm.transformers_utils.configs.deepseek_v4 import (
+    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8,
+    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8,
+    DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
     """DeepSeek-V4 sparse-MLA on Ampere via portable Triton kernels."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        config = self.config
+        fp8_decode = config.deepseek_v4_sm86_sparse_mla_decode_fp8
+        int8_decode = config.deepseek_v4_sm86_sparse_mla_decode_int8
+        prefill = config.deepseek_v4_sm86_sparse_mla_prefill
+        if fp8_decode != DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8:
+            raise ValueError(
+                "Unsupported DeepSeek V4 SM86 fp8 decode kernel "
+                f"{fp8_decode!r}; expected "
+                f"{DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8!r}"
+            )
+        if int8_decode != DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8:
+            raise ValueError(
+                "Unsupported DeepSeek V4 SM86 int8 decode kernel "
+                f"{int8_decode!r}; expected "
+                f"{DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8!r}"
+            )
+        if prefill != DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL:
+            raise ValueError(
+                "Unsupported DeepSeek V4 SM86 prefill kernel "
+                f"{prefill!r}; expected {DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL!r}"
+            )
+        if self.kv_cache_dtype == "int8_ds_mla":
+            decode_symbol = DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8
+        elif self.kv_cache_dtype == "fp8_ds_mla":
+            decode_symbol = DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8
+        else:
+            raise ValueError(
+                "DeepSeek V4 SM86 sparse MLA requires fp8_ds_mla or "
+                f"int8_ds_mla KV cache, got {self.kv_cache_dtype}"
+            )
+        logger.info_once(
+            "DeepSeek V4 SM86 sparse MLA kernels: kv_cache_dtype=%s, "
+            "decode=%s, prefill=%s",
+            self.kv_cache_dtype,
+            decode_symbol,
+            DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL,
+        )
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -102,17 +149,45 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         extra_idx = None
         if topk_indices is not None:
             extra_idx = topk_indices.reshape(num_decode_tokens, -1)
-        out = flash_sparse_mla_decode(
-            q=q_rows,
-            swa_cache=swa_k_cache,
-            swa_indices=swa_indices,
-            swa_lens=swa_lens,
-            scale=self.scale,
-            attn_sink=self.attn_sink,
-            extra_cache=None if swa_only else kv_cache,
-            extra_indices=extra_idx,
-            extra_lens=None if topk_lens is None else topk_lens,
-        )
+        if self.kv_cache_dtype == "int8_ds_mla":
+            swa_rows, swa_scales = get_int8_ds_mla_cache_views(
+                swa_k_cache, swa_metadata.block_size
+            )
+            extra_rows = None
+            extra_scales = None
+            if not swa_only:
+                assert kv_cache is not None
+                assert attn_metadata is not None
+                extra_rows, extra_scales = get_int8_ds_mla_cache_views(
+                    kv_cache, attn_metadata.block_size // self.compress_ratio
+                )
+            out = triton_sparse_int8_mla_decode(
+                q=q_rows,
+                swa_cache=swa_rows,
+                swa_scale=swa_scales,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_cache=extra_rows,
+                extra_scale=extra_scales,
+                extra_indices=extra_idx,
+                extra_lens=None if topk_lens is None else topk_lens,
+            )
+        elif self.kv_cache_dtype == "fp8_ds_mla":
+            out = flash_sparse_mla_decode(
+                q=q_rows,
+                swa_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_cache=None if swa_only else kv_cache,
+                extra_indices=extra_idx,
+                extra_lens=None if topk_lens is None else topk_lens,
+            )
+        else:
+            raise ValueError(f"Unsupported SM86 KV cache dtype {self.kv_cache_dtype}")
         output[:num_decode_tokens].copy_(out)
         if output.shape[1] > self.n_local_heads:
             output[:, self.n_local_heads :].zero_()
@@ -179,6 +254,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                     block_table=block_table[chunk_start:chunk_end],
                     block_size=attn_metadata.block_size // self.compress_ratio,
                     offset=0,
+                    cache_dtype=self.kv_cache_dtype,
                 )
 
             swa_block_table = swa_metadata.block_table[num_decodes:]
@@ -190,6 +266,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 block_table=swa_block_table[chunk_start:chunk_end],
                 block_size=swa_metadata.block_size,
                 offset=chunk_N,
+                cache_dtype=self.kv_cache_dtype,
             )
 
             query_start = (
