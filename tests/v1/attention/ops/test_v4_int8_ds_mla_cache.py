@@ -167,3 +167,44 @@ def test_generic_gather_dispatches_int8_ds_mla() -> None:
     torch.testing.assert_close(
         out[0], expected[5:8], rtol=0, atol=_INT8_DS_MLA_ATOL
     )
+
+
+def test_generic_gather_leaves_fp8_shaped_aux_cache_on_fp8_path(monkeypatch) -> None:
+    import vllm.models.deepseek_v4.common.ops.cache_utils as cache_utils
+
+    calls = []
+
+    def fail_int8(*args, **kwargs):
+        raise AssertionError("int8 gather must not read fp8-shaped cache")
+
+    def record_fp8(*args, **kwargs):
+        calls.append("fp8")
+
+    monkeypatch.setattr(
+        cache_utils, "dequantize_and_gather_int8_ds_mla_cache", fail_int8
+    )
+    monkeypatch.setattr(cache_utils, "_dequantize_and_gather_k_cache_torch", record_fp8)
+    monkeypatch.setattr(cache_utils, "_supports_fp8e4nv_in_triton", lambda: False)
+
+    device = _device()
+    block_size = 64
+    out = torch.empty(1, 1, 512, dtype=torch.bfloat16, device=device)
+    fp8_shaped_cache = torch.zeros(
+        2, block_size, 584, dtype=torch.uint8, device=device
+    )
+    seq_lens = torch.tensor([1], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([1], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[0]], dtype=torch.int32, device=device)
+
+    dequantize_and_gather_k_cache(
+        out,
+        fp8_shaped_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        offset=0,
+        cache_dtype="int8_ds_mla",
+    )
+
+    assert calls == ["fp8"]
