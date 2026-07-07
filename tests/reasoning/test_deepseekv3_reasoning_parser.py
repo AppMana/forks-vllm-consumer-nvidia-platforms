@@ -46,6 +46,20 @@ def test_deepseek_v4_reasoning_parser_alias():
     assert parser_cls is DeepSeekV4ParserReasoningAdapter
 
 
+def test_deepseek_v4_alias_initializes_reasoning_tokens(tokenizer):
+    # Regression test for the same underlying requirement as the old
+    # DeepSeekV3ReasoningWithThinkingParser alias fix: ReasoningConfig.
+    # initialize_token_ids must be able to resolve <think>/</think> for
+    # deepseek_v4 without per-request chat_template_kwargs. Superseded by the
+    # native DeepSeekV4Parser-backed adapter (see deepseek_v4_engine_reasoning_parser),
+    # which owns think-token config directly instead of aliasing the v3 parser.
+    parser_cls = ReasoningParserManager.get_reasoning_parser("deepseek_v4")
+    parser = parser_cls(tokenizer)
+
+    assert parser.reasoning_start_str == "<think>"
+    assert parser.reasoning_end_str == "</think>"
+
+
 def test_identity_reasoning_parser_basic(tokenizer):
     parser = IdentityReasoningParser(tokenizer)
 

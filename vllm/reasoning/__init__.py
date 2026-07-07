@@ -29,6 +29,12 @@ _REASONING_PARSERS_TO_REGISTER = {
         "DeepSeekV3ReasoningParser",
     ),
     "deepseek_v4": (
+        # Native DeepSeekV4Parser-backed adapter (see
+        # deepseek_v4_engine_reasoning_parser) supersedes aliasing to the v3
+        # reasoning parser: it owns <think>/</think> token config directly, so
+        # ReasoningConfig.initialize_token_ids resolves them without
+        # per-request chat_template_kwargs (same requirement the
+        # DeepSeekV3ReasoningWithThinkingParser alias used to satisfy).
         "deepseek_v4_engine_reasoning_parser",
         "DeepSeekV4ParserReasoningAdapter",
     ),
