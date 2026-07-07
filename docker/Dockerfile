@@ -1182,7 +1182,7 @@ for name in (
 ):
     importlib.import_module(name)
 
-for dist in ("vllm", "flash-mla"):
+for dist in ("vllm",):
     importlib.metadata.version(dist)
 flash_mla = importlib.import_module("flash_mla")
 if not hasattr(flash_mla, "flash_sparse_mla_prefill"):
