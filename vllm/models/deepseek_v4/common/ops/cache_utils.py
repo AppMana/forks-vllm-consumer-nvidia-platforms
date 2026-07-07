@@ -154,6 +154,16 @@ def get_int8_ds_mla_cache_views(
     return data, scales
 
 
+def _has_int8_ds_mla_cache_layout(k_cache: torch.Tensor, block_size: int) -> bool:
+    if k_cache.dtype != torch.uint8:
+        return False
+    if k_cache.dim() == 3:
+        return k_cache.shape[-1] == _INT8_DS_MLA_TOKEN_BYTES
+    if k_cache.dim() == 2:
+        return k_cache.shape[-1] == block_size * _INT8_DS_MLA_TOKEN_BYTES
+    return False
+
+
 def dequantize_global_slots_int8_ds_mla_cache(
     out: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1042,10 +1052,14 @@ def dequantize_and_gather_k_cache(
     writes FNUZ on gfx942 and OCP on gfx950).
     """
     if cache_dtype == "int8_ds_mla":
-        dequantize_and_gather_int8_ds_mla_cache(
-            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
-        )
-        return
+        if _has_int8_ds_mla_cache_layout(k_cache, block_size):
+            dequantize_and_gather_int8_ds_mla_cache(
+                out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+            )
+            return
+        # Some DeepSeek V4 auxiliary/indexer caches remain in the fp8_ds_mla
+        # byte layout even when the main MLA cache uses int8_ds_mla.
+        cache_dtype = "fp8_ds_mla"
 
     # sm_8x lacks fp8e4nv in Triton (and the cutedsl path needs `quack`, which
     # is not installed on Ampere). Use the torch fallback there.
