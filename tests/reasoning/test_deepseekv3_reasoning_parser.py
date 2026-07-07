@@ -9,6 +9,9 @@ from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.reasoning import ReasoningParserManager
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from vllm.reasoning.deepseek_v3_reasoning_parser import DeepSeekV3ReasoningParser
+from vllm.reasoning.deepseek_v3_reasoning_parser import (
+    DeepSeekV3ReasoningWithThinkingParser,
+)
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
 
 REASONING_MODEL_NAME = "deepseek-ai/DeepSeek-V3.1"
@@ -37,7 +40,15 @@ def test_parser_selection(tokenizer, thinking, expected_parser_type):
 def test_deepseek_v4_reasoning_parser_alias():
     parser_cls = ReasoningParserManager.get_reasoning_parser("deepseek_v4")
 
-    assert parser_cls is DeepSeekV3ReasoningParser
+    assert parser_cls is DeepSeekV3ReasoningWithThinkingParser
+
+
+def test_deepseek_v4_alias_initializes_reasoning_tokens(tokenizer):
+    parser_cls = ReasoningParserManager.get_reasoning_parser("deepseek_v4")
+    parser = parser_cls(tokenizer)
+
+    assert parser.reasoning_start_str == "<think>"
+    assert parser.reasoning_end_str == "</think>"
 
 
 def test_identity_reasoning_parser_basic(tokenizer):
