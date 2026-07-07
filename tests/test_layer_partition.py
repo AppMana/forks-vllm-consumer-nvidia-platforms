@@ -13,19 +13,20 @@ compute_layer_range = partition.compute_layer_range
 select_shards = partition.select_shards
 
 
-def test_compute_layer_counts_puts_extra_layers_at_tail():
-    assert compute_layer_counts(7, 3) == [2, 2, 3]
-    assert compute_layer_counts(7, 4) == [1, 2, 2, 2]
-    assert compute_layer_counts(61, 12) == [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6]
+def test_compute_layer_counts_matches_vllm_pp_policy():
+    assert compute_layer_counts(7, 3) == [2, 3, 2]
+    assert compute_layer_counts(7, 4) == [2, 2, 2, 1]
+    assert compute_layer_counts(43, 10) == [4, 4, 4, 4, 4, 4, 5, 5, 5, 4]
+    assert compute_layer_counts(61, 12) == [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 5]
 
 
 def test_compute_layer_range():
     assert compute_layer_range(7, 3, 0) == (0, 2)
-    assert compute_layer_range(7, 3, 1) == (2, 4)
-    assert compute_layer_range(7, 3, 2) == (4, 7)
-    assert compute_layer_range(7, 4, 0) == (0, 1)
-    assert compute_layer_range(7, 4, 1) == (1, 3)
-    assert compute_layer_range(7, 4, 3) == (5, 7)
+    assert compute_layer_range(7, 3, 1) == (2, 5)
+    assert compute_layer_range(7, 3, 2) == (5, 7)
+    assert compute_layer_range(7, 4, 0) == (0, 2)
+    assert compute_layer_range(7, 4, 1) == (2, 4)
+    assert compute_layer_range(7, 4, 3) == (6, 7)
 
 
 def test_select_shards_uses_pp_rank_after_tp_grouping(tmp_path):
@@ -53,9 +54,9 @@ def test_select_shards_uses_pp_rank_after_tp_grouping(tmp_path):
         "embed.safetensors", "l0.safetensors", "l1.safetensors"
     ]
     assert select_shards(index, config, rank=2, tp_size=2, pp_size=3) == [
-        "l2.safetensors", "l3.safetensors"
+        "l2.safetensors", "l3.safetensors", "l4.safetensors"
     ]
     assert select_shards(index, config, rank=4, tp_size=2, pp_size=3) == [
-        "l4.safetensors", "l5.safetensors", "l6.safetensors",
-        "mtp.safetensors", "tail.safetensors"
+        "l5.safetensors", "l6.safetensors", "mtp.safetensors",
+        "tail.safetensors"
     ]

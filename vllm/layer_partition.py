@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Helpers for deterministic PP layer ownership and shard localization.
 
-vLLM's runtime uses :func:`vllm.distributed.utils.get_pp_indices`, but its
-default uneven split policy differs from AppMana's rank-local model
-materialization policy. This module emits an explicit
-``VLLM_PP_LAYER_PARTITION`` value and uses the same counts to select the
-rank-local safetensors shards.
+The shard selector must use the same uneven split policy as
+``vllm.distributed.utils.get_pp_indices``. Otherwise a rank-local safetensors
+view can contain a different layer range than the model instance on that rank.
 """
 
 from __future__ import annotations
@@ -31,10 +29,14 @@ def compute_layer_counts(num_layers: int, pp_size: int) -> list[int]:
         raise ValueError(f"pp_size must be positive, got {pp_size}")
 
     base, remainder = divmod(num_layers, pp_size)
-    # Put the larger ranks at the tail. Equivalently, when the remainder is
-    # large, put the smaller deficit at the head; this gives:
-    # 7/3 -> 2,2,3 and 7/4 -> 1,2,2,2.
-    return [base] * (pp_size - remainder) + [base + 1] * remainder
+    partitions = [base] * pp_size
+    # Match vllm.distributed.utils.get_pp_indices: put remainder layers on the
+    # middle/tail ranks, excluding the final rank because it also owns the
+    # output head/norm. Examples: 7/3 -> 2,3,2; 43/10 ->
+    # 4,4,4,4,4,4,5,5,5,4.
+    for i in range(2, remainder + 2):
+        partitions[-i] += 1
+    return partitions
 
 
 def compute_layer_range(num_layers: int, pp_size: int, pp_rank: int) -> tuple[int, int]:
