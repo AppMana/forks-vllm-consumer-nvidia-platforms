@@ -11,6 +11,7 @@ import platform
 from collections.abc import Callable
 from datetime import timedelta
 from functools import cache, lru_cache, wraps
+from importlib.util import find_spec
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
 import torch
@@ -39,10 +40,16 @@ else:
 
 logger = init_logger(__name__)
 
-try:
-    import vllm._qutlass_C  # noqa: F401
-except ImportError as e:
-    logger.warning("Failed to import from vllm._qutlass_C: %r", e)
+def _import_optional_qutlass() -> None:
+    if find_spec("vllm._qutlass_C") is None:
+        return
+    try:
+        import vllm._qutlass_C  # noqa: F401
+    except ImportError as e:
+        logger.warning_once("Failed to import from vllm._qutlass_C: %r", e)
+
+
+_import_optional_qutlass()
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -227,10 +234,7 @@ class CudaPlatformBase(Platform):
             logger.warning_once(
                 "Failed to import from vllm._moe_C_stable_libtorch: %r", e
             )
-        try:
-            import vllm._qutlass_C  # noqa: F401
-        except ImportError as e:
-            logger.warning_once("Failed to import from vllm._qutlass_C: %r", e)
+        _import_optional_qutlass()
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
