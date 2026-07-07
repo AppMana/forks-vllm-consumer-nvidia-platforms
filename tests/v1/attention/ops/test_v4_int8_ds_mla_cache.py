@@ -2,8 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 int8_ds_mla cache layout tests."""
 
+import inspect
+
 import torch
 
+from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
+    compress_norm_rope_store_triton,
+)
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     dequantize_and_gather_int8_ds_mla_cache,
     dequantize_global_slots_int8_ds_mla_cache,
@@ -23,6 +28,11 @@ def _expected_int8_dequant(k: torch.Tensor) -> torch.Tensor:
     scale = (k.float().abs().amax(dim=-1) / 127.0).clamp_min(1.0e-12)
     q = torch.round(k.float() / scale.unsqueeze(-1)).clamp(-127, 127)
     return (q * scale.unsqueeze(-1)).to(torch.bfloat16)
+
+
+def test_int8_ds_mla_compressor_launcher_accepts_runtime_selector() -> None:
+    signature = inspect.signature(compress_norm_rope_store_triton)
+    assert "int8_ds_mla" in signature.parameters
 
 
 def test_int8_ds_mla_cache_shapes_and_page_sizes() -> None:
