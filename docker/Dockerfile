@@ -42,6 +42,9 @@ ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 ARG APPMANA_NCCL_GIT_REF=b8fabdc5145fab760c1a9acce2892ac6077b1679
+ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
+ARG INSTALL_USB4_RDMA_PROVIDER=true
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.20
 
 # OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
 # Python bootstrap. Set to "manylinux" alongside a manylinux build base such
@@ -724,6 +727,9 @@ ARG PYTHON_VERSION
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
+ARG APPMANA_THUNDERBOLT_RELEASE_REPO
+ARG INSTALL_USB4_RDMA_PROVIDER
+ARG USB4_RDMA_PROVIDER_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /vllm-workspace
@@ -807,6 +813,29 @@ RUN set -eux; \
     ln -sf libnccl.so.2 libnccl.so; \
     ldconfig; \
     test "$(readlink -f libnccl.so.2)" = "/usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7"
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    if [ "${INSTALL_USB4_RDMA_PROVIDER}" = "true" ]; then \
+        set -eux; \
+        . /etc/os-release; \
+        rm -f /etc/apt/apt.conf.d/docker-clean; \
+        apt-get update -y; \
+        apt-get install -y --no-install-recommends --allow-change-held-packages \
+            ca-certificates \
+            curl \
+            ibverbs-utils \
+            libibverbs1 \
+            rdma-core; \
+        curl -fsSL -o /tmp/usb4-rdma-provider.deb \
+            "${APPMANA_THUNDERBOLT_RELEASE_REPO}/releases/download/v${USB4_RDMA_PROVIDER_VERSION}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
+        apt-get install -y --no-install-recommends --allow-change-held-packages \
+            /tmp/usb4-rdma-provider.deb; \
+        dpkg-query -W -f='${Package} ${Version}\n' usb4-rdma-provider; \
+        test -e /usr/lib/x86_64-linux-gnu/libibverbs/libusb4_rdma-rdmav34.so; \
+        rm -f /tmp/usb4-rdma-provider.deb; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Install uv for faster pip installs
 RUN python3 -m pip install uv
