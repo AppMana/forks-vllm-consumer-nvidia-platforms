@@ -34,6 +34,20 @@ def _make_mla_spec(page_size: int, block_size: int = 256) -> MLAAttentionSpec:
     )
 
 
+def _make_int8_mla_spec(page_size: int, block_size: int = 256) -> MLAAttentionSpec:
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        page_size_padded=page_size,
+        cache_dtype_str="int8_ds_mla",
+        model_version="deepseek_v4",
+        alignment=516,
+        compress_ratio=4,
+    )
+
+
 def _make_full_spec() -> FullAttentionSpec:
     return FullAttentionSpec(
         block_size=16,
@@ -158,6 +172,35 @@ class TestInterleavedPacking:
 
         for i, v in enumerate(views):
             assert (v == i + 1).all(), f"View {i} was corrupted"
+
+    def test_packed_offsets_are_four_byte_aligned_for_int8_ds_mla(self):
+        prefix = FullAttentionSpec(
+            block_size=1,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.uint8,
+        )
+        int8_mla = _make_int8_mla_spec(page_size=64 * 516)
+        groups = [
+            KVCacheGroupSpec(
+                ["prefix.0", "int8_mla.0"],
+                UniformTypeKVCacheSpecs(
+                    block_size=256,
+                    kv_cache_specs={
+                        "prefix.0": prefix,
+                        "int8_mla.0": int8_mla,
+                    },
+                ),
+            ),
+        ]
+
+        _, tensors = _get_kv_cache_config_packed(
+            _mock_vllm_config(), groups, 1024 * 1024
+        )
+        by_layer = {t.shared_by[0]: t for t in tensors}
+
+        assert by_layer["int8_mla.0"].offset % 4 == 0
+        assert by_layer["int8_mla.0"].block_stride % 4 == 0
 
     def test_hma_attention_groups_keep_default_backing(self):
         full = _make_full_spec()

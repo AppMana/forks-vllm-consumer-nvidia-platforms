@@ -1288,7 +1288,18 @@ def _get_kv_cache_config_packed(
     """
     # buckets = {page_size: [[layer_names], [layer_names], ...]}
     buckets = _bucket_layers_by_page_size(kv_cache_groups)
-    total_num_bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+    packed_slots: list[tuple[int, int, list[str]]] = []
+    byte_offset = 0
+    for ps, slots in buckets.items():
+        for slot in slots:
+            # Some byte-packed KV formats store wider values inside the uint8
+            # backing tensor (for example int8_ds_mla stores a fp32 row scale).
+            # Keep every packed slot page-aligned enough for those inner fields.
+            byte_offset = round_up(byte_offset, 4)
+            packed_slots.append((byte_offset, ps, slot))
+            byte_offset += ps
+
+    total_num_bytes_per_block = round_up(byte_offset, 4)
 
     num_blocks = available_memory // total_num_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
@@ -1296,18 +1307,15 @@ def _get_kv_cache_config_packed(
     total_size = total_num_bytes_per_block * num_blocks
 
     kv_cache_tensors: list[KVCacheTensor] = []
-    byte_offset = 0
-    for ps, slots in buckets.items():
-        for slot in slots:
-            kv_cache_tensors.append(
-                KVCacheTensor(
-                    size=total_size,
-                    shared_by=slot,
-                    offset=byte_offset,
-                    block_stride=total_num_bytes_per_block,
-                )
+    for byte_offset, _ps, slot in packed_slots:
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=total_size,
+                shared_by=slot,
+                offset=byte_offset,
+                block_stride=total_num_bytes_per_block,
             )
-            byte_offset += ps
+        )
 
     return num_blocks, kv_cache_tensors
 
