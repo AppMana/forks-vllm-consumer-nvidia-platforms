@@ -142,6 +142,16 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
         ),
         (
             SimpleNamespace(
+                model="deepseek-ai/DeepSeek-V4-Flash",
+                architectures=["DeepseekV4ForCausalLM"],
+                runner_type="generate",
+                is_moe=True,
+                is_quantized=True,
+            ),
+            False,
+        ),
+        (
+            SimpleNamespace(
                 model="Qwen/Qwen1.5-MoE-A2.7B",
                 architectures=["Qwen2MoeForCausalLM"],
                 runner_type="generate",
