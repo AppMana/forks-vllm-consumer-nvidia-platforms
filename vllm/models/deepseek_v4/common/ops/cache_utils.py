@@ -1092,11 +1092,20 @@ def dequantize_and_gather_k_cache(
         cache_dtype = "fp8_ds_mla"
 
     # sm_8x lacks fp8e4nv in Triton (and the cutedsl path needs `quack`, which
-    # is not installed on Ampere). Use the torch fallback there.
+    # is not installed on Ampere). Use the native CUDA gather/dequant op there;
+    # the torch fallback performs host synchronizations and can wedge PP serving.
     if not _supports_fp8e4nv_in_triton():
-        _dequantize_and_gather_k_cache_torch(
-            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        native_op = getattr(
+            torch.ops._C,
+            "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache",
+            None,
         )
+        if native_op is None:
+            raise RuntimeError(
+                "Missing torch.ops._C.deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache "
+                "for sm_8x fp8_ds_mla dequantize/gather"
+            )
+        native_op(out, k_cache, seq_lens, gather_lens, block_table, block_size, offset)
         return
     if has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
