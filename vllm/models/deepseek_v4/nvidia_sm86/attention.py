@@ -38,11 +38,13 @@ from vllm.models.deepseek_v4.common.ops.cache_utils import (
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    decode_sparse_attention_triton,
     sparse_attention_triton,
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
 from vllm.transformers_utils.configs.deepseek_v4 import (
     DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8,
+    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON,
     DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8,
     DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL,
 )
@@ -60,11 +62,15 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         fp8_decode = config.deepseek_v4_sm86_sparse_mla_decode_fp8
         int8_decode = config.deepseek_v4_sm86_sparse_mla_decode_int8
         prefill = config.deepseek_v4_sm86_sparse_mla_prefill
-        if fp8_decode != DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8:
+        if (
+            fp8_decode != DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8
+            and fp8_decode != DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON
+        ):
             raise ValueError(
                 "Unsupported DeepSeek V4 SM86 fp8 decode kernel "
-                f"{fp8_decode!r}; expected "
-                f"{DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8!r}"
+                f"{fp8_decode!r}; expected one of "
+                f"{DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8!r}, "
+                f"{DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON!r}"
             )
         if int8_decode != DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8:
             raise ValueError(
@@ -80,12 +86,13 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         if self.kv_cache_dtype == "int8_ds_mla":
             decode_symbol = DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8
         elif self.kv_cache_dtype == "fp8_ds_mla":
-            decode_symbol = DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8
+            decode_symbol = fp8_decode
         else:
             raise ValueError(
                 "DeepSeek V4 SM86 sparse MLA requires fp8_ds_mla or "
                 f"int8_ds_mla KV cache, got {self.kv_cache_dtype}"
             )
+        self.fp8_decode_symbol = fp8_decode
         logger.info_once(
             "DeepSeek V4 SM86 sparse MLA kernels: kv_cache_dtype=%s, "
             "decode=%s, prefill=%s",
@@ -175,20 +182,44 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 extra_lens=None if topk_lens is None else topk_lens,
             )
         elif self.kv_cache_dtype == "fp8_ds_mla":
-            out = flash_sparse_mla_decode(
-                q=q_rows,
-                swa_cache=swa_k_cache,
-                swa_indices=swa_indices,
-                swa_lens=swa_lens,
-                scale=self.scale,
-                attn_sink=self.attn_sink,
-                extra_cache=None if swa_only else kv_cache,
-                extra_indices=extra_idx,
-                extra_lens=None if topk_lens is None else topk_lens,
-            )
+            if self.fp8_decode_symbol == DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8:
+                out = flash_sparse_mla_decode(
+                    q=q_rows,
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_indices,
+                    swa_lens=swa_lens,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    extra_cache=None if swa_only else kv_cache,
+                    extra_indices=extra_idx,
+                    extra_lens=None if topk_lens is None else topk_lens,
+                )
+            elif (
+                self.fp8_decode_symbol
+                == DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON
+            ):
+                decode_sparse_attention_triton(
+                    q=q_rows,
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_indices,
+                    swa_lens=swa_lens,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    out=output[:num_decode_tokens],
+                    extra_cache=None if swa_only else kv_cache,
+                    extra_indices=extra_idx,
+                    extra_lens=None if topk_lens is None else topk_lens,
+                )
+                out = None
+            else:
+                raise ValueError(
+                    "Unsupported DeepSeek V4 SM86 fp8 decode kernel "
+                    f"{self.fp8_decode_symbol!r}"
+                )
         else:
             raise ValueError(f"Unsupported SM86 KV cache dtype {self.kv_cache_dtype}")
-        output[:num_decode_tokens].copy_(out)
+        if out is not None:
+            output[:num_decode_tokens].copy_(out)
         if output.shape[1] > self.n_local_heads:
             output[:, self.n_local_heads :].zero_()
 

@@ -5,6 +5,10 @@ from typing import Any
 from transformers import PretrainedConfig
 
 DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8 = "flash_mla.flash_sparse_mla_decode"
+DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON = (
+    "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels."
+    "decode_sparse_attention_triton"
+)
 DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8 = (
     "flash_mla.triton_sparse_int8_mla_decode"
 )

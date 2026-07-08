@@ -23,6 +23,10 @@ from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (  # noqa: E402
 from vllm.models.deepseek_v4.nvidia_sm86.attention import (  # noqa: E402
     DeepseekV4SM86Attention,
 )
+from vllm.transformers_utils.configs.deepseek_v4 import (  # noqa: E402
+    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8,
+    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON,
+)
 
 _FP8_DIM = 448
 _ROPE_DIM = 64
@@ -219,3 +223,18 @@ def test_sm86_prefill_uses_triton_attention() -> None:
     source = inspect.getsource(DeepseekV4SM86Attention._forward_prefill)
     assert "sparse_attention_triton" in source
     assert "flash_sparse_mla_prefill" not in source
+
+
+def test_sm86_fp8_decode_dispatch_supports_native_and_triton_fqns() -> None:
+    assert DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8 == (
+        "flash_mla.flash_sparse_mla_decode"
+    )
+    assert DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON == (
+        "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels."
+        "decode_sparse_attention_triton"
+    )
+    source = inspect.getsource(DeepseekV4SM86Attention._forward_decode)
+    assert "DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8" in source
+    assert "DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON" in source
+    assert "flash_sparse_mla_decode(" in source
+    assert "decode_sparse_attention_triton(" in source
