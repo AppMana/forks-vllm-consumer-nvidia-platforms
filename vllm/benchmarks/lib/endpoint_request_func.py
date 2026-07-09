@@ -202,6 +202,7 @@ async def async_request_openai_completions(
             if response.status == 200:
                 first_chunk_received = False
                 handler = StreamedResponseHandler()
+                done_received = False
 
                 async for chunk_bytes in response.content.iter_any():
                     chunk_bytes = chunk_bytes.strip()
@@ -218,33 +219,38 @@ async def async_request_openai_completions(
 
                         chunk = message.removeprefix("data: ")
 
-                        if chunk != "[DONE]":
-                            data = json.loads(chunk)
+                        if chunk == "[DONE]":
+                            done_received = True
+                            break
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if choices := data.get("choices"):
-                                # Note that text could be empty here
-                                # e.g. for special tokens
-                                text = choices[0].get("text")
-                                timestamp = time.perf_counter()
-                                # First token
-                                if not first_chunk_received:
-                                    first_chunk_received = True
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                        data = json.loads(chunk)
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                        # NOTE: Some completion API might have a last
+                        # usage summary response without a token so we
+                        # want to check a token was generated
+                        if choices := data.get("choices"):
+                            # Note that text could be empty here
+                            # e.g. for special tokens
+                            text = choices[0].get("text")
+                            timestamp = time.perf_counter()
+                            # First token
+                            if not first_chunk_received:
+                                first_chunk_received = True
+                                ttft = time.perf_counter() - st
+                                output.ttft = ttft
 
-                                most_recent_timestamp = timestamp
-                                generated_text += text or ""
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
-                                if (pt := usage.get("prompt_tokens")) is not None:
-                                    output.prompt_len = pt
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
+
+                            most_recent_timestamp = timestamp
+                            generated_text += text or ""
+                        elif usage := data.get("usage"):
+                            output.output_tokens = usage.get("completion_tokens")
+                            if (pt := usage.get("prompt_tokens")) is not None:
+                                output.prompt_len = pt
+                    if done_received:
+                        break
                 if first_chunk_received:
                     output.success = True
                 else:
@@ -381,6 +387,7 @@ async def async_request_openai_chat_completions(
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
                 handler = StreamedResponseHandler()
+                done_received = False
                 async for chunk_bytes in response.content.iter_any():
                     chunk_bytes = chunk_bytes.strip()
                     if not chunk_bytes:
@@ -396,28 +403,33 @@ async def async_request_openai_chat_completions(
 
                         chunk = message.removeprefix("data: ")
 
-                        if chunk != "[DONE]":
-                            timestamp = time.perf_counter()
-                            data = json.loads(chunk)
+                        if chunk == "[DONE]":
+                            done_received = True
+                            break
 
-                            if choices := data.get("choices"):
-                                content = choices[0]["delta"].get("content")
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = timestamp - st
-                                    output.ttft = ttft
+                        timestamp = time.perf_counter()
+                        data = json.loads(chunk)
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                        if choices := data.get("choices"):
+                            content = choices[0]["delta"].get("content")
+                            # First token
+                            if ttft == 0.0:
+                                ttft = timestamp - st
+                                output.ttft = ttft
 
-                                generated_text += content or ""
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
-                                if (pt := usage.get("prompt_tokens")) is not None:
-                                    output.prompt_len = pt
+                            # Decoding phase
+                            else:
+                                output.itl.append(timestamp - most_recent_timestamp)
 
-                            most_recent_timestamp = timestamp
+                            generated_text += content or ""
+                        elif usage := data.get("usage"):
+                            output.output_tokens = usage.get("completion_tokens")
+                            if (pt := usage.get("prompt_tokens")) is not None:
+                                output.prompt_len = pt
+
+                        most_recent_timestamp = timestamp
+                    if done_received:
+                        break
 
                 output.generated_text = generated_text
                 output.success = True
@@ -501,6 +513,7 @@ async def async_request_openai_audio(
             ) as response:
                 if response.status == 200:
                     handler = StreamedResponseHandler()
+                    done_received = False
 
                     async for chunk_bytes in response.content.iter_any():
                         chunk_bytes = chunk_bytes.strip()
@@ -512,30 +525,31 @@ async def async_request_openai_audio(
                             if type(message) is bytes:
                                 message = message.decode("utf-8")
                             chunk = message.removeprefix("data: ")
-                            if chunk != "[DONE]":
-                                timestamp = time.perf_counter()
-                                data = json.loads(chunk)
+                            if chunk == "[DONE]":
+                                done_received = True
+                                break
 
-                                if choices := data.get("choices"):
-                                    content = choices[0]["delta"].get("content")
-                                    # First token
-                                    if ttft == 0.0:
-                                        ttft = timestamp - st
-                                        output.ttft = ttft
+                            timestamp = time.perf_counter()
+                            data = json.loads(chunk)
 
-                                    # Decoding phase
-                                    else:
-                                        output.itl.append(
-                                            timestamp - most_recent_timestamp
-                                        )
+                            if choices := data.get("choices"):
+                                content = choices[0]["delta"].get("content")
+                                # First token
+                                if ttft == 0.0:
+                                    ttft = timestamp - st
+                                    output.ttft = ttft
 
-                                    generated_text += content or ""
-                                elif usage := data.get("usage"):
-                                    output.output_tokens = usage.get(
-                                        "completion_tokens"
-                                    )
+                                # Decoding phase
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
 
-                                most_recent_timestamp = timestamp
+                                generated_text += content or ""
+                            elif usage := data.get("usage"):
+                                output.output_tokens = usage.get("completion_tokens")
+
+                            most_recent_timestamp = timestamp
+                        if done_received:
+                            break
 
                     output.generated_text = generated_text
                     output.success = True
