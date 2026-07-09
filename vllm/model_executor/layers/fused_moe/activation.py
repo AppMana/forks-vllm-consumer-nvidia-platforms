@@ -138,8 +138,18 @@ def apply_moe_activation(
     # Activations with gated multiplication (gate × activation(up))
     if activation == MoEActivation.SILU:
         if clamp_limit is not None:
-            # Fused silu(clamp(gate)) * clamp(up); equivalent to swiglu_limit_func.
-            torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, 1.0, 0.0)
+            from vllm.model_executor.layers.activation import (
+                _use_native_clamped_silu_on_cuda,
+                silu_and_mul_with_clamp_native_out,
+            )
+
+            if _use_native_clamped_silu_on_cuda():
+                silu_and_mul_with_clamp_native_out(output, input, clamp_limit)
+            else:
+                # Fused silu(clamp(gate)) * clamp(up); equivalent to swiglu_limit_func.
+                torch.ops._C.silu_and_mul_with_clamp(
+                    output, input, clamp_limit, 1.0, 0.0
+                )
         else:
             torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:
@@ -151,7 +161,19 @@ def apply_moe_activation(
     elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
         # SwiGLU-OAI on packed w13 (gate = first half, up = second half).
         assert clamp_limit is not None, "SWIGLUOAI_UNINTERLEAVE requires clamp_limit"
-        torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, alpha, beta)
+        from vllm.model_executor.layers.activation import (
+            _use_native_clamped_silu_on_cuda,
+            silu_and_mul_with_clamp_native_out,
+        )
+
+        if _use_native_clamped_silu_on_cuda():
+            silu_and_mul_with_clamp_native_out(
+                output, input, clamp_limit, alpha, beta
+            )
+        else:
+            torch.ops._C.silu_and_mul_with_clamp(
+                output, input, clamp_limit, alpha, beta
+            )
     elif activation == MoEActivation.SWIGLUSTEP:
         from vllm.model_executor.layers.activation import swiglustep_and_mul_triton
 

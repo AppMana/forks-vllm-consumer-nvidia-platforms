@@ -23,6 +23,23 @@ from vllm.utils.collection_utils import LazyDict
 logger = init_logger(__name__)
 
 
+def _use_native_clamped_silu_on_cuda() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability(86)
+
+
+def silu_and_mul_with_clamp_native_out(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    limit: float,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> None:
+    d = input.shape[-1] // 2
+    gate = torch.clamp(input[..., :d], max=limit)
+    up = torch.clamp(input[..., d:], min=-limit, max=limit)
+    output.copy_(gate * torch.sigmoid(alpha * gate) * (up + beta))
+
+
 @triton.jit
 def _swiglustep_and_mul_kernel(
     o_ptr,
@@ -184,6 +201,8 @@ class SiluAndMulWithClamp(CustomOp):
             self._forward_method = self.forward_native
         elif current_platform.is_cuda_alike():
             self.op = torch.ops._C.silu_and_mul_with_clamp
+            if _use_native_clamped_silu_on_cuda():
+                self._forward_method = self.forward_native
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
 
@@ -197,6 +216,11 @@ class SiluAndMulWithClamp(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        if _use_native_clamped_silu_on_cuda():
+            silu_and_mul_with_clamp_native_out(
+                out, x, self.swiglu_limit, self.alpha, self.beta
+            )
+            return out
         self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
         return out
 
