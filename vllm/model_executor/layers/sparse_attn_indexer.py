@@ -219,13 +219,14 @@ def sparse_attn_indexer(
         # scale_fmt can be None, but the function expects str
         assert scale_fmt is not None
         assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
-        ops.indexer_k_quant_and_cache(
-            k,
-            kv_cache,
-            slot_mapping,
-            quant_block_size,
-            "int8" if _indexer_int8 else scale_fmt,
-        )
+        if _indexer_int8:
+            ops.indexer_k_quant_and_cache_int8(
+                k, kv_cache, slot_mapping, quant_block_size
+            )
+        else:
+            ops.indexer_k_quant_and_cache(
+                k, kv_cache, slot_mapping, quant_block_size, scale_fmt
+            )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:

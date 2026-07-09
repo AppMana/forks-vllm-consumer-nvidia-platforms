@@ -2808,6 +2808,25 @@ def indexer_k_quant_and_cache(
     )
 
 
+def indexer_k_quant_and_cache_int8(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    quant_block_size: int,
+) -> None:
+    """Symmetric INT8 indexer K-cache writer (rintf(k/scale) clamped to
+    +/-127, fp32 absmax/127 scales in the fp8 scale slots).
+
+    This is the registry symbol for the ``indexer_cache_int8`` role of the
+    AppMana DSV4 kernel config block (``"appmana"`` in the checkpoint
+    config.json); membership of ``vllm._custom_ops.indexer_k_quant_and_cache_int8``
+    in ``appmana.kernels`` activates the INT8 indexer cache.
+    """
+    torch.ops._C_cache_ops.indexer_k_quant_and_cache(
+        k, kv_cache, slot_mapping, quant_block_size, "int8"
+    )
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,

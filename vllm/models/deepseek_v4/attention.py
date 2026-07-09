@@ -55,6 +55,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
 )
+from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+    activate_appmana_kernel_config,
+    resolve_appmana_kernel_config_from_hf_config,
+)
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
@@ -171,6 +175,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         layer_id = extract_layer_index(prefix)
 
         self.config = config
+        # Resolve + activate the unified AppMana kernel config ("appmana"
+        # block in the checkpoint config.json) before any consumer (indexer,
+        # compressor, backend dispatch) reads the kernel gates. Runs in every
+        # worker process at model build; idempotent by value.
+        activate_appmana_kernel_config(
+            resolve_appmana_kernel_config_from_hf_config(config)
+        )
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
@@ -700,9 +711,23 @@ class DeepseekV4Indexer(nn.Module):
         self.q_lora_rank = q_lora_rank  # 1536
         self.compress_ratio = compress_ratio
         self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
+        # Log the TRUE payload format (mxfp4/fp8/int8) and query mode so
+        # benchmark rows can be validated from the logs.
+        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+            indexer_cache_is_int8,
+            indexer_imma_enabled,
+        )
+
+        if self.use_fp4_kv:
+            _indexer_cache_fmt = "mxfp4"
+            _indexer_query_mode = "mxfp4"
+        else:
+            _indexer_cache_fmt = "int8" if indexer_cache_is_int8() else "fp8"
+            _indexer_query_mode = "int8-imma" if indexer_imma_enabled() else "fp8"
         logger.info_once(
-            "Using %s indexer cache for Lightning Indexer.",
-            "MXFP4" if self.use_fp4_kv else "FP8",
+            "Lightning Indexer: cache_payload=%s query=%s",
+            _indexer_cache_fmt,
+            _indexer_query_mode,
         )
 
         # no tensor parallel, just replicated

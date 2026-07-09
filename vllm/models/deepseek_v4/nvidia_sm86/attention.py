@@ -25,12 +25,17 @@ Ampere; the Triton kernels upcast FP8 inputs to bf16 internally.
 
 import torch
 
-# HARD dependencies: Ampere sm_86 sparse-MLA decode runs through explicit
-# flash_mla symbols. No try/except, no env gate, no silent fallback.
-from flash_mla import flash_sparse_mla_decode, triton_sparse_int8_mla_decode
+# HARD dependencies: Ampere sm_86 sparse-MLA decode/prefill run through
+# explicit flash_mla symbols. No try/except, no env gate, no silent fallback.
+from flash_mla import (
+    flash_sparse_mla_decode,
+    flash_sparse_mla_prefill,
+    triton_sparse_int8_mla_decode,
+)
 
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    build_flashinfer_mixed_sparse_indices,
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
@@ -42,15 +47,39 @@ from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
     sparse_attention_triton,
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
-from vllm.transformers_utils.configs.deepseek_v4 import (
-    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8,
-    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON,
-    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8,
-    DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL,
+from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+    ROLE_SPARSE_MLA_DECODE_FP8,
+    ROLE_SPARSE_MLA_DECODE_INT8,
+    ROLE_SPARSE_MLA_PREFILL,
+    SPARSE_MLA_DECODE_FP8_FLASH,
+    SPARSE_MLA_DECODE_FP8_TRITON,
+    SPARSE_MLA_PREFILL_FLASH,
+    SPARSE_MLA_PREFILL_TRITON,
+    ResolvedAppmanaKernelConfig,
+    resolve_appmana_kernel_config_from_hf_config,
+    resolved_proof_line,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+
+def validate_sm86_kernel_selection(
+    resolved: ResolvedAppmanaKernelConfig, *, kv_cache_dtype: str
+) -> None:
+    """SM86-specific cross-checks between kernel selection and cache dtype."""
+    if kv_cache_dtype not in ("fp8_ds_mla", "int8_ds_mla"):
+        raise ValueError(
+            "DeepSeek V4 SM86 sparse MLA requires fp8_ds_mla or "
+            f"int8_ds_mla KV cache, got {kv_cache_dtype}"
+        )
+    prefill = resolved.roles[ROLE_SPARSE_MLA_PREFILL]
+    if prefill == SPARSE_MLA_PREFILL_FLASH and kv_cache_dtype != "fp8_ds_mla":
+        raise ValueError(
+            f"{SPARSE_MLA_PREFILL_FLASH!r} consumes fp8_ds_mla paged caches "
+            f"only; kv_cache_dtype={kv_cache_dtype} is not supported. Use "
+            f"{SPARSE_MLA_PREFILL_TRITON!r} instead."
+        )
 
 
 class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
@@ -58,47 +87,29 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        config = self.config
-        fp8_decode = config.deepseek_v4_sm86_sparse_mla_decode_fp8
-        int8_decode = config.deepseek_v4_sm86_sparse_mla_decode_int8
-        prefill = config.deepseek_v4_sm86_sparse_mla_prefill
-        if (
-            fp8_decode != DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8
-            and fp8_decode != DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON
-        ):
-            raise ValueError(
-                "Unsupported DeepSeek V4 SM86 fp8 decode kernel "
-                f"{fp8_decode!r}; expected one of "
-                f"{DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8!r}, "
-                f"{DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON!r}"
-            )
-        if int8_decode != DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8:
-            raise ValueError(
-                "Unsupported DeepSeek V4 SM86 int8 decode kernel "
-                f"{int8_decode!r}; expected "
-                f"{DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8!r}"
-            )
-        if prefill != DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL:
-            raise ValueError(
-                "Unsupported DeepSeek V4 SM86 prefill kernel "
-                f"{prefill!r}; expected {DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL!r}"
-            )
+        # Unified kernel selection: the "appmana" checkpoint config block
+        # (with the deprecated role-keyed HF override strings as fallback).
+        # Resolution fails closed on unknown symbols / duplicate roles.
+        resolved = resolve_appmana_kernel_config_from_hf_config(self.config)
+        validate_sm86_kernel_selection(resolved, kv_cache_dtype=self.kv_cache_dtype)
+        self.fp8_decode_symbol = resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8]
+        self.int8_decode_symbol = resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8]
+        self.prefill_symbol = resolved.roles[ROLE_SPARSE_MLA_PREFILL]
         if self.kv_cache_dtype == "int8_ds_mla":
-            decode_symbol = DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8
-        elif self.kv_cache_dtype == "fp8_ds_mla":
-            decode_symbol = fp8_decode
+            decode_symbol = self.int8_decode_symbol
         else:
-            raise ValueError(
-                "DeepSeek V4 SM86 sparse MLA requires fp8_ds_mla or "
-                f"int8_ds_mla KV cache, got {self.kv_cache_dtype}"
-            )
-        self.fp8_decode_symbol = fp8_decode
+            decode_symbol = self.fp8_decode_symbol
         logger.info_once(
             "DeepSeek V4 SM86 sparse MLA kernels: kv_cache_dtype=%s, "
             "decode=%s, prefill=%s",
             self.kv_cache_dtype,
             decode_symbol,
-            DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL,
+            self.prefill_symbol,
+        )
+        # Startup proof line: every active role -> symbol plus the resolved
+        # cache dtype, single line, stable format (benchmark validity check).
+        logger.info_once(
+            "%s", resolved_proof_line(resolved, kv_cache_dtype=self.kv_cache_dtype)
         )
 
     @classmethod
@@ -182,7 +193,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 extra_lens=None if topk_lens is None else topk_lens,
             )
         elif self.kv_cache_dtype == "fp8_ds_mla":
-            if self.fp8_decode_symbol == DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8:
+            if self.fp8_decode_symbol == SPARSE_MLA_DECODE_FP8_FLASH:
                 out = flash_sparse_mla_decode(
                     q=q_rows,
                     swa_cache=swa_k_cache,
@@ -194,10 +205,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                     extra_indices=extra_idx,
                     extra_lens=None if topk_lens is None else topk_lens,
                 )
-            elif (
-                self.fp8_decode_symbol
-                == DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON
-            ):
+            elif self.fp8_decode_symbol == SPARSE_MLA_DECODE_FP8_TRITON:
                 decode_sparse_attention_triton(
                     q=q_rows,
                     swa_cache=swa_k_cache,
@@ -233,6 +241,17 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_metadata,
     ) -> None:
+        if self.prefill_symbol == SPARSE_MLA_PREFILL_FLASH:
+            self._forward_prefill_flash(
+                q=q,
+                positions=positions,
+                compressed_k_cache=compressed_k_cache,
+                swa_k_cache=swa_k_cache,
+                output=output,
+                attn_metadata=attn_metadata,
+                swa_metadata=swa_metadata,
+            )
+            return
         swa_only = attn_metadata is None
 
         num_prefill_tokens = swa_metadata.num_prefill_tokens
@@ -329,6 +348,126 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 attn_sink=self.attn_sink,
                 out=output[query_start:query_end],
             )
+
+    def _forward_prefill_flash(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: DeepseekV4FlashMLAMetadata | None,
+        swa_metadata,
+    ) -> None:
+        """Native flash_mla staged sparse-MLA prefill.
+
+        ``flash_mla.flash_sparse_mla_prefill`` mirrors the decode interface:
+        it consumes the paged fp8_ds_mla caches directly with per-query-token
+        GLOBAL slot indices (compact-left, -1 padded). The adapter below
+        builds those indices from the block tables — reusing the mixed
+        sparse-index builder that already serves the FlashInfer backend —
+        instead of dequant+gather staging a bf16 workspace like the Triton
+        path (the flash_mla op stages internally).
+        """
+        swa_only = attn_metadata is None
+
+        num_decodes = swa_metadata.num_decodes
+        num_prefills = swa_metadata.num_prefills
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        num_reqs = num_decodes + num_prefills
+        num_tokens = num_decode_tokens + num_prefill_tokens
+
+        assert swa_metadata.query_start_loc is not None
+        assert swa_metadata.token_to_req_indices is not None
+        assert swa_metadata.seq_lens is not None
+        assert swa_metadata.block_table is not None
+
+        # Local (sequence-space) top-k indices, same sources as the Triton
+        # path: the C4A indexer buffer or the C128A metadata builder.
+        if not swa_only:
+            assert attn_metadata is not None
+            if self.compress_ratio == 4:
+                assert self.topk_indices_buffer is not None
+                topk_indices = self.topk_indices_buffer[
+                    num_decode_tokens:num_tokens
+                ]
+            else:
+                topk_indices = attn_metadata.c128a_prefill_topk_indices
+            top_k = topk_indices.shape[-1]
+            compressed_block_table = attn_metadata.block_table[
+                num_decodes:num_reqs
+            ]
+            compressed_block_size = attn_metadata.block_size // self.compress_ratio
+        else:
+            assert self.topk_indices_buffer is not None
+            topk_indices = self.topk_indices_buffer[
+                num_decode_tokens:num_tokens, :0
+            ]
+            top_k = 0
+            compressed_block_table = None
+            compressed_block_size = swa_metadata.block_size
+
+        # Rebase request-indexed metadata to the prefill rows so the mixed
+        # builder runs without the decode rows (decode has its own path).
+        query_start_loc = swa_metadata.query_start_loc[num_decodes : num_reqs + 1]
+        query_start_loc = query_start_loc - query_start_loc[0]
+        token_to_req_indices = (
+            swa_metadata.token_to_req_indices[num_decode_tokens:num_tokens]
+            - num_decodes
+        )
+        seq_lens = swa_metadata.seq_lens[num_decodes:num_reqs]
+        swa_block_table = swa_metadata.block_table[num_decodes:num_reqs]
+
+        empty_decode_swa = torch.empty(
+            (0, self.window_size), dtype=torch.int32, device=q.device
+        )
+        mixed_indices, mixed_lens = build_flashinfer_mixed_sparse_indices(
+            empty_decode_swa,
+            None,
+            None,
+            topk_indices[:num_prefill_tokens],
+            query_start_loc,
+            seq_lens,
+            token_to_req_indices,
+            swa_block_table,
+            swa_metadata.block_size,
+            compressed_block_table,
+            compressed_block_size,
+            self.window_size,
+            self.compress_ratio,
+            top_k,
+        )
+
+        # Column layout: [0, window) = SWA global slots (compact-left, -1
+        # padded), [window, window+padded_topk) = compressed global slots.
+        # mixed_lens = window_size + topk_len for prefill rows.
+        swa_indices = mixed_indices[:, : self.window_size].contiguous()
+        swa_lens = (
+            torch.clamp(positions + 1, max=self.window_size).to(torch.int32)
+        )
+        extra_cache = None
+        extra_indices = None
+        extra_lens = None
+        if not swa_only and top_k > 0:
+            extra_cache = compressed_k_cache
+            extra_indices = mixed_indices[:, self.window_size :].contiguous()
+            extra_lens = (mixed_lens - self.window_size).to(torch.int32)
+
+        out = flash_sparse_mla_prefill(
+            q=q,
+            swa_cache=swa_k_cache,
+            swa_indices=swa_indices,
+            swa_lens=swa_lens,
+            scale=self.scale,
+            attn_sink=self.attn_sink,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices,
+            extra_lens=extra_lens,
+        )
+        output.copy_(out)
+        if output.shape[1] > self.n_local_heads:
+            output[:, self.n_local_heads :].zero_()
 
 
 DeepseekV4SM86Attention = DeepseekV4TritonSM86Attention
