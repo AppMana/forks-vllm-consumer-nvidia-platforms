@@ -75,6 +75,26 @@ def _gather_workspace_shapes(
     )
 
 
+def _reserve_prefill_gather_workspace(
+    total_seq_lens: int,
+    max_total_seq_len: int,
+    head_dim: int,
+    fp8_dtype: torch.dtype,
+    use_fp4_cache: bool,
+) -> None:
+    reserve_seq_lens = max(total_seq_lens, max_total_seq_len)
+    if reserve_seq_lens <= 0:
+        return
+    values_spec, scales_spec = _gather_workspace_shapes(
+        reserve_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+    )
+    current_workspace_manager().get_simultaneous(
+        values_spec,
+        scales_spec,
+        ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+    )
+
+
 def kv_cache_as_quant_view(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -122,13 +142,12 @@ def sparse_attn_indexer(
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
-        values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
-        )
-        current_workspace_manager().get_simultaneous(
-            values_spec,
-            scales_spec,
-            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+        _reserve_prefill_gather_workspace(
+            total_seq_lens=total_seq_lens,
+            max_total_seq_len=total_seq_lens,
+            head_dim=head_dim,
+            fp8_dtype=fp8_dtype,
+            use_fp4_cache=use_fp4_cache,
         )
 
         # Dummy allocation to simulate for peak logits tensor memory during inference.
@@ -158,6 +177,15 @@ def sparse_attn_indexer(
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
+    # CUDA graph capture may be decode-only. Reserve the prefill gather workspace
+    # here as well so the shared workspace is large enough before it is locked.
+    _reserve_prefill_gather_workspace(
+        total_seq_lens=total_seq_lens,
+        max_total_seq_len=total_seq_lens,
+        head_dim=head_dim,
+        fp8_dtype=fp8_dtype,
+        use_fp4_cache=use_fp4_cache,
+    )
     slot_mapping = attn_metadata_narrowed.slot_mapping
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0

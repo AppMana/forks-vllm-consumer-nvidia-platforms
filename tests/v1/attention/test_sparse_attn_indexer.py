@@ -9,6 +9,7 @@ from vllm.model_executor.layers.quantization.dsv4_int import Dsv4IntConfig
 from vllm.model_executor.layers.sparse_attn_indexer import (
     SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH,
     SM120_SHORT_ROW_TOPK_MAX_WIDTH,
+    _reserve_prefill_gather_workspace,
     _should_use_sm120_short_row_topk_decode,
 )
 from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
@@ -105,6 +106,35 @@ def test_fp8_mqa_logits_uses_fused_imma_workspace_on_auto_int8(
     )
 
     torch.testing.assert_close(actual, torch.full((2, 5), 3.0))
+
+
+def test_sparse_indexer_prefill_workspace_reserves_max_total_seq_len(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class FakeWorkspaceManager:
+        def get_simultaneous(self, *specs):
+            calls.append(specs)
+            return tuple(torch.empty((), dtype=dtype) for _shape, dtype in specs)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.sparse_attn_indexer.current_workspace_manager",
+        lambda: FakeWorkspaceManager(),
+    )
+
+    _reserve_prefill_gather_workspace(
+        total_seq_lens=7,
+        max_total_seq_len=1234,
+        head_dim=128,
+        fp8_dtype=torch.uint8,
+        use_fp4_cache=False,
+    )
+
+    assert calls
+    values_spec, scales_spec, _topk_spec = calls[-1]
+    assert values_spec == ((1234, 128), torch.uint8)
+    assert scales_spec == ((1234, 4), torch.uint8)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
