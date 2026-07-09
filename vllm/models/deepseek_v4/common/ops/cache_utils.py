@@ -36,7 +36,15 @@ _TOKEN_DATA_SIZE = _TOKEN_FP8_DIM + _TOKEN_BF16_DIM * 2  # 576 bytes
 _N_REAL_QUANT_BLOCKS = 7  # 448 / 64
 _INT8_DS_MLA_DIM = 512
 _INT8_DS_MLA_SCALE_BYTES = 4
-_INT8_DS_MLA_TOKEN_BYTES = _INT8_DS_MLA_DIM + _INT8_DS_MLA_SCALE_BYTES
+# 512 int8 bytes + 4-byte fp32 row scale + 12 bytes padding = 528. The token
+# stride MUST stay a 16-byte multiple: a 516-byte stride makes consecutive
+# token rows alternate 16-byte alignment, so any consumer with 16B vectorized
+# access (csrc uint4 stores, Triton vectorized loads/stores) faults with
+# "CUDA error: misaligned address" on odd rows.
+_INT8_DS_MLA_PAD_BYTES = 12
+_INT8_DS_MLA_TOKEN_BYTES = (
+    _INT8_DS_MLA_DIM + _INT8_DS_MLA_SCALE_BYTES + _INT8_DS_MLA_PAD_BYTES
+)
 
 
 def _flatten_int8_ds_mla_cache(k_cache: torch.Tensor) -> torch.Tensor:
@@ -133,6 +141,203 @@ def quantize_and_insert_int8_ds_mla_cache(
     )
 
 
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens_full",
+        "num_tokens_insert",
+        "cache_block_size",
+        "block_stride",
+    ],
+    do_not_specialize_on_alignment=[
+        "q_ptr",
+        "q_out_ptr",
+        "kv_ptr",
+        "k_cache_ptr",
+        "slot_mapping_ptr",
+        "positions_ptr",
+        "cos_sin_ptr",
+    ],
+)
+def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
+    q_ptr,
+    q_out_ptr,
+    kv_ptr,
+    k_cache_ptr,
+    slot_mapping_ptr,
+    positions_ptr,
+    cos_sin_ptr,
+    num_tokens_full,
+    num_tokens_insert,
+    cache_block_size,
+    block_stride,
+    eps,
+    num_heads: tl.constexpr,
+    num_heads_padded: tl.constexpr,
+    head_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    token_stride: tl.constexpr,
+):
+    """Fused per-(token, slot) Q RMSNorm+RoPE / KV RoPE+int8 cache insert.
+
+    Slot semantics mirror the csrc fp8_ds_mla writer
+    (``fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert``):
+      slot < num_heads               -> live Q: RMSNorm (no weight) + GPT-J
+                                        RoPE on dims [448, 512), write q_out
+      num_heads <= slot < padded     -> pad Q: zero-fill q_out
+      slot == num_heads_padded       -> KV: GPT-J RoPE (no norm) + rowwise
+                                        int8 quant + 528B-layout cache insert
+
+    All addressing is plain byte arithmetic with no 16-byte vectorization
+    assumption, so packed multi-layer caches with arbitrary 4-byte-aligned
+    offsets/strides are safe.
+    """
+    token = tl.program_id(0)
+    slot = tl.program_id(1)
+    if token >= num_tokens_full:
+        return
+
+    offs = tl.arange(0, head_dim)
+    is_kv = slot == num_heads_padded
+
+    if (not is_kv) and (slot >= num_heads):
+        # Pad-Q slot: zero-fill.
+        out_row = q_out_ptr + (token * num_heads_padded + slot) * head_dim
+        tl.store(out_row + offs, tl.zeros((head_dim,), dtype=tl.bfloat16))
+        return
+
+    slot_idx = tl.full((), -1, tl.int64)
+    if is_kv:
+        if token >= num_tokens_insert:
+            return
+        slot_idx = tl.load(slot_mapping_ptr + token)
+        if slot_idx < 0:
+            return
+        x = tl.load(kv_ptr + token * head_dim + offs).to(tl.float32)
+    else:
+        x = tl.load(
+            q_ptr + (token * num_heads + slot) * head_dim + offs
+        ).to(tl.float32)
+        # Per-head RMSNorm (no weight), fp32 math.
+        rms_rcp = tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + eps)
+        x = x * rms_rcp
+
+    # ── GPT-J RoPE on interleaved (even, odd) pairs of dims [448, 512) ──
+    NUM_PAIRS: tl.constexpr = head_dim // 2
+    NOPE_PAIRS: tl.constexpr = (head_dim - rope_dim) // 2
+    HALF_ROPE: tl.constexpr = rope_dim // 2
+
+    pair_2d = tl.reshape(x, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair_local = pair_idx - NOPE_PAIRS
+    is_rope_pair = rope_pair_local >= 0
+    cs_idx = tl.maximum(rope_pair_local, 0)
+
+    pos = tl.load(positions_ptr + token)
+    cs_base = cos_sin_ptr + pos * rope_dim
+    cos_v = tl.load(cs_base + cs_idx, mask=is_rope_pair, other=1.0)
+    sin_v = tl.load(cs_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0)
+
+    new_even = even * cos_v - odd * sin_v
+    new_odd = odd * cos_v + even * sin_v
+    x = tl.interleave(new_even, new_odd)  # [head_dim] fp32
+
+    if is_kv:
+        # bf16 round-trip, then rowwise symmetric int8 quant (matches
+        # _quantize_and_insert_int8_ds_mla_cache_kernel).
+        x = x.to(tl.bfloat16).to(tl.float32)
+        absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1.0e-12)
+        row_scale = absmax / 127.0
+        scaled = x / row_scale
+        rounded = scaled + tl.where(scaled >= 0.0, 0.5, -0.5)
+        q_i8 = tl.maximum(tl.minimum(rounded, 127.0), -127.0).to(tl.int8)
+
+        block_idx = slot_idx // cache_block_size
+        pos_in_block = slot_idx % cache_block_size
+        row_ptr = (
+            k_cache_ptr
+            + block_idx.to(tl.int64) * block_stride
+            + pos_in_block * token_stride
+        )
+        tl.store(row_ptr + offs, q_i8.to(tl.uint8, bitcast=True))
+        scale_ptr = (row_ptr + head_dim).to(tl.pointer_type(tl.float32))
+        tl.store(scale_ptr, row_scale)
+    else:
+        out_row = q_out_ptr + (token * num_heads_padded + slot) * head_dim
+        tl.store(out_row + offs, x.to(tl.bfloat16))
+
+
+def fused_qnorm_rope_kv_int8_ds_mla_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_heads_padded: int,
+    eps: float,
+    block_size: int,
+) -> torch.Tensor:
+    """int8_ds_mla SWA-cache twin of the csrc fp8 writer.
+
+    Q side: per-head RMSNorm (no weight) + GPT-J RoPE, returning a
+    ``[N, num_heads_padded, 512]`` bf16 tensor with zero-filled pad heads.
+    KV side: GPT-J RoPE + rowwise int8 quant + paged 528-byte-layout insert.
+
+    With DP padding ``slot_mapping`` can be shorter than ``q``: Q norm/rope
+    runs on every row; KV insert only on the first ``slot_mapping.shape[0]``.
+    """
+    assert q.dim() == 3 and q.shape[-1] == _INT8_DS_MLA_DIM, (
+        f"q must be [N, H, 512], got {q.shape}"
+    )
+    assert q.is_contiguous(), "q must be contiguous"
+    assert kv.dim() == 2 and kv.shape[-1] == _INT8_DS_MLA_DIM, (
+        f"kv must be [N, 512], got {kv.shape}"
+    )
+    assert kv.is_contiguous(), "kv must be contiguous"
+    assert q.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16
+    assert k_cache.dtype == torch.uint8, f"K cache must be uint8, got {k_cache.dtype}"
+    assert positions.dtype == torch.int64
+    assert slot_mapping.dtype == torch.int64
+    assert cos_sin_cache.dtype == torch.float32
+    assert cos_sin_cache.dim() == 2 and cos_sin_cache.shape[-1] == 64
+    assert cos_sin_cache.is_contiguous()
+
+    num_tokens_full, num_heads, head_dim = q.shape
+    num_tokens_insert = slot_mapping.shape[0]
+    assert kv.shape[0] == num_tokens_full
+    assert positions.shape[0] == num_tokens_full
+    assert num_tokens_insert <= num_tokens_full
+    assert num_heads_padded >= num_heads
+
+    flat_cache = _flatten_int8_ds_mla_cache(k_cache)
+    q_out = q.new_empty(num_tokens_full, num_heads_padded, head_dim)
+    if num_tokens_full == 0:
+        return q_out
+    _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel[
+        (num_tokens_full, num_heads_padded + 1)
+    ](
+        q,
+        q_out,
+        kv,
+        flat_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        num_tokens_full,
+        num_tokens_insert,
+        block_size,
+        flat_cache.stride(0),
+        eps,
+        num_heads=num_heads,
+        num_heads_padded=num_heads_padded,
+        head_dim=_INT8_DS_MLA_DIM,
+        rope_dim=64,
+        token_stride=_INT8_DS_MLA_TOKEN_BYTES,
+    )
+    return q_out
+
+
 def get_int8_ds_mla_cache_views(
     k_cache: torch.Tensor,
     block_size: int = 64,
@@ -147,7 +352,7 @@ def get_int8_ds_mla_cache_views(
         )
     data = rows[..., :_INT8_DS_MLA_DIM].view(torch.int8)
     scales = (
-        rows[..., _INT8_DS_MLA_DIM : _INT8_DS_MLA_TOKEN_BYTES]
+        rows[..., _INT8_DS_MLA_DIM : _INT8_DS_MLA_DIM + _INT8_DS_MLA_SCALE_BYTES]
         .view(torch.float32)
         .squeeze(-1)
     )
@@ -179,6 +384,7 @@ def _dequantize_global_slots_int8_ds_mla_cache_kernel(
     out_stride0,
     out_stride1,
     out_stride2,
+    token_stride: tl.constexpr,
     topk: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -203,7 +409,7 @@ def _dequantize_global_slots_int8_ds_mla_cache_kernel(
     cache_base = (
         k_cache_ptr
         + block_idx.to(tl.int64) * cache_block_stride
-        + pos_in_block * 516
+        + pos_in_block * token_stride
     )
     q_u8 = tl.load(cache_base + offsets, mask=valid, other=0)
     q = q_u8.to(tl.int8, bitcast=True).to(tl.float32)
@@ -245,6 +451,7 @@ def dequantize_global_slots_int8_ds_mla_cache(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        token_stride=_INT8_DS_MLA_TOKEN_BYTES,
         topk=topk,
         BLOCK=triton.next_power_of_2(_INT8_DS_MLA_DIM),
     )

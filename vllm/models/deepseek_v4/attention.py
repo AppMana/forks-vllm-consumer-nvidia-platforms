@@ -25,6 +25,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
+    fused_qnorm_rope_kv_int8_ds_mla_insert,
 )
 
 if TYPE_CHECKING:
@@ -565,6 +566,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_dtype = swa_kv_cache.dtype
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
+        if cache_dtype == torch.uint8 and self.kv_cache_dtype == "int8_ds_mla":
+            # int8_ds_mla paged path: 512 signed-int8 bytes + fp32 row scale
+            # per token (528B stride). MUST NOT fall through to the csrc
+            # fp8_ds_mla writer below: that kernel writes the 576/584-byte
+            # UE8M0 layout with 16B uint4 stores, which both corrupts the
+            # packed 528B pages and faults with "CUDA error: misaligned
+            # address" when the packed block stride is not a 16B multiple.
+            return fused_qnorm_rope_kv_int8_ds_mla_insert(
+                q,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                positions,
+                cos_sin_cache,
+                self.padded_heads,
+                self.eps,
+                swa_metadata.block_size,
+            )
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling

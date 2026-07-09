@@ -172,7 +172,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
             alignment=576
             if uses_fp8_ds_mla_layout
-            else (516 if uses_int8_ds_mla_layout else None),
+            else (528 if uses_int8_ds_mla_layout else None),
             model_version="deepseek_v4",
         )
 
@@ -265,7 +265,7 @@ class DeepseekCompressor(nn.Module):
             )
             if self._int8_ds_mla:
                 self._quant_block = 512
-                self._token_stride = 516
+                self._token_stride = 528
                 self._scale_dim = 4
             else:
                 self._quant_block = 64

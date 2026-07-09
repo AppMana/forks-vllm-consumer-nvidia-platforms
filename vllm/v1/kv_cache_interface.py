@@ -390,8 +390,9 @@ class MLAAttentionSpec(FullAttentionSpec):
             self.model_version == "deepseek_v4"
             and self.cache_dtype_str == "int8_ds_mla"
         ):
-            # 512 signed-int8 row bytes + one fp32 row scale.
-            return self.storage_block_size * 516
+            # 512 signed-int8 row bytes + one fp32 row scale + 12B pad
+            # (528 keeps the token stride a 16-byte multiple).
+            return self.storage_block_size * 528
         if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             head_dim = self.head_size // 2
         else:
@@ -580,8 +581,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             self.model_version == "deepseek_v4"
             and self.cache_dtype_str == "int8_ds_mla"
         ):
-            # 512 signed-int8 row bytes + one fp32 row scale.
-            return self.storage_block_size * 516
+            # 512 signed-int8 row bytes + one fp32 row scale + 12B pad
+            # (528 keeps the token stride a 16-byte multiple).
+            return self.storage_block_size * 528
         assert self.model_version in (None, "deepseek_v4"), (
             f"Unsupported model version: {self.model_version}"
         )
