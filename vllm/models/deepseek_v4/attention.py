@@ -447,6 +447,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
+        if not isinstance(attn_metadata, dict):
+            # Profile/dummy runs may intentionally omit attention metadata
+            # to skip attention while still exercising the surrounding model.
+            out.zero_()
+            return
+
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
         # downstream reads q on default). Indexer/compressor go on aux for

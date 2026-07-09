@@ -367,6 +367,94 @@ def send_recv_test_worker(
         torch.testing.assert_close(test_tensor, recv_tensor)
 
 
+def _make_dsv4_intermediates(
+    num_tokens: int,
+    hidden_size: int,
+    hc_mult: int,
+    rank: int,
+    step: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    base = rank * 1000 + step * 100
+    hidden_row = torch.arange(hidden_size, dtype=torch.float32, device=device)
+    hc_row = torch.arange(hc_mult * hidden_size, dtype=torch.float32,
+                          device=device).reshape(hc_mult, hidden_size)
+    mix_row = torch.arange(hc_mult * hc_mult, dtype=torch.float32,
+                           device=device).reshape(hc_mult, hc_mult)
+
+    return {
+        "hidden_states":
+        (hidden_row + base).expand(num_tokens, hidden_size).to(torch.bfloat16),
+        "residual":
+        (hc_row + base + 1).expand(num_tokens, hc_mult,
+                                   hidden_size).to(torch.bfloat16),
+        "post_mix":
+        torch.full((num_tokens, hc_mult, 1),
+                   base + 2,
+                   dtype=torch.float32,
+                   device=device),
+        "res_mix":
+        (mix_row + base + 3).expand(num_tokens, hc_mult,
+                                    hc_mult).contiguous(),
+    }
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def dsv4_pp_intermediate_transport_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank,
+                                      distributed_init_port)
+
+    token_counts = [16_384, 1, 512, 2, 4096]
+    hidden_size = 64
+    hc_mult = 8
+
+    if not get_pp_group().is_first_rank:
+        persistent = _make_dsv4_intermediates(max(token_counts), hidden_size,
+                                              hc_mult, 0, -1, device)
+
+    previous_send = []
+    for step, num_tokens in enumerate(token_counts):
+        if previous_send:
+            for handle in previous_send:
+                handle.wait()
+            previous_send = []
+
+        if not get_pp_group().is_first_rank:
+            tensor_dict, handles, postprocess = get_pp_group().irecv_tensor_dict()
+            assert tensor_dict is not None
+            for handle in handles:
+                handle.wait()
+            for fn in postprocess:
+                fn()
+
+            for key, recv in tensor_dict.items():
+                persistent[key][:num_tokens].copy_(recv[:num_tokens],
+                                                   non_blocking=True)
+            torch.cuda.synchronize(device)
+
+            expected = _make_dsv4_intermediates(num_tokens, hidden_size, hc_mult,
+                                                0, step, device)
+            for key, want in expected.items():
+                torch.testing.assert_close(persistent[key][:num_tokens], want)
+
+        if not get_pp_group().is_last_rank:
+            payload = _make_dsv4_intermediates(num_tokens, hidden_size, hc_mult,
+                                               rank, step, device)
+            previous_send = get_pp_group().isend_tensor_dict(payload)
+
+    for handle in previous_send:
+        handle.wait()
+
+
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize("tp_size", [2])
 @pytest.mark.parametrize(
@@ -392,6 +480,14 @@ def test_multi_process_pipeline_parallel(
     test_target: Callable[..., Any],
 ):
     multi_process_parallel(monkeypatch, 1, pp_size, test_target)
+
+
+@multi_gpu_test(num_gpus=2)
+def test_dsv4_pp_intermediate_transport_multiturn(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    multi_process_parallel(monkeypatch, 1, 2,
+                           dsv4_pp_intermediate_transport_worker)
 
 
 @multi_gpu_test(num_gpus=4)
