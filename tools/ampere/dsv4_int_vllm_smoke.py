@@ -65,7 +65,22 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-model-len", type=int, default=512)
-    parser.add_argument("--kv-cache-dtype", default="fp8")
+    parser.add_argument(
+        "--kv-cache-dtype",
+        default="fp8",
+        help=(
+            "kv cache dtype; pass 'auto' to take the checkpoint's "
+            "appmana.cache_type default"
+        ),
+    )
+    parser.add_argument(
+        "--hf-overrides",
+        default=None,
+        help=(
+            "JSON dict merged into the HF config; a dict-valued key like "
+            '\'{"appmana": {...}}\' replaces the whole block'
+        ),
+    )
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
@@ -120,6 +135,8 @@ def main() -> int:
 
     from vllm import LLM, SamplingParams
 
+    hf_overrides = json.loads(args.hf_overrides) if args.hf_overrides else {}
+
     before = _gpu_snapshot()
     llm = LLM(
         model=args.model,
@@ -132,6 +149,7 @@ def main() -> int:
         tensor_parallel_size=1,
         pipeline_parallel_size=args.pipeline_parallel_size,
         load_format=args.load_format,
+        hf_overrides=hf_overrides,
     )
 
     prompts = [args.prompt for _ in range(args.num_prompts)]

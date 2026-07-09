@@ -395,6 +395,56 @@ def _fused_indexer_q_rope_fp8_torch(
     return index_q_fp8, index_weights_out
 
 
+def fused_indexer_q_rope_quant_int8(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+    index_weights_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused RoPE + symmetric INT8 quant of the indexer query (s8 x s8 IMMA).
+
+    Output is a symmetric INT8 tensor (NOT fp8); the per-(token, head) q scale
+    is folded into ``index_weights_out`` identically to the fp8 path.
+    cuTeDSL/fp8 fast paths are fp8-only, so this always uses the Triton kernel.
+
+    This is the registry symbol for the ``indexer_query_int8`` role of the
+    AppMana DSV4 kernel config block (``"appmana"`` in the checkpoint
+    config.json); membership of
+    ``vllm.models.deepseek_v4.common.ops.fused_indexer_q.fused_indexer_q_rope_quant_int8``
+    in ``appmana.kernels`` activates the integer-MMA indexer query (and
+    requires the INT8 indexer cache).
+    """
+    num_tokens, num_index_q_heads, index_q_head_dim = index_q.shape
+    if index_weights_out is None:
+        index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+    index_q_int8 = torch.empty_like(index_q, dtype=torch.int8)
+    _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
+        positions,
+        index_q,
+        index_q.stride(0),
+        index_q.stride(1),
+        index_q_cos_sin_cache,
+        index_q_cos_sin_cache.stride(0),
+        index_q_cos_sin_cache.shape[-1] // 2,
+        index_q_int8,
+        index_q_int8.stride(0),
+        index_q_int8.stride(1),
+        index_q_head_dim,
+        index_weights,
+        index_weights.stride(0),
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        index_weights_out,
+        index_weights_out.stride(0),
+        QK_INT8=True,
+        num_warps=1,
+    )
+    return index_q_int8, index_weights_out
+
+
 def fused_indexer_q_rope_quant(
     positions: torch.Tensor,
     index_q: torch.Tensor,
@@ -514,33 +564,15 @@ def fused_indexer_q_rope_quant(
         ), index_weights_out
 
     if q_is_int8:
-        # INT8 integer-MMA query for the s8 x s8 indexer on Ampere. Output is a
-        # symmetric INT8 tensor (NOT fp8); the per-(token, head) q scale is folded
-        # into index_weights_out identically to the fp8 path. cuTeDSL/fp8 fast
-        # paths are fp8-only, so always use the Triton kernel here.
-        index_q_int8 = torch.empty_like(index_q, dtype=torch.int8)
-        _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
+        return fused_indexer_q_rope_quant_int8(
             positions,
             index_q,
-            index_q.stride(0),
-            index_q.stride(1),
             index_q_cos_sin_cache,
-            index_q_cos_sin_cache.stride(0),
-            index_q_cos_sin_cache.shape[-1] // 2,
-            index_q_int8,
-            index_q_int8.stride(0),
-            index_q_int8.stride(1),
-            index_q_head_dim,
             index_weights,
-            index_weights.stride(0),
             index_weights_softmax_scale,
             index_weights_head_scale,
-            index_weights_out,
-            index_weights_out.stride(0),
-            QK_INT8=True,
-            num_warps=1,
+            index_weights_out=index_weights_out,
         )
-        return index_q_int8, index_weights_out
 
     fp8_dtype = current_platform.fp8_dtype()
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz

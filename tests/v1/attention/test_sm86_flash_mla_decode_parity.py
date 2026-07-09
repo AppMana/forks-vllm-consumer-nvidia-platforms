@@ -219,10 +219,14 @@ def test_flash_mla_prefill_rejects_or_matches_real_swa_metadata_shape() -> None:
     assert cd < 8e-5, f"real vLLM [T,1,W] SWA metadata shape changed FlashMLA prefill output: cos_diff={cd:.2e}"
 
 
-def test_sm86_prefill_uses_triton_attention() -> None:
+def test_sm86_prefill_dispatches_triton_and_native() -> None:
+    """The prefill role selects between the Triton staging path and the
+    native flash_mla prefill via the appmana kernel config."""
     source = inspect.getsource(DeepseekV4SM86Attention._forward_prefill)
     assert "sparse_attention_triton" in source
-    assert "flash_sparse_mla_prefill" not in source
+    assert "_forward_prefill_flash" in source
+    native = inspect.getsource(DeepseekV4SM86Attention._forward_prefill_flash)
+    assert "flash_sparse_mla_prefill(" in native
 
 
 def test_sm86_fp8_decode_dispatch_supports_native_and_triton_fqns() -> None:
@@ -234,7 +238,96 @@ def test_sm86_fp8_decode_dispatch_supports_native_and_triton_fqns() -> None:
         "decode_sparse_attention_triton"
     )
     source = inspect.getsource(DeepseekV4SM86Attention._forward_decode)
-    assert "DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8" in source
-    assert "DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON" in source
+    assert "SPARSE_MLA_DECODE_FP8_FLASH" in source
+    assert "SPARSE_MLA_DECODE_FP8_TRITON" in source
     assert "flash_sparse_mla_decode(" in source
     assert "decode_sparse_attention_triton(" in source
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 8,
+    reason="flash_mla sparse-MLA prefill requires Ampere (sm_8x)",
+)
+def test_flash_mla_prefill_matches_triton_reference_with_extra_cache() -> None:
+    """Numeric parity: native flash_mla prefill vs the Triton reference on
+    identical synthetic fp8_ds_mla inputs, including short rows (-1 padded
+    SWA windows) and a second compressed cache stream."""
+    torch.manual_seed(7)
+    dev = "cuda"
+    T, H, block_size = 6, 64, 32
+    swa_topk, extra_topk = 128, 512
+    scale = 1.0 / math.sqrt(_HEAD_DIM)
+
+    swa_slots = swa_topk + 64
+    extra_slots = extra_topk + 128
+    swa_cache = torch.zeros(
+        (swa_slots + block_size - 1) // block_size,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device=dev,
+    )
+    extra_cache = torch.zeros(
+        (extra_slots + block_size - 1) // block_size,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device=dev,
+    )
+    for slot in range(swa_slots):
+        _write_fp8_ds_mla_token(swa_cache, slot, block_size)
+    for slot in range(extra_slots):
+        _write_fp8_ds_mla_token(extra_cache, slot, block_size)
+
+    q = torch.randn(T, H, _HEAD_DIM, device=dev, dtype=torch.bfloat16)
+    # Short rows: valid entries compact-left, -1 padding after (the layout
+    # produced by build_flashinfer_mixed_sparse_indices for prefill tokens).
+    swa_lens = torch.randint(
+        swa_topk // 2, swa_topk + 1, (T,), dtype=torch.int32, device=dev
+    )
+    extra_lens = torch.randint(
+        extra_topk // 2, extra_topk + 1, (T,), dtype=torch.int32, device=dev
+    )
+    swa_idx = torch.full((T, swa_topk), -1, dtype=torch.int32, device=dev)
+    extra_idx = torch.full((T, extra_topk), -1, dtype=torch.int32, device=dev)
+    for t in range(T):
+        swa_idx[t, : swa_lens[t]] = torch.randperm(swa_slots, device=dev)[
+            : swa_lens[t]
+        ].to(torch.int32)
+        extra_idx[t, : extra_lens[t]] = torch.randperm(extra_slots, device=dev)[
+            : extra_lens[t]
+        ].to(torch.int32)
+    sink = torch.randn(H, device=dev, dtype=torch.float32) * 0.1
+
+    flash_out = flash_sparse_mla_prefill(
+        q=q,
+        swa_cache=swa_cache,
+        swa_indices=swa_idx,
+        swa_lens=swa_lens,
+        scale=scale,
+        attn_sink=sink,
+        extra_cache=extra_cache,
+        extra_indices=extra_idx,
+        extra_lens=extra_lens,
+    )
+    # Triton reference: the decode kernel computes the same absorbed sparse
+    # attention over the same (swa, extra) global-slot selection.
+    tri_out = torch.empty_like(q)
+    decode_sparse_attention_triton(
+        q=q,
+        swa_cache=swa_cache,
+        swa_indices=swa_idx,
+        swa_lens=swa_lens,
+        scale=scale,
+        attn_sink=sink,
+        out=tri_out,
+        extra_cache=extra_cache,
+        extra_indices=extra_idx,
+        extra_lens=extra_lens,
+    )
+
+    torch.testing.assert_close(
+        flash_out.float(), tri_out.float(), rtol=2e-2, atol=2e-2
+    )
+    cd = _cos_diff(flash_out.float(), tri_out.float())
+    assert cd < 8e-5, f"flash_mla prefill vs Triton cos_diff={cd:.2e}"

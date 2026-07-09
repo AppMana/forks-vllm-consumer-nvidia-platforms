@@ -296,6 +296,19 @@ def get_quant_config(
                     appmana_imma
                 )
 
+        # Copy the unified AppMana kernel-config block ("appmana" at the top
+        # level of the checkpoint config.json) alongside the quantization
+        # config so Dsv4IntConfig.from_config sees it and the block travels
+        # with the pickled quant config into Ray workers.
+        if (
+            model_config.quantization in ("dsv4_int", "dsv4_mxfp4_int8")
+            and "appmana" not in hf_quant_config
+        ):
+            appmana_block = getattr(model_config.hf_config, "appmana", None)
+            if appmana_block is not None:
+                hf_quant_config = dict(hf_quant_config)
+                hf_quant_config["appmana"] = appmana_block
+
         # For modelopt_mixed, config.json's quantization_config may or may
         # not contain the per-layer quantized_layers map.  Newer checkpoints
         # embed it directly; older ones keep it only in hf_quant_config.json.
