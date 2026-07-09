@@ -43,7 +43,7 @@ def _make_int8_mla_spec(page_size: int, block_size: int = 256) -> MLAAttentionSp
         page_size_padded=page_size,
         cache_dtype_str="int8_ds_mla",
         model_version="deepseek_v4",
-        alignment=516,
+        alignment=528,
         compress_ratio=4,
     )
 
@@ -173,14 +173,17 @@ class TestInterleavedPacking:
         for i, v in enumerate(views):
             assert (v == i + 1).all(), f"View {i} was corrupted"
 
-    def test_packed_offsets_are_four_byte_aligned_for_int8_ds_mla(self):
+    def test_packed_offsets_are_16_byte_aligned_for_int8_ds_mla(self):
+        # 16-byte alignment of offsets AND block stride: cache writers use
+        # 16B vectorized stores; a non-16B stride alternates block alignment
+        # and faults with "CUDA error: misaligned address".
         prefix = FullAttentionSpec(
             block_size=1,
             num_kv_heads=1,
             head_size=1,
             dtype=torch.uint8,
         )
-        int8_mla = _make_int8_mla_spec(page_size=64 * 516)
+        int8_mla = _make_int8_mla_spec(page_size=64 * 528)
         groups = [
             KVCacheGroupSpec(
                 ["prefix.0", "int8_mla.0"],
@@ -199,8 +202,8 @@ class TestInterleavedPacking:
         )
         by_layer = {t.shared_by[0]: t for t in tensors}
 
-        assert by_layer["int8_mla.0"].offset % 4 == 0
-        assert by_layer["int8_mla.0"].block_stride % 4 == 0
+        assert by_layer["int8_mla.0"].offset % 16 == 0
+        assert by_layer["int8_mla.0"].block_stride % 16 == 0
 
     def test_hma_attention_groups_keep_default_backing(self):
         full = _make_full_spec()

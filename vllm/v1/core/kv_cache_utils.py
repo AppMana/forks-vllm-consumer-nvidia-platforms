@@ -1293,13 +1293,18 @@ def _get_kv_cache_config_packed(
     for ps, slots in buckets.items():
         for slot in slots:
             # Some byte-packed KV formats store wider values inside the uint8
-            # backing tensor (for example int8_ds_mla stores a fp32 row scale).
-            # Keep every packed slot page-aligned enough for those inner fields.
-            byte_offset = round_up(byte_offset, 4)
+            # backing tensor (for example int8_ds_mla stores a fp32 row scale)
+            # and several cache writers use 16-byte vectorized stores (the
+            # csrc fp8_ds_mla uint4 path). Keep every packed slot offset AND
+            # the per-block stride 16-byte aligned, otherwise consecutive
+            # blocks alternate 16B alignment and those writers fault with
+            # "CUDA error: misaligned address" (observed: block stride
+            # 42696 ≡ 8 mod 16 on the int8_ds_mla PP=10 deploy).
+            byte_offset = round_up(byte_offset, 16)
             packed_slots.append((byte_offset, ps, slot))
             byte_offset += ps
 
-    total_num_bytes_per_block = round_up(byte_offset, 4)
+    total_num_bytes_per_block = round_up(byte_offset, 16)
 
     num_blocks = available_memory // total_num_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)

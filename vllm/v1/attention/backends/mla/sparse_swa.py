@@ -92,7 +92,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             cache_dtype_str=self.cache_config.cache_dtype,
             alignment=576
             if uses_fp8_ds_mla_layout
-            else (516 if uses_int8_ds_mla_layout else None),
+            else (528 if uses_int8_ds_mla_layout else None),
             model_version="deepseek_v4",
         )
 
@@ -143,7 +143,7 @@ class DeepseekSparseSWABackend(AttentionBackend):
             # head_size passed in is the semantic head_dim (512).
             return (num_blocks, block_size, 584)
         if cache_dtype_str == "int8_ds_mla":
-            return (num_blocks, block_size, 516)
+            return (num_blocks, block_size, 528)
         else:
             return (num_blocks, block_size, head_size)
 

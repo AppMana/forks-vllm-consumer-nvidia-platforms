@@ -53,10 +53,10 @@ def test_int8_ds_mla_resolves_to_uint8_even_for_fp8_layout_backend() -> None:
 def test_int8_ds_mla_cache_shapes_and_page_sizes() -> None:
     assert DeepseekV4FlashMLABackend.get_kv_cache_shape(
         3, 64, 1, 512, "int8_ds_mla"
-    ) == (3, 64, 516)
+    ) == (3, 64, 528)
     assert DeepseekSparseSWABackend.get_kv_cache_shape(
         3, 64, 1, 512, "int8_ds_mla"
-    ) == (3, 64, 516)
+    ) == (3, 64, 528)
 
     main_spec = MLAAttentionSpec(
         block_size=256,
@@ -65,10 +65,10 @@ def test_int8_ds_mla_cache_shapes_and_page_sizes() -> None:
         dtype=torch.uint8,
         compress_ratio=4,
         cache_dtype_str="int8_ds_mla",
-        alignment=516,
+        alignment=528,
         model_version="deepseek_v4",
     )
-    assert main_spec.real_page_size_bytes == 64 * 516
+    assert main_spec.real_page_size_bytes == 64 * 528
 
     swa_spec = SlidingWindowMLASpec(
         block_size=64,
@@ -77,10 +77,10 @@ def test_int8_ds_mla_cache_shapes_and_page_sizes() -> None:
         dtype=torch.uint8,
         sliding_window=128,
         cache_dtype_str="int8_ds_mla",
-        alignment=516,
+        alignment=528,
         model_version="deepseek_v4",
     )
-    assert swa_spec.real_page_size_bytes == 64 * 516
+    assert swa_spec.real_page_size_bytes == 64 * 528
 
 
 def test_int8_ds_mla_insert_global_dequant_and_views() -> None:
@@ -88,7 +88,7 @@ def test_int8_ds_mla_insert_global_dequant_and_views() -> None:
     block_size = 4
     k = torch.randn(6, 512, dtype=torch.bfloat16, device=device)
     slot_mapping = torch.tensor([0, 1, 5, -1, 8, 9], dtype=torch.int64, device=device)
-    k_cache = torch.zeros(3, block_size, 516, dtype=torch.uint8, device=device)
+    k_cache = torch.zeros(3, block_size, 528, dtype=torch.uint8, device=device)
 
     quantize_and_insert_int8_ds_mla_cache(k, k_cache, slot_mapping, block_size)
 
@@ -97,7 +97,7 @@ def test_int8_ds_mla_insert_global_dequant_and_views() -> None:
     assert rows_i8.dtype == torch.int8
     assert scales.shape == (3, block_size)
     assert scales.dtype == torch.float32
-    assert rows_i8.stride()[1] == 516
+    assert rows_i8.stride()[1] == 528
 
     slot_ids = torch.tensor([[0, 5, -1], [8, 9, 1]], dtype=torch.int64, device=device)
     out = torch.empty(2, 3, 512, dtype=torch.bfloat16, device=device)
@@ -116,7 +116,7 @@ def test_int8_ds_mla_gather_dequant() -> None:
     device = _device()
     block_size = 4
     k = torch.randn(8, 512, dtype=torch.bfloat16, device=device)
-    k_cache = torch.zeros(2, block_size, 516, dtype=torch.uint8, device=device)
+    k_cache = torch.zeros(2, block_size, 528, dtype=torch.uint8, device=device)
     slot_mapping = torch.arange(8, dtype=torch.int64, device=device)
     quantize_and_insert_int8_ds_mla_cache(k, k_cache, slot_mapping, block_size)
 
@@ -149,7 +149,7 @@ def test_int8_ds_mla_gather_dequant_prefill_shape() -> None:
     num_blocks = 40
     num_tokens = num_blocks * block_size
     k = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device=device)
-    k_cache = torch.zeros(num_blocks, block_size, 516, dtype=torch.uint8, device=device)
+    k_cache = torch.zeros(num_blocks, block_size, 528, dtype=torch.uint8, device=device)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
     quantize_and_insert_int8_ds_mla_cache(k, k_cache, slot_mapping, block_size)
 
@@ -182,7 +182,7 @@ def test_generic_gather_dispatches_int8_ds_mla() -> None:
     device = _device()
     block_size = 4
     k = torch.randn(8, 512, dtype=torch.bfloat16, device=device)
-    k_cache = torch.zeros(2, block_size, 516, dtype=torch.uint8, device=device)
+    k_cache = torch.zeros(2, block_size, 528, dtype=torch.uint8, device=device)
     slot_mapping = torch.arange(8, dtype=torch.int64, device=device)
     quantize_and_insert_int8_ds_mla_cache(k, k_cache, slot_mapping, block_size)
 
@@ -207,6 +207,221 @@ def test_generic_gather_dispatches_int8_ds_mla() -> None:
     )
 
 
+def test_int8_ds_mla_token_stride_is_16_byte_multiple() -> None:
+    """516-byte token rows alternate 16B alignment across consecutive tokens;
+    every packed-layout consumer (csrc uint4 stores, Triton vectorization)
+    requires a 16-byte-multiple stride. 528 = 512 int8 + 4B fp32 scale + 12B pad.
+    """
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        _INT8_DS_MLA_TOKEN_BYTES,
+    )
+
+    assert _INT8_DS_MLA_TOKEN_BYTES % 16 == 0
+    assert _INT8_DS_MLA_TOKEN_BYTES == 528
+
+
+def _reference_qnorm_rope(
+    x: torch.Tensor,  # [..., 512] bf16
+    positions: torch.Tensor,  # [N] int64
+    cos_sin: torch.Tensor,  # [max_pos, 64] fp32
+    eps: float | None,
+) -> torch.Tensor:
+    """Reference for the fused q-norm/rope (eps given) or kv rope (eps None).
+
+    Matches the csrc fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+    semantics: fp32 math, RMSNorm over the whole 512-dim head (no weight),
+    GPT-J RoPE on dims [448, 512) with interleaved (even, odd) pairs.
+    """
+    xf = x.to(torch.float32)
+    if eps is not None:
+        rms_rcp = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+        xf = xf * rms_rcp
+    rope = xf[..., 448:].clone()
+    even = rope[..., 0::2].clone()
+    odd = rope[..., 1::2].clone()
+    # cos_sin rows: 32 cos then 32 sin.
+    cs = cos_sin[positions]  # [N, 64]
+    shape = [positions.shape[0]] + [1] * (xf.dim() - 2) + [32]
+    cos = cs[:, :32].view(shape)
+    sin = cs[:, 32:].view(shape)
+    rope[..., 0::2] = even * cos - odd * sin
+    rope[..., 1::2] = odd * cos + even * sin
+    out = torch.cat([xf[..., :448], rope], dim=-1)
+    return out
+
+
+def _reference_int8_quant_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row-wise int8 quant matching the Triton writers (bf16 round-trip,
+    absmax/127 scale, round-half-away-from-zero)."""
+    xf = x.to(torch.bfloat16).to(torch.float32)
+    absmax = xf.abs().amax(dim=-1).clamp_min(1.0e-12)
+    scale = absmax / 127.0
+    s = xf / scale.unsqueeze(-1)
+    rounded = torch.trunc(s + torch.where(s >= 0, 0.5, -0.5))
+    return rounded.clamp(-127, 127).to(torch.int8), scale
+
+
+def _run_fused_insert_case(k_cache: torch.Tensor, block_size: int) -> None:
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        fused_qnorm_rope_kv_int8_ds_mla_insert,
+    )
+
+    device = k_cache.device
+    torch.manual_seed(0)
+    num_tokens = 6
+    num_heads = 3
+    padded_heads = 4
+    eps = 1e-6
+    q = torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device=device)
+    positions = torch.tensor([0, 3, 7, 11, 2, 5], dtype=torch.int64, device=device)
+    cos_sin = torch.randn(16, 64, dtype=torch.float32, device=device)
+    slot_mapping = torch.tensor([0, 1, 5, -1, 8, 9], dtype=torch.int64, device=device)
+
+    q_out = fused_qnorm_rope_kv_int8_ds_mla_insert(
+        q,
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin,
+        padded_heads,
+        eps,
+        block_size,
+    )
+    torch.cuda.synchronize()
+
+    # ----- Q side: RMSNorm + RoPE + zero padding -----
+    assert q_out.shape == (num_tokens, padded_heads, 512)
+    q_ref = _reference_qnorm_rope(q, positions, cos_sin, eps).to(torch.bfloat16)
+    torch.testing.assert_close(
+        q_out[:, :num_heads], q_ref, rtol=1.6e-2, atol=1.6e-2
+    )
+    assert torch.equal(
+        q_out[:, num_heads:], torch.zeros_like(q_out[:, num_heads:])
+    )
+
+    # ----- KV side: RoPE (no norm) + int8 row + fp32 scale -----
+    kv_ref = _reference_qnorm_rope(kv.unsqueeze(1), positions, cos_sin, None)[:, 0]
+    q_i8_ref, scale_ref = _reference_int8_quant_row(kv_ref)
+
+    rows_i8, scales = get_int8_ds_mla_cache_views(k_cache, block_size)
+    for token, slot in enumerate(slot_mapping.tolist()):
+        if slot < 0:
+            continue
+        b, p = divmod(slot, block_size)
+        got = rows_i8[b, p].to(torch.float32) * scales[b, p]
+        want = q_i8_ref[token].to(torch.float32) * scale_ref[token]
+        torch.testing.assert_close(got, want, rtol=0, atol=_INT8_DS_MLA_ATOL)
+
+
+def test_fused_qnorm_rope_kv_int8_insert_contiguous() -> None:
+    device = _device()
+    if device.type != "cuda":
+        return
+    block_size = 4
+    k_cache = torch.zeros(3, block_size, 528, dtype=torch.uint8, device=device)
+    _run_fused_insert_case(k_cache, block_size)
+
+
+def test_fused_qnorm_rope_kv_int8_insert_packed_crash_geometry() -> None:
+    """Reconstruct the JobSet dsv4-m2-int4-int8kv-001 fault geometry: the SWA
+    cache is a strided view of a packed multi-layer per-block buffer whose
+    block stride is NOT a 16-byte multiple (observed 42696 ≡ 8 mod 16) and
+    whose storage offset is only 4-byte aligned. The insert must neither fault
+    (csrc uint4 stores did: CUDA misaligned address) nor corrupt bytes outside
+    its own rows.
+    """
+    device = _device()
+    if device.type != "cuda":
+        return
+    block_size = 4
+    num_blocks = 3
+    page_bytes = block_size * 528
+    block_stride = page_bytes + 24  # ≡ 8 mod 16, like the packed layout
+    storage_offset = 4  # 4-byte aligned only
+    backing = torch.full(
+        (storage_offset + num_blocks * block_stride,),
+        0xAB,
+        dtype=torch.uint8,
+        device=device,
+    )
+    k_cache = backing.as_strided(
+        (num_blocks, block_size, 528),
+        (block_stride, 528, 1),
+        storage_offset=storage_offset,
+    )
+    k_cache.zero_()
+    _run_fused_insert_case(k_cache, block_size)
+    # Bytes outside the cache view must be untouched.
+    flat = backing.clone()
+    flat_view = flat.as_strided(
+        (num_blocks, block_size, 528),
+        (block_stride, 528, 1),
+        storage_offset=storage_offset,
+    )
+    flat_view.copy_(k_cache)
+    mask = torch.ones_like(backing, dtype=torch.bool)
+    mask_view = mask.as_strided(
+        (num_blocks, block_size, 528),
+        (block_stride, 528, 1),
+        storage_offset=storage_offset,
+    )
+    mask_view.fill_(False)
+    assert torch.all(backing[mask] == 0xAB)
+
+
+def test_fused_qnorm_rope_kv_insert_dispatches_int8(monkeypatch) -> None:
+    """attention._fused_qnorm_rope_kv_insert must route int8_ds_mla uint8
+    caches to the int8 writer, NOT the csrc fp8_ds_mla writer (which writes a
+    576/584-byte layout with 16B uint4 stores)."""
+    import types
+
+    import vllm.models.deepseek_v4.attention as dsv4_attention
+
+    calls: list[str] = []
+
+    def record_int8(*args, **kwargs):
+        calls.append("int8")
+        q = args[0]
+        return q.new_zeros(q.shape[0], args[6], q.shape[-1])
+
+    monkeypatch.setattr(
+        dsv4_attention,
+        "fused_qnorm_rope_kv_int8_ds_mla_insert",
+        record_int8,
+    )
+
+    device = _device()
+    layer = types.SimpleNamespace(
+        swa_cache_layer=types.SimpleNamespace(
+            prefix="swa",
+            kv_cache=torch.zeros(2, 4, 528, dtype=torch.uint8, device=device),
+        ),
+        kv_cache_dtype="int8_ds_mla",
+        rotary_emb=types.SimpleNamespace(
+            cos_sin_cache=torch.zeros(8, 64, dtype=torch.float32, device=device)
+        ),
+        padded_heads=4,
+        n_local_heads=4,
+        eps=1e-6,
+    )
+    attn_metadata = {
+        "swa": types.SimpleNamespace(
+            slot_mapping=torch.zeros(2, dtype=torch.int64, device=device),
+            block_size=4,
+        )
+    }
+    q = torch.zeros(2, 4, 512, dtype=torch.bfloat16, device=device)
+    kv = torch.zeros(2, 512, dtype=torch.bfloat16, device=device)
+    positions = torch.zeros(2, dtype=torch.int64, device=device)
+
+    dsv4_attention.DeepseekV4Attention._fused_qnorm_rope_kv_insert(
+        layer, q, kv, positions, attn_metadata
+    )
+    assert calls == ["int8"]
+
+
 def test_generic_gather_leaves_fp8_shaped_aux_cache_on_fp8_path(monkeypatch) -> None:
     import vllm.models.deepseek_v4.common.ops.cache_utils as cache_utils
 
@@ -223,6 +438,15 @@ def test_generic_gather_leaves_fp8_shaped_aux_cache_on_fp8_path(monkeypatch) -> 
     )
     monkeypatch.setattr(cache_utils, "_dequantize_and_gather_k_cache_torch", record_fp8)
     monkeypatch.setattr(cache_utils, "_supports_fp8e4nv_in_triton", lambda: False)
+    # Environments whose _C provides the native sm_8x gather take that path
+    # instead of the torch fallback; force the fallback so this test observes
+    # a single deterministic fp8 route on every build.
+    monkeypatch.setattr(
+        cache_utils.torch.ops._C,
+        "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache",
+        record_fp8,
+        raising=False,
+    )
 
     device = _device()
     block_size = 64

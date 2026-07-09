@@ -273,7 +273,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
 
     if INT8_DS_MLA:
         tl.static_assert(HEAD_SIZE == 512)
-        tl.static_assert(TOKEN_STRIDE == 516)
+        tl.static_assert(TOKEN_STRIDE == 528)
         tl.static_assert(SCALE_DIM == 4)
         result_bf16 = result.to(tl.bfloat16).to(tl.float32)
         absmax = tl.maximum(tl.max(tl.abs(result_bf16), axis=0), 1.0e-12)
