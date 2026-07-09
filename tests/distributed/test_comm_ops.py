@@ -408,6 +408,9 @@ def dsv4_pp_intermediate_transport_worker(
     distributed_init_port: str,
 ):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    # keep this worker on the multi-tensor wire format; the packed path is
+    # covered by dsv4_pp_packed_intermediate_transport_worker.
+    monkeypatch.setenv("VLLM_PP_PACK_TENSOR_DICT", "0")
     device = torch.device(f"cuda:{rank}")
     torch.accelerator.set_device_index(device)
     init_test_distributed_environment(tp_size, pp_size, rank,
@@ -482,12 +485,107 @@ def test_multi_process_pipeline_parallel(
     multi_process_parallel(monkeypatch, 1, pp_size, test_target)
 
 
+@ray.remote(num_gpus=1, max_calls=1)
+def dsv4_pp_packed_intermediate_transport_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("VLLM_PP_PACK_TENSOR_DICT", "1")
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank,
+                                      distributed_init_port)
+
+    # count the wire-level P2P calls: the packed path must collapse the
+    # four-tensor MHC stream into ONE NCCL message per hop per turn.
+    isend_calls = {"n": 0}
+    irecv_calls = {"n": 0}
+    real_isend = torch.distributed.isend
+    real_irecv = torch.distributed.irecv
+
+    def counting_isend(*args, **kwargs):
+        isend_calls["n"] += 1
+        return real_isend(*args, **kwargs)
+
+    def counting_irecv(*args, **kwargs):
+        irecv_calls["n"] += 1
+        return real_irecv(*args, **kwargs)
+
+    monkeypatch.setattr(torch.distributed, "isend", counting_isend)
+    monkeypatch.setattr(torch.distributed, "irecv", counting_irecv)
+
+    token_counts = [16_384, 1, 512, 2, 4096]
+    hidden_size = 64
+    hc_mult = 8
+
+    if not get_pp_group().is_first_rank:
+        persistent = _make_dsv4_intermediates(max(token_counts), hidden_size,
+                                              hc_mult, 0, -1, device)
+
+    previous_send = []
+    expected_recvs = 0
+    expected_sends = 0
+    for step, num_tokens in enumerate(token_counts):
+        if previous_send:
+            for handle in previous_send:
+                handle.wait()
+            previous_send = []
+
+        if not get_pp_group().is_first_rank:
+            tensor_dict, handles, postprocess = get_pp_group(
+            ).irecv_tensor_dict(recv_tensor_dict=persistent)
+            assert tensor_dict is not None
+            for handle in handles:
+                handle.wait()
+            for fn in postprocess:
+                fn()
+            torch.cuda.synchronize(device)
+
+            expected_recvs += 1
+            assert irecv_calls["n"] == expected_recvs, (
+                f"step {step}: expected one irecv per turn, got "
+                f"{irecv_calls['n']} after {expected_recvs} turns")
+
+            expected = _make_dsv4_intermediates(num_tokens, hidden_size, hc_mult,
+                                                0, step, device)
+            for key, want in expected.items():
+                got = tensor_dict[key]
+                assert got.data_ptr() == persistent[key].data_ptr()
+                torch.testing.assert_close(got, want)
+                torch.testing.assert_close(persistent[key][:num_tokens], want)
+
+        if not get_pp_group().is_last_rank:
+            payload = _make_dsv4_intermediates(num_tokens, hidden_size, hc_mult,
+                                               rank, step, device)
+            previous_send = get_pp_group().isend_tensor_dict(payload)
+
+            expected_sends += 1
+            assert isend_calls["n"] == expected_sends, (
+                f"step {step}: expected one isend per turn, got "
+                f"{isend_calls['n']} after {expected_sends} turns")
+
+    for handle in previous_send:
+        handle.wait()
+
+
 @multi_gpu_test(num_gpus=2)
 def test_dsv4_pp_intermediate_transport_multiturn(
     monkeypatch: pytest.MonkeyPatch,
 ):
     multi_process_parallel(monkeypatch, 1, 2,
                            dsv4_pp_intermediate_transport_worker)
+
+
+@multi_gpu_test(num_gpus=2)
+def test_dsv4_pp_packed_intermediate_transport_multiturn(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    multi_process_parallel(monkeypatch, 1, 2,
+                           dsv4_pp_packed_intermediate_transport_worker)
 
 
 @multi_gpu_test(num_gpus=4)
