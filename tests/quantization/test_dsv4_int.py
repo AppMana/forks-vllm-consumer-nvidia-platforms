@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.dsv4_int import (
     _e8m0_to_fp32_scale,
     _unpack_int4_pairs,
     dequantize_allspark_uint8_w8a16,
+    dequantize_fp8_block_to_bf16,
     dequantize_int4_w4a16,
     dequantize_int8_w8a16,
     dequantize_uint4_asym_w4a16,
@@ -513,6 +514,297 @@ def test_allspark_channel_int8_linear_method_matches_dequant_reference():
     torch.cuda.synchronize()
 
     assert _snr_db(reference, actual) > 45.0
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    a = a.float().reshape(-1)
+    b = b.float().reshape(-1)
+    return (a @ b / (a.norm() * b.norm())).item()
+
+
+def _make_wo_a_method(strategy: str) -> Dsv4Int8LinearMethod:
+    cfg = Dsv4IntConfig.from_config(
+        {
+            "quant_method": "dsv4_int",
+            "config_groups": {
+                "linears_w8a16": {
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "symmetric": True,
+                        "strategy": strategy,
+                    }
+                }
+            },
+        }
+    )
+    method = Dsv4Int8LinearMethod(cfg, "model.layers.0.attn.wo_a")
+    assert method.force_dequant
+    return method
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
+    reason="requires torch float8 dtypes",
+)
+def test_dequantize_fp8_block_to_bf16_matches_reference():
+    torch.manual_seed(7)
+    n = 256
+    k = 256
+    source = (torch.randn(n, k) * 0.5).clamp(-4, 4)
+    weight_fp8 = source.to(torch.float8_e4m3fn)
+    scale_e8m0 = torch.randint(120, 134, (2, 2), dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+
+    actual = dequantize_fp8_block_to_bf16(weight_fp8, scale_e8m0)
+
+    scale = _e8m0_to_fp32_scale(scale_e8m0)
+    scale_full = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    reference = weight_fp8.to(torch.float32) * scale_full[:n, :k]
+
+    assert actual.dtype is torch.bfloat16
+    # e4m3 has 3 mantissa bits, bf16 has 7, so fp8 -> bf16 is essentially exact.
+    assert torch.allclose(actual.float(), reference.to(torch.bfloat16).float())
+    assert _snr_db(reference, actual) > 45.0
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
+    reason="requires torch float8 dtypes",
+)
+def test_wo_a_bf16_direct_beats_int8_channel_accuracy(capsys):
+    torch.manual_seed(21)
+    n = 512
+    k = 512
+    source = (torch.randn(n, k) * 0.5).clamp(-4, 4)
+    weight_fp8 = source.to(torch.float8_e4m3fn)
+    scale_e8m0 = torch.randint(120, 134, (4, 4), dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+
+    scale = _e8m0_to_fp32_scale(scale_e8m0)
+    scale_full = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    fp32_ref = weight_fp8.to(torch.float32) * scale_full[:n, :k]
+
+    # (a) new path: fp8 -> bf16 direct
+    a = dequantize_fp8_block_to_bf16(weight_fp8, scale_e8m0).float()
+    # (b) today's path: fp8 -> int8 channelwise -> bf16
+    channel = requantize_fp8_to_allspark_uint8_w8a16(weight_fp8, scale_e8m0)
+    b = dequantize_allspark_uint8_w8a16(channel["qweight"], channel["scales"]).float()
+
+    snr_a = _snr_db(fp32_ref, a)
+    snr_b = _snr_db(fp32_ref, b)
+    cos_a = _cosine(fp32_ref, a)
+    cos_b = _cosine(fp32_ref, b)
+    with capsys.disabled():
+        print(
+            f"\nwo_a accuracy vs fp32 fp8-dequant reference:\n"
+            f"  (a) fp8->bf16 direct   : SNR={snr_a:6.2f} dB  cos={cos_a:.6f}\n"
+            f"  (b) fp8->int8ch->bf16  : SNR={snr_b:6.2f} dB  cos={cos_b:.6f}\n"
+            f"  gain (a-b)             : {snr_a - snr_b:6.2f} dB  "
+            f"cos +{cos_a - cos_b:.6f}"
+        )
+
+    assert snr_a > snr_b
+    assert cos_a > cos_b
+
+
+@pytest.fixture
+def single_rank_parallel_state():
+    import tempfile
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    with set_current_vllm_config(VllmConfig()):
+        temp_file = tempfile.mkstemp()[1]
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"file://{temp_file}",
+            backend="gloo",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+        yield
+
+
+@pytest.mark.parametrize("strategy", ["block", "channel"])
+def test_wo_a_create_weights_registers_bf16_weight_and_nan_scale(
+    strategy, single_rank_parallel_state
+):
+    method = _make_wo_a_method(strategy)
+
+    class FakeLayer(torch.nn.Module):
+        pass
+
+    layer = FakeLayer()
+    method.create_weights(
+        layer,
+        input_size_per_partition=256,
+        output_partition_sizes=[128],
+        input_size=256,
+        output_size=128,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda *a, **k: None,
+    )
+    assert layer.weight.dtype is torch.bfloat16
+    assert layer.weight.shape == (128, 256)
+    # Sentinel: a native BF16 checkpoint never loads the scale.
+    assert torch.isnan(layer.weight_scale_inv.data).all()
+
+
+@pytest.mark.parametrize("strategy", ["block", "channel"])
+def test_wo_a_native_bf16_load_skips_int8_dequant(strategy, monkeypatch):
+    method = _make_wo_a_method(strategy)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("native BF16 wo_a must not go through INT8 dequant")
+
+    monkeypatch.setattr(
+        dsv4_int_module, "dequantize_allspark_uint8_w8a16", _boom
+    )
+    monkeypatch.setattr(dsv4_int_module, "dequantize_int8_w8a16", _boom)
+
+    torch.manual_seed(3)
+    n, k = 128, 256
+    ref_weight = (torch.randn(n, k) * 0.02).to(torch.bfloat16)
+
+    class FakeLayer(torch.nn.Module):
+        pass
+
+    layer = FakeLayer()
+    layer.input_size_per_partition = k
+    layer.output_size_per_partition = n
+    layer.weight = torch.nn.Parameter(ref_weight.clone(), requires_grad=False)
+    # NaN sentinel scale => no scale carried by the checkpoint (native BF16).
+    scale_shape = (1, 2) if strategy == "block" else (n,)
+    layer.weight_scale_inv = torch.nn.Parameter(
+        torch.full(scale_shape, float("nan"), dtype=torch.bfloat16),
+        requires_grad=False,
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert getattr(layer, "_dsv4_int_dequanted", False)
+    assert not getattr(layer, "_dsv4_int_allspark", False)
+    assert layer.weight.dtype is torch.bfloat16
+    assert torch.equal(layer.weight.data, ref_weight)
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
+    reason="requires torch float8 dtypes",
+)
+def test_wo_a_legacy_int8_block_scale_still_dequantizes():
+    method = _make_wo_a_method("block")
+
+    torch.manual_seed(4)
+    n, k = 128, 256
+    int8_codes = torch.randint(-128, 128, (n, k), dtype=torch.int8)
+    scale = (torch.rand(1, 2, dtype=torch.float32) * 0.01 + 0.001).to(torch.bfloat16)
+
+    # create_weights registers the wo_a weight as BF16; a legacy INT8 checkpoint
+    # copies its integer codes losslessly into that BF16 param.
+    class FakeLayer(torch.nn.Module):
+        pass
+
+    layer = FakeLayer()
+    layer.input_size_per_partition = k
+    layer.output_size_per_partition = n
+    layer.weight = torch.nn.Parameter(
+        int8_codes.to(torch.bfloat16), requires_grad=False
+    )
+    layer.weight_scale_inv = torch.nn.Parameter(scale.clone(), requires_grad=False)
+
+    method.process_weights_after_loading(layer)
+
+    assert getattr(layer, "_dsv4_int_dequanted", False)
+    reference = dequantize_int8_w8a16(int8_codes, scale, block_size=(128, 128))
+    assert layer.weight.dtype is torch.bfloat16
+    assert torch.equal(layer.weight.data, reference)
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
+    reason="requires torch float8 dtypes",
+)
+def test_requant_checkpoint_emits_bf16_wo_a_without_scale(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+
+    shard_name = "model-00001-of-00001.safetensors"
+    wo_a_fp8 = torch.randn(128, 128).clamp(-2, 2).to(torch.float8_e4m3fn)
+    wo_a_scale = torch.full((1, 1), 127, dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+    wq_a_fp8 = torch.randn(128, 128).clamp(-2, 2).to(torch.float8_e4m3fn)
+    expert_packed = _pack_nibbles(torch.randint(0, 16, (4, 64), dtype=torch.uint8))
+    tensors = {
+        "layers.0.attn.wo_a.weight": wo_a_fp8,
+        "layers.0.attn.wo_a.scale": wo_a_scale,
+        "layers.0.attn.wq_a.weight": wq_a_fp8,
+        "layers.0.attn.wq_a.scale": torch.full((1, 1), 127, dtype=torch.uint8).view(
+            torch.float8_e8m0fnu
+        ),
+        "layers.0.ffn.experts.0.w1.weight": expert_packed,
+        "layers.0.ffn.experts.0.w1.scale": torch.full(
+            (4, 2), 127, dtype=torch.uint8
+        ),
+    }
+    save_file(tensors, str(src / shard_name))
+    (src / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "num_hidden_layers": 1,
+                "expert_dtype": "fp4",
+            }
+        )
+    )
+    (src / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": "0"},
+                "weight_map": {name: shard_name for name in tensors},
+            }
+        )
+    )
+
+    convert_checkpoint(
+        src,
+        dst,
+        device="cpu",
+        out_scale_dtype=torch.bfloat16,
+        overwrite=False,
+        layer_remap=None,
+    )
+
+    index = json.loads((dst / "model.safetensors.index.json").read_text())
+    assert "layers.0.attn.wo_a.weight" in index["weight_map"]
+    # No scale companion for wo_a.
+    assert "layers.0.attn.wo_a.scale" not in index["weight_map"]
+    assert "layers.0.attn.wo_a.weight_scale_inv" not in index["weight_map"]
+    # wq_a still carries its INT8 scale.
+    assert "layers.0.attn.wq_a.scale" in index["weight_map"]
+
+    scale = _e8m0_to_fp32_scale(wo_a_scale)
+    reference = (wo_a_fp8.to(torch.float32) * scale).to(torch.bfloat16)
+    with safe_open(dst / shard_name, framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        assert "layers.0.attn.wo_a.scale" not in keys
+        wo_a = handle.get_tensor("layers.0.attn.wo_a.weight")
+        assert wo_a.dtype is torch.bfloat16
+        assert torch.equal(wo_a, reference)
+        assert handle.get_tensor("layers.0.attn.wq_a.weight").dtype is torch.int8
 
 
 def test_checkpoint_audit_classifies_deepseek_v4_precision_roles():

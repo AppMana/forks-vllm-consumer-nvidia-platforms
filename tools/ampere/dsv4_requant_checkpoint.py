@@ -42,6 +42,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from dsv4_checkpoint_audit import classify_tensor, matched_scale_name  # noqa: E402
 
 from vllm.model_executor.layers.quantization.dsv4_int import (  # noqa: E402
+    dequantize_fp8_block_to_bf16,
     requantize_fp8_to_allspark_uint8_w8a16,
     requantize_fp8_to_int8_w8a16,
     requantize_mxfp4_to_int4_w4a16,
@@ -53,6 +54,11 @@ _FP8_WEIGHT_ROLES = {
     "mtp_fp8_weight",
 }
 _LAYER_NAME_RE = re.compile(r"^layers\.(\d+)\.(.*)$")
+# WO_A is consumed by a custom inverse-RoPE BF16 einsum at runtime, never a GEMM.
+# Requantizing it to INT8 (fp8 -> int8 -> bf16) is pure accuracy loss with zero
+# runtime benefit: the weight is BF16 in memory either way. Dequantize the fp8
+# source straight to BF16 and emit it with no scale companion.
+_WO_A_WEIGHT_SUBSTR = ".attn.wo_a."
 
 
 def _log(message: str) -> None:
@@ -73,6 +79,15 @@ def _remap_tensor_name(name: str, layer_remap: dict[int, int] | None) -> str | N
 
 _EXPERT_NAME_RE = re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.")
 _GATE_NAME_RE = re.compile(r"^layers\.\d+\.ffn\.gate\.(weight|bias)$")
+
+
+def _is_wo_a_scale(name: str) -> bool:
+    """True for the fp8 block scale companion of a wo_a weight.
+
+    wo_a is emitted as a scale-free BF16 tensor, so its source ``.scale`` entry
+    must be dropped from the rewritten index too (the shard no longer holds it).
+    """
+    return _WO_A_WEIGHT_SUBSTR in name and name.endswith(".scale")
 
 
 def _subset_drop(name: str, keep_experts: int | None, drop_mtp: bool) -> bool:
@@ -153,6 +168,8 @@ def _write_index(
     remapped_weight_map = {}
     for name, shard in index["weight_map"].items():
         if _subset_drop(name, keep_experts, drop_mtp):
+            continue
+        if _is_wo_a_scale(name):
             continue
         remapped = _remap_tensor_name(name, layer_remap)
         if remapped is not None:
@@ -497,7 +514,7 @@ def convert_shard(
         raise ValueError(f"{src_shard.name} missing scales for: {sample}")
 
     out: dict[str, torch.Tensor] = {}
-    counts = {"int4": 0, "mxfp4": 0, "int8": 0, "preserve": 0}
+    counts = {"int4": 0, "mxfp4": 0, "int8": 0, "wo_a_bf16": 0, "preserve": 0}
     paired_scales = {
         matched_scale_name(name)
         for name, role in roles.items()
@@ -539,6 +556,16 @@ def convert_shard(
                 assert scale_name is not None
                 out_scale_name = _remap_tensor_name(scale_name, layer_remap)
                 assert out_scale_name is not None
+                if _WO_A_WEIGHT_SUBSTR in name:
+                    # Dequantize fp8 (128x128 UE8M0 block scales) straight to
+                    # BF16; emit no scale companion (its scale name is already in
+                    # ``paired_scales`` and so is skipped).
+                    out[out_name] = dequantize_fp8_block_to_bf16(
+                        handle.get_tensor(name),
+                        handle.get_tensor(scale_name),
+                    ).cpu()
+                    counts["wo_a_bf16"] += 1
+                    continue
                 if dense_int8_strategy == "channel":
                     converted = requantize_fp8_to_allspark_uint8_w8a16(
                         handle.get_tensor(name),
@@ -615,7 +642,7 @@ def convert_checkpoint(
     if layer_remap is not None:
         _log(f"layer_remap={layer_remap}")
 
-    totals = {"int4": 0, "mxfp4": 0, "int8": 0, "preserve": 0}
+    totals = {"int4": 0, "mxfp4": 0, "int8": 0, "wo_a_bf16": 0, "preserve": 0}
     _log(f"converting {len(shards)} shards from {src} to {dst}")
     for shard in shards:
         _log(f"-> {shard.name}")
@@ -635,7 +662,8 @@ def convert_checkpoint(
             totals[key] += value
         _log(
             f"{shard.name}: int4={counts['int4']} mxfp4={counts['mxfp4']} "
-            f"int8={counts['int8']} preserve={counts['preserve']}"
+            f"int8={counts['int8']} wo_a_bf16={counts['wo_a_bf16']} "
+            f"preserve={counts['preserve']}"
         )
 
     _copy_metadata(src, dst)
@@ -662,7 +690,8 @@ def convert_checkpoint(
         )
     _log(
         f"done: int4={totals['int4']} mxfp4={totals['mxfp4']} "
-        f"int8={totals['int8']} preserve={totals['preserve']}"
+        f"int8={totals['int8']} wo_a_bf16={totals['wo_a_bf16']} "
+        f"preserve={totals['preserve']}"
     )
 
 

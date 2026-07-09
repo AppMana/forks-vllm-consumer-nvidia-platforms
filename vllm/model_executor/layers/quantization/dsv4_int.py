@@ -324,6 +324,37 @@ def requantize_fp8_to_int8_w8a16(
     }
 
 
+def dequantize_fp8_block_to_bf16(
+    weight_fp8: torch.Tensor,
+    scale_e8m0: torch.Tensor,
+    *,
+    block_size: tuple[int, int] = (128, 128),
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize one FP8 e4m3 tensor with 2D UE8M0 block scales to BF16.
+
+    This is the lossless-as-possible target for tensors that are consumed as
+    BF16 at runtime anyway (``wo_a``): the FP8 e4m3 mantissa (3 bits) fits inside
+    BF16 (8 bits) with room to spare, so ``fp8 -> bf16`` is far more faithful
+    than the ``fp8 -> int8 -> bf16`` round trip the dense INT8 path uses.
+    """
+    if weight_fp8.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"weight must be float8_e4m3fn, got {weight_fp8.dtype}")
+
+    bn, bk = block_size
+    n, k = weight_fp8.shape
+    gn = (n + bn - 1) // bn
+    gk = (k + bk - 1) // bk
+    if scale_e8m0.shape != (gn, gk):
+        raise ValueError(f"expected scale shape {(gn, gk)}, got {scale_e8m0.shape}")
+
+    dequant = weight_fp8.to(torch.float32)
+    scale = _e8m0_to_fp32_scale(scale_e8m0)
+    scale_full = scale.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
+    dequant = dequant * scale_full[:n, :k]
+    return dequant.to(out_dtype)
+
+
 def requantize_fp8_to_allspark_uint8_w8a16(
     weight_fp8: torch.Tensor,
     scale_e8m0: torch.Tensor,
@@ -648,9 +679,10 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Dsv4IntConfig, prefix: str) -> None:
         self.quant_config = quant_config
         self.strategy = quant_config.int8_weight_strategy
-        # WO_A is consumed by a custom inverse-RoPE einsum path whose FP8 helper
-        # expects block scales. Keep this one on the BF16 reference path even
-        # when the rest of the dense INT8 linears use AllSpark.
+        # WO_A is consumed by a custom inverse-RoPE BF16 einsum (not a GEMM), so
+        # it must reach runtime as BF16. New checkpoints store it BF16-native
+        # (no scale); legacy checkpoints store INT8/UINT8 codes + scale and are
+        # dequantized once at load. Either way this layer never takes AllSpark.
         self.force_dequant = ".attn.wo_a" in prefix
 
     def create_weights(
@@ -674,11 +706,25 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
         layer.weight_block_size = self.BLOCK_SIZE if self.strategy == "block" else None
         layer._dsv4_int8_strategy = self.strategy
 
+        # WO_A is dequantized-at-runtime either way (it feeds a BF16 einsum, not
+        # a GEMM), so both the new BF16-native and the legacy INT8+scale
+        # checkpoints end up as a BF16 weight. Register the weight as BF16 so a
+        # native BF16 checkpoint loads directly; a legacy INT8/UINT8 checkpoint
+        # copies its integer codes losslessly into BF16 (values in [-128, 255]
+        # are exact in bfloat16) and is scaled back in
+        # ``process_weights_after_loading``. The scale param is registered with a
+        # NaN sentinel so we can detect at load time whether the checkpoint
+        # carried a scale (legacy) or not (native BF16) without a config flag.
+        weight_dtype = (
+            params_dtype
+            if self.force_dequant
+            else (torch.int8 if self.strategy == "block" else torch.uint8)
+        )
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
-                dtype=torch.int8 if self.strategy == "block" else torch.uint8,
+                dtype=weight_dtype,
             ),
             input_dim=1,
             output_dim=0,
@@ -688,21 +734,33 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
         set_weight_attrs(weight, parameter_attrs)
 
         if self.strategy == "block":
+            scale_shape: tuple[int, ...] = (
+                (output_size_per_partition + self.BLOCK_SIZE[0] - 1)
+                // self.BLOCK_SIZE[0],
+                (input_size_per_partition + self.BLOCK_SIZE[1] - 1)
+                // self.BLOCK_SIZE[1],
+            )
+            scale_data = (
+                torch.full(scale_shape, float("nan"), dtype=params_dtype)
+                if self.force_dequant
+                else torch.empty(scale_shape, dtype=params_dtype)
+            )
             weight_scale = BlockQuantScaleParameter(
-                data=torch.empty(
-                    (output_size_per_partition + self.BLOCK_SIZE[0] - 1)
-                    // self.BLOCK_SIZE[0],
-                    (input_size_per_partition + self.BLOCK_SIZE[1] - 1)
-                    // self.BLOCK_SIZE[1],
-                    dtype=params_dtype,
-                ),
+                data=scale_data,
                 input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
             )
         else:
+            scale_data = (
+                torch.full(
+                    (output_size_per_partition,), float("nan"), dtype=params_dtype
+                )
+                if self.force_dequant
+                else torch.empty(output_size_per_partition, dtype=params_dtype)
+            )
             weight_scale = ChannelQuantScaleParameter(
-                data=torch.empty(output_size_per_partition, dtype=params_dtype),
+                data=scale_data,
                 output_dim=0,
                 weight_loader=weight_loader,
             )
@@ -714,6 +772,30 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
             layer, "_dsv4_int_allspark", False
         ):
             return
+        if self.force_dequant:
+            # WO_A. The scale param keeps its NaN sentinel when the checkpoint
+            # did not carry a scale, i.e. it is a native BF16 wo_a: the weight is
+            # already the correct BF16 tensor, so skip both AllSpark and the
+            # INT8 dequant entirely (no accuracy loss). Legacy checkpoints
+            # (INT8/UINT8 codes + scale) fall through to the historical
+            # dequantize-at-load behaviour.
+            scale = layer.weight_scale_inv.data
+            if torch.isnan(scale).all():
+                layer._dsv4_int_dequanted = True
+                _dsv4_log_path("native_bf16_wo_a")
+                return
+            if self.strategy == "channel":
+                weight = dequantize_allspark_uint8_w8a16(layer.weight.data, scale)
+                path = "dequant_channel_bf16_wo_a"
+            else:
+                weight = dequantize_int8_w8a16(
+                    layer.weight.data, scale, block_size=self.BLOCK_SIZE
+                )
+                path = "dequant_block_bf16_wo_a"
+            replace_parameter(layer, "weight", weight.contiguous())
+            layer._dsv4_int_dequanted = True
+            _dsv4_log_path(path)
+            return
         if self.strategy == "channel":
             # AllSpark is the only Ampere channel-W8A16 kernel: the 2026-06-10
             # A5000 GEMM matrix measured it 2-5x faster than the (now removed)
@@ -721,7 +803,7 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
             # both dims) is identical to Triton's, so any layer Triton could
             # take AllSpark already takes. Layers AllSpark cannot take (op
             # unavailable, unaligned dims) fall through to the bf16 dequant.
-            if not self.force_dequant and self._try_process_allspark(layer):
+            if self._try_process_allspark(layer):
                 _dsv4_log_path("allspark")
                 return
             weight = dequantize_allspark_uint8_w8a16(
@@ -730,7 +812,7 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
             )
             replace_parameter(layer, "weight", weight.contiguous())
             layer._dsv4_int_dequanted = True
-            _dsv4_log_path("dequant_channel_bf16" + ("_wo_a" if self.force_dequant else ""))
+            _dsv4_log_path("dequant_channel_bf16")
             return
 
         weight = dequantize_int8_w8a16(
