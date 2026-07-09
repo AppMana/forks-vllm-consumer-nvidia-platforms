@@ -185,6 +185,7 @@ def warmup_long_prefill_kernels(
         # DeepSeek V4 indexer compresses context 4:1. Warming this directly
         # avoids first-request JIT even when a PP rank has no long prefill work.
         warmup_prefill_chunk_metadata_kernel(device, compress_ratio=4)
+        warmup_block_table_slot_mapping_kernel(model_runner, device)
 
     if _is_deepseek_v4_model_runner(model_runner):
         logger.info(
@@ -215,6 +216,43 @@ def warmup_long_prefill_kernels(
         )
 
 
+def warmup_block_table_slot_mapping_kernel(
+    model_runner: GPUModelRunner,
+    device: torch.device,
+) -> bool:
+    input_batch = getattr(model_runner, "input_batch", None)
+    block_tables = getattr(getattr(input_batch, "block_table", None), "block_tables", None)
+    if not block_tables:
+        return False
+
+    max_tokens = int(model_runner.scheduler_config.max_num_batched_tokens)
+    if max_tokens <= 0:
+        return False
+
+    query_start_loc = torch.tensor([0, max_tokens], dtype=torch.int32, device=device)
+    positions = torch.arange(max_tokens, dtype=torch.int64, device=device)
+
+    multi_group_block_table = input_batch.block_table
+    try:
+        block_ids = tuple(
+            list(range(1, cdiv(max_tokens, block_table.block_size) + 1))
+            for block_table in block_tables
+        )
+        multi_group_block_table.add_row(block_ids, 0)
+        multi_group_block_table.commit_block_table(1)
+        multi_group_block_table.compute_slot_mapping(1, query_start_loc, positions)
+        torch.accelerator.synchronize()
+    finally:
+        multi_group_block_table.clear_row(0)
+        multi_group_block_table.commit_block_table(1)
+
+    logger.info(
+        "Block-table slot-mapping warmup completed with %d scheduled tokens.",
+        max_tokens,
+    )
+    return True
+
+
 @torch.inference_mode()
 def warmup_kernels(
     model_runner: GPUModelRunner,
@@ -229,6 +267,20 @@ def warmup_kernels(
     decode_query_len + 1 prompt tokens each. The second iteration simulates
     a decode step with all requests generating decode_query_len tokens.
     """
+    pp_size = getattr(model_runner.parallel_config, "pipeline_parallel_size", 1)
+    if _is_deepseek_v4_model_runner(model_runner) and pp_size > 1:
+        logger.info(
+            "Skipping generic V2 warmup_kernels for DeepSeek V4 with pipeline "
+            "parallel size %d; direct DeepSeek V4 warmups cover the prefill "
+            "specializations without startup PP tensor transport.",
+            pp_size,
+        )
+        warmup_long_prefill_kernels(
+            model_runner, worker_execute_model, worker_sample_tokens
+        )
+        torch.accelerator.synchronize()
+        return
+
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query

@@ -741,34 +741,31 @@ def warmup_prefill_chunk_metadata_kernel(
         return
 
     num_reqs = 1
-    query_len = 128
+    query_len = 1024
     compressed_seq_len = cdiv(query_len, compress_ratio)
     query_start_loc = torch.tensor([0, query_len], dtype=torch.int32, device=device)
+    query_start_loc_cpu = torch.tensor([0, query_len], dtype=torch.int32)
     uncompressed_seq_lens = torch.tensor(
         [query_len], dtype=torch.int32, device=device
     )
-    cu_compressed_seq_lens = torch.tensor(
-        [0, compressed_seq_len], dtype=torch.int32, device=device
+    compressed_seq_lens = torch.tensor(
+        [compressed_seq_len], dtype=torch.int32, device=device
     )
-    token_to_seq = torch.empty(compressed_seq_len, dtype=torch.int32, device=device)
-    cu_compressed_seq_len_ks = torch.empty(
-        query_len, dtype=torch.int32, device=device
-    )
-    cu_compressed_seq_len_ke = torch.empty(
-        query_len, dtype=torch.int32, device=device
+    compressed_seq_lens_cpu = torch.tensor([compressed_seq_len], dtype=torch.int32)
+    block_table = torch.zeros(
+        (num_reqs, cdiv(query_len, 256)), dtype=torch.int32, device=device
     )
 
-    _build_prefill_chunk_metadata_kernel[(num_reqs,)](
-        query_start_loc,
-        uncompressed_seq_lens,
-        cu_compressed_seq_lens,
-        token_to_seq,
-        cu_compressed_seq_len_ks,
-        cu_compressed_seq_len_ke,
+    build_prefill_chunk_metadata(
         0,
-        query_len,
-        BLOCK_SIZE=1024,
-        COMPRESS_RATIO=compress_ratio,
+        num_reqs,
+        query_start_loc,
+        query_start_loc_cpu,
+        uncompressed_seq_lens,
+        compressed_seq_lens,
+        compressed_seq_lens_cpu,
+        block_table,
+        compress_ratio,
     )
     torch.accelerator.synchronize()
     _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS.add(key)
