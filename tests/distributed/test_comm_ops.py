@@ -5,6 +5,7 @@
 Run `pytest tests/distributed/test_comm_ops.py`.
 """
 
+import pickle
 from collections.abc import Callable
 from typing import Any
 
@@ -251,7 +252,9 @@ def test_irecv_tensor_dict_send_allgather_postprocess_binds_keys(
         ("a", TensorMetadata("cpu", torch.int32, torch.Size([4]))),
         ("b", TensorMetadata("cpu", torch.int32, torch.Size([4]))),
     ]
-    g.recv_object = lambda src=None: metadata_list  # type: ignore[method-assign]
+    g._recv_tensor_dict_metadata = (  # type: ignore[method-assign]
+        lambda src=None: metadata_list
+    )
 
     ag = _DummyAllGatherGroup(world_size=2, rank_in_group=0)
     td, handles, postprocess = g.irecv_tensor_dict(all_gather_group=ag)
@@ -295,7 +298,7 @@ def test_irecv_tensor_dict_can_use_preallocated_recv_buffers(
     monkeypatch.setattr(torch.distributed, "irecv", fake_irecv)
 
     g = _make_group_for_unit_test(rank_in_group=1, world_size=2)
-    g.recv_object = lambda src=None: [  # type: ignore[method-assign]
+    g._recv_tensor_dict_metadata = lambda src=None: [  # type: ignore[method-assign]
         ("hidden_states", TensorMetadata("cpu", torch.int32, torch.Size([4])))
     ]
 
@@ -572,6 +575,84 @@ def dsv4_pp_packed_intermediate_transport_worker(
         handle.wait()
 
 
+@ray.remote(num_gpus=1, max_calls=1)
+def dsv4_pp_metadata_cache_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("VLLM_PP_PACK_TENSOR_DICT", "1")
+    monkeypatch.setenv("VLLM_PP_CACHE_TENSOR_DICT_METADATA", "1")
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank,
+                                      distributed_init_port)
+
+    # repeated identical shapes must skip the full metadata pickle on the
+    # object channel; a shape change must re-send the full schema.
+    token_counts = [8, 8, 8, 2, 2]
+    hidden_size = 64
+    hc_mult = 8
+
+    group = get_pp_group()
+    sent_objects: list[Any] = []
+    real_send_object = group.send_object
+
+    def recording_send_object(obj: Any, dst: int) -> None:
+        sent_objects.append(obj)
+        return real_send_object(obj, dst=dst)
+
+    monkeypatch.setattr(group, "send_object", recording_send_object)
+
+    if not group.is_first_rank:
+        persistent = _make_dsv4_intermediates(max(token_counts), hidden_size,
+                                              hc_mult, 0, -1, device)
+
+    previous_send = []
+    for step, num_tokens in enumerate(token_counts):
+        if previous_send:
+            for handle in previous_send:
+                handle.wait()
+            previous_send = []
+
+        if not group.is_first_rank:
+            tensor_dict, handles, postprocess = group.irecv_tensor_dict(
+                recv_tensor_dict=persistent)
+            assert tensor_dict is not None
+            for handle in handles:
+                handle.wait()
+            for fn in postprocess:
+                fn()
+            torch.cuda.synchronize(device)
+
+            expected = _make_dsv4_intermediates(num_tokens, hidden_size, hc_mult,
+                                                0, step, device)
+            for key, want in expected.items():
+                torch.testing.assert_close(persistent[key][:num_tokens], want)
+
+        if not group.is_last_rank:
+            payload = _make_dsv4_intermediates(num_tokens, hidden_size, hc_mult,
+                                               rank, step, device)
+            previous_send = group.isend_tensor_dict(payload)
+
+    for handle in previous_send:
+        handle.wait()
+
+    if not group.is_last_rank:
+        assert len(sent_objects) == len(token_counts)
+        tags = [obj[0] for obj in sent_objects]
+        assert tags == ["full", "cached", "cached", "full", "cached"], (
+            f"unexpected metadata channel tags: {tags}")
+        full_size = len(pickle.dumps(sent_objects[0]))
+        cached_size = len(pickle.dumps(sent_objects[1]))
+        assert cached_size < full_size, (
+            f"cached metadata message ({cached_size}B) should be smaller "
+            f"than the full schema ({full_size}B)")
+
+
 @multi_gpu_test(num_gpus=2)
 def test_dsv4_pp_intermediate_transport_multiturn(
     monkeypatch: pytest.MonkeyPatch,
@@ -586,6 +667,13 @@ def test_dsv4_pp_packed_intermediate_transport_multiturn(
 ):
     multi_process_parallel(monkeypatch, 1, 2,
                            dsv4_pp_packed_intermediate_transport_worker)
+
+
+@multi_gpu_test(num_gpus=2)
+def test_dsv4_pp_metadata_cache_multiturn(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    multi_process_parallel(monkeypatch, 1, 2, dsv4_pp_metadata_cache_worker)
 
 
 @multi_gpu_test(num_gpus=4)

@@ -175,6 +175,30 @@ def _packed_view(
     return staging[offset : offset + nbytes].view(metadata.dtype).view(metadata.size)
 
 
+# tags for the PP tensor-dict metadata channel: a "full" message carries the
+# complete metadata list, a "cached" message only names the epoch of the last
+# full schema sent to the same peer.
+_PP_METADATA_FULL = "full"
+_PP_METADATA_CACHED = "cached"
+
+
+def _tensor_dict_schema_key(metadata_list: list[tuple[str, Any]]) -> tuple | None:
+    """Hashable schema of a tensor-dict metadata list, or None.
+
+    Returns None when the list carries any non-tensor value: those are data,
+    not schema, and must travel on every send.
+    """
+    key_parts = []
+    for key, value in metadata_list:
+        if isinstance(value, TensorMetadata):
+            key_parts.append((key, value.device, value.dtype, tuple(value.size)))
+        elif key == _PP_PACKED_NBYTES_KEY:
+            key_parts.append((key, value))
+        else:
+            return None
+    return tuple(key_parts)
+
+
 _group_name_counter: dict[str, int] = {}
 
 
@@ -1066,6 +1090,60 @@ class GroupCoordinator:
             buffers[peer] = buf
         return buf
 
+    def _pp_metadata_cache_enabled(self) -> bool:
+        # read the env once per group; workers set it before the first hop.
+        enabled: bool | None = getattr(self, "_pp_cache_tensor_dict_metadata", None)
+        if enabled is None:
+            enabled = envs.VLLM_PP_CACHE_TENSOR_DICT_METADATA
+            self._pp_cache_tensor_dict_metadata = enabled
+        return enabled
+
+    def _send_tensor_dict_metadata(
+        self, metadata_list: list[tuple[str, Any]], dst: int
+    ) -> None:
+        if not self._pp_metadata_cache_enabled():
+            self.send_object(metadata_list, dst=dst)
+            return
+        cache: dict[int, tuple[tuple | None, int]] | None = getattr(
+            self, "_metadata_send_cache", None
+        )
+        if cache is None:
+            cache = {}
+            self._metadata_send_cache = cache
+        schema_key = _tensor_dict_schema_key(metadata_list)
+        cached = cache.get(dst)
+        if schema_key is not None and cached is not None and cached[0] == schema_key:
+            self.send_object((_PP_METADATA_CACHED, cached[1]), dst=dst)
+            return
+        epoch = 1 if cached is None else cached[1] + 1
+        cache[dst] = (schema_key, epoch)
+        self.send_object((_PP_METADATA_FULL, epoch, metadata_list), dst=dst)
+
+    def _recv_tensor_dict_metadata(self, src: int) -> list[tuple[str, Any]]:
+        if not self._pp_metadata_cache_enabled():
+            return self.recv_object(src=src)
+        cache: dict[int, tuple[int, list[tuple[str, Any]]]] | None = getattr(
+            self, "_metadata_recv_cache", None
+        )
+        if cache is None:
+            cache = {}
+            self._metadata_recv_cache = cache
+        message = self.recv_object(src=src)
+        tag = message[0]
+        if tag == _PP_METADATA_CACHED:
+            epoch = message[1]
+            cached = cache.get(src)
+            assert cached is not None and cached[0] == epoch, (
+                f"PP metadata cache desync with rank {src}: sender referenced "
+                f"schema epoch {epoch}, receiver has "
+                f"{'nothing' if cached is None else f'epoch {cached[0]}'}"
+            )
+            return cached[1]
+        assert tag == _PP_METADATA_FULL, f"Unknown PP metadata tag {tag!r}"
+        _, epoch, metadata_list = message
+        cache[src] = (epoch, metadata_list)
+        return metadata_list
+
     def send_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
@@ -1141,8 +1219,8 @@ class GroupCoordinator:
             tensor_dict, all_gather_group, all_gather_tensors
         ):
             layout, total_nbytes = _packed_tensor_layout(metadata_list)
-            self.send_object(
-                [*metadata_list, (_PP_PACKED_NBYTES_KEY, total_nbytes)], dst=dst
+            self._send_tensor_dict_metadata(
+                [*metadata_list, (_PP_PACKED_NBYTES_KEY, total_nbytes)], dst
             )
             device = tensor_dict[layout[0][0]].device
             staging = self._packed_staging_buffer(
@@ -1157,7 +1235,7 @@ class GroupCoordinator:
             packed.record_stream(torch.cuda.current_stream(device))
             return [handle]
 
-        self.send_object(metadata_list, dst=dst)
+        self._send_tensor_dict_metadata(metadata_list, dst)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
@@ -1255,7 +1333,7 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
 
-        recv_metadata_list = self.recv_object(src=src)
+        recv_metadata_list = self._recv_tensor_dict_metadata(src)
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []
