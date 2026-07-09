@@ -7170,7 +7170,13 @@ class GPUModelRunner(
                         shape_block_size = kernel_block_size
 
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
-                    # the unquantized shape.
+                    # the unquantized shape. NOTE: deliberately not upstream's
+                    # `spec.cache_dtype_str` getattr — for MLA layers that
+                    # field is set to the *global* cache_config.cache_dtype at
+                    # spec-construction time (mla_attention.py:get_kv_cache_spec),
+                    # not the per-layer skip-aware value, so it silently
+                    # ignores --kv-cache-dtype-skip-layers for DeepSeek V4's
+                    # MLA attention. kv_quant_mode IS populated per-layer.
                     layer_cache_dtype_str = (
                         "auto"
                         if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
@@ -7282,7 +7288,10 @@ class GPUModelRunner(
                 kernel_block_sizes[group.kv_cache_group_id],
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
+                cache_dtype_str=(
+                    getattr(kv_cache_spec, "cache_dtype_str", None)
+                    or self.cache_config.cache_dtype
+                ),
             )
             # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
             if block_dim == 0:

@@ -306,6 +306,16 @@ def _reshape_kv_cache(
                 # Skipped layers (--kv-cache-dtype-skip-layers) keep the
                 # unquantized shape; only the quantized primary uses the
                 # quantized cache dtype's (possibly packed) layout.
+                # NOTE: deliberately NOT upstream's
+                # `_cache_dtype_for_spec`/`spec.cache_dtype_str` getattr here:
+                # cache_dtype_str is set to the *global* cache_config.cache_dtype
+                # at spec-construction time for MLA layers (see
+                # mla_attention.py:get_kv_cache_spec), not the per-layer
+                # skip-aware value, so it silently ignores
+                # --kv-cache-dtype-skip-layers for DeepSeek V4's MLA attention.
+                # kv_quant_mode IS populated per-layer (from self.kv_cache_dtype,
+                # which the skip-layers check already resolves to "auto"), so it
+                # is the correct source of truth here.
                 layer_cache_dtype = (
                     "auto"
                     if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE

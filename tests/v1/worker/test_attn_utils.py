@@ -3,7 +3,7 @@
 
 import torch
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode, MLAAttentionSpec
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -240,3 +240,61 @@ def test_reshape_padded_quantized_kv_cache_preserves_scale_stride():
     assert kv_cache.stride(0) == spec.page_size_bytes
     assert kv_cache.stride(1) == 16 * 1 * 8
     assert kv_cache[1, 1].storage_offset() == spec.page_size_bytes + 16 * 1 * 8
+
+
+class FakeDSMLABackend:
+    seen_cache_dtypes: list[str] = []
+
+    @classmethod
+    def get_kv_cache_shape(
+        cls,
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        cls.seen_cache_dtypes.append(cache_dtype_str)
+        if cache_dtype_str == "fp8_ds_mla":
+            return (num_blocks, block_size, 584)
+        return (num_blocks, block_size, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        assert not include_num_layers_dimension
+        return (0, 1, 2)
+
+
+def test_reshape_kv_cache_prefers_layer_cache_dtype_over_global_dtype():
+    FakeDSMLABackend.seen_cache_dtypes.clear()
+    spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        compress_ratio=4,
+        cache_dtype_str="fp8_ds_mla",
+        model_version="deepseek_v4",
+    )
+    raw_tensors = {"layer": torch.zeros(spec.page_size_bytes * 2, dtype=torch.int8)}
+    attn_groups = [
+        AttentionGroup(
+            backend=FakeDSMLABackend,
+            layer_names=["layer"],
+            kv_cache_spec=spec,
+            kv_cache_group_id=0,
+        )
+    ]
+
+    kv_cache = _reshape_kv_cache(
+        attn_groups,
+        raw_tensors,
+        "fp8",
+        [spec.storage_block_size],
+        {},
+    )["layer"]
+
+    assert FakeDSMLABackend.seen_cache_dtypes == ["fp8_ds_mla"]
+    assert kv_cache.shape == (2, 16, 584)
