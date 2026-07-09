@@ -196,6 +196,27 @@ def test_silu_and_mul_with_clamp(
     opcheck(torch.ops._C.silu_and_mul_with_clamp, (out_buf, x, swiglu_limit))
 
 
+def test_silu_and_mul_with_clamp_sm86_fallback_skips_custom_op(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.activation as activation
+
+    monkeypatch.setattr(
+        activation, "_use_native_clamped_silu_on_cuda", lambda: True
+    )
+    layer = SiluAndMulWithClamp(10.0)
+
+    class RaisingOp:
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("custom clamped silu op should not be called")
+
+    layer.op = RaisingOp()
+    x = torch.randn(4, 16)
+    out = layer.forward_cuda(x)
+    torch.testing.assert_close(out, layer.forward_native(x))
+
+
 @pytest.mark.parametrize(
     "activation",
     [
