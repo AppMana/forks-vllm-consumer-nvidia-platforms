@@ -247,6 +247,10 @@ def _reshape_attention_kv_cache(
     return kv_cache.permute(*inv_order)
 
 
+def _cache_dtype_for_spec(kv_cache_spec: AttentionSpec, fallback: str) -> str:
+    return getattr(kv_cache_spec, "cache_dtype_str", None) or fallback
+
+
 def _reshape_kv_cache(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, torch.Tensor],
@@ -300,12 +304,13 @@ def _reshape_kv_cache(
                     kv_cache_spec.storage_block_size // kernel_block_size
                 )
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                layer_cache_dtype = _cache_dtype_for_spec(kv_cache_spec, cache_dtype)
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=layer_cache_dtype,
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -381,7 +386,7 @@ def _update_hybrid_attention_layout(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=_cache_dtype_for_spec(kv_cache_spec, cache_dtype),
         )
         # if the first dim of the kvcache's layout is already num_blocks, continue
         if block_dim == 0:
