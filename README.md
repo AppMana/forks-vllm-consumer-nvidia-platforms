@@ -52,31 +52,69 @@ on the int4mse-int8 checkpoint over the 12-node chain.
 
 ### sm86 Sparse MLA Kernel Notes
 
-The known-good Ampere serving path is hybrid:
+Both stages run the fused tensor-core kernels from
+`AppMana/forks-flash-mla-ampere-dsv4` (tag `dsv4-sm86-kernels-2026-07-09`).
+At true 16k-slot footprint on an A5000: decode 22.5 us @ top-k 512 (2.10x the
+prior kernel, ~9.5x Triton), prefill 3.0-3.3 us/token (1.8x Triton). Both
+accept `fp8_ds_mla` and `int8_ds_mla` caches. See that repo's README for the
+full tables, the ncu evidence, and the benchmarking caveats.
 
-| Stage | Kernel path | Notes |
-| --- | --- | --- |
-| Decode sparse MLA | `flash_mla.flash_sparse_mla_decode` from `AppMana/forks-flash-mla-ampere-dsv4` | One CUDA launch for the decode batch; local parity against Triton is ~1e-6 cosine difference. |
-| Prefill sparse MLA | vLLM `sparse_attention_triton` over gathered bf16 KV | Uses `dequantize_and_gather_k_cache` and `combine_topk_swa_indices`; this is the stable path for chunked prefill. |
+Earlier revisions of this file recorded "Triton beats FlashMLA prefill ~3.7x".
+That was measured on an L2-resident 192-slot cache; at production footprint the
+result inverts. Do not re-derive kernel policy from small-cache microbenches.
 
-Real-tensor A5000 microbenchmarks with fp8_ds_mla cache tensors, 64 heads,
-top-k 512:
+### Configuration: the `appmana` checkpoint-config block
 
-| Case | FlashMLA | Triton | Result |
-| --- | ---: | ---: | --- |
-| Decode T=1 | 0.045 ms | 0.233 ms | FlashMLA 5.23x faster |
-| Decode T=4 | 0.142 ms | 0.225 ms | FlashMLA 1.59x faster |
-| Prefill T=64 | 1.949 ms | 0.492 ms | Triton 3.96x faster |
-| Prefill T=256 | 7.722 ms | 2.113 ms | Triton 3.65x faster |
-| Prefill T=1024 | 30.388 ms | 8.285 ms | Triton 3.67x faster |
+Kernel selection is checkpoint-config driven, not environment driven. The
+checkpoint's `config.json` carries one block, overridable wholesale via
+`--hf-overrides '{"appmana": {...}}'`:
 
-The failed FlashMLA prefill integration was introduced by `31ab06a7b9`
-(`Wire sm86 FlashMLA prefill`). It replaced the gathered bf16 Triton prefill
-with direct paged-cache FlashMLA prefill. A RED test using real vLLM SWA
-metadata shape `[T, 1, window]` reproduced the bug (`cos_diff=1.92e-03` vs the
-same indices as 2-D). `flash_mla` now normalizes `[T, 1, W]` sparse-index
-tensors to `[T, W]`, but vLLM still routes sm86 prefill through Triton because
-that is both correct and faster for the measured prefill sizes.
+```json
+"appmana": {
+  "kernels": [
+    "flash_mla.flash_sparse_mla_decode",
+    "flash_mla.triton_sparse_int8_mla_decode",
+    "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels.sparse_attention_triton",
+    "vllm._custom_ops.indexer_k_quant_and_cache_int8",
+    "vllm.models.deepseek_v4.common.ops.fused_indexer_q.fused_indexer_q_rope_quant_int8",
+    "vllm.model_executor.layers.quantization.utils.marlin_utils.marlin_act_int8_process_scales"
+  ],
+  "cache_type": "fp8_ds_mla"
+}
+```
+
+Every value is the exact importable symbol that gets activated; the role is
+inferred from a registry. Unknown symbols, duplicate roles, and invalid
+`cache_type` values fail closed at startup. A `kernels` list is authoritative
+for toggles (unlisted = off), which is what makes the int8 indexer independent
+of the dense IMMA runtime. `cache_type` sets the default KV dtype only when the
+CLI passes `--kv-cache-dtype auto`; an explicit CLI value always wins. The
+resolved configuration prints once at startup as `appmana kernels resolved: ...`
+— treat that line as the validity gate for any benchmark row.
+
+Legacy role-keyed `--hf-overrides` keys
+(`deepseek_v4_sm86_sparse_mla_decode_fp8`, `..._decode_int8`, `..._prefill`) and
+the top-level `__experimental_enable_imma_...` flag still work with a
+deprecation warning; the block wins when both are present.
+
+`APPMANA_DSV4_*` environment variables configure the *benchmark harness*, not
+kernels. `APPMANA_DSV4_INDEXER_CACHE_INT8` has had zero consumers since the
+upstream rebase — setting it does nothing.
+
+### Operational caveats
+
+- **Overlay images report the base image's version string.** The Python hotfix
+  overlay copies `vllm/` over an existing image without regenerating
+  `_version.py`, so a hotfix image still logs the base commit
+  (e.g. `v31.dev57+g82df3f6bb`). Verify overlay contents by image tag/digest,
+  never by the reported version.
+- **`VLLM_PP_ASYNC_TOKEN_COMM` and `VLLM_PP_STATIC_DECODE_INTERMEDIATE_COMM`
+  are dead at HEAD** — the implementation lived on `appmana/vllm-ampere-prerebase`
+  and was never re-ported. A/B results on those knobs are noise.
+- **`vllm/layer_partition.py` ignores `VLLM_PP_LAYER_PARTITION`.** It replicates
+  only the default uneven-split branch of `get_pp_indices`. If that env is set,
+  rank-local shard materialization and the model's own partition disagree, which
+  loads wrong layers and yields NaN/garbage output.
 
 ---
 
