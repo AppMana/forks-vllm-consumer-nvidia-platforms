@@ -91,6 +91,20 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _is_deepseek_v4_pp(vllm_config: VllmConfig) -> bool:
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if getattr(parallel_config, "pipeline_parallel_size", 1) <= 1:
+        return False
+
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) == "deepseek_v4":
+        return True
+
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return any("DeepseekV4" in arch or "DeepSeekV4" in arch for arch in architectures)
+
+
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -440,9 +454,18 @@ class Worker(WorkerBase):
             by adjusting the `gpu_memory_utilization` parameter.
         """
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
-            self.model_runner.profile_run()
+            # The generic profile batch can wedge DeepSeek V4 PP startup before
+            # serving begins. With an explicit KV budget we do not need it for
+            # sizing; DeepSeek-specific warmup handles the kernels we rely on.
+            if _is_deepseek_v4_pp(self.vllm_config):
+                logger.info(
+                    "Skipping DeepSeek V4 PP profile_run during explicit KV "
+                    "cache sizing."
+                )
+            else:
+                # still need a profile run which compiles the model for
+                # max_num_batched_tokens
+                self.model_runner.profile_run()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "

@@ -81,6 +81,8 @@ def kernel_warmup(worker: "Worker"):
     sparse_mla_triton_warmup_if_needed(worker)
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     _deepseek_v4_sparse_mla_prefill_warmup(worker)
+    _deepseek_v4_block_table_slot_mapping_warmup(worker)
+    _deepseek_v4_marlin_moe_warmup(worker)
 
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
@@ -169,6 +171,104 @@ def _deepseek_v4_sparse_mla_prefill_warmup(worker: "Worker") -> None:
     )
 
     _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker)
+
+
+def _deepseek_v4_block_table_slot_mapping_warmup(worker: "Worker") -> None:
+    if not _is_deepseek_v4_worker(worker):
+        return
+
+    model_runner = worker.model_runner
+    if model_runner is None:
+        return
+
+    from vllm.v1.worker.gpu.warmup import warmup_block_table_slot_mapping_kernel
+
+    warmup_block_table_slot_mapping_kernel(model_runner, model_runner.device)
+
+
+def _deepseek_v4_marlin_moe_warmup(worker: "Worker") -> None:
+    """Warm DSv4 int4/int8 Marlin MoE without full-model PP traffic."""
+    if not _is_deepseek_v4_worker(worker):
+        return
+
+    from vllm.model_executor.layers.quantization.dsv4_int import Dsv4Int4MoEMethod
+
+    model = worker.get_model()
+    max_tokens = max(1, int(worker.scheduler_config.max_num_batched_tokens))
+    token_sizes = sorted({1, min(16, max_tokens), max_tokens})
+    warmed: set[tuple[int, int, int, torch.dtype]] = set()
+
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if not isinstance(quant_method, Dsv4Int4MoEMethod):
+            continue
+        if not all(
+            hasattr(module, attr)
+            for attr in (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            )
+        ):
+            continue
+
+        hidden_size = int(getattr(module, "hidden_size", quant_method.hidden_size))
+        intermediate_size = int(
+            getattr(
+                module,
+                "intermediate_size_per_partition",
+                quant_method.intermediate_size,
+            )
+        )
+        top_k = max(1, int(getattr(module, "top_k", 1)))
+        input_dtype = quant_method.input_dtype or torch.bfloat16
+        key = (hidden_size, intermediate_size, top_k, input_dtype)
+        if key in warmed:
+            continue
+        warmed.add(key)
+
+        device = module.w13_weight.device
+        dtype = getattr(module, "params_dtype", torch.bfloat16)
+        expert_ids = _deepseek_v4_marlin_warmup_expert_ids(module, top_k, device)
+        topk_weights = torch.full(
+            (1, top_k), 1.0 / top_k, dtype=torch.float32, device=device
+        )
+
+        for num_tokens in token_sizes:
+            x = torch.zeros((num_tokens, hidden_size), dtype=dtype, device=device)
+            topk_ids = expert_ids.expand(num_tokens, top_k).contiguous()
+            weights = topk_weights.expand(num_tokens, top_k).contiguous()
+            quant_method.apply(module, x, weights, topk_ids)
+            torch.cuda.synchronize(device)
+
+    if warmed:
+        logger.info(
+            "DeepSeek V4 Marlin MoE warmup completed for %d unique shapes and "
+            "token sizes %s.",
+            len(warmed),
+            token_sizes,
+        )
+
+
+def _deepseek_v4_marlin_warmup_expert_ids(
+    module: torch.nn.Module, top_k: int, device: torch.device
+) -> torch.Tensor:
+    expert_map = getattr(module, "expert_map", None)
+    if callable(expert_map):
+        expert_map = expert_map()
+
+    if isinstance(expert_map, torch.Tensor):
+        local_globals = torch.nonzero(expert_map >= 0, as_tuple=False).flatten()
+        if local_globals.numel() > 0:
+            repeats = (top_k + local_globals.numel() - 1) // local_globals.numel()
+            return local_globals.repeat(repeats)[:top_k].to(
+                device=device, dtype=torch.int32
+            ).view(1, top_k)
+
+    local_num_experts = max(1, int(getattr(module, "local_num_experts", 1)))
+    ids = torch.arange(top_k, dtype=torch.int32, device=device) % local_num_experts
+    return ids.view(1, top_k)
 
 
 def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
