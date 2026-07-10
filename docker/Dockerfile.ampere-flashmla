@@ -24,7 +24,7 @@ init_path = pkg / "__init__.py"
 init_text = init_path.read_text()
 export_line = (
     "from .int8_sparse_mla import (quantize_int8_ds_mla_rows, "
-    "sparse_int8_mla_decode, sparse_int8_mla_prefill_native_staged)\n"
+    "sparse_int8_mla_decode, sparse_int8_mla_prefill)\n"
 )
 if "sparse_int8_mla_decode" not in init_text:
     init_path.write_text(init_text.rstrip() + "\n" + export_line)
