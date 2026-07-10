@@ -954,6 +954,7 @@ __global__ void deepseekV4Fp8DsMlaGatherKernel(
     int32_t const* __restrict__ seq_lens,
     int32_t const* __restrict__ gather_lens,
     int32_t const* __restrict__ block_table, int const num_reqs,
+    int const num_blocks, int const block_table_width,
     int64_t const block_table_stride0, int64_t const block_table_stride1,
     int const max_gather_len, int const block_size, int const offset,
     int64_t const out_stride0, int64_t const out_stride1,
@@ -973,10 +974,18 @@ __global__ void deepseekV4Fp8DsMlaGatherKernel(
   int const logical_pos = start_pos + token_id;
   int const block_in_seq = logical_pos / block_size;
   int const pos_in_block = logical_pos - block_in_seq * block_size;
+  // Bounds guards mirror the torch fallback oracle
+  // (_dequantize_and_gather_k_cache_torch / _gather_token_bytes): a windowed or
+  // chunked gather can drive block_in_seq past the block_table width, and the
+  // fetched physical block can be stale/out of range. Either unchecked read is
+  // an out-of-bounds access that surfaces asynchronously as an IMA in the next
+  // kernel. Treat both as an empty slot (zero-fill), exactly like physical < 0.
   int32_t const physical_block =
-      block_table[req_id * block_table_stride0 +
-                  block_in_seq * block_table_stride1];
-  if (physical_block < 0) {
+      (block_in_seq >= 0 && block_in_seq < block_table_width)
+          ? block_table[req_id * block_table_stride0 +
+                        block_in_seq * block_table_stride1]
+          : -1;
+  if (physical_block < 0 || physical_block >= num_blocks) {
     for (int dim = threadIdx.x; dim < kDSV4HeadDim; dim += blockDim.x) {
       out[req_id * out_stride0 + (offset + token_id) * out_stride1 +
           dim * out_stride2] = __float2bfloat16(0.0f);
@@ -1321,7 +1330,9 @@ void deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache(
       reinterpret_cast<uint8_t const*>(k_cache.const_data_ptr()),
       seq_lens.const_data_ptr<int32_t>(),
       gather_lens.has_value() ? gather_lens->const_data_ptr<int32_t>() : nullptr,
-      block_table.const_data_ptr<int32_t>(), num_reqs, block_table.stride(0),
+      block_table.const_data_ptr<int32_t>(), num_reqs,
+      static_cast<int>(k_cache.size(0)), static_cast<int>(block_table.size(1)),
+      block_table.stride(0),
       block_table.stride(1), max_gather_len, static_cast<int>(block_size),
       static_cast<int>(offset), out.stride(0), out.stride(1), out.stride(2),
       cache_block_stride);
