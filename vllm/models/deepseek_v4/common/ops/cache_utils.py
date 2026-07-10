@@ -14,8 +14,6 @@ preparation.
   window indices for sparse prefill.
 """
 
-import os
-
 import torch
 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -1303,15 +1301,7 @@ def dequantize_and_gather_k_cache(
     # sm_8x lacks fp8e4nv in Triton (and the cutedsl path needs `quack`, which
     # is not installed on Ampere). Use the native CUDA gather/dequant op there;
     # the torch fallback performs host synchronizations and can wedge PP serving.
-    # APPMANA_DSV4_FORCE_TORCH_GATHER=1 reverts to the pure-torch fallback (the
-    # exact known-good pre-82df3f6bb0 / 26.10-tok/s path) so we can A/B the
-    # native gather kernel against the oracle without a rebuild.
     if not _supports_fp8e4nv_in_triton():
-        if os.getenv("APPMANA_DSV4_FORCE_TORCH_GATHER", "0") == "1":
-            _dequantize_and_gather_k_cache_torch(
-                out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
-            )
-            return
         native_op = getattr(
             torch.ops._C,
             "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache",
