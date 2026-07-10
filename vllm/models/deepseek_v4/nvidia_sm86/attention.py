@@ -359,7 +359,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_metadata,
     ) -> None:
-        """Native flash_mla staged sparse-MLA prefill.
+        """Native flash_mla fused sparse-MLA prefill (whole-cache dequant + tensor cores).
 
         ``flash_mla.flash_sparse_mla_prefill`` mirrors the decode interface:
         it consumes the paged fp8_ds_mla caches directly with per-query-token
