@@ -75,7 +75,20 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--max-model-len", type=int, default=17408)
     parser.add_argument("--kv-cache-dtype", default="int8_ds_mla")
+    parser.add_argument(
+        "--hf-overrides",
+        default=None,
+        help='JSON dict merged into the HF config, e.g. \'{"appmana": {...}}\' '
+        "to activate the unified kernel-config block on a checkpoint that "
+        "predates it.",
+    )
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument(
+        "--load-format",
+        default="dummy",
+        help='"dummy" (default) for shape-only repros; "auto" to load the real '
+        "trimmed weights so routing/topk value distributions match production.",
+    )
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
     parser.add_argument("--long-prefill-token-threshold", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
@@ -87,6 +100,8 @@ def main() -> int:
     from vllm import LLM, SamplingParams
 
     kwargs = {}
+    if args.hf_overrides:
+        kwargs["hf_overrides"] = json.loads(args.hf_overrides)
     if args.compile:
         kwargs["compilation_config"] = {
             "cudagraph_mode": "FULL_DECODE_ONLY",
@@ -104,7 +119,7 @@ def main() -> int:
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         tensor_parallel_size=1,
         pipeline_parallel_size=args.pipeline_parallel_size,
-        load_format="dummy",
+        load_format=args.load_format,
         max_num_seqs=2,
         max_num_batched_tokens=args.max_num_batched_tokens,
         enable_chunked_prefill=True,
