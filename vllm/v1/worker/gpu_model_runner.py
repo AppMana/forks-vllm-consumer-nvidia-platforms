@@ -713,12 +713,20 @@ class GPUModelRunner(
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
         self.async_output_copy_stream: torch.cuda.Stream | None = None
-        # cuda event to synchronize use of reused CPU tensors between steps
-        # when async scheduling is enabled.
-        self.prepare_inputs_event: torch.Event | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
-            self.prepare_inputs_event = torch.Event()
+        # cuda event to synchronize use of reused pinned CPU input tensors
+        # between steps. Required in EVERY configuration, not only async
+        # scheduling: on a non-last PP rank execute_model returns right after
+        # enqueueing the forward (async isend, no device sync), so the next
+        # step's _update_states can mutate the shared pinned buffers (e.g.
+        # input_batch.num_computed_tokens_cpu_tensor) while the previous
+        # step's non_blocking H2D copies are still queued behind its forward
+        # kernels; the DMA then reads the FUTURE value. Observed on the
+        # PP=10 chunked-prefill deploy: device seq_lens materialized 2 chunks
+        # ahead of the CPU-sized indexer workspace and topKPerRowPrefill
+        # scanned past its logits allocation (Warp Illegal Address).
+        self.prepare_inputs_event: torch.Event = torch.Event()
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -3766,13 +3774,11 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
-        if self.prepare_inputs_event is None:
-            yield
-            return
-
-        # Ensure prior step has finished with reused CPU tensors.
-        # This is required in the async scheduling case because
-        # the CPU->GPU transfer happens async.
+        # Ensure the prior step has finished with the reused pinned CPU
+        # tensors before this step mutates them. The prior step's H2D
+        # input copies are non_blocking: with async scheduling, and on any
+        # PP rank (execute_model returns after enqueue, no device sync),
+        # those DMAs can still be pending when the next step starts.
         self.prepare_inputs_event.synchronize()
         try:
             yield

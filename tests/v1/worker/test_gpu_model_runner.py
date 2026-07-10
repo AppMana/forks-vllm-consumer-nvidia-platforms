@@ -1638,3 +1638,58 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+def test_input_prep_h2d_ordered_against_next_step_cpu_mutation():
+    """Pinned CPU input buffers may only be mutated for step k+1 once step
+    k's non_blocking H2D input-prep copies have EXECUTED on the device.
+
+    On a non-last PP rank, execute_model returns right after enqueueing the
+    forward (the step ends in an async isend, with no device sync), so the
+    engine calls _update_states for the next chunk while the previous chunk's
+    input-prep DMAs can still be queued behind its forward kernels. The DMA
+    then reads the FUTURE value out of the shared pinned buffer: on the
+    dsv4-final-fusedkernels-008 run, num_computed_tokens materialized on
+    device 2 chunks ahead of the CPU-side snapshot, so the indexer built
+    cu_seqlen_ke (3328..3584) against a logits/K workspace sized from the CPU
+    value (3072) and topKPerRowPrefill scanned past the allocation
+    (Warp Illegal Address, core gpucore.appmana-027.2762).
+
+    synchronize_input_prep() must therefore enforce the ordering in EVERY
+    configuration, not only under async scheduling.
+    """
+    # Production configuration of the failing runs: --no-async-scheduling.
+    vllm_config = get_vllm_config()
+    vllm_config.scheduler_config.async_scheduling = False
+    with set_current_vllm_config(vllm_config):
+        model_config = vllm_config.model_config
+        num_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
+        head_size = model_config.get_head_size()
+        vllm_config.compilation_config.static_forward_context["layer.0"] = Attention(
+            num_heads, head_size, 0.1
+        )
+        runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
+    assert not runner.use_async_scheduling
+    device = runner.device
+
+    pinned = torch.tensor([12288], dtype=torch.int32, pin_memory=True)
+    gpu = torch.zeros(1, dtype=torch.int32, device=device)
+
+    torch.cuda.synchronize()
+    # Stand-in for the previous chunk's forward kernels: delay the stream so
+    # the input-prep DMA below cannot execute immediately.
+    torch.cuda._sleep(1_000_000_000)
+    # Step k input prep: async H2D from the shared pinned buffer.
+    with runner.synchronize_input_prep():
+        gpu.copy_(pinned, non_blocking=True)
+    # Step k+1 preprocess: the engine mutates the shared pinned buffer for
+    # the next chunk. This must wait for step k's DMA to have executed.
+    with runner.synchronize_input_prep():
+        pinned.fill_(14336)
+    torch.cuda.synchronize()
+
+    assert gpu.item() == 12288, (
+        "step k's non_blocking H2D read step k+1's value from the shared "
+        "pinned buffer: input-prep DMAs are not ordered against the next "
+        "step's CPU mutation"
+    )
