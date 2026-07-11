@@ -2509,3 +2509,86 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+# ---------------------------------------------------------------------------
+# C128A-only PP rank: KV-cache group init (DSV4). See the analysis below and
+# tools/ampere/dsv4_int8kv_repro.py --model .../ckpt-1layer-c128a.
+# ---------------------------------------------------------------------------
+
+
+def _c128a_only_grouped_specs() -> list[UniformTypeKVCacheSpecs]:
+    """The two UniformType groups a C128A-only rank produces (real geometry
+    captured from ckpt-1layer-c128a under fp8_ds_mla): a tiny latent-MLA main
+    cache (compress 128, block 256 -> storage 2) and a large sliding-window
+    companion cache (compress 1, block 64). The SWA page (37440 B) exceeds the
+    full-MLA page, which is exactly the case group padding does not handle."""
+    mla = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        compress_ratio=128,
+        model_version="deepseek_v4",
+    )
+    swa = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        compress_ratio=1,
+        model_version="deepseek_v4",
+    )
+    mla_group = UniformTypeKVCacheSpecs.from_specs({"model.layers.0.attn": mla})
+    swa_group = UniformTypeKVCacheSpecs.from_specs(
+        {"model.layers.0.attn.swa_cache": swa}
+    )
+    assert mla_group is not None and swa_group is not None
+    # Precondition of the bug: the sliding-window companion page is strictly
+    # larger than the latent-MLA (tiling-base) page.
+    assert max(swa_group.get_page_sizes()) > max(mla_group.get_page_sizes())
+    return [mla_group, swa_group]
+
+
+@pytest.mark.xfail(
+    reason=(
+        "DSV4 C128A-only PP rank: KV-cache group init fails. "
+        "_get_kv_cache_groups_uniform_groups hardcodes grouped_specs[0] (the "
+        "latent-MLA group) as the tiling base and pads every sliding-window "
+        "page UP to the nearest full-MLA page (size_to_candidate uses "
+        "min(x for x in all_page_sizes if x >= ps)); it asserts "
+        "max(sm_page_sizes) <= max(all_page_sizes). On a C128A-only rank the "
+        "latent-MLA main cache is heavily compressed (compress 128, block 256 "
+        "-> storage 2 -> ~1728 B/page) while its sliding-window companion is "
+        "uncompressed (compress 1, block 64 -> 37440 B/page), so the base "
+        "group is NOT the largest and the invariant is violated. Mixed 4-5 "
+        "layer production slices always include a lighter-compression (e.g. "
+        "C4) latent layer whose page dominates, so max(all_page_sizes) stays "
+        "above the SWA page and this is latent there. A safe fix is invasive: "
+        "the tiling base must be chosen as the largest-page group (or the "
+        "full-MLA pages padded up to the SWA page), which changes downstream "
+        "layer_tuple_bytes / concurrency math and must be validated against "
+        "the mixed-slice path -- not forced blind. This is also the in-process "
+        "signature of the C128A-only bug whose mp-executor sibling surfaces as "
+        "the CompressorBackend reshape RuntimeError once a mixed partition "
+        "clears this assertion."
+    ),
+    raises=AssertionError,
+    strict=True,
+)
+def test_c128a_only_rank_kv_cache_group_init_succeeds():
+    """When fixed, a C128A-only rank must produce groups with correct page
+    geometry (the SWA companion tiling into aligned pages) instead of asserting.
+    """
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(
+        _c128a_only_grouped_specs()
+    )
+    # Post-fix expectations: init returns groups covering both layers, and no
+    # padded page is smaller than the layer it must hold.
+    covered = {name for g in groups for name in g.layer_names}
+    assert covered == {"model.layers.0.attn", "model.layers.0.attn.swa_cache"}
