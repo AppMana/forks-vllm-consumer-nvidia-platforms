@@ -1227,6 +1227,30 @@ class Worker(WorkerBase):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
+def _stash_appmana_pp_transport_overrides(vllm_config: VllmConfig) -> None:
+    """Resolve appmana.pp_transport from the checkpoint config and stash the PP
+    transport overrides process-wide (defensive: a no-op for non-DSV4 /
+    blockless runs, and never fatal to distributed init)."""
+    try:
+        from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+            APPMANA_CONFIG_KEY,
+            resolve_appmana_kernel_config_from_hf_config,
+            stash_pp_transport_overrides,
+        )
+
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None or getattr(hf_config, APPMANA_CONFIG_KEY, None) is None:
+            return
+        resolved = resolve_appmana_kernel_config_from_hf_config(hf_config)
+        stash_pp_transport_overrides(resolved.pp_pack, resolved.pp_cache_metadata)
+    except Exception:
+        logger.exception(
+            "Failed to stash appmana PP transport overrides; falling back to "
+            "VLLM_PP_* env vars for PP transport toggles."
+        )
+
+
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
     rank: int,
@@ -1239,6 +1263,14 @@ def init_worker_distributed_environment(
     from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
     init_batch_invariance()
+
+    # AppMana DSV4: stash the PP transport overrides from the checkpoint's
+    # "appmana.pp_transport" block. This is the robust plumbing point: every
+    # worker (including remote Ray workers) has vllm_config in hand here, well
+    # before the first PP hop, so the GroupCoordinator's _pp_pack_enabled /
+    # _pp_metadata_cache_enabled see the value that rode VllmConfig rather than
+    # relying on env-var forwarding (which is allowlist-limited to the driver).
+    _stash_appmana_pp_transport_overrides(vllm_config)
     override_envs_for_eplb(
         parallel_config,
         moe_backend=getattr(vllm_config.kernel_config, "moe_backend", None),
