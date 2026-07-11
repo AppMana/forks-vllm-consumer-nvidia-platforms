@@ -199,6 +199,35 @@ def _tensor_dict_schema_key(metadata_list: list[tuple[str, Any]]) -> tuple | Non
     return tuple(key_parts)
 
 
+def _appmana_pp_pack_override() -> bool | None:
+    """The process-wide appmana.pp_transport.pack override, or None if unset.
+
+    Defensive lazy import: the appmana config module is import-light, but this
+    keeps parallel_state usable if it is ever unavailable (non-DSV4 / blockless
+    runs), in which case the caller falls back to the env var exactly as before.
+    """
+    try:
+        from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+            pp_pack_override,
+        )
+
+        return pp_pack_override()
+    except Exception:
+        return None
+
+
+def _appmana_pp_cache_metadata_override() -> bool | None:
+    """The process-wide appmana.pp_transport.cache_metadata override, or None."""
+    try:
+        from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+            pp_cache_metadata_override,
+        )
+
+        return pp_cache_metadata_override()
+    except Exception:
+        return None
+
+
 _group_name_counter: dict[str, int] = {}
 
 
@@ -1034,10 +1063,16 @@ class GroupCoordinator:
         return use_all_gather
 
     def _pp_pack_enabled(self) -> bool:
-        # read the env once per group; workers set it before the first hop.
+        # Resolve once per group; workers stash the appmana override before the
+        # first hop. Precedence: explicit appmana.pp_transport.pack value >
+        # VLLM_PP_PACK_TENSOR_DICT env (deprecated fallback) > built-in default
+        # (the env default, True). The appmana value rides VllmConfig to every
+        # Ray worker; the env var is only forwarded via a fixed allowlist.
         enabled: bool | None = getattr(self, "_pp_pack_tensor_dict", None)
         if enabled is None:
-            enabled = envs.VLLM_PP_PACK_TENSOR_DICT
+            enabled = _appmana_pp_pack_override()
+            if enabled is None:
+                enabled = envs.VLLM_PP_PACK_TENSOR_DICT
             self._pp_pack_tensor_dict = enabled
         return enabled
 
@@ -1091,10 +1126,15 @@ class GroupCoordinator:
         return buf
 
     def _pp_metadata_cache_enabled(self) -> bool:
-        # read the env once per group; workers set it before the first hop.
+        # Resolve once per group; workers stash the appmana override before the
+        # first hop. Precedence: explicit appmana.pp_transport.cache_metadata
+        # value > VLLM_PP_CACHE_TENSOR_DICT_METADATA env (deprecated fallback) >
+        # built-in default (the env default, True).
         enabled: bool | None = getattr(self, "_pp_cache_tensor_dict_metadata", None)
         if enabled is None:
-            enabled = envs.VLLM_PP_CACHE_TENSOR_DICT_METADATA
+            enabled = _appmana_pp_cache_metadata_override()
+            if enabled is None:
+                enabled = envs.VLLM_PP_CACHE_TENSOR_DICT_METADATA
             self._pp_cache_tensor_dict_metadata = enabled
         return enabled
 
