@@ -155,6 +155,38 @@ def _e8m0_to_fp32_scale(scale_e8m0: torch.Tensor) -> torch.Tensor:
     return torch.exp2(u.to(torch.float32) - 127.0)
 
 
+def _block_scale_to_fp32(scale: torch.Tensor) -> torch.Tensor:
+    """Convert a per-128x128-tile block scale to FP32, in either on-disk
+    convention DeepSeek V4 checkpoints use.
+
+    * MX-style UE8M0 (``float8_e8m0fnu``, or its raw int8/uint8 byte view):
+      the stored byte IS a biased power-of-two exponent -> ``exp2(byte-127)``.
+      This is what ``deepseek-ai/DeepSeek-V4-Flash``'s attention/dense FP8
+      linears use.
+    * classic per-tile float scale (``float32``, and by extension bf16/fp16
+      if a caller narrows it): the stored value already IS the scale factor,
+      used verbatim. This is what
+      ``deepseek-ai/DeepSeek-V4-Flash-Base`` uses for the SAME tensor roles
+      (attention/dense FP8 linears AND, unlike Flash, the routed experts).
+
+    Both conventions decode to the same physical quantity (a per-tile FP32
+    multiplier), so every ``fp8-block -> {INT8,UINT8,INT4}`` requant function
+    below is source-format-agnostic once it goes through this helper.
+    """
+    if scale.dtype == torch.float8_e8m0fnu:
+        return _e8m0_to_fp32_scale(scale)
+    if scale.dtype in (torch.float32, torch.bfloat16, torch.float16):
+        return scale.to(torch.float32)
+    if scale.dtype in (torch.int8, torch.uint8):
+        # A raw byte container with no float dtype attached is only ever
+        # produced by the MX-style path in these checkpoints (classic tile
+        # scales are always stored as an actual float dtype) so treat it as
+        # E8M0. Callers with classic float scales must not narrow to a byte
+        # dtype before calling this helper.
+        return _e8m0_to_fp32_scale(scale)
+    raise TypeError(f"unsupported block scale dtype: {scale.dtype}")
+
+
 def requantize_mxfp4_to_int4_w4a16(
     weight_packed: torch.Tensor,
     scale_e8m0: torch.Tensor,
@@ -212,6 +244,88 @@ def requantize_mxfp4_to_int4_w4a16(
         "qweight_packed": packed,
         "scales": new_scale.to(out_scale_dtype),
         "group_size": 32,
+    }
+
+
+def requantize_fp8_block_to_int4_w4a16(
+    weight_fp8: torch.Tensor,
+    scale_block: torch.Tensor,
+    *,
+    block_size: tuple[int, int] = (128, 128),
+    group_size: int = 32,
+    scale_mode: str = "mse",
+    out_scale_dtype: torch.dtype = torch.bfloat16,
+) -> dict[str, torch.Tensor | int]:
+    """Convert one full-width FP8 e4m3 block-quantized tensor to INT4 W4A16,
+    group size 32, matching the on-disk Marlin convention used for
+    MXFP4-sourced experts (packed 2 values/byte, BF16 per-group scale).
+
+    This is the routed-expert path for ``deepseek-ai/DeepSeek-V4-Flash-Base``,
+    whose routed experts are stored full width as F8_E4M3 + a classic FP32
+    128x128-tile scale (NOT the packed 2-per-byte MXFP4 + E8M0 group scale
+    that ``requantize_mxfp4_to_int4_w4a16`` consumes for
+    ``deepseek-ai/DeepSeek-V4-Flash``). ``scale_block`` accepts either
+    on-disk scale convention via ``_block_scale_to_fp32``.
+
+    Noise floor differs from the MXFP4-sourced path: fp8-block source has a
+    3-bit e4m3 mantissa (finer than MXFP4's 4-value E2M1 codebook) but a
+    16x coarser scale grid (128x128 tiles vs MXFP4's 32-wide groups), so the
+    per-group MSE scale search below re-derives its own scale table each
+    call rather than assuming the MXFP4 hyperparameters
+    (``tools/ampere/dsv4_requant_checkpoint_test.py`` covers both sources
+    against a synthetic ground truth to confirm MSE still beats absmax7 on
+    this source).
+    """
+    if weight_fp8.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"weight must be float8_e4m3fn, got {weight_fp8.dtype}")
+    n, k = weight_fp8.shape
+    if k % group_size != 0:
+        raise ValueError(
+            f"weight last dim {k} is not divisible by group_size={group_size}"
+        )
+
+    bn, bk = block_size
+    gn = (n + bn - 1) // bn
+    gk = (k + bk - 1) // bk
+    if scale_block.shape != (gn, gk):
+        raise ValueError(f"expected scale shape {(gn, gk)}, got {scale_block.shape}")
+
+    dequant = weight_fp8.to(torch.float32)
+    scale = _block_scale_to_fp32(scale_block)
+    scale_full = scale.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
+    dequant = dequant * scale_full[:n, :k]
+
+    grouped = dequant.reshape(n, k // group_size, group_size)
+    abs_max = grouped.abs().amax(dim=-1)
+    abs_max = abs_max.clamp(min=torch.finfo(torch.float32).tiny)
+
+    if scale_mode == "absmax7":
+        new_scale = abs_max / 7.0
+    elif scale_mode == "mse":
+        best_scale = abs_max / 7.0
+        best_err = None
+        for div in torch.linspace(5.0, 9.5, 19, device=grouped.device):
+            cand = (abs_max / div).to(out_scale_dtype).to(torch.float32)
+            q = torch.round(grouped / cand.unsqueeze(-1)).clamp(-8, 7)
+            err = (q * cand.unsqueeze(-1) - grouped).pow(2).sum(dim=-1)
+            if best_err is None:
+                best_err = err
+                best_scale = cand
+            else:
+                mask = err < best_err
+                best_err = torch.where(mask, err, best_err)
+                best_scale = torch.where(mask, cand, best_scale)
+        new_scale = best_scale.clamp(min=torch.finfo(torch.float32).tiny)
+    else:
+        raise ValueError(f"unsupported fp8-block->INT4 scale mode: {scale_mode!r}")
+
+    int4_signed = torch.round(grouped / new_scale.unsqueeze(-1)).clamp(-8, 7)
+    unsigned = (int4_signed + 8).to(torch.uint8)
+    packed = _pack_int4_pairs(unsigned.reshape(n, k)).view(torch.int8)
+    return {
+        "qweight_packed": packed,
+        "scales": new_scale.to(out_scale_dtype),
+        "group_size": group_size,
     }
 
 
@@ -286,12 +400,17 @@ def quantize_fp32_to_uint4_affine_w4a16(
 
 def requantize_fp8_to_int8_w8a16(
     weight_fp8: torch.Tensor,
-    scale_e8m0: torch.Tensor,
+    scale_block: torch.Tensor,
     *,
     block_size: tuple[int, int] = (128, 128),
     out_scale_dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, torch.Tensor | tuple[int, int]]:
-    """Convert one FP8 e4m3 tensor to INT8 W8A16 with 2D block scales."""
+    """Convert one FP8 e4m3 tensor to INT8 W8A16 with 2D block scales.
+
+    ``scale_block`` accepts either on-disk convention (see
+    ``_block_scale_to_fp32``): MX-style UE8M0 (Flash) or classic FP32 per-tile
+    (Flash-Base).
+    """
     if weight_fp8.dtype != torch.float8_e4m3fn:
         raise TypeError(f"weight must be float8_e4m3fn, got {weight_fp8.dtype}")
 
@@ -299,11 +418,11 @@ def requantize_fp8_to_int8_w8a16(
     n, k = weight_fp8.shape
     gn = (n + bn - 1) // bn
     gk = (k + bk - 1) // bk
-    if scale_e8m0.shape != (gn, gk):
-        raise ValueError(f"expected scale shape {(gn, gk)}, got {scale_e8m0.shape}")
+    if scale_block.shape != (gn, gk):
+        raise ValueError(f"expected scale shape {(gn, gk)}, got {scale_block.shape}")
 
     dequant = weight_fp8.to(torch.float32)
-    scale = _e8m0_to_fp32_scale(scale_e8m0)
+    scale = _block_scale_to_fp32(scale_block)
     scale_full = scale.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
     dequant = dequant * scale_full[:n, :k]
 
@@ -326,12 +445,16 @@ def requantize_fp8_to_int8_w8a16(
 
 def dequantize_fp8_block_to_bf16(
     weight_fp8: torch.Tensor,
-    scale_e8m0: torch.Tensor,
+    scale_block: torch.Tensor,
     *,
     block_size: tuple[int, int] = (128, 128),
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Dequantize one FP8 e4m3 tensor with 2D UE8M0 block scales to BF16.
+    """Dequantize one FP8 e4m3 tensor with 2D block scales to BF16.
+
+    ``scale_block`` accepts either on-disk convention (see
+    ``_block_scale_to_fp32``): MX-style UE8M0 (Flash) or classic FP32 per-tile
+    (Flash-Base).
 
     This is the lossless-as-possible target for tensors that are consumed as
     BF16 at runtime anyway (``wo_a``): the FP8 e4m3 mantissa (3 bits) fits inside
@@ -345,11 +468,11 @@ def dequantize_fp8_block_to_bf16(
     n, k = weight_fp8.shape
     gn = (n + bn - 1) // bn
     gk = (k + bk - 1) // bk
-    if scale_e8m0.shape != (gn, gk):
-        raise ValueError(f"expected scale shape {(gn, gk)}, got {scale_e8m0.shape}")
+    if scale_block.shape != (gn, gk):
+        raise ValueError(f"expected scale shape {(gn, gk)}, got {scale_block.shape}")
 
     dequant = weight_fp8.to(torch.float32)
-    scale = _e8m0_to_fp32_scale(scale_e8m0)
+    scale = _block_scale_to_fp32(scale_block)
     scale_full = scale.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
     dequant = dequant * scale_full[:n, :k]
     return dequant.to(out_dtype)
@@ -357,12 +480,16 @@ def dequantize_fp8_block_to_bf16(
 
 def requantize_fp8_to_allspark_uint8_w8a16(
     weight_fp8: torch.Tensor,
-    scale_e8m0: torch.Tensor,
+    scale_block: torch.Tensor,
     *,
     block_size: tuple[int, int] = (128, 128),
     out_scale_dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, torch.Tensor | str]:
     """Convert one FP8 e4m3 tensor to AllSpark channelwise UINT8 W8A16.
+
+    ``scale_block`` accepts either on-disk convention (see
+    ``_block_scale_to_fp32``): MX-style UE8M0 (Flash) or classic FP32 per-tile
+    (Flash-Base).
 
     AllSpark's Ampere kernel consumes per-output-channel scales and stores
     signed INT8 values in uint8 form with an implicit +128 bias.
@@ -374,11 +501,11 @@ def requantize_fp8_to_allspark_uint8_w8a16(
     n, k = weight_fp8.shape
     gn = (n + bn - 1) // bn
     gk = (k + bk - 1) // bk
-    if scale_e8m0.shape != (gn, gk):
-        raise ValueError(f"expected scale shape {(gn, gk)}, got {scale_e8m0.shape}")
+    if scale_block.shape != (gn, gk):
+        raise ValueError(f"expected scale shape {(gn, gk)}, got {scale_block.shape}")
 
     dequant = weight_fp8.to(torch.float32)
-    scale = _e8m0_to_fp32_scale(scale_e8m0)
+    scale = _block_scale_to_fp32(scale_block)
     scale_full = scale.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
     dequant = dequant * scale_full[:n, :k]
 

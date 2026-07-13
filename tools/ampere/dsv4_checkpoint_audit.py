@@ -64,6 +64,15 @@ _PRESERVE_DTYPE_NAMES = {
 }
 _FP8_WEIGHT_DTYPE_NAMES = {"torch.float8_e4m3fn", "F8_E4M3"}
 _FP8_SCALE_DTYPE_NAMES = {"torch.float8_e8m0fnu", "F8_E8M0"}
+# deepseek-ai/DeepSeek-V4-Flash-Base stores the SAME fp8-block-quantized
+# tensor roles as Flash (routed experts too, unlike Flash) with a *classic*
+# per-128x128-tile FP32 scale instead of Flash's MX-style UE8M0 byte. Both are
+# valid block-scale conventions for the fp8-block quantize/dequantize helpers
+# in dsv4_int.py (see _block_scale_to_fp32 there); this module just needs to
+# recognize both dtypes as legitimate "fp8 block" scales, and separately
+# distinguish Base's full-width F8_E4M3 routed-expert weight (fp8-block
+# source) from Flash's packed I8 container (MXFP4 source).
+_FP8_BLOCK_SCALE_DTYPE_NAMES = {"torch.float32", "F32"}
 
 
 @dataclass(frozen=True)
@@ -93,11 +102,20 @@ def _is_mtp_fp8_parent(name: str) -> bool:
 
 def classify_tensor(name: str, dtype: str) -> tuple[str, str]:
     if _ROUTED_EXPERT_WEIGHT_RE.search(name):
+        # Flash: packed 2-values/byte MXFP4 container (I8). Flash-Base: full
+        # width F8_E4M3 with a classic FP32 128x128-tile scale companion.
+        if dtype in _FP8_WEIGHT_DTYPE_NAMES:
+            return "routed_expert_fp8_block_weight", "quantize_int4_w4a16_candidate"
         return "routed_expert_mxfp4_weight", "quantize_asym_int4_awq_candidate"
     if _ROUTED_EXPERT_SCALE_RE.search(name):
+        if dtype in _FP8_BLOCK_SCALE_DTYPE_NAMES:
+            return "routed_expert_fp8_block_scale", "quantize_int4_w4a16_candidate"
         return "routed_expert_mxfp4_scale", "quantize_asym_int4_awq_candidate"
-    if dtype in _PRESERVE_DTYPE_NAMES:
-        return "preserved_precision_tensor", "preserve"
+    # These fp8-parent checks must run BEFORE the blanket preserve-dtype
+    # check below: Flash-Base's classic tile scales are stored F32, which is
+    # also the generic "leave this tensor alone" preserve dtype for unrelated
+    # tensors (norms, biases, ...). Name-gating on the fp8-parent substring
+    # lists keeps this from misclassifying real F32 passthrough tensors.
     if (
         _is_mtp_fp8_parent(name)
         and name.endswith(".weight")
@@ -107,21 +125,27 @@ def classify_tensor(name: str, dtype: str) -> tuple[str, str]:
     if (
         _is_mtp_fp8_parent(name)
         and name.endswith(".scale")
-        and dtype in _FP8_SCALE_DTYPE_NAMES
+        and (dtype in _FP8_SCALE_DTYPE_NAMES or dtype in _FP8_BLOCK_SCALE_DTYPE_NAMES)
     ):
         return "mtp_fp8_scale", "quantize_int8_w8a16_candidate"
-    if _is_fp8_parent(name) and name.endswith(".weight"):
-        if dtype not in _FP8_WEIGHT_DTYPE_NAMES:
-            return "unknown", "manual_review"
+    if _is_fp8_parent(name) and name.endswith(".weight") and dtype in _FP8_WEIGHT_DTYPE_NAMES:
         if any(parent in name for parent in _INDEXER_QK_PARENTS):
             return "indexer_qk_fp8_weight", "measure_recall_then_quantize"
         return "dense_fp8_weight", "quantize_int8_w8a16_candidate"
-    if _is_fp8_parent(name) and name.endswith(".scale"):
-        if dtype not in _FP8_SCALE_DTYPE_NAMES:
-            return "unknown", "manual_review"
+    if (
+        _is_fp8_parent(name)
+        and name.endswith(".scale")
+        and (dtype in _FP8_SCALE_DTYPE_NAMES or dtype in _FP8_BLOCK_SCALE_DTYPE_NAMES)
+    ):
         if any(parent in name for parent in _INDEXER_QK_PARENTS):
             return "indexer_qk_fp8_scale", "measure_recall_then_quantize"
         return "dense_fp8_scale", "quantize_int8_w8a16_candidate"
+    if dtype in _PRESERVE_DTYPE_NAMES:
+        return "preserved_precision_tensor", "preserve"
+    if _is_fp8_parent(name) and name.endswith(".weight"):
+        return "unknown", "manual_review"
+    if _is_fp8_parent(name) and name.endswith(".scale"):
+        return "unknown", "manual_review"
     return "unknown", "manual_review"
 
 
