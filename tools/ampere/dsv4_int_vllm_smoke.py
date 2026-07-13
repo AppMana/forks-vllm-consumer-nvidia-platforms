@@ -84,6 +84,17 @@ def main() -> int:
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Cap the paged KV cache size. The native sparse-MLA prefill "
+            "dequantizes the WHOLE paged cache into a bf16 buffer "
+            "(total_slots x 512 x 2B), so an uncapped cache on a large "
+            "gpu-memory-utilization OOMs at the first prefill."
+        ),
+    )
     parser.add_argument("--cuda-visible-devices", default=None)
     parser.add_argument(
         "--allow-display-gpu",
@@ -136,6 +147,9 @@ def main() -> int:
     from vllm import LLM, SamplingParams
 
     hf_overrides = json.loads(args.hf_overrides) if args.hf_overrides else {}
+    extra_kwargs = {}
+    if args.kv_cache_memory_bytes is not None:
+        extra_kwargs["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
 
     before = _gpu_snapshot()
     llm = LLM(
@@ -150,6 +164,7 @@ def main() -> int:
         pipeline_parallel_size=args.pipeline_parallel_size,
         load_format=args.load_format,
         hf_overrides=hf_overrides,
+        **extra_kwargs,
     )
 
     prompts = [args.prompt for _ in range(args.num_prompts)]

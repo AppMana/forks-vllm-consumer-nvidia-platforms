@@ -33,6 +33,7 @@ from vllm.transformers_utils.configs.deepseek_v4_appmana import (
     ROLE_SPARSE_MLA_PREFILL,
     SPARSE_MLA_DECODE_FP8_FLASH,
     SPARSE_MLA_DECODE_FP8_TRITON,
+    SPARSE_MLA_DECODE_INT8_FLASH,
     SPARSE_MLA_DECODE_INT8_TRITON,
     SPARSE_MLA_PREFILL_FLASH,
     SPARSE_MLA_PREFILL_TRITON,
@@ -88,6 +89,10 @@ def test_registry_covers_all_roles_with_expected_symbols():
     assert (
         KERNEL_REGISTRY[SPARSE_MLA_DECODE_INT8_TRITON] == ROLE_SPARSE_MLA_DECODE_INT8
     )
+    assert (
+        KERNEL_REGISTRY[SPARSE_MLA_DECODE_INT8_FLASH] == ROLE_SPARSE_MLA_DECODE_INT8
+    )
+    assert SPARSE_MLA_DECODE_INT8_FLASH == "flash_mla.sparse_int8_mla_decode"
     assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_TRITON] == ROLE_SPARSE_MLA_PREFILL
     assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_FLASH] == ROLE_SPARSE_MLA_PREFILL
     assert KERNEL_REGISTRY[INDEXER_CACHE_INT8_WRITER] == ROLE_INDEXER_CACHE_INT8
@@ -543,6 +548,13 @@ def test_sm86_attention_dispatches_all_registered_prefill_symbols():
     assert "_forward_prefill_flash" in source
     native = inspect.getsource(DeepseekV4SM86Attention._forward_prefill_flash)
     assert "flash_sparse_mla_prefill(" in native
+    # int8_ds_mla caches dispatch to the fused int8 variant of the SAME native
+    # prefill (528B strided views), still selected by SPARSE_MLA_PREFILL_FLASH.
+    assert "sparse_int8_mla_prefill(" in native
+    decode = inspect.getsource(DeepseekV4SM86Attention._forward_decode)
+    assert "SPARSE_MLA_DECODE_INT8_FLASH" in decode
+    assert "sparse_int8_mla_decode(" in decode
+    assert "triton_sparse_int8_mla_decode(" in decode
 
 
 # ---------------------------------------------------------------------------
@@ -648,7 +660,10 @@ def test_activate_stashes_pp_transport_overrides(monkeypatch):
     assert appmana_mod.pp_cache_metadata_override() is None
 
 
-def test_sm86_native_prefill_requires_fp8_ds_mla_cache():
+def test_sm86_native_prefill_supports_fp8_and_int8_caches():
+    """The fused native prefill consumes BOTH fp8_ds_mla and int8_ds_mla paged
+    caches (flash_mla 93bbf4e: int8 whole-cache dequant pass, runtime row
+    stride), so selecting it must validate under either cache dtype."""
     from vllm.models.deepseek_v4.nvidia_sm86.attention import (
         validate_sm86_kernel_selection,
     )
@@ -656,7 +671,35 @@ def test_sm86_native_prefill_requires_fp8_ds_mla_cache():
     resolved = resolve_appmana_kernel_config(
         {"kernels": [SPARSE_MLA_PREFILL_FLASH]}
     )
-    with pytest.raises(ValueError, match="fp8_ds_mla"):
-        validate_sm86_kernel_selection(resolved, kv_cache_dtype="int8_ds_mla")
-    # fp8_ds_mla is fine.
     validate_sm86_kernel_selection(resolved, kv_cache_dtype="fp8_ds_mla")
+    validate_sm86_kernel_selection(resolved, kv_cache_dtype="int8_ds_mla")
+    # non-ds_mla caches still fail closed.
+    with pytest.raises(ValueError, match="ds_mla"):
+        validate_sm86_kernel_selection(resolved, kv_cache_dtype="fp8")
+
+
+def test_sm86_int8_decode_native_selectable_triton_default():
+    """The native flash_mla int8 decode is SELECTABLE for the int8 decode role;
+    the Triton int8 decode remains the documented default."""
+    from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+        SELECTOR_ROLE_DEFAULTS,
+    )
+
+    assert (
+        SELECTOR_ROLE_DEFAULTS[ROLE_SPARSE_MLA_DECODE_INT8]
+        == SPARSE_MLA_DECODE_INT8_TRITON
+    )
+    resolved = resolve_appmana_kernel_config(
+        {"kernels": [SPARSE_MLA_DECODE_INT8_FLASH]}
+    )
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_FLASH
+    # Both int8 decode symbols claim one role: listing both is a hard error.
+    with pytest.raises(ValueError, match="same role"):
+        resolve_appmana_kernel_config(
+            {
+                "kernels": [
+                    SPARSE_MLA_DECODE_INT8_FLASH,
+                    SPARSE_MLA_DECODE_INT8_TRITON,
+                ]
+            }
+        )

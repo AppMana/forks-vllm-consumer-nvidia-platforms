@@ -30,6 +30,8 @@ import torch
 from flash_mla import (
     flash_sparse_mla_decode,
     flash_sparse_mla_prefill,
+    sparse_int8_mla_decode,
+    sparse_int8_mla_prefill,
     triton_sparse_int8_mla_decode,
 )
 
@@ -53,8 +55,9 @@ from vllm.transformers_utils.configs.deepseek_v4_appmana import (
     ROLE_SPARSE_MLA_PREFILL,
     SPARSE_MLA_DECODE_FP8_FLASH,
     SPARSE_MLA_DECODE_FP8_TRITON,
+    SPARSE_MLA_DECODE_INT8_FLASH,
+    SPARSE_MLA_DECODE_INT8_TRITON,
     SPARSE_MLA_PREFILL_FLASH,
-    SPARSE_MLA_PREFILL_TRITON,
     ResolvedAppmanaKernelConfig,
     resolve_appmana_kernel_config_from_hf_config,
     resolved_proof_line,
@@ -73,13 +76,10 @@ def validate_sm86_kernel_selection(
             "DeepSeek V4 SM86 sparse MLA requires fp8_ds_mla or "
             f"int8_ds_mla KV cache, got {kv_cache_dtype}"
         )
-    prefill = resolved.roles[ROLE_SPARSE_MLA_PREFILL]
-    if prefill == SPARSE_MLA_PREFILL_FLASH and kv_cache_dtype != "fp8_ds_mla":
-        raise ValueError(
-            f"{SPARSE_MLA_PREFILL_FLASH!r} consumes fp8_ds_mla paged caches "
-            f"only; kv_cache_dtype={kv_cache_dtype} is not supported. Use "
-            f"{SPARSE_MLA_PREFILL_TRITON!r} instead."
-        )
+    # The fused native prefill consumes both fp8_ds_mla and int8_ds_mla paged
+    # caches (flash_mla 93bbf4e: whole-cache int8 dequant pass, runtime row
+    # stride); on int8 caches _forward_prefill_flash dispatches to the int8
+    # variant of the same kernel, so no cross-check is needed here.
 
 
 class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
@@ -179,19 +179,39 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 extra_rows, extra_scales = get_int8_ds_mla_cache_views(
                     kv_cache, attn_metadata.block_size // self.compress_ratio
                 )
-            out = triton_sparse_int8_mla_decode(
-                q=q_rows,
-                swa_cache=swa_rows,
-                swa_scale=swa_scales,
-                swa_indices=swa_indices,
-                swa_lens=swa_lens,
-                scale=self.scale,
-                attn_sink=self.attn_sink,
-                extra_cache=extra_rows,
-                extra_scale=extra_scales,
-                extra_indices=extra_idx,
-                extra_lens=None if topk_lens is None else topk_lens,
-            )
+            if self.int8_decode_symbol == SPARSE_MLA_DECODE_INT8_FLASH:
+                out = sparse_int8_mla_decode(
+                    q=q_rows,
+                    swa_cache=swa_rows,
+                    swa_scale=swa_scales,
+                    swa_indices=swa_indices,
+                    swa_lens=swa_lens,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    extra_cache=extra_rows,
+                    extra_scale=extra_scales,
+                    extra_indices=extra_idx,
+                    extra_lens=None if topk_lens is None else topk_lens,
+                )
+            elif self.int8_decode_symbol == SPARSE_MLA_DECODE_INT8_TRITON:
+                out = triton_sparse_int8_mla_decode(
+                    q=q_rows,
+                    swa_cache=swa_rows,
+                    swa_scale=swa_scales,
+                    swa_indices=swa_indices,
+                    swa_lens=swa_lens,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    extra_cache=extra_rows,
+                    extra_scale=extra_scales,
+                    extra_indices=extra_idx,
+                    extra_lens=None if topk_lens is None else topk_lens,
+                )
+            else:
+                raise ValueError(
+                    "Unsupported DeepSeek V4 SM86 int8 decode kernel "
+                    f"{self.int8_decode_symbol!r}"
+                )
         elif self.kv_cache_dtype == "fp8_ds_mla":
             if self.fp8_decode_symbol == SPARSE_MLA_DECODE_FP8_FLASH:
                 out = flash_sparse_mla_decode(
@@ -454,17 +474,44 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
             extra_indices = mixed_indices[:, self.window_size :].contiguous()
             extra_lens = (mixed_lens - self.window_size).to(torch.int32)
 
-        out = flash_sparse_mla_prefill(
-            q=q,
-            swa_cache=swa_k_cache,
-            swa_indices=swa_indices,
-            swa_lens=swa_lens,
-            scale=self.scale,
-            attn_sink=self.attn_sink,
-            extra_cache=extra_cache,
-            extra_indices=extra_indices,
-            extra_lens=extra_lens,
-        )
+        if self.kv_cache_dtype == "int8_ds_mla":
+            # Same fused native prefill, int8 variant: the 528-byte-token paged
+            # caches are consumed through strided (int8 rows, fp32 scales)
+            # views; the kernel takes the row stride at runtime.
+            swa_rows, swa_scales = get_int8_ds_mla_cache_views(
+                swa_k_cache, swa_metadata.block_size
+            )
+            extra_rows = None
+            extra_scales = None
+            if extra_cache is not None:
+                extra_rows, extra_scales = get_int8_ds_mla_cache_views(
+                    extra_cache, compressed_block_size
+                )
+            out = sparse_int8_mla_prefill(
+                q=q,
+                swa_cache=swa_rows,
+                swa_scale=swa_scales,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_cache=extra_rows,
+                extra_scale=extra_scales,
+                extra_indices=extra_indices,
+                extra_lens=extra_lens,
+            )
+        else:
+            out = flash_sparse_mla_prefill(
+                q=q,
+                swa_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_cache=extra_cache,
+                extra_indices=extra_indices,
+                extra_lens=extra_lens,
+            )
         output.copy_(out)
         if output.shape[1] > self.n_local_heads:
             output[:, self.n_local_heads :].zero_()
