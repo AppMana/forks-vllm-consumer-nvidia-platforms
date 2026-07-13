@@ -21,16 +21,13 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.kernels.mhc.tilelang import (
-    hc_head_fused_kernel_tilelang,
-    mhc_post_tilelang,
-)
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mhc import HCHeadOp, MHCPostOp
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -84,6 +81,13 @@ class DSparkDeepseekV4Model(nn.Module):
             prefix=maybe_prefix(prefix, "main_proj"),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # CustomOp dispatchers (aiter/tilelang/Triton-sm86/torch-fallback), NOT
+        # the bare mhc_post_tilelang/hc_head_fused_kernel_tilelang functions:
+        # those are TileLang-only and have no sm_8x (Ampere) fallback. Mirrors
+        # DeepseekV4Model's own self.mhc_post/self.hc_head in nvidia/model.py.
+        self.mhc_post = MHCPostOp()
+        self.hc_head = HCHeadOp()
 
         current_vllm_config = get_current_vllm_config()
         self.layers = nn.ModuleList(
@@ -184,9 +188,9 @@ class DSparkDeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        hidden_states = self.mhc_post(hidden_states, residual, post_mix, res_mix)
         # hc_head reduces the hc copies; return the PRE-norm head hidden
-        hidden_states = hc_head_fused_kernel_tilelang(
+        hidden_states = self.hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,
