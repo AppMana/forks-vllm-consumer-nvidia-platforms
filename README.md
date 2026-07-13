@@ -16,28 +16,138 @@ pipelined `PPHandler`, not the fork's old per-token `torch.cuda.synchronize`).
 base FP8/MXFP4 release. The model loads it directly (per-expert + separate-projection
 names; fused at load by the stacked/expert mappings — do **not** pre-fuse).
 
-### What's in this fork (sm_86 + chain serving)
+### What this fork adds
 
-- **`nvidia_sm86/` attention backend** — capability-selected at `major == 8`;
-  FlashMLA CUDA sparse-MLA decode, gathered bf16 Triton sparse-MLA prefill,
-  and the AppMana INT8 IMMA indexer path. The prefill path intentionally stays
-  on Triton: a direct paged-cache FlashMLA prefill experiment misread vLLM's
-  real `[T, 1, window]` SWA index tensor as top-k width `1`, and after fixing
-  that shape handling the current FlashMLA prefill kernel was still slower than
-  the materialized bf16 Triton prefill kernel on RTX A5000.
-- **`dsv4_int` quant** — INT4 Marlin experts + INT8 AllSpark dense + INT8 IMMA indexer.
-- **MHC pipeline-parallel fix** (`models/deepseek_v4/nvidia/model.py`) — DeepSeek-V4 carries
-  a 4-tensor head-compression stream `(hidden, residual, post_mix, res_mix)` between
-  decoder layers. Upstream only passed `hidden_states` across a PP boundary and ran
-  `mhc_post` (the final collapse) on every rank, corrupting the residual stream (PP=N ≠
-  PP=1). Now all four cross the boundary via the existing **async** `isend/irecv_tensor_dict`
-  path and `mhc_post` runs only on the last rank → PP=N is token-identical to PP=1.
-- **`VLLM_RAY_WORKER_IP_ORDER`** (`v1/executor/ray_utils.py`, `envs.py`) — re-ported from
-  fork commit `ccf544b3c` (dropped in the rebase). Binds vLLM PP ranks to the chain-index
-  IP order injected by the `tb-chain-webhook`. Without it `RayExecutorV2` ranks were
-  scrambled vs the per-rank shard materialization (pod ordinal == chain index), so every
-  worker loaded the **wrong layers' shards → uninitialized weights → NaN logits**. This
-  was the production NaN root cause.
+Upstream vLLM's DeepSeek-V4 sparse-MLA path assumes Hopper-or-newer kernels
+(DeepGEMM, CuTeDSL gathers, the sm90 FlashMLA/FlashInfer sparse attention) plus
+Triton `fp8e4nv`, none of which run on sm_86. This fork re-implements the DSV4
+kernel surface for Ampere twice over: portable Triton kernels that decode fp8
+e4m3 arithmetically (`common/ops/fp8e4m3_arith.py`) or run s8 x s8 integer MMA,
+and fused native CUDA kernels in the sibling fork
+[`AppMana/forks-flash-mla-ampere-dsv4`](https://github.com/AppMana/forks-flash-mla-ampere-dsv4),
+which ship into the serving image as the `flash_mla` wheel. It also adds an
+INT8 variant of the whole stack end to end (`int8_ds_mla` KV cache, INT8
+indexer cache and query, W4A8 dense activations); upstream has no `int8_ds_mla`
+layout at all. Which kernel serves each role is selected by the checkpoint's
+`appmana` config block (see below), never by env vars.
+
+#### Kernel microbenchmarks at production shapes
+
+DSV4 production shapes: H=64 query heads, d=576 (512 nope + 64 rope), dv=512,
+top-k 512 and 1024, T=1 decode, 1024-token prefill chunks at 16k context. All
+rows below were measured on an RTX A5000 (sm_86) against true >=16k-slot paged
+caches (L2-resident microbenches invert the prefill conclusions; see
+"Benchmarking caveats" in the flash_mla fork README), CUDA events, best of
+repeated runs, measured 2026-07-13 with the committed harnesses in the
+flash_mla fork (`benchmarks/bench_sparse_mla_decode_16k.py`,
+`bench_int8_sparse_mla.py`, `bench_sparse_mla_16k_matrix.py`). They are
+consistent with the numbers recorded at that repo's tag
+`dsv4-sm86-kernels-2026-07-09` and in its commit `eb855ae`, within the
+busy-sibling-GPU jitter documented in that repo's caveats.
+
+There is no runnable upstream baseline for sparse-MLA attention on sm_86
+(upstream's sparse kernels require sm90+), so the reference row for each native
+CUDA kernel is this fork's own portable Triton kernel for the same role,
+labeled as such.
+
+**Sparse-MLA decode** (T=1, us per call):
+
+| Kernel | Repo | Lang | Cache | top-k 512 | top-k 1024 |
+| --- | --- | --- | --- | ---: | ---: |
+| `flash_mla.flash_sparse_mla_decode` (fused: selection dequant, heads-as-M `mma.m16n8k16`, warp-wide combine) | flash_mla | CUDA | fp8_ds_mla | **24.7** | **28.4** |
+| `flash_mla.sparse_int8_mla_decode` (same fused path, int8 dequant pre-pass) | flash_mla | CUDA | int8_ds_mla | **21.9** | **28.0** |
+| `flash_mla.triton_sparse_int8_mla_decode` (s8 x s8 IMMA QK, bf16 PV) | flash_mla | Triton | int8_ds_mla | 45.8 | 86.2 |
+| Legacy native decode (`FLASH_MLA_DECODE_FUSED=0`, in-CTA fp8 dequant; A/B reference) | flash_mla | CUDA | fp8_ds_mla | 46.8 | 80.2 |
+| `nvidia_sm86.triton_kernels.decode_sparse_attention_triton` (portable baseline) | this repo | Triton | fp8_ds_mla | 213.7 | 422.8 |
+
+The fused CUDA decode is 8.7x / 14.9x the Triton fp8 baseline and 1.9x / 2.8x
+the prior native kernel; the native int8 decode is 2.1x / 3.1x the Triton int8
+decode and matches fp8 latency. Across the model's 61 sparse-MLA layers the
+fused decode saves roughly 1.5 ms per output token vs the prior native kernel.
+
+**Sparse-MLA prefill** (1024-token chunk at 16k context, us per token):
+
+| Kernel | Repo | Lang | Cache | width 512 | width 1024 |
+| --- | --- | --- | --- | ---: | ---: |
+| `flash_mla.flash_sparse_mla_prefill` (fused: whole-cache dequant pass, bf16 tensor-core attention) | flash_mla | CUDA | fp8_ds_mla | **2.9** | **5.2** |
+| Same entry over int8 cache (`flash_mla.sparse_int8_mla_prefill`) | flash_mla | CUDA | int8_ds_mla | **2.8** | **4.9** |
+| `triton_sparse_int8_mla_decode` at prefill token counts | flash_mla | Triton | int8_ds_mla | 3.3 | 6.3 |
+| `sparse_attention_triton` + Triton dequant-gather (production Triton prefill) | this repo | Triton | fp8_ds_mla | 5.2 | 10.2 |
+| `sparse_attention_triton` attention body alone (pre-gathered bf16 rows) | this repo | Triton | bf16 | 3.8 | 7.4 |
+
+The flash_mla fork's README carries the design narratives (heads-as-M decode
+rewrite, whole-cache-dequant prefill), the ncu evidence, the rejected
+experiments, and the benchmarking caveats; read it before trusting or
+re-deriving any kernel policy. That fork also makes the upstream dense
+(non-sparse) FlashMLA forward launch on sm_86 at all (single-buffer `kp1`
+pipeline + dv-512 dispatch; upstream's kernel exceeds the 100 KB
+shared-memory cap).
+
+**KV-cache write / gather kernels** (parity-tested; no timing harness, so no
+numbers are claimed):
+
+| Kernel | Lang | What it does | Upstream equivalent |
+| --- | --- | --- | --- |
+| `_C.deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache` | CUDA | fp8_ds_mla paged cache to bf16 prefill gather workspace, zero-fill bounds guards | CuTeDSL `dequant_gather_k` (sm90+); replaced the torch fallback on sm_8x |
+| `cache_utils.dequantize_global_slots_k_cache` | Triton | fp8_ds_mla dequant by global slot index | none (new indexing mode) |
+| `cache_utils.fused_qnorm_rope_kv_int8_ds_mla_insert` | Triton | fused q-norm + rope + quant + insert into the int8_ds_mla SWA cache (528 B/token: 512 int8 + fp32 scale + pad, 16 B aligned) | the native fp8 writer `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert` (fp8-only) |
+| `cache_utils.quantize_and_insert_int8_ds_mla_cache`, `dequantize_global_slots_int8_ds_mla_cache`, `dequantize_and_gather_int8_ds_mla_cache` | Triton | int8_ds_mla insert + gather family | none; upstream has no int8_ds_mla |
+| `_C_cache_ops.indexer_k_quant_and_cache(..., "int8")` | CUDA | symmetric INT8 mode added to upstream's indexer K-cache writer; 99.48% mean top-512 recall vs the fp8 path on real tensors | the same kernel's fp8 path |
+
+**Indexer / mHC / GEMM enablement kernels.** The upstream fast path for each of
+these either cannot execute on sm_86 or does not exist (the runnable fallback
+was eager torch), so there is no like-for-like microbench; they are functional
+replacements validated by parity tests:
+
+| Kernel | Lang | What it does | Upstream equivalent |
+| --- | --- | --- | --- |
+| `nvidia_sm86.triton_kernels.fp8_mqa_logits_triton`, `fp8_paged_mqa_logits_triton`, `fp8_paged_mqa_logits_rowwise_triton` | Triton | Lightning-indexer logits over the fp8 or int8 indexer cache (software fp8 decode; s8 x s8 IMMA when the int8 query is active) | DeepGEMM `fp8_mqa_logits` / `fp8_paged_mqa_logits` (sm90) and Triton `fp8e4nv` kernels (sm89+) |
+| `nvidia_sm86.triton_kernels.mqa_logits_workspace_triton` | Triton | fused MQA logits over the prefill gather workspace (fp8 or s8 IMMA); replaces the fork's own chunked torch fallback | DeepGEMM `fp8_mqa_logits` (sm90) |
+| `common/ops/fused_indexer_q.fused_indexer_q_rope_quant_int8` | Triton | INT8 output mode added to the fused indexer-Q rope + quant kernel (q scale folded into weights, feeds the IMMA logits) | the same kernel's fp8/mxfp4 modes |
+| `nvidia_sm86.triton_kernels.tf32_hc_prenorm_gemm_triton` | Triton | TF32 split-K prenorm GEMM feeding the mHC pre-fuse | eager torch |
+| `kernels/mhc/triton.py`: `mhc_pre_triton`, `mhc_post_triton`, `mhc_fused_post_pre_triton` | Triton | the DSV4 mHC stream ops (pre-fuse, post collapse, fused post+pre between layers) | TileLang mHC kernels (TileLang is not shipped on the Ampere image), else eager torch |
+| `nvidia_sm86.triton_kernels.deepseek_v4_fp8_einsum_triton`, `common/ops/fp8_einsum.deepseek_v4_sm12x_fp8_einsum` | Triton | block-scaled fp8 `bhr,hdr->bhd` einsum for `wo_a` | DeepGEMM `fp8_einsum`; off the hot path since `wo_a` is stored BF16 for dsv4_int (`152467e1ef`) |
+| `backends/mla/sparse_mla_kernels.py` | Triton | portable sparse-MLA library (accumulate / merge / finish with attention sink, fp8_ds_mla paged and gathered variants) | none; test-covered, superseded in production by the kernels above |
+
+#### Other major additions (non-kernel)
+
+- **`appmana` checkpoint config block** — fail-closed, checkpoint-driven kernel
+  selection, `cache_type` default, and `pp_transport` toggles (details below).
+- **`dsv4_int` quant method** — INT4 Marlin experts (group 32, MSE scales) +
+  INT8 AllSpark dense + optional W4A8 activations, wiring upstream Marlin /
+  AllSpark GEMMs; produced by `tools/ampere/dsv4_requant_checkpoint.py`.
+- **`int8_ds_mla` KV-cache dtype end to end** — packed-slot alignment, SWA
+  insert path, runner support, cudagraph safety.
+- **MHC pipeline-parallel fix** (`models/deepseek_v4/nvidia/model.py`) —
+  DeepSeek-V4 carries a 4-tensor head-compression stream `(hidden, residual,
+  post_mix, res_mix)` between decoder layers. Upstream passed only
+  `hidden_states` across a PP boundary and ran `mhc_post` on every rank,
+  corrupting the residual stream (PP=N != PP=1). All four tensors now cross via
+  the async `isend/irecv_tensor_dict` path and `mhc_post` runs only on the last
+  rank, so PP=N is token-identical to PP=1.
+- **PP transport** — pack the PP intermediate-tensor dict into one NCCL message
+  per hop (`624d5e1263`) and cache the pickled metadata schema across steps
+  (`626da25f1c`); toggled via `appmana.pp_transport`.
+- **`VLLM_RAY_WORKER_IP_ORDER`** (`v1/executor/ray_utils.py`) — binds vLLM PP
+  ranks to the chain-index IP order injected by the `tb-chain-webhook`. Without
+  it `RayExecutorV2` ranks were scrambled vs per-rank shard materialization, so
+  workers loaded the wrong layers' shards (uninitialized weights, NaN logits).
+  This was the production NaN root cause.
+- **`vllm/layer_partition.py`** — rank-local shard partition matching vLLM's PP
+  layer split (see caveat below about `VLLM_PP_LAYER_PARTITION`).
+- **DSV4 warmup coverage** — sparse-prefill, mHC, fused-decode, and async-PP
+  postprocess warmup so no rank JIT-compiles Triton during serving (a single
+  compiling rank deadlocks the PP chain).
+- **Native clamped SiLU routing on sm_86** — `SiluAndMulWithClamp` and the
+  fused-MoE clamped SiLU run as eager torch ops so Python hotfix overlays stay
+  independent of the base image's compiled `_C` op schema (`0cb2020074`).
+- **DeepSeek V4 reasoning parser registration** — `<think>` token
+  initialization without per-request `chat_template_kwargs`.
+- **Benchmark client fix** — stop stream parsing at the `[DONE]` frame
+  (`26e2397621`).
+- **Ampere image pipeline** — `docker/Dockerfile.ampere-*` +
+  `tools/ampere/build_vllm_ampere_image.sh`, AppMana NCCL fork, usb4-rdma
+  provider, flash_mla wheel pinning, and a fast python-only hotfix overlay.
 
 ### Deploy
 
@@ -49,19 +159,6 @@ worker commands materialize each rank's shards by pod ordinal.
 
 **Measured (single-user, server-side Prometheus):** ~**26.7 tok/s** decode, **~175 ms TTFT**
 on the int4mse-int8 checkpoint over the 12-node chain.
-
-### sm86 Sparse MLA Kernel Notes
-
-Both stages run the fused tensor-core kernels from
-`AppMana/forks-flash-mla-ampere-dsv4` (tag `dsv4-sm86-kernels-2026-07-09`).
-At true 16k-slot footprint on an A5000: decode 22.5 us @ top-k 512 (2.10x the
-prior kernel, ~9.5x Triton), prefill 3.0-3.3 us/token (1.8x Triton). Both
-accept `fp8_ds_mla` and `int8_ds_mla` caches. See that repo's README for the
-full tables, the ncu evidence, and the benchmarking caveats.
-
-Earlier revisions of this file recorded "Triton beats FlashMLA prefill ~3.7x".
-That was measured on an L2-resident 192-slot cache; at production footprint the
-result inverts. Do not re-derive kernel policy from small-cache microbenches.
 
 ### Configuration: the `appmana` checkpoint-config block
 
@@ -79,7 +176,8 @@ checkpoint's `config.json` carries one block, overridable wholesale via
     "vllm.models.deepseek_v4.common.ops.fused_indexer_q.fused_indexer_q_rope_quant_int8",
     "vllm.model_executor.layers.quantization.utils.marlin_utils.marlin_act_int8_process_scales"
   ],
-  "cache_type": "fp8_ds_mla"
+  "cache_type": "fp8_ds_mla",
+  "pp_transport": {"pack": true, "cache_metadata": true}
 }
 ```
 
@@ -89,7 +187,10 @@ inferred from a registry. Unknown symbols, duplicate roles, and invalid
 for toggles (unlisted = off), which is what makes the int8 indexer independent
 of the dense IMMA runtime. `cache_type` sets the default KV dtype only when the
 CLI passes `--kv-cache-dtype auto`; an explicit CLI value always wins. The
-resolved configuration prints once at startup as `appmana kernels resolved: ...`
+optional `pp_transport` sub-block toggles the PP intermediate-tensor transport
+optimizations (`pack`, `cache_metadata`); unlike env vars it reliably reaches
+remote Ray workers. The resolved configuration prints once at startup as
+`appmana kernels resolved: ...`
 — treat that line as the validity gate for any benchmark row.
 
 Legacy role-keyed `--hf-overrides` keys
