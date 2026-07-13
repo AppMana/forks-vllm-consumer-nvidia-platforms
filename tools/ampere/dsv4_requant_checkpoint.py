@@ -43,6 +43,7 @@ from dsv4_checkpoint_audit import classify_tensor, matched_scale_name  # noqa: E
 
 from vllm.model_executor.layers.quantization.dsv4_int import (  # noqa: E402
     dequantize_fp8_block_to_bf16,
+    requantize_fp8_block_to_int4_w4a16,
     requantize_fp8_to_allspark_uint8_w8a16,
     requantize_fp8_to_int8_w8a16,
     requantize_mxfp4_to_int4_w4a16,
@@ -514,11 +515,23 @@ def convert_shard(
         raise ValueError(f"{src_shard.name} missing scales for: {sample}")
 
     out: dict[str, torch.Tensor] = {}
-    counts = {"int4": 0, "mxfp4": 0, "int8": 0, "wo_a_bf16": 0, "preserve": 0}
+    counts = {
+        "int4": 0,
+        "mxfp4": 0,
+        "int8": 0,
+        "wo_a_bf16": 0,
+        "preserve": 0,
+        "int4_from_fp8_block": 0,
+    }
     paired_scales = {
         matched_scale_name(name)
         for name, role in roles.items()
-        if role == "routed_expert_mxfp4_weight" or role in _FP8_WEIGHT_ROLES
+        if role
+        in (
+            "routed_expert_mxfp4_weight",
+            "routed_expert_fp8_block_weight",
+        )
+        or role in _FP8_WEIGHT_ROLES
     }
     paired_scales.discard(None)
 
@@ -551,6 +564,31 @@ def convert_shard(
                     out[out_name] = converted["qweight_packed"].cpu()
                     out[out_scale_name] = converted["scales"].cpu()
                     counts["int4"] += 1
+            elif role == "routed_expert_fp8_block_weight":
+                # deepseek-ai/DeepSeek-V4-Flash-Base source: full-width
+                # F8_E4M3 weight + classic FP32 128x128-tile scale (not
+                # packed MXFP4), requantized straight to the same INT4
+                # W4A16 group-32 on-disk convention as the MXFP4 path above.
+                if expert_format == "mxfp4":
+                    raise NotImplementedError(
+                        f"{name}: fp8-block routed experts (Flash-Base source) "
+                        "have no native MXFP4 on-disk form to preserve; "
+                        "--expert-format mxfp4 only applies to MXFP4-sourced "
+                        "(Flash) checkpoints"
+                    )
+                scale_name = matched_scale_name(name)
+                assert scale_name is not None
+                out_scale_name = _remap_tensor_name(scale_name, layer_remap)
+                assert out_scale_name is not None
+                converted = requantize_fp8_block_to_int4_w4a16(
+                    handle.get_tensor(name),
+                    handle.get_tensor(scale_name),
+                    scale_mode="mse",
+                    out_scale_dtype=out_scale_dtype,
+                )
+                out[out_name] = converted["qweight_packed"].cpu()
+                out[out_scale_name] = converted["scales"].cpu()
+                counts["int4_from_fp8_block"] += 1
             elif role in _FP8_WEIGHT_ROLES:
                 scale_name = matched_scale_name(name)
                 assert scale_name is not None
@@ -642,7 +680,14 @@ def convert_checkpoint(
     if layer_remap is not None:
         _log(f"layer_remap={layer_remap}")
 
-    totals = {"int4": 0, "mxfp4": 0, "int8": 0, "wo_a_bf16": 0, "preserve": 0}
+    totals = {
+        "int4": 0,
+        "mxfp4": 0,
+        "int8": 0,
+        "wo_a_bf16": 0,
+        "preserve": 0,
+        "int4_from_fp8_block": 0,
+    }
     _log(f"converting {len(shards)} shards from {src} to {dst}")
     for shard in shards:
         _log(f"-> {shard.name}")
@@ -663,7 +708,8 @@ def convert_checkpoint(
         _log(
             f"{shard.name}: int4={counts['int4']} mxfp4={counts['mxfp4']} "
             f"int8={counts['int8']} wo_a_bf16={counts['wo_a_bf16']} "
-            f"preserve={counts['preserve']}"
+            f"preserve={counts['preserve']} "
+            f"int4_from_fp8_block={counts['int4_from_fp8_block']}"
         )
 
     _copy_metadata(src, dst)
@@ -691,7 +737,8 @@ def convert_checkpoint(
     _log(
         f"done: int4={totals['int4']} mxfp4={totals['mxfp4']} "
         f"int8={totals['int8']} wo_a_bf16={totals['wo_a_bf16']} "
-        f"preserve={totals['preserve']}"
+        f"preserve={totals['preserve']} "
+        f"int4_from_fp8_block={totals['int4_from_fp8_block']}"
     )
 
 
