@@ -229,6 +229,146 @@ def test_sm86_prefill_dispatches_triton_and_native() -> None:
     assert "flash_sparse_mla_prefill(" in native
 
 
+def test_sm86_int8_dispatch_supports_native_and_triton_fqns() -> None:
+    """int8_ds_mla: the decode role selects between the Triton int8 decode and
+    the native flash_mla int8 decode; the FLASH prefill symbol dispatches to
+    the fused int8 prefill on int8 caches."""
+    from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+        SPARSE_MLA_DECODE_INT8_FLASH,
+        SPARSE_MLA_DECODE_INT8_TRITON,
+    )
+
+    assert SPARSE_MLA_DECODE_INT8_FLASH == "flash_mla.sparse_int8_mla_decode"
+    assert SPARSE_MLA_DECODE_INT8_TRITON == "flash_mla.triton_sparse_int8_mla_decode"
+    source = inspect.getsource(DeepseekV4SM86Attention._forward_decode)
+    assert "SPARSE_MLA_DECODE_INT8_FLASH" in source
+    assert "SPARSE_MLA_DECODE_INT8_TRITON" in source
+    assert "sparse_int8_mla_decode(" in source
+    assert "triton_sparse_int8_mla_decode(" in source
+    native = inspect.getsource(DeepseekV4SM86Attention._forward_prefill_flash)
+    assert "sparse_int8_mla_prefill(" in native
+    assert "get_int8_ds_mla_cache_views(" in native
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 8,
+    reason="flash_mla sparse-MLA kernels require Ampere (sm_8x)",
+)
+def test_flash_mla_int8_native_matches_triton_on_vllm_528B_views() -> None:
+    """Numeric parity on the EXACT artifacts vLLM hands the kernels: a paged
+    528-byte-token int8_ds_mla byte cache read through
+    ``get_int8_ds_mla_cache_views`` strided views. Native int8 decode and
+    native fused int8 prefill vs the incumbent Triton int8 decode."""
+    from flash_mla import (
+        sparse_int8_mla_decode,
+        sparse_int8_mla_prefill,
+        triton_sparse_int8_mla_decode,
+    )
+
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        get_int8_ds_mla_cache_views,
+    )
+
+    torch.manual_seed(29)
+    dev = "cuda"
+    T, H, block_size = 4, 64, 64
+    swa_topk, extra_topk = 128, 384
+    scale = 1.0 / math.sqrt(_HEAD_DIM)
+    token_bytes = 528  # 512 int8 + 4B fp32 scale + 12B pad
+
+    def build(num_slots: int) -> tuple[torch.Tensor, torch.Tensor]:
+        nb = (num_slots + block_size - 1) // block_size
+        rows = (torch.randn(nb * block_size, _HEAD_DIM, device=dev) * 2.0).to(
+            torch.bfloat16
+        )
+        s = (rows.float().abs().amax(dim=-1) / 127.0).clamp_min(1e-12)
+        q_i8 = (
+            torch.round(rows.float() / s.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
+        )
+        cache = torch.zeros(
+            nb, block_size, token_bytes, dtype=torch.uint8, device=dev
+        )
+        cache[:, :, :512] = q_i8.view(nb, block_size, 512).view(torch.uint8)
+        cache[:, :, 512:516] = (
+            s.to(torch.float32).view(nb, block_size, 1).view(torch.uint8)
+        )
+        # the vLLM paged cache arrives flattened per block; the oracle's K is
+        # the dequantized rows ROUNDED TO BF16 (the kernels stage K as bf16),
+        # matching the flash_mla fork's own oracle convention.
+        dequant = (q_i8.float() * s.unsqueeze(-1)).to(torch.bfloat16).float()
+        return cache.view(nb, block_size * token_bytes), dequant
+
+    swa_cache, swa_K = build(swa_topk + 32)
+    extra_cache, extra_K = build(extra_topk + 32)
+    swa_rows, swa_scales = get_int8_ds_mla_cache_views(swa_cache, block_size)
+    extra_rows, extra_scales = get_int8_ds_mla_cache_views(extra_cache, block_size)
+    assert swa_rows.stride(1) == token_bytes  # strided, not contiguous
+
+    q = torch.randn(T, H, _HEAD_DIM, device=dev, dtype=torch.bfloat16)
+    swa_lens = torch.randint(1, swa_topk + 1, (T,), dtype=torch.int32, device=dev)
+    extra_lens = torch.randint(1, extra_topk + 1, (T,), dtype=torch.int32, device=dev)
+    swa_idx = torch.randint(
+        0, swa_rows.shape[0] * block_size, (T, swa_topk), dtype=torch.int32, device=dev
+    )
+    extra_idx = torch.randint(
+        0,
+        extra_rows.shape[0] * block_size,
+        (T, extra_topk),
+        dtype=torch.int32,
+        device=dev,
+    )
+    sink = torch.randn(H, device=dev, dtype=torch.float32) * 0.1
+
+    # fp32 oracle over the dequantized rows (concatenated swa + extra streams).
+    ref = torch.zeros(T, H, _HEAD_DIM, device=dev, dtype=torch.float32)
+    for t in range(T):
+        K = torch.cat(
+            [
+                swa_K[swa_idx[t, : swa_lens[t]].long()],
+                extra_K[extra_idx[t, : extra_lens[t]].long()],
+            ]
+        )
+        scores = (q[t].float() @ K.t()) * scale
+        m = torch.maximum(
+            scores.max(dim=-1, keepdim=True).values, sink[:, None].float()
+        )
+        p = torch.exp(scores - m)
+        ref[t] = (p @ K) / (
+            p.sum(-1, keepdim=True) + torch.exp(sink[:, None].float() - m)
+        )
+
+    kwargs = dict(
+        scale=scale,
+        attn_sink=sink,
+        extra_cache=extra_rows,
+        extra_scale=extra_scales,
+        extra_indices=extra_idx,
+        extra_lens=extra_lens,
+    )
+    tri = triton_sparse_int8_mla_decode(
+        q, swa_rows, swa_scales, swa_idx, swa_lens, **kwargs
+    )
+    native_decode = sparse_int8_mla_decode(
+        q, swa_rows, swa_scales, swa_idx, swa_lens, **kwargs
+    )
+    native_prefill = sparse_int8_mla_prefill(
+        q, swa_rows, swa_scales, swa_idx, swa_lens, **kwargs
+    )
+
+    for name, out in (
+        ("triton decode", tri),
+        ("native decode", native_decode),
+        ("native prefill", native_prefill),
+    ):
+        cd = _cos_diff(out.float(), ref)
+        assert cd < 8e-5, f"int8 {name} vs fp32 oracle on 528B views cos_diff={cd:.2e}"
+    # Native kernels hold the tight elementwise bound vs the oracle (the
+    # Triton decode additionally quantizes Q to int8, so it is exempt here
+    # and covered by its cos bound above).
+    torch.testing.assert_close(native_decode.float(), ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(native_prefill.float(), ref, rtol=2e-2, atol=2e-2)
+
+
 def test_sm86_fp8_decode_dispatch_supports_native_and_triton_fqns() -> None:
     assert DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8 == (
         "flash_mla.flash_sparse_mla_decode"
