@@ -374,6 +374,225 @@ def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
     torch.cuda.synchronize(device)
 
 
+def _is_deepseek_v4_worker(worker: "Worker") -> bool:
+    architectures = getattr(worker.model_config.hf_config, "architectures", None) or ()
+    return any("DeepseekV4" in arch or "DeepSeekV4" in arch for arch in architectures)
+
+
+def _deepseek_v4_sparse_mla_prefill_warmup(worker: "Worker") -> None:
+    """Warm DSv4 sparse-prefill kernels without PP tensor transport.
+
+    Do not drive this through GPUModelRunner._dummy_run: on PP rank 0 that
+    executes a real model prefill before startup and can leave a CUDA kernel
+    outstanding while graph capture starts. Warm the kernels directly with a
+    bounded synthetic row instead.
+    """
+    if not _is_deepseek_v4_worker(worker):
+        return
+
+    max_tokens = worker.scheduler_config.max_num_batched_tokens
+    if worker.model_runner is None or max_tokens <= 0:
+        return
+
+    prefill_tokens = max(
+        1, min(max_tokens, _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS)
+    )
+    logger.info(
+        "Warming DeepSeek V4 sparse-MLA prefill Triton kernels with %d tokens.",
+        prefill_tokens,
+    )
+
+    _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker)
+
+
+def _deepseek_v4_block_table_slot_mapping_warmup(worker: "Worker") -> None:
+    if not _is_deepseek_v4_worker(worker):
+        return
+
+    model_runner = worker.model_runner
+    if model_runner is None:
+        return
+
+    from vllm.v1.worker.gpu.warmup import warmup_block_table_slot_mapping_kernel
+
+    warmup_block_table_slot_mapping_kernel(model_runner, model_runner.device)
+
+
+def _deepseek_v4_marlin_moe_warmup(worker: "Worker") -> None:
+    """Warm DSv4 int4/int8 Marlin MoE without full-model PP traffic."""
+    if not _is_deepseek_v4_worker(worker):
+        return
+
+    from vllm.model_executor.layers.quantization.dsv4_int import Dsv4Int4MoEMethod
+
+    model = worker.get_model()
+    max_tokens = max(1, int(worker.scheduler_config.max_num_batched_tokens))
+    token_sizes = sorted({1, min(16, max_tokens), max_tokens})
+    warmed: set[tuple[int, int, int, torch.dtype]] = set()
+
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if not isinstance(quant_method, Dsv4Int4MoEMethod):
+            continue
+        if not all(
+            hasattr(module, attr)
+            for attr in (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+            )
+        ):
+            continue
+
+        hidden_size = int(getattr(module, "hidden_size", quant_method.hidden_size))
+        intermediate_size = int(
+            getattr(
+                module,
+                "intermediate_size_per_partition",
+                quant_method.intermediate_size,
+            )
+        )
+        top_k = max(1, int(getattr(module, "top_k", 1)))
+        input_dtype = quant_method.input_dtype or torch.bfloat16
+        key = (hidden_size, intermediate_size, top_k, input_dtype)
+        if key in warmed:
+            continue
+        warmed.add(key)
+
+        device = module.w13_weight.device
+        dtype = getattr(module, "params_dtype", torch.bfloat16)
+        expert_ids = _deepseek_v4_marlin_warmup_expert_ids(module, top_k, device)
+        topk_weights = torch.full(
+            (1, top_k), 1.0 / top_k, dtype=torch.float32, device=device
+        )
+
+        for num_tokens in token_sizes:
+            x = torch.zeros((num_tokens, hidden_size), dtype=dtype, device=device)
+            topk_ids = expert_ids.expand(num_tokens, top_k).contiguous()
+            weights = topk_weights.expand(num_tokens, top_k).contiguous()
+            quant_method.apply(module, x, weights, topk_ids)
+            torch.cuda.synchronize(device)
+
+    if warmed:
+        logger.info(
+            "DeepSeek V4 Marlin MoE warmup completed for %d unique shapes and "
+            "token sizes %s.",
+            len(warmed),
+            token_sizes,
+        )
+
+
+def _deepseek_v4_marlin_warmup_expert_ids(
+    module: torch.nn.Module, top_k: int, device: torch.device
+) -> torch.Tensor:
+    expert_map = getattr(module, "expert_map", None)
+    if callable(expert_map):
+        expert_map = expert_map()
+
+    if isinstance(expert_map, torch.Tensor):
+        local_globals = torch.nonzero(expert_map >= 0, as_tuple=False).flatten()
+        if local_globals.numel() > 0:
+            repeats = (top_k + local_globals.numel() - 1) // local_globals.numel()
+            return local_globals.repeat(repeats)[:top_k].to(
+                device=device, dtype=torch.int32
+            ).view(1, top_k)
+
+    local_num_experts = max(1, int(getattr(module, "local_num_experts", 1)))
+    ids = torch.arange(top_k, dtype=torch.int32, device=device) % local_num_experts
+    return ids.view(1, top_k)
+
+
+def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        combine_topk_swa_indices,
+        dequantize_and_gather_k_cache,
+    )
+    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        sparse_attention_triton,
+    )
+
+    device = worker.model_runner.device
+    hf_config = worker.model_config.hf_config
+    tp_size = max(1, int(worker.parallel_config.tensor_parallel_size))
+    num_heads = int(getattr(hf_config, "num_attention_heads", 128)) // tp_size
+    num_heads = max(1, num_heads)
+    block_size = 64
+    topk = int(getattr(hf_config, "index_topk", _DEEPSEEK_V4_SYNTHETIC_TOPK))
+    topk = max(1, topk)
+    window = int(getattr(hf_config, "sliding_window", _DEEPSEEK_V4_SYNTHETIC_WINDOW))
+    window = max(1, window)
+    width = topk + window
+
+    # Native Ampere gather/dequant path over the fp8_ds_mla uint8 cache layout.
+    # Each page stores all token payloads first, then 8 scale bytes per token.
+    gathered = torch.empty(
+        (1, 1, _DEEPSEEK_V4_MLA_HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.zeros(
+        (1, block_size, _DEEPSEEK_V4_FP8_DS_MLA_PAGE_TOKEN_BYTES),
+        dtype=torch.uint8,
+        device=device,
+    )
+    seq_lens = torch.tensor([1], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([1], dtype=torch.int32, device=device)
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    dequantize_and_gather_k_cache(
+        gathered,
+        k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        offset=0,
+    )
+    torch.cuda.synchronize(device)
+
+    # Combined C4A/C128A top-k + SWA index path. Use a single late-position row
+    # so both the top-k and SWA portions are active while the launch stays small.
+    topk_indices = torch.arange(topk, dtype=torch.int32, device=device).view(1, topk)
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    context_len = max(topk * 4, window)
+    seq_lens = torch.tensor([context_len], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([window], dtype=torch.int32, device=device)
+    indices, lengths = combine_topk_swa_indices(
+        topk_indices,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        window_size=window,
+        compress_ratio=4,
+        topk=topk,
+        M=width,
+        N=topk,
+    )
+    torch.cuda.synchronize(device)
+
+    # Sparse attention proper: one query row, real local head count, full
+    # top-k+SWA width. num_tokens is pinned off specialization in the Triton JIT,
+    # while num_heads and index width are the expensive specializations to warm.
+    q = torch.zeros(
+        (1, num_heads, _DEEPSEEK_V4_MLA_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv = torch.zeros(
+        (width, 1, _DEEPSEEK_V4_MLA_HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
+    out = torch.empty_like(q)
+    sink = torch.zeros((num_heads,), dtype=torch.float32, device=device)
+    sparse_attention_triton(
+        q=q,
+        kv=kv,
+        indices=indices.unsqueeze(1),
+        lengths=lengths,
+        scale=1.0,
+        attn_sink=sink,
+        out=out,
+    )
+    torch.cuda.synchronize(device)
+
+
 # TODO: remove once FlashInfer upstream fixes the persistent file cache
 # to resolve collisions like `use_8x4_sf_layout=True/False`, which causes
 # invalid tactics to be chosen
