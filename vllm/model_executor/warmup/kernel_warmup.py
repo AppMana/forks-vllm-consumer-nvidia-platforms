@@ -181,9 +181,22 @@ def _deepseek_v4_block_table_slot_mapping_warmup(worker: "Worker") -> None:
     if model_runner is None:
         return
 
-    from vllm.v1.worker.gpu.warmup import warmup_block_table_slot_mapping_kernel
+    from vllm.v1.worker.gpu.warmup import (
+        warmup_block_table_slot_mapping_kernel,
+        warmup_post_update_kernel,
+        warmup_post_update_num_computed_tokens_kernel,
+    )
 
     warmup_block_table_slot_mapping_kernel(model_runner, model_runner.device)
+    # Runs regardless of speculative_config: postprocess_num_computed_tokens
+    # and post_update are generic per-rank v1 scheduling bookkeeping (every
+    # PP rank, every step), not DSpark-specific -- but under PP>1 their
+    # first-ever compile landing mid-serving-step (interleaved with another
+    # rank's in-flight tensor-dict recv) is exactly the class of startup
+    # wedge this function already exists to avoid for the block-table kernel
+    # above.
+    warmup_post_update_num_computed_tokens_kernel(model_runner, model_runner.device)
+    warmup_post_update_kernel(model_runner, model_runner.device)
 
 
 def _deepseek_v4_marlin_moe_warmup(worker: "Worker") -> None:

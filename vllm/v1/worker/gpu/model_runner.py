@@ -1110,6 +1110,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
+        proposed_tokens: torch.Tensor | None = None,
     ) -> None:
         # Update the number of computed tokens.
         if self.is_last_pp_rank:
@@ -1117,6 +1118,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
         else:
             output_bin_counts = None
+        if query_start_loc is None:
+            # The async PP-deferred path (update_pp_decode_requests, consuming
+            # a prior step's broadcast pp_size steps later) has no "this
+            # step's query length" concept -- there is no batch being
+            # scheduled right now on this rank, just a stale sampled result
+            # being applied. A zero-filled tensor here is EXACTLY equivalent
+            # to the None branch inside _post_update_kernel (query_start -
+            # query_end both load 0 => query_len=0, matching the kernel's own
+            # `if query_start_loc_ptr is None: query_len = 0`).
+            query_start_loc = torch.zeros(
+                idx_mapping.shape[0] + 1, dtype=torch.int32, device=idx_mapping.device
+            )
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
@@ -1129,6 +1142,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
         )
+        if proposed_tokens is not None:
+            # Deferred PP consume path only: the same-rank case (last rank
+            # applying its own draft) already writes this directly in
+            # sample_tokens(), before propose()'s return value is broadcast.
+            valid = idx_mapping >= 0
+            if bool(valid.any()):
+                self.req_states.draft_tokens[idx_mapping[valid]] = proposed_tokens[valid]
 
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
@@ -1419,15 +1439,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states, input_batch, grammar_output
         )
 
-        if self.pp_handler is not None:
-            # Broadcast to non-last PP ranks (handles spec decode multi-token).
-            self.pp_handler.broadcast(
-                sampler_output.sampled_token_ids,
-                num_sampled,
-                num_rejected,
-                input_batch,
-            )
-
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
@@ -1504,6 +1515,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+
+        if self.pp_handler is not None:
+            # Broadcast to non-last PP ranks: this step's verified sampled
+            # tokens, concatenated with the newly-proposed (not yet
+            # verified) next block from propose() above -- both ride in the
+            # same single broadcast message. Must happen after propose()
+            # since draft_tokens doesn't exist before that call returns.
+            self.pp_handler.broadcast(
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch,
+                proposed_token_ids=self.req_states.draft_tokens[input_batch.idx_mapping]
+                if self.speculator is not None
+                else None,
+            )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

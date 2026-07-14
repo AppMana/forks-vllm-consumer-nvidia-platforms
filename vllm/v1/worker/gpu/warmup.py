@@ -340,15 +340,11 @@ def warmup_post_update_kernel(
     # a None-valued pointer argument as a different compiled kernel from a
     # real-tensor argument of the same otherwise-matching shape/dtype (it
     # changes the generated null-check/launcher code, not just a runtime
-    # branch inside the kernel body). model_runner.py:1474 (synchronous
-    # postprocess after this rank's own sampler) always passes a real
-    # query_start_loc tensor; model_runner.py:788 (update_pp_decode_requests,
-    # the ASYNC PP-deferred path -- non-last ranks consuming a prior step's
-    # broadcast sampled output pp_size steps later) always passes
-    # query_start_loc=None. Both must be warmed independently or the second
-    # one still compiles live, mid-serving-step, exactly interleaved with
-    # in-flight cross-rank tensor-dict recv on another rank -- which is what
-    # was actually wedging the CUDA driver's module-load call.
+    # branch inside the kernel body). model_runner.py's synchronous
+    # postprocess after this rank's own sampler always passes a real
+    # query_start_loc tensor; the ASYNC PP-deferred path (non-last ranks
+    # consuming a prior step's broadcast) always passes query_start_loc=None.
+    # Both must be warmed independently.
     for warm_query_start_loc in (query_start_loc, None):
         post_update(
             idx_mapping,
