@@ -48,7 +48,14 @@ _INDEXER_QK_PARENTS = (
     ".attn.indexer.wq_b.",
     ".attn.indexer.compressor.wkv.",
 )
-_MTP_FP8_PARENT_RE = re.compile(r"^mtp\.\d+\.[eh]_proj\.")
+# e_proj/h_proj: vanilla Flash's per-stage mtp output-head fp8 projections.
+# main_proj: DSpark's restructured mtp.0 output projection (replaces e_proj/
+# h_proj for the stage whose output feeds the next mtp stage instead of
+# producing a standalone next-token distribution). Same fp8-block on-disk
+# convention as e_proj/h_proj, verified against the real DSpark checkpoint
+# (F8_E4M3 weight + F8_E8M0 scale, matching its Flash-derived MX-style
+# backbone).
+_MTP_FP8_PARENT_RE = re.compile(r"^mtp\.\d+\.(?:[eh]_proj|main_proj)\.")
 
 _PRESERVE_DTYPE_NAMES = {
     "torch.bfloat16",

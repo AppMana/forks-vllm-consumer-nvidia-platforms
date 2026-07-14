@@ -959,6 +959,16 @@ def test_checkpoint_audit_classifies_deepseek_v4_precision_roles():
         "mtp_fp8_scale",
         "quantize_int8_w8a16_candidate",
     )
+    # DSpark's restructured mtp.0 output projection (replaces e_proj/h_proj);
+    # found missing via a full-checkpoint audit against the real DSpark data.
+    assert classify_tensor("mtp.0.main_proj.weight", "F8_E4M3") == (
+        "mtp_fp8_weight",
+        "quantize_int8_w8a16_candidate",
+    )
+    assert classify_tensor("mtp.0.main_proj.scale", "F8_E8M0") == (
+        "mtp_fp8_scale",
+        "quantize_int8_w8a16_candidate",
+    )
 
 
 @pytest.mark.skipif(
