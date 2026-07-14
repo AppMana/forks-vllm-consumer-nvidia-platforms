@@ -229,15 +229,52 @@ def warmup_block_table_slot_mapping_kernel(
     if max_tokens <= 0:
         return False
 
-    query_start_loc = torch.tensor([0, max_tokens], dtype=torch.int32, device=device)
-    positions = torch.arange(max_tokens, dtype=torch.int64, device=device)
-
     multi_group_block_table = input_batch.block_table
-    try:
-        block_ids = tuple(
-            list(range(1, cdiv(max_tokens, block_table.block_size) + 1))
-            for block_table in block_tables
+
+    # max_num_batched_tokens is a whole-BATCH token budget (possibly summed
+    # across many concurrent requests) and is independent of max_model_len;
+    # it can legitimately exceed max_model_len. The block-table row we are
+    # about to synthesize below, however, represents a SINGLE request, whose
+    # real on-GPU capacity (block_table.max_num_blocks_per_req, in
+    # kernel-block units) was sized from max_model_len when the KV-cache
+    # manager was built. In production configs max_model_len is large enough
+    # that this never matters, but on deliberately small max_model_len
+    # configs (testbed shrinks, unit tests) max_num_batched_tokens can be
+    # larger than a single row's capacity, and writing
+    # cdiv(max_num_batched_tokens, block_size) blocks into that row overflows
+    # its backing buffer. Clamp the synthetic row to what each group's table
+    # can actually hold; the goal here is only to JIT-warm the kernel, not to
+    # exercise the full max_num_batched_tokens budget in one row.
+    block_counts = []
+    for block_table in block_tables:
+        wanted = cdiv(max_tokens, block_table.block_size)
+        # append_row() expands each pre-remap block id into
+        # blocks_per_kv_block kernel-block ids for hybrid tables, so the
+        # capacity ceiling on the PRE-remap count we pass to add_row() is
+        # max_num_blocks_per_req // blocks_per_kv_block, not
+        # max_num_blocks_per_req directly.
+        capacity = max(
+            1, block_table.max_num_blocks_per_req // max(1, block_table.blocks_per_kv_block)
         )
+        block_counts.append(min(wanted, capacity))
+
+    effective_tokens = min(
+        max_tokens,
+        min(
+            count * block_table.block_size
+            for count, block_table in zip(block_counts, block_tables)
+        ),
+    )
+    if effective_tokens <= 0:
+        return False
+
+    query_start_loc = torch.tensor(
+        [0, effective_tokens], dtype=torch.int32, device=device
+    )
+    positions = torch.arange(effective_tokens, dtype=torch.int64, device=device)
+
+    try:
+        block_ids = tuple(list(range(1, count + 1)) for count in block_counts)
         multi_group_block_table.add_row(block_ids, 0)
         multi_group_block_table.commit_block_table(1)
         multi_group_block_table.compute_slot_mapping(1, query_start_loc, positions)
@@ -246,10 +283,19 @@ def warmup_block_table_slot_mapping_kernel(
         multi_group_block_table.clear_row(0)
         multi_group_block_table.commit_block_table(1)
 
-    logger.info(
-        "Block-table slot-mapping warmup completed with %d scheduled tokens.",
-        max_tokens,
-    )
+    if effective_tokens < max_tokens:
+        logger.info(
+            "Block-table slot-mapping warmup completed with %d scheduled "
+            "tokens (clamped from max_num_batched_tokens=%d to fit each "
+            "group's block-table capacity).",
+            effective_tokens,
+            max_tokens,
+        )
+    else:
+        logger.info(
+            "Block-table slot-mapping warmup completed with %d scheduled tokens.",
+            effective_tokens,
+        )
     return True
 
 

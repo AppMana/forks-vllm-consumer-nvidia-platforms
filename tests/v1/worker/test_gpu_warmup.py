@@ -15,6 +15,8 @@ class _FakeKVConnector:
 
 class _FakeBlockTable:
     block_size = 16
+    max_num_blocks_per_req = 100
+    blocks_per_kv_block = 1
 
 
 class _FakeMultiGroupBlockTable:
@@ -150,6 +152,45 @@ def test_deepseek_v4_long_prefill_warmup_directly_warms_slot_mapping(monkeypatch
         ("clear_row", 0),
         ("commit_block_table", 1),
     ]
+
+
+class _TinyCapacityBlockTable:
+    """block_size=16, max_num_blocks_per_req=4 -> a single row can only hold
+    4*16=64 tokens. Mirrors a KV-cache manager built against a small
+    max_model_len (testbed/shrink configs, unit tests): max_num_batched_tokens
+    can still carry its full production-scale default and exceed that."""
+
+    block_size = 16
+    max_num_blocks_per_req = 4
+    blocks_per_kv_block = 1
+
+
+def test_block_table_warmup_clamps_to_table_capacity(monkeypatch):
+    """Regression test for the fp8-block-checkpoint smoke-test crash this
+    session: warmup previously sized its synthetic row from
+    max_num_batched_tokens alone, overflowing block_table.np whenever that
+    exceeded a single row's real (max_model_len-derived) capacity --
+    reproduced independently on the pre-existing MXFP4/Flash path, so this is
+    a general block-table-warmup bug, not specific to the fp8-block source."""
+    block_table = _FakeMultiGroupBlockTable()
+    block_table.block_tables = [_TinyCapacityBlockTable()]
+    model_runner = SimpleNamespace(
+        input_batch=SimpleNamespace(block_table=block_table),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    result = gpu_warmup.warmup_block_table_slot_mapping_kernel(
+        model_runner, torch.device("cpu")
+    )
+
+    assert result is True
+    # cdiv(8192, 16) = 512 blocks would be requested unclamped; the table can
+    # only hold 4, so the clamp must land on exactly 4.
+    assert block_table.calls[0] == ("add_row", ([1, 2, 3, 4],), 0)
+    # slot mapping must cover only the clamped token count (4*16=64), not
+    # the full max_num_batched_tokens=8192 that would have overflowed.
+    assert block_table.calls[2] == ("compute_slot_mapping", 1, (0, 64), 64)
 
 
 def test_deepseek_v4_pp_warmup_kernels_skip_generic_execute_model(monkeypatch):
