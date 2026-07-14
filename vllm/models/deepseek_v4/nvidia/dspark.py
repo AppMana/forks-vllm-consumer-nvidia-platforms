@@ -37,12 +37,12 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
-from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 from .model import (
     DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
     make_deepseek_v4_expert_params_mapping,
 )
 
@@ -315,7 +315,22 @@ def _insert_context_kv(
         )
 
 
-class DSparkDeepseekV4ForCausalLM(nn.Module, SupportsPP):
+class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
+    """Inherits from the TARGET's own ForCausalLM class, not bare nn.Module --
+    matches the established upstream idiom for PP-interface-compliant draft
+    models (EagleLlamaForCausalLM(LlamaForCausalLM), DFlashQwen3ForCausalLM
+    (Qwen3ForCausalLM)): the only purpose of the inheritance is to pick up
+    SupportsPP + make_empty_intermediate_tensors via the class hierarchy for
+    config/model.py's verify_with_parallel_config gate. __init__ deliberately
+    does NOT call the parent's (bypassed via nn.Module.__init__ directly,
+    same as upstream) -- this class builds its own small draft model, not the
+    target's real layers. Confirmed via upstream source: neither Eagle nor
+    DFlash's forward() has any PP-aware control flow either (no is_last_rank
+    check, no real IntermediateTensors handling) -- PP+speculative-decode is
+    unvalidated anywhere in upstream vLLM's test suite, so this inheritance
+    is a hygiene/consistency match, not a deeper correctness guarantee.
+    """
+
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
     # load_dspark_model always aliases the target's (PP=1 only -- see
     # dspark/utils.py's PP>1 gate on embed_tokens aliasing).
@@ -325,7 +340,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, SupportsPP):
     draft_id_to_target_id = None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__()
+        nn.Module.__init__(self)
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
@@ -346,17 +361,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, SupportsPP):
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        """Satisfies the SupportsPP interface contract (required by
-        config/model.py's verify_with_parallel_config gate to even allow
-        constructing a VllmConfig with pipeline_parallel_size > 1). Called by
-        the generic profiling path on PP rank > 0 -- NOT by real generation:
-        the draft's layers/heads are unconditionally colocated on
-        get_pp_group().is_last_rank (see DSparkDeepseekV4Model), and the
-        model-runner already gates the entire speculator (propose()) behind
-        `if not self.is_last_pp_rank: return None, None` before this model is
-        ever invoked for real drafting. So the actual tensor contents here are
-        never consumed for correctness -- only the shape/dtype need to be
-        profiling-safe.
+        """NOTE: NOT inherited from DeepseekV4ForCausalLM despite the class
+        hierarchy above -- the target sets this as a per-INSTANCE attribute
+        inside its own __init__ (self.make_empty_intermediate_tensors =
+        self.model.make_empty_intermediate_tensors), which this class's
+        __init__ deliberately never calls (see class docstring). Verified
+        empirically: without this explicit override, config/model.py's
+        verify_with_parallel_config gate fails the same way it did before
+        SupportsPP was added at all. Only shape/dtype need to be
+        profiling-safe -- see forward()'s docstring for why the contents are
+        never consumed for correctness.
         """
         return IntermediateTensors(
             {
