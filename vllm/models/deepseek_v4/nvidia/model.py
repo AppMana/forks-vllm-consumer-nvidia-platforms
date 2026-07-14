@@ -1142,9 +1142,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
-                )
+                aux_recon = self.mhc_post(hidden_states, residual, post_mix, res_mix)
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
 
