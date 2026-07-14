@@ -255,6 +255,119 @@ def warmup_block_table_slot_mapping_kernel(
     return True
 
 
+def warmup_post_update_num_computed_tokens_kernel(
+    model_runner: GPUModelRunner,
+    device: torch.device,
+) -> bool:
+    """Force the first-ever compile of _post_update_num_computed_tokens_kernel
+    during warmup, not mid-serving-step.
+
+    Under pipeline_parallel_size > 1, postprocess_num_computed_tokens runs on
+    every rank once per step (it's per-rank scheduling bookkeeping, not
+    last-rank-only like sampling). If this kernel's first compile happens
+    live -- interleaved with another rank's in-flight cross-process
+    irecv_tensor_dict handoff for the SAME step -- it can wedge inside the
+    CUDA driver's module-load call (triton/compiler/compiler.py:_init_handles
+    -> driver.active.utils.load_binary) rather than the compile itself;
+    compiling before entering the PP hot loop avoids that timing window
+    entirely. Mirrors warmup_block_table_slot_mapping_kernel's synthetic-input
+    pattern.
+    """
+    from vllm.v1.worker.gpu.input_batch import post_update_num_computed_tokens
+
+    req_states = getattr(model_runner, "req_states", None)
+    num_computed_tokens = getattr(req_states, "num_computed_tokens", None)
+    num_computed_tokens_gpu = getattr(num_computed_tokens, "gpu", None)
+    if num_computed_tokens_gpu is None:
+        return False
+
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 0], dtype=torch.int32, device=device)
+
+    post_update_num_computed_tokens(
+        idx_mapping,
+        num_computed_tokens_gpu,
+        query_start_loc,
+    )
+    torch.accelerator.synchronize()
+
+    logger.info("post_update_num_computed_tokens kernel warmup completed.")
+    return True
+
+
+def warmup_post_update_kernel(
+    model_runner: GPUModelRunner,
+    device: torch.device,
+) -> bool:
+    """Force the first-ever compile of _post_update_kernel during warmup.
+
+    Same rationale as warmup_post_update_num_computed_tokens_kernel above:
+    postprocess_sampled -> post_update runs on every PP rank once per step
+    (accept/reject + all_token_ids bookkeeping), and a first compile
+    interleaved with another rank's in-flight cross-process tensor-dict recv
+    can wedge inside the CUDA driver's module-load call. Reuses the model
+    runner's own real req_states buffers (matching production dtypes/shapes)
+    so the compiled kernel is actually reused by the real call, not just a
+    differently-specialized one.
+    """
+    from vllm.v1.worker.gpu.input_batch import post_update
+
+    req_states = getattr(model_runner, "req_states", None)
+    if req_states is None:
+        return False
+    num_computed_tokens_gpu = getattr(
+        getattr(req_states, "num_computed_tokens", None), "gpu", None
+    )
+    all_token_ids_gpu = getattr(getattr(req_states, "all_token_ids", None), "gpu", None)
+    total_len_gpu = getattr(getattr(req_states, "total_len", None), "gpu", None)
+    last_sampled_tokens = getattr(req_states, "last_sampled_tokens", None)
+    if any(
+        t is None
+        for t in (num_computed_tokens_gpu, all_token_ids_gpu, total_len_gpu, last_sampled_tokens)
+    ):
+        return False
+
+    num_speculative_steps = int(getattr(model_runner, "num_speculative_steps", 0) or 0)
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    sampled_tokens = torch.zeros(
+        1, num_speculative_steps + 1, dtype=torch.int64, device=device
+    )
+    num_sampled = torch.zeros(1, dtype=torch.int32, device=device)
+    num_rejected = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 0], dtype=torch.int32, device=device)
+
+    # Two real call sites, two distinct Triton specializations: Triton treats
+    # a None-valued pointer argument as a different compiled kernel from a
+    # real-tensor argument of the same otherwise-matching shape/dtype (it
+    # changes the generated null-check/launcher code, not just a runtime
+    # branch inside the kernel body). model_runner.py:1474 (synchronous
+    # postprocess after this rank's own sampler) always passes a real
+    # query_start_loc tensor; model_runner.py:788 (update_pp_decode_requests,
+    # the ASYNC PP-deferred path -- non-last ranks consuming a prior step's
+    # broadcast sampled output pp_size steps later) always passes
+    # query_start_loc=None. Both must be warmed independently or the second
+    # one still compiles live, mid-serving-step, exactly interleaved with
+    # in-flight cross-rank tensor-dict recv on another rank -- which is what
+    # was actually wedging the CUDA driver's module-load call.
+    for warm_query_start_loc in (query_start_loc, None):
+        post_update(
+            idx_mapping,
+            num_computed_tokens_gpu,
+            last_sampled_tokens,
+            None,  # output_bin_counts: None on non-last-rank in the real call too
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            warm_query_start_loc,
+            all_token_ids_gpu,
+            total_len_gpu,
+        )
+    torch.accelerator.synchronize()
+
+    logger.info("post_update kernel warmup completed (both query_start_loc specializations).")
+    return True
+
+
 @torch.inference_mode()
 def warmup_kernels(
     model_runner: GPUModelRunner,
