@@ -17,6 +17,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -36,7 +37,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 
 from .model import (
     DeepseekV4DecoderLayer,
@@ -72,57 +73,101 @@ class DSparkDeepseekV4Model(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
-        self.main_proj = ReplicatedLinear(
-            config.hidden_size * len(self.target_layer_ids),
-            config.hidden_size,
-            bias=False,
-            return_bias=False,
-            quant_config=vllm_config.quant_config,
-            prefix=maybe_prefix(prefix, "main_proj"),
-        )
-        self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # --- PP placement -----------------------------------------------
+        # dspark_target_layer_ids are, by the checkpoint's own construction,
+        # the LAST len(target_layer_ids) layers of the (much larger) target
+        # model (e.g. real checkpoint: [40,41,42] of 43 layers). Under any
+        # contiguous, order-preserving PP layer split (vLLM's
+        # get_pp_indices), the last chunk of layers always lands on
+        # get_pp_group().is_last_rank -- so the target's aux hidden states
+        # this draft consumes are ALWAYS produced on that same rank.
+        #
+        # This draft model's own 3 layers must therefore be constructed
+        # ENTIRELY on that same last rank, NOT distributed via a fresh
+        # make_layers(self.num_dspark_layers, ...) call: verified
+        # empirically that get_pp_indices(3, rank, 10) scatters a 3-layer
+        # stack across ranks 6-8 (not rank 9), which would silently require
+        # an extra cross-rank hop the rest of this class does not implement.
+        # Other ranks get PPMissingLayer stand-ins (mirrors the main model's
+        # own is_first_rank/is_last_rank-gated embed_tokens/norm pattern in
+        # nvidia/model.py) so they do not allocate GPU memory for a draft
+        # they will never run.
+        #
+        # NOTE: this only makes module CONSTRUCTION PP-safe (no wasted
+        # memory, no shape mismatch on non-owning ranks). forward()'s control
+        # flow below, the speculator orchestration that calls it
+        # (DFlashSpeculator, shared with other aux-hidden-state speculators),
+        # and dspark/utils.py's embed/lm_head aliasing are NOT yet updated
+        # for PP>1 -- see the caller-side PP question called out in the
+        # accompanying report before removing the
+        # "DSpark does not support pipeline parallelism" guard.
+        self._owns_dspark_layers = get_pp_group().is_last_rank
 
-        # CustomOp dispatchers (aiter/tilelang/Triton-sm86/torch-fallback), NOT
-        # the bare mhc_post_tilelang/hc_head_fused_kernel_tilelang functions:
-        # those are TileLang-only and have no sm_8x (Ampere) fallback. Mirrors
-        # DeepseekV4Model's own self.mhc_post/self.hc_head in nvidia/model.py.
-        self.mhc_post = MHCPostOp()
-        self.hc_head = HCHeadOp()
+        if self._owns_dspark_layers:
+            self.main_proj = ReplicatedLinear(
+                config.hidden_size * len(self.target_layer_ids),
+                config.hidden_size,
+                bias=False,
+                return_bias=False,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "main_proj"),
+            )
+            self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        current_vllm_config = get_current_vllm_config()
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV4DecoderLayer(
-                    current_vllm_config,
-                    prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
-                )
-                for i in range(self.num_dspark_layers)
-            ]
-        )
+            # CustomOp dispatchers (aiter/tilelang/Triton-sm86/torch-fallback),
+            # NOT the bare mhc_post_tilelang/hc_head_fused_kernel_tilelang
+            # functions: those are TileLang-only and have no sm_8x (Ampere)
+            # fallback. Mirrors DeepseekV4Model's own self.mhc_post/
+            # self.hc_head in nvidia/model.py.
+            self.mhc_post = MHCPostOp()
+            self.hc_head = HCHeadOp()
 
-        # Heads: final norm + hc_head, and the Markov head
-        # Loaded from the "final" MTP layer weights (mtp.*) in the target checkpoint
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        hc_dim = self.hc_mult * config.hidden_size
-        self.hc_head_fn = nn.Parameter(
-            torch.empty(self.hc_mult, hc_dim, dtype=torch.float32),
-            requires_grad=False,
-        )
-        self.hc_head_base = nn.Parameter(
-            torch.empty(self.hc_mult, dtype=torch.float32), requires_grad=False
-        )
-        self.hc_head_scale = nn.Parameter(
-            torch.empty(1, dtype=torch.float32), requires_grad=False
-        )
-        draft_vocab_size = (
-            getattr(config, "draft_vocab_size", None) or config.vocab_size
-        )
-        self.markov_head = DSparkMarkovHead(
-            config.vocab_size,
-            draft_vocab_size,
-            config.dspark_markov_rank,
-            prefix=maybe_prefix(prefix, "markov_head"),
-        )
+            current_vllm_config = get_current_vllm_config()
+            self.layers = nn.ModuleList(
+                [
+                    DeepseekV4DecoderLayer(
+                        current_vllm_config,
+                        prefix=maybe_prefix(
+                            prefix, f"layers.{self.num_hidden_layers + i}"
+                        ),
+                    )
+                    for i in range(self.num_dspark_layers)
+                ]
+            )
+
+            # Heads: final norm + hc_head, and the Markov head. Loaded from
+            # the "final" MTP layer weights (mtp.*) in the target checkpoint.
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            hc_dim = self.hc_mult * config.hidden_size
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(self.hc_mult, hc_dim, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.hc_head_base = nn.Parameter(
+                torch.empty(self.hc_mult, dtype=torch.float32), requires_grad=False
+            )
+            self.hc_head_scale = nn.Parameter(
+                torch.empty(1, dtype=torch.float32), requires_grad=False
+            )
+            draft_vocab_size = (
+                getattr(config, "draft_vocab_size", None) or config.vocab_size
+            )
+            self.markov_head = DSparkMarkovHead(
+                config.vocab_size,
+                draft_vocab_size,
+                config.dspark_markov_rank,
+                prefix=maybe_prefix(prefix, "markov_head"),
+            )
+        else:
+            self.main_proj = PPMissingLayer()
+            self.main_norm = PPMissingLayer()
+            self.mhc_post = PPMissingLayer()
+            self.hc_head = PPMissingLayer()
+            self.layers = nn.ModuleList(
+                [PPMissingLayer() for _ in range(self.num_dspark_layers)]
+            )
+            self.norm = PPMissingLayer()
+            self.markov_head = PPMissingLayer()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
