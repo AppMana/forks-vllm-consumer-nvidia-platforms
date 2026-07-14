@@ -839,6 +839,22 @@ class WorkerProc:
         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
 
+        # Give each PP/TP rank its own Triton kernel cache directory. Triton's
+        # default on-disk cache (~/.triton/cache, shared across all worker
+        # processes on this host) is not safe for two ranks compiling the same
+        # new kernel signature for the first time at close to the same
+        # wall-clock time under enforce_eager + pipeline_parallel_size>1: one
+        # rank can wedge forever inside triton/compiler/compiler.py's
+        # _init_handles/launch_metadata waiting on that shared cache's lock
+        # for an entry the other rank is simultaneously writing. Must be set
+        # before any Triton-JIT'd kernel is imported/compiled in this process.
+        os.environ.setdefault(
+            "TRITON_CACHE_DIR",
+            os.path.join(
+                os.path.expanduser("~"), ".triton", "cache", f"rank{kwargs.get('rank', 0)}"
+            ),
+        )
+
         worker = None
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
