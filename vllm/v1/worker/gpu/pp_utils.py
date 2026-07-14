@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -226,6 +227,10 @@ class PPHandler:
         parts.append(num_rejected.to(torch.int64).unsqueeze(1))
         # One single tensor, one broadcast call.
         payload = torch.cat(parts, dim=1).contiguous()
+
+        if current_platform.is_xpu():
+            self.main_stream.synchronize()
+
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             torch.distributed.broadcast(

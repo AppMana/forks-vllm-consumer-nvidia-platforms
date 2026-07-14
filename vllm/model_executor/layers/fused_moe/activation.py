@@ -107,6 +107,22 @@ def activation_without_mul(activation: str) -> str:
     return MoEActivation.from_str(activation).without_mul().value
 
 
+def silu_and_mul_with_clamp(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    clamp_limit: float,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+) -> None:
+    if topk_ids is not None and expert_map is not None:
+        from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
+
+        swiglu_limit_func(output, input, clamp_limit, topk_ids, expert_map)
+    else:
+        # Fused silu(clamp(gate)) * clamp(up); equivalent to swiglu_limit_func.
+        torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, 1.0, 0.0)
+
+
 def apply_moe_activation(
     activation: MoEActivation,
     output: torch.Tensor,
@@ -115,6 +131,8 @@ def apply_moe_activation(
     clamp_limit: float | None = None,
     alpha: float = 1.0,
     beta: float = 0.0,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply MoE activation function.
 
@@ -146,10 +164,7 @@ def apply_moe_activation(
             if _use_native_clamped_silu_on_cuda():
                 silu_and_mul_with_clamp_native_out(output, input, clamp_limit)
             else:
-                # Fused silu(clamp(gate)) * clamp(up); equivalent to swiglu_limit_func.
-                torch.ops._C.silu_and_mul_with_clamp(
-                    output, input, clamp_limit, 1.0, 0.0
-                )
+                silu_and_mul_with_clamp(output, input, clamp_limit, topk_ids, expert_map)
         else:
             torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:
