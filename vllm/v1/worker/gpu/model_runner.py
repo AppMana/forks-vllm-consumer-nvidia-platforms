@@ -209,7 +209,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
+                # dspark: verified PP-safe. dspark_target_layer_ids are always
+                # the target's LAST layers, which always land on
+                # get_pp_group().is_last_rank under any contiguous PP split;
+                # DSparkDeepseekV4Model colocates all its own layers/heads on
+                # that same rank (nvidia/dspark.py); aux_hidden_states are
+                # already only populated on is_last_pp_rank generically
+                # (this file, ExecuteModelState); and propose() is already
+                # gated behind `if not self.is_last_pp_rank: return None,
+                # None` before the speculator is ever invoked. eagle3/dflash
+                # have NOT been traced for the same colocation guarantee --
+                # left blocked.
+                if self.use_pp and self.speculative_config.method != "dspark":
                     raise ValueError(
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."

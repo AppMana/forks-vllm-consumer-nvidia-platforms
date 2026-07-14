@@ -37,7 +37,9 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
+from vllm.sequence import IntermediateTensors
 
 from .model import (
     DeepseekV4DecoderLayer,
@@ -313,9 +315,10 @@ def _insert_context_kv(
         )
 
 
-class DSparkDeepseekV4ForCausalLM(nn.Module):
+class DSparkDeepseekV4ForCausalLM(nn.Module, SupportsPP):
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
-    # load_dspark_model always aliases the target's.
+    # load_dspark_model always aliases the target's (PP=1 only -- see
+    # dspark/utils.py's PP>1 gate on embed_tokens aliasing).
     has_own_embed_tokens = False
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
@@ -336,6 +339,32 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        """Satisfies the SupportsPP interface contract (required by
+        config/model.py's verify_with_parallel_config gate to even allow
+        constructing a VllmConfig with pipeline_parallel_size > 1). Called by
+        the generic profiling path on PP rank > 0 -- NOT by real generation:
+        the draft's layers/heads are unconditionally colocated on
+        get_pp_group().is_last_rank (see DSparkDeepseekV4Model), and the
+        model-runner already gates the entire speculator (propose()) behind
+        `if not self.is_last_pp_rank: return None, None` before this model is
+        ever invoked for real drafting. So the actual tensor contents here are
+        never consumed for correctness -- only the shape/dtype need to be
+        profiling-safe.
+        """
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size), dtype=dtype, device=device
+                )
+            }
+        )
 
     # --- Hooks used by the speculator -------------------------------------
 
@@ -365,8 +394,20 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
+        # Structural-only: satisfies interfaces.supports_pp's
+        # supports_kw(forward, "intermediate_tensors") inspection so
+        # verify_with_parallel_config allows constructing a
+        # pipeline_parallel_size > 1 VllmConfig at all. Always None in
+        # practice -- the speculator calls this directly (not through the
+        # generic per-rank PP forward loop) and only ever does so on
+        # get_pp_group().is_last_rank (model_runner.py gates propose() behind
+        # `if not self.is_last_pp_rank: return None, None` before reaching
+        # the speculator), where this draft's layers/heads are unconditionally
+        # colocated (see DSparkDeepseekV4Model.__init__).
+        intermediate_tensors: IntermediateTensors | None = None,
     ) -> torch.Tensor:
         # Returns the pre-norm hc_head hidden ([T, hidden_size]).
+        del intermediate_tensors
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
