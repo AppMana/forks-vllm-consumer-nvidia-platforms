@@ -28,6 +28,7 @@ import re
 import shutil
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -508,6 +509,7 @@ def convert_shard(
     expert_int4_scale_mode: str,
     keep_experts: int | None = None,
     drop_mtp: bool = False,
+    name_filter: Callable[[str], bool] | None = None,
 ) -> dict[str, int]:
     roles, _dtypes, missing_scales = _classify_shard(src_shard)
     if missing_scales:
@@ -540,6 +542,8 @@ def convert_shard(
             if name in paired_scales:
                 continue
             if _subset_drop(name, keep_experts, drop_mtp):
+                continue
+            if name_filter is not None and not name_filter(name):
                 continue
             role = roles[name]
             out_name = _remap_tensor_name(name, layer_remap)
@@ -629,6 +633,129 @@ def convert_shard(
 
     save_file(out, str(dst_shard))
     return counts
+
+
+_MTP_PREFIX_RE = re.compile(r"^mtp\.\d+\.")
+
+
+def splice_mtp(
+    dst: Path,
+    mtp_src: Path,
+    *,
+    device: str,
+    out_scale_dtype: torch.dtype,
+    dense_int8_strategy: str,
+    out_shard_name: str = "model-mtp-dspark.safetensors",
+) -> dict[str, int]:
+    """Requantize ``mtp_src``'s ``mtp.*`` subtree into the SAME INT4/INT8
+    on-disk convention as the already-converted backbone at ``dst``, and
+    splice it into ``dst``'s safetensors index.
+
+    ``mtp_src`` is deepseek-ai/DeepSeek-V4-Flash-DSpark: its ``mtp.0`` is a
+    RESTRUCTURED replacement for whatever mtp.0 the backbone source (Base)
+    natively carries (DSpark rewires mtp.0's output head to feed mtp.1
+    instead of producing a standalone next-token distribution), and its
+    ``mtp.1``/``mtp.2`` are ADDED stages (three DeepSpec draft stages total,
+    matching ``config.json``'s ``dspark_target_layer_ids`` having 3 entries
+    -- verified against the real DSpark index this session, correcting an
+    earlier 2-stage assumption). ``dst`` must have been converted with
+    ``drop_mtp=True`` (its own native mtp.* must be absent) since DSpark's
+    mtp.0 REPLACES it wholesale rather than merging with it.
+    """
+    dst_index_path = dst / "model.safetensors.index.json"
+    dst_index = json.loads(dst_index_path.read_text())
+    existing_mtp = [n for n in dst_index["weight_map"] if n.startswith("mtp.")]
+    if existing_mtp:
+        raise ValueError(
+            f"{dst} already carries {len(existing_mtp)} mtp.* tensors "
+            f"(e.g. {existing_mtp[0]!r}); convert the backbone with "
+            "drop_mtp=True before splicing DSpark's mtp subtree, since "
+            "DSpark's mtp.0 replaces rather than merges with the backbone's "
+            "native mtp.0"
+        )
+
+    mtp_index = json.loads((mtp_src / "model.safetensors.index.json").read_text())
+    by_shard: dict[str, list[str]] = defaultdict(list)
+    for name, shard in mtp_index["weight_map"].items():
+        if _MTP_PREFIX_RE.match(name):
+            by_shard[shard].append(name)
+    if not by_shard:
+        raise ValueError(f"no mtp.* tensors found in {mtp_src}'s index")
+
+    stage_ids = sorted({int(n.split(".")[1]) for names in by_shard.values() for n in names})
+    _log(f"splicing mtp stages {stage_ids} from {mtp_src}")
+
+    tmp_dir = dst / ".mtp-splice-tmp"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir()
+    try:
+        totals = {
+            "int4": 0,
+            "mxfp4": 0,
+            "int8": 0,
+            "wo_a_bf16": 0,
+            "preserve": 0,
+            "int4_from_fp8_block": 0,
+        }
+        merged: dict[str, torch.Tensor] = {}
+        for shard_idx, (shard, names) in enumerate(sorted(by_shard.items())):
+            name_set = set(names)
+            tmp_shard = tmp_dir / f"part-{shard_idx:04d}.safetensors"
+            counts = convert_shard(
+                mtp_src / shard,
+                tmp_shard,
+                device=device,
+                out_scale_dtype=out_scale_dtype,
+                layer_remap=None,
+                dense_int8_strategy=dense_int8_strategy,
+                expert_format="int4",
+                expert_int4_scale_mode="mse",
+                name_filter=lambda n, ns=name_set: n in ns,
+            )
+            for key, value in counts.items():
+                totals[key] += value
+            with safe_open(tmp_shard, framework="pt", device="cpu") as handle:
+                for name in handle.keys():
+                    merged[name] = handle.get_tensor(name)
+
+        save_file(merged, str(dst / out_shard_name))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    weight_map = dict(dst_index["weight_map"])
+    for name in merged:
+        weight_map[name] = out_shard_name
+    dst_index["weight_map"] = weight_map
+    total_size = sum(path.stat().st_size for path in dst.glob("*.safetensors"))
+    dst_index.setdefault("metadata", {})
+    dst_index["metadata"]["total_size"] = str(total_size)
+    dst_index["metadata"]["mtp_spliced_from"] = str(mtp_src)
+    dst_index["metadata"]["mtp_stages"] = str(stage_ids)
+    dst_index_path.write_text(json.dumps(dst_index, indent=2, sort_keys=True) + "\n")
+
+    mtp_cfg = json.loads((mtp_src / "config.json").read_text())
+    dst_cfg_path = dst / "config.json"
+    dst_cfg = json.loads(dst_cfg_path.read_text())
+    for key in (
+        "dspark_block_size",
+        "dspark_markov_rank",
+        "dspark_noise_token_id",
+        "dspark_target_layer_ids",
+    ):
+        if key in mtp_cfg:
+            dst_cfg[key] = mtp_cfg[key]
+    dst_cfg["num_nextn_predict_layers"] = len(stage_ids)
+    dst_cfg_path.write_text(json.dumps(dst_cfg, indent=2) + "\n")
+
+    _log(
+        f"mtp splice done: stages={stage_ids} "
+        f"int4={totals['int4']} int8={totals['int8']} "
+        f"wo_a_bf16={totals['wo_a_bf16']} preserve={totals['preserve']} "
+        f"int4_from_fp8_block={totals['int4_from_fp8_block']} "
+        f"-> {out_shard_name}"
+    )
+    return totals
 
 
 def convert_checkpoint(
@@ -798,6 +925,14 @@ def main() -> int:
         help="Testbed subsetting: drop mtp.* tensors and set "
         "num_nextn_predict_layers=0.",
     )
+    parser.add_argument(
+        "--mtp-src",
+        type=Path,
+        help="Splice this checkpoint's mtp.* subtree (e.g. "
+        "deepseek-ai/DeepSeek-V4-Flash-DSpark) into the converted backbone "
+        "instead of --src's own mtp.*, requantized to the same on-disk "
+        "convention. Implies --drop-mtp for the backbone pass.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     layer_remap = None
@@ -808,22 +943,38 @@ def main() -> int:
             raise SystemExit("--keep-layers and --layer-remap are mutually exclusive")
         layer_remap = {i: i for i in range(args.keep_layers)}
 
+    out_scale_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.scale_dtype]
     convert_checkpoint(
         args.src.resolve(),
         args.dst.resolve(),
         device=args.device,
-        out_scale_dtype={"bf16": torch.bfloat16, "fp16": torch.float16}[
-            args.scale_dtype
-        ],
+        out_scale_dtype=out_scale_dtype,
         overwrite=args.overwrite,
         layer_remap=layer_remap,
         dense_int8_strategy=args.dense_int8_strategy,
         expert_format=args.expert_format,
         expert_int4_scale_mode=args.expert_int4_scale_mode,
-        num_output_shards=args.num_output_shards,
+        num_output_shards=None if args.mtp_src is not None else args.num_output_shards,
         keep_experts=args.keep_experts,
-        drop_mtp=args.drop_mtp,
+        drop_mtp=args.drop_mtp or args.mtp_src is not None,
     )
+    if args.mtp_src is not None:
+        splice_mtp(
+            args.dst.resolve(),
+            args.mtp_src.resolve(),
+            device=args.device,
+            out_scale_dtype=out_scale_dtype,
+            dense_int8_strategy=args.dense_int8_strategy,
+        )
+        _ensure_mtp_shared_tensors(args.dst.resolve())
+        if args.num_output_shards is not None:
+            cfg = json.loads((args.dst.resolve() / "config.json").read_text())
+            _log(f"resharding spliced checkpoint to {args.num_output_shards} output shards")
+            _reshard_safetensors(
+                args.dst.resolve(),
+                num_output_shards=args.num_output_shards,
+                num_hidden_layers=int(cfg["num_hidden_layers"]),
+            )
     return 0
 
 

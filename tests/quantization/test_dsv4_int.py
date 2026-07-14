@@ -12,7 +12,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from tools.ampere.dsv4_checkpoint_audit import classify_tensor, matched_scale_name
-from tools.ampere.dsv4_requant_checkpoint import convert_checkpoint
+from tools.ampere.dsv4_requant_checkpoint import convert_checkpoint, splice_mtp
 import vllm.model_executor.layers.quantization.dsv4_int as dsv4_int_module
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
 from vllm.model_executor.layers.linear import LinearBase
@@ -1250,6 +1250,160 @@ def test_requant_checkpoint_rejects_mxfp4_passthrough_for_fp8_block_experts(tmp_
             overwrite=False,
             layer_remap=None,
             expert_format="mxfp4",
+        )
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn"),
+    reason="requires torch float8 dtypes",
+)
+def test_splice_mtp_replaces_backbone_mtp_with_dspark_three_stages(tmp_path):
+    """The DSpark splice: mtp.0 is RESTRUCTURED (replaces whatever mtp.0 the
+    backbone source natively carries), mtp.1 AND mtp.2 are ADDED (three
+    DeepSpec draft stages total -- corrected from an earlier 2-stage
+    assumption after diffing the real DSpark index this session). All three
+    stages requantize to the same on-disk convention as the backbone."""
+    backbone_src = tmp_path / "backbone_src"
+    dst = tmp_path / "dst"
+    mtp_src = tmp_path / "mtp_src"
+    backbone_src.mkdir()
+    mtp_src.mkdir()
+
+    backbone_shard = "model-00001-of-00001.safetensors"
+    backbone_tensors = {
+        "layers.0.attn.wq_a.weight": torch.randn(130, 129)
+        .clamp(-2, 2)
+        .to(torch.float8_e4m3fn),
+        "layers.0.attn.wq_a.scale": torch.full((2, 2), 0.05, dtype=torch.float32),
+        # Backbone's OWN native mtp.0 (Base-sourced) must be dropped, not
+        # merged, once a --mtp-src splice is requested.
+        "mtp.0.enorm.weight": torch.ones(8, dtype=torch.bfloat16),
+    }
+    save_file(backbone_tensors, str(backbone_src / backbone_shard))
+    (backbone_src / "config.json").write_text(
+        json.dumps({"architectures": ["DeepseekV4ForCausalLM"], "num_hidden_layers": 1})
+    )
+    (backbone_src / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": "0"},
+                "weight_map": {name: backbone_shard for name in backbone_tensors},
+            }
+        )
+    )
+
+    convert_checkpoint(
+        backbone_src,
+        dst,
+        device="cpu",
+        out_scale_dtype=torch.bfloat16,
+        overwrite=False,
+        layer_remap=None,
+        drop_mtp=True,
+    )
+    assert not [
+        n
+        for n in json.loads((dst / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
+        if n.startswith("mtp.")
+    ]
+
+    mtp_shard = "model-00001-of-00001.safetensors"
+    mtp_tensors: dict[str, torch.Tensor] = {}
+    for stage in (0, 1, 2):
+        mtp_tensors[f"mtp.{stage}.attn.wq_a.weight"] = (
+            torch.randn(64, 64).clamp(-2, 2).to(torch.float8_e4m3fn)
+        )
+        mtp_tensors[f"mtp.{stage}.attn.wq_a.scale"] = torch.full(
+            (1, 1), 0.05, dtype=torch.float32
+        )
+        mtp_tensors[f"mtp.{stage}.ffn.experts.0.w1.weight"] = (
+            torch.randn(4, 64).clamp(-2, 2).to(torch.float8_e4m3fn)
+        )
+        mtp_tensors[f"mtp.{stage}.ffn.experts.0.w1.scale"] = torch.full(
+            (1, 1), 0.05, dtype=torch.float32
+        )
+        mtp_tensors[f"mtp.{stage}.main_norm.weight"] = torch.ones(
+            8, dtype=torch.bfloat16
+        )
+    # non-mtp tensor in the same source shard must NOT be pulled in
+    mtp_tensors["layers.0.attn.wq_a.weight"] = (
+        torch.randn(130, 129).clamp(-2, 2).to(torch.float8_e4m3fn)
+    )
+    mtp_tensors["layers.0.attn.wq_a.scale"] = torch.full(
+        (2, 2), 0.05, dtype=torch.float32
+    )
+    save_file(mtp_tensors, str(mtp_src / mtp_shard))
+    (mtp_src / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "num_hidden_layers": 1,
+                "dspark_block_size": 5,
+                "dspark_markov_rank": 256,
+                "dspark_noise_token_id": 128799,
+                "dspark_target_layer_ids": [40, 41, 42],
+            }
+        )
+    )
+    (mtp_src / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": "0"},
+                "weight_map": {name: mtp_shard for name in mtp_tensors},
+            }
+        )
+    )
+
+    totals = splice_mtp(
+        dst,
+        mtp_src,
+        device="cpu",
+        out_scale_dtype=torch.bfloat16,
+        dense_int8_strategy="block",
+    )
+    assert totals["int4_from_fp8_block"] == 3  # one expert weight per stage
+    assert totals["int8"] == 3  # one attn linear per stage
+    assert totals["preserve"] == 3  # main_norm per stage
+
+    index = json.loads((dst / "model.safetensors.index.json").read_text())
+    weight_map = index["weight_map"]
+    for stage in (0, 1, 2):
+        assert f"mtp.{stage}.attn.wq_a.weight" in weight_map
+        assert f"mtp.{stage}.ffn.experts.0.w1.weight" in weight_map
+        assert f"mtp.{stage}.main_norm.weight" in weight_map
+    # the non-mtp tensor from mtp_src's shard must not have leaked in
+    assert not [n for n in weight_map if n == "layers.1.attn.wq_a.weight"]
+    non_mtp_backbone_tensors = [
+        n for n in weight_map if not n.startswith("mtp.") and "attn.wq_a" in n
+    ]
+    # weight + scale for the original backbone's single attn.wq_a only
+    assert len(non_mtp_backbone_tensors) == 2
+
+    dst_shards = {p.name for p in dst.glob("*.safetensors")}
+    with safe_open(
+        dst / weight_map["mtp.1.ffn.experts.0.w1.weight"], framework="pt", device="cpu"
+    ) as handle:
+        assert handle.get_tensor("mtp.1.ffn.experts.0.w1.weight").dtype is torch.int8
+        assert (
+            handle.get_tensor("mtp.1.ffn.experts.0.w1.scale").dtype is torch.bfloat16
+        )
+
+    cfg = json.loads((dst / "config.json").read_text())
+    assert cfg["num_nextn_predict_layers"] == 3
+    assert cfg["dspark_target_layer_ids"] == [40, 41, 42]
+    assert cfg["dspark_block_size"] == 5
+
+    # re-splicing without a fresh drop_mtp backbone must fail loudly instead
+    # of silently duplicating/orphaning tensors
+    with pytest.raises(ValueError, match="already carries"):
+        splice_mtp(
+            dst,
+            mtp_src,
+            device="cpu",
+            out_scale_dtype=torch.bfloat16,
+            dense_int8_strategy="block",
         )
 
 
