@@ -726,20 +726,37 @@ class GPUModelRunner(
         self.async_output_copy_stream: torch.cuda.Stream | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
-        # cuda event to synchronize use of reused pinned CPU input tensors
-        # between steps. Required in EVERY configuration, not only async
-        # scheduling: on a non-last PP rank execute_model returns right after
-        # enqueueing the forward (async isend, no device sync), so the next
-        # step's _update_states can mutate the shared pinned buffers (e.g.
-        # input_batch.num_computed_tokens_cpu_tensor) while the previous
-        # step's non_blocking H2D copies are still queued behind its forward
-        # kernels; the DMA then reads the FUTURE value. Observed on the
-        # PP=10 chunked-prefill deploy: device seq_lens materialized 2 chunks
-        # ahead of the CPU-sized indexer workspace and topKPerRowPrefill
-        # scanned past its logits allocation (Warp Illegal Address).
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock;
+        # Pool of cuda events to synchronize use of reused pinned CPU input
+        # tensors between steps. Required in EVERY configuration, not only
+        # async scheduling: on a non-last PP rank execute_model returns right
+        # after enqueueing the forward (async isend, no device sync), so the
+        # next step's _update_states can mutate the shared pinned buffers
+        # (e.g. input_batch.num_computed_tokens_cpu_tensor) while the
+        # previous step's non_blocking H2D copies are still queued behind its
+        # forward kernels; the DMA then reads the FUTURE value. Observed on
+        # the PP=10 chunked-prefill deploy: device seq_lens materialized 2
+        # chunks ahead of the CPU-sized indexer workspace and
+        # topKPerRowPrefill scanned past its logits allocation (Warp Illegal
+        # Address).
+        #
+        # A single reusable event only remembers the most recent record()
+        # call: with max_concurrent_batches > 1 (PP or async scheduling),
+        # more than one step's worth of work can be in flight at once, so a
+        # later step's record() can overwrite the event before an earlier
+        # step's synchronize() ever observes it, silently defeating the
+        # fence. Confirmed on hardware 2026-07-15: replacing the wait with a
+        # full torch.cuda.synchronize() eliminated decode corruption under
+        # PP=10. Pool the events to pipeline depth so no slot is reused
+        # until its previous occupant has had a full pipeline depth's worth
+        # of steps to be waited on.
+        #
+        # Blocking (sleep) events to avoid busy-polling the CUDA driver lock;
         # under TP contention that spin can balloon and make the rank a straggler.
-        self.prepare_inputs_event: torch.Event = torch.cuda.Event(blocking=True)
+        prepare_inputs_pool_size = max(1, self.vllm_config.max_concurrent_batches)
+        self.prepare_inputs_events: list[torch.Event] = [
+            torch.cuda.Event(blocking=True) for _ in range(prepare_inputs_pool_size)
+        ]
+        self.prepare_inputs_event_idx = 0
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -3802,24 +3819,22 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
-        # Ensure the prior step has finished with the reused pinned CPU
-        # tensors before this step mutates them. The prior step's H2D
-        # input copies are non_blocking: with async scheduling, and on any
-        # PP rank (execute_model returns after enqueue, no device sync),
-        # those DMAs can still be pending when the next step starts.
-        #
-        # DIAGNOSTIC: a single reusable torch.cuda.Event only remembers the
-        # most recent record() call. With PP > 2, more than one step's worth
-        # of work can be in flight at once, so a later step's record() can
-        # overwrite the event before an earlier step's synchronize() ever
-        # observes it -- silently defeating this fence. Full device
-        # synchronize is unambiguously correct (if slower); used here to
-        # confirm the hazard before landing a properly-pooled fix.
-        torch.cuda.synchronize()
+        # Ensure the prior occupant of this pool slot has finished with the
+        # reused pinned CPU tensors before this step mutates them. The prior
+        # step's H2D input copies are non_blocking: with async scheduling,
+        # and on any PP rank (execute_model returns after enqueue, no device
+        # sync), those DMAs can still be pending when a later step starts.
+        # See self.prepare_inputs_events for why this is pooled to pipeline
+        # depth rather than a single reusable event.
+        idx = self.prepare_inputs_event_idx
+        self.prepare_inputs_events[idx].synchronize()
         try:
             yield
         finally:
-            self.prepare_inputs_event.record()
+            self.prepare_inputs_events[idx].record()
+            self.prepare_inputs_event_idx = (idx + 1) % len(
+                self.prepare_inputs_events
+            )
 
     def _model_forward(
         self,
