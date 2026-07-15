@@ -130,6 +130,18 @@ class Scheduler(SchedulerInterface):
         self.recompute_kv_load_failures = True
         self.defer_block_free = False
         kv_transfer_config = self.vllm_config.kv_transfer_config
+
+        # With overlapping batches (async scheduling or PP), a step may still
+        # be writing a freed request's KV blocks when those blocks are
+        # reassigned to a new request, since completion (EOS) is only known
+        # once the full micro-batch drains through every in-flight step. This
+        # is general to any multi-batch deployment, not just KV-connector
+        # consumers, so defer freeing whenever more than one batch can be
+        # in flight.
+        multiple_inflight_batches = self.vllm_config.max_concurrent_batches > 1
+        if multiple_inflight_batches:
+            self.defer_block_free = True
+
         if kv_transfer_config is not None:
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
@@ -143,14 +155,6 @@ class Scheduler(SchedulerInterface):
                 self.connector_prefix_cache_stats = PrefixCacheStats()
             kv_load_failure_policy = kv_transfer_config.kv_load_failure_policy
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
-
-            # With overlapping batches (async scheduling or PP), a step may
-            # still be writing a freed request's KV blocks. A consumer KV
-            # Connector can reallocate and fill those blocks via a load that
-            # isn't ordered against that write, so defer freeing them.
-            multiple_inflight_batches = self.vllm_config.max_concurrent_batches > 1
-            if multiple_inflight_batches and kv_transfer_config.is_kv_consumer:
-                self.defer_block_free = True
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
