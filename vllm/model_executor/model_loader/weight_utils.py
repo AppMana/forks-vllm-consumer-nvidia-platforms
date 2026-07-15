@@ -626,12 +626,15 @@ def filter_duplicate_safetensors_files(
     weight_files_in_index = set()
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
-    # Lazily use whatever index-referenced files are actually present locally,
-    # rather than requiring the full index to resolve. A pipeline-parallel
-    # rank's local directory intentionally holds only its own shard subset
-    # (see DeepSeek V4's per-rank shard staging); any weight the model
-    # genuinely still needs but doesn't have will surface as a real error
-    # from the model's own load_weights, not from this generic precondition.
+    # Check if files referenced in model.safetensors.index.json actually exist.
+    # Raise error if any file is missing.
+    hf_weights_files_set = set(hf_weights_files)
+    missing_files = weight_files_in_index - hf_weights_files_set
+    if missing_files:
+        raise FileNotFoundError(
+            f"Weight files referenced in index but missing: {missing_files}"
+        )
+    # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
 
