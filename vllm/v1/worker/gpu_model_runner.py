@@ -3807,7 +3807,15 @@ class GPUModelRunner(
         # input copies are non_blocking: with async scheduling, and on any
         # PP rank (execute_model returns after enqueue, no device sync),
         # those DMAs can still be pending when the next step starts.
-        self.prepare_inputs_event.synchronize()
+        #
+        # DIAGNOSTIC: a single reusable torch.cuda.Event only remembers the
+        # most recent record() call. With PP > 2, more than one step's worth
+        # of work can be in flight at once, so a later step's record() can
+        # overwrite the event before an earlier step's synchronize() ever
+        # observes it -- silently defeating this fence. Full device
+        # synchronize is unambiguously correct (if slower); used here to
+        # confirm the hazard before landing a properly-pooled fix.
+        torch.cuda.synchronize()
         try:
             yield
         finally:
