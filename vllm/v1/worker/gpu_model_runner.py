@@ -1177,6 +1177,13 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        torch.cuda.nvtx.range_push("_update_states_cpu_write")
+        try:
+            return self._update_states_impl(scheduler_output)
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+    def _update_states_impl(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -3807,10 +3814,14 @@ class GPUModelRunner(
         # input copies are non_blocking: with async scheduling, and on any
         # PP rank (execute_model returns after enqueue, no device sync),
         # those DMAs can still be pending when the next step starts.
+        torch.cuda.nvtx.range_push("prepare_inputs_wait")
         self.prepare_inputs_event.synchronize()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("prepare_inputs_body")
         try:
             yield
         finally:
+            torch.cuda.nvtx.range_pop()
             self.prepare_inputs_event.record()
 
     def _model_forward(

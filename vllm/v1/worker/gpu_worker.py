@@ -1025,8 +1025,10 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
+            torch.cuda.nvtx.range_push("pp_send_wait")
             for handle in self._pp_send_work:
                 handle.wait()
+            torch.cuda.nvtx.range_pop()
             self._pp_send_work = []
 
         intermediate_tensors = None
@@ -1073,6 +1075,7 @@ class Worker(WorkerBase):
                 and self.model_runner.intermediate_tensors is not None
             ):
                 recv_tensor_dict = self.model_runner.intermediate_tensors.tensors
+            torch.cuda.nvtx.range_push("pp_irecv_post")
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
@@ -1080,6 +1083,7 @@ class Worker(WorkerBase):
                     recv_tensor_dict=recv_tensor_dict,
                 )
             )
+            torch.cuda.nvtx.range_pop()
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -1110,11 +1114,13 @@ class Worker(WorkerBase):
         )
 
         # launch non-blocking send of intermediate tensors
+        torch.cuda.nvtx.range_push("pp_isend_post")
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
+        torch.cuda.nvtx.range_pop()
 
         return None
 
