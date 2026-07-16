@@ -43,21 +43,39 @@ class TestComputeCacheKey:
     def test_deterministic(self, tmp_path):
         src, index = _make_checkpoint(tmp_path)
         index_bytes = json.dumps(index).encode()
-        k1 = prep_pp_shards.compute_cache_key(str(src), index_bytes, 0, 4)
-        k2 = prep_pp_shards.compute_cache_key(str(src), index_bytes, 0, 4)
+        k1 = prep_pp_shards.compute_cache_key(str(src), index_bytes, 4)
+        k2 = prep_pp_shards.compute_cache_key(str(src), index_bytes, 4)
         assert k1 == k2
 
-    def test_different_rank_different_key(self, tmp_path):
-        src, index = _make_checkpoint(tmp_path)
-        index_bytes = json.dumps(index).encode()
-        k0 = prep_pp_shards.compute_cache_key(str(src), index_bytes, 0, 4)
-        k1 = prep_pp_shards.compute_cache_key(str(src), index_bytes, 1, 4)
-        assert k0 != k1
+    def test_deliberately_rank_independent(self, tmp_path):
+        # vllm serve invokes --model once with the LEADER's own staged path,
+        # and distributed_executor_backend=ray resolves that SAME path
+        # string independently on every remote worker's own node. If the
+        # cache key included pp_rank, every rank would stage under a
+        # DIFFERENT directory name, and a remote worker looking for the
+        # leader's hash on its own disk would find nothing -- confirmed
+        # live 2026-07-16: every remote worker failed with "Repo id must be
+        # in the form repo_name or namespace/repo_name" immediately
+        # downstream of exactly this. compute_cache_key must not take a
+        # pp_rank parameter at all -- this test exists so a future
+        # regression re-adding rank-sensitivity fails at the call site, not
+        # silently in production.
+        import inspect
+
+        params = inspect.signature(prep_pp_shards.compute_cache_key).parameters
+        assert "pp_rank" not in params
 
     def test_different_index_content_different_key(self, tmp_path):
         src, index = _make_checkpoint(tmp_path)
-        k_a = prep_pp_shards.compute_cache_key(str(src), b"index-v1", 0, 4)
-        k_b = prep_pp_shards.compute_cache_key(str(src), b"index-v2", 0, 4)
+        k_a = prep_pp_shards.compute_cache_key(str(src), b"index-v1", 4)
+        k_b = prep_pp_shards.compute_cache_key(str(src), b"index-v2", 4)
+        assert k_a != k_b
+
+    def test_different_pp_size_different_key(self, tmp_path):
+        src, index = _make_checkpoint(tmp_path)
+        index_bytes = json.dumps(index).encode()
+        k_a = prep_pp_shards.compute_cache_key(str(src), index_bytes, 2)
+        k_b = prep_pp_shards.compute_cache_key(str(src), index_bytes, 4)
         assert k_a != k_b
 
 
@@ -68,7 +86,7 @@ class TestStageShards:
         # Rank owns layers [0, 2) of 4 -> shard 00002 (layers 0,1) needed,
         # shard 00003 (layers 2,3) symlink-only, shard 00001 (dense) needed.
         dest_dir = prep_pp_shards.stage_shards(
-            str(src), str(dest_root), pp_rank=0, pp_size=2, local_layer_range=(0, 2)
+            str(src), str(dest_root), pp_size=2, local_layer_range=(0, 2)
         )
 
         assert os.path.isfile(
@@ -94,7 +112,7 @@ class TestStageShards:
         src, index = _make_checkpoint(tmp_path)
         dest_root = tmp_path / "dest"
         dest_dir = prep_pp_shards.stage_shards(
-            str(src), str(dest_root), pp_rank=0, pp_size=2, local_layer_range=(0, 2)
+            str(src), str(dest_root), pp_size=2, local_layer_range=(0, 2)
         )
         with open(os.path.join(dest_dir, prep_pp_shards.SAFE_WEIGHTS_INDEX_NAME)) as f:
             staged_index = json.load(f)
@@ -114,7 +132,7 @@ class TestStageShards:
         src, _ = _make_checkpoint(tmp_path)
         dest_root = tmp_path / "dest"
         dest_dir = prep_pp_shards.stage_shards(
-            str(src), str(dest_root), pp_rank=0, pp_size=2, local_layer_range=(0, 2)
+            str(src), str(dest_root), pp_size=2, local_layer_range=(0, 2)
         )
         hf_weights_files = [
             os.path.join(dest_dir, f)
@@ -130,7 +148,7 @@ class TestStageShards:
         src, _ = _make_checkpoint(tmp_path)
         dest_root = tmp_path / "dest"
         dest_dir = prep_pp_shards.stage_shards(
-            str(src), str(dest_root), pp_rank=0, pp_size=2, local_layer_range=(0, 2)
+            str(src), str(dest_root), pp_size=2, local_layer_range=(0, 2)
         )
         assert os.path.isfile(os.path.join(dest_dir, "config.json"))
 
@@ -138,7 +156,7 @@ class TestStageShards:
         src, _ = _make_checkpoint(tmp_path)
         dest_root = tmp_path / "dest"
         dest_dir = prep_pp_shards.stage_shards(
-            str(src), str(dest_root), pp_rank=0, pp_size=2, local_layer_range=(0, 2)
+            str(src), str(dest_root), pp_size=2, local_layer_range=(0, 2)
         )
 
         calls = []
@@ -150,39 +168,62 @@ class TestStageShards:
         )
 
         dest_dir_2 = prep_pp_shards.stage_shards(
-            str(src), str(dest_root), pp_rank=0, pp_size=2, local_layer_range=(0, 2)
+            str(src), str(dest_root), pp_size=2, local_layer_range=(0, 2)
         )
         assert dest_dir_2 == dest_dir
         assert calls == []
 
-    def test_different_pp_config_different_directory(self, tmp_path):
+    def test_different_pp_size_different_directory(self, tmp_path):
         src, _ = _make_checkpoint(tmp_path)
         dest_root = tmp_path / "dest"
         dest_a = prep_pp_shards.stage_shards(
-            str(src), str(dest_root), pp_rank=0, pp_size=2, local_layer_range=(0, 2)
+            str(src), str(dest_root), pp_size=2, local_layer_range=(0, 2)
         )
         dest_b = prep_pp_shards.stage_shards(
-            str(src), str(dest_root), pp_rank=1, pp_size=2, local_layer_range=(2, 4)
+            str(src), str(dest_root), pp_size=4, local_layer_range=(2, 3)
         )
         assert dest_a != dest_b
-        # Rank 1's staged dir must not contain rank 0's real-copied shard
-        # as a real file if rank 1 doesn't need it -- it should be a symlink
-        # (or absent-then-created fresh), never silently reused.
+
+    def test_same_pp_size_different_rank_same_directory_different_content(
+        self, tmp_path
+    ):
+        # The critical, previously-broken invariant: vllm serve invokes
+        # --model once with the LEADER's own staged path, and
+        # distributed_executor_backend=ray resolves that SAME path string
+        # independently on every remote worker's own node (each backed by
+        # its own hostPath directory) -- so every rank of one real run MUST
+        # stage under the identical directory NAME, with only the
+        # real-copy-vs-symlink CONTENT differing per rank's own
+        # local_layer_range.
+        src, _ = _make_checkpoint(tmp_path)
+        dest_root = tmp_path / "dest"
+        dest_rank0 = prep_pp_shards.stage_shards(
+            str(src), str(dest_root), pp_size=2, local_layer_range=(0, 2)
+        )
+        dest_rank1 = prep_pp_shards.stage_shards(
+            str(src), str(dest_root), pp_size=2, local_layer_range=(2, 4)
+        )
+        assert dest_rank0 == dest_rank1
+        # Content reflects whichever rank staged it MOST RECENTLY (rank 1):
+        # shard 00002 (layers 0,1) is no longer needed, must be a symlink.
         assert os.path.islink(
-            os.path.join(dest_b, "model-00002-of-00003.safetensors")
+            os.path.join(dest_rank1, "model-00002-of-00003.safetensors")
+        )
+        assert not os.path.islink(
+            os.path.join(dest_rank1, "model-00003-of-00003.safetensors")
         )
 
     def test_incomplete_prior_run_is_not_treated_as_complete(self, tmp_path):
         src, _ = _make_checkpoint(tmp_path)
         dest_root = tmp_path / "dest"
         index_bytes = (src / prep_pp_shards.SAFE_WEIGHTS_INDEX_NAME).read_bytes()
-        cache_key = prep_pp_shards.compute_cache_key(str(src), index_bytes, 0, 2)
+        cache_key = prep_pp_shards.compute_cache_key(str(src), index_bytes, 2)
         dest_dir = prep_pp_shards.destination_dir(str(dest_root), cache_key)
         os.makedirs(dest_dir)
         # No .prep-complete marker written -> must be treated as incomplete
         # and (re)staged rather than silently used as-is.
         result = prep_pp_shards.stage_shards(
-            str(src), str(dest_root), pp_rank=0, pp_size=2, local_layer_range=(0, 2)
+            str(src), str(dest_root), pp_size=2, local_layer_range=(0, 2)
         )
         assert os.path.isfile(
             os.path.join(result, prep_pp_shards.COMPLETE_MARKER)

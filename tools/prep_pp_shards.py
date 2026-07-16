@@ -14,10 +14,12 @@ every tensor in a symlinked shard, so its bulk data is never actually read
 over the network.
 
 The destination directory name is a deterministic hash of the checkpoint's
-own index.json content plus (pp_rank, pp_size) -- not of any human-assigned
-job/run name -- so repeated runs of the same config reuse the staged
-directory for free, and a different config never collides with or silently
-reuses another config's stale shards.
+own index.json content plus pp_size -- deliberately NOT pp_rank (vLLM's Ray
+executor resolves the same --model path string independently on every
+worker's own node, so every rank must agree on the same path) and not any
+human-assigned job/run name -- so repeated runs of the same config reuse the
+staged directory for free, and a different config never collides with or
+silently reuses another config's stale shards.
 
 Usage:
     python prep_pp_shards.py --source-dir /hf-cache/.../snapshots/<rev> \
@@ -38,13 +40,26 @@ SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 COMPLETE_MARKER = ".prep-complete"
 
 
-def compute_cache_key(
-    source_dir: str, index_bytes: bytes, pp_rank: int, pp_size: int
-) -> str:
+def compute_cache_key(source_dir: str, index_bytes: bytes, pp_size: int) -> str:
+    """Deliberately excludes pp_rank. vLLM's distributed_executor_backend=ray
+    resolves a SINGLE --model path string independently on every worker's
+    own node -- the leader passes its own staged path once, and every
+    remote worker actor re-resolves that exact same string against its own
+    local disk. Since staging lives on a per-node hostPath (see
+    dsv4-benchmark-jobset-proof.yaml), the physical directory a given path
+    string resolves to already differs correctly per node; the path STRING
+    must be identical across all ranks or a remote worker looks for the
+    leader's own hash on its own disk, finds nothing, and vLLM's model-path
+    resolver falls through to treating it as a bogus HF Hub repo id.
+    Confirmed live 2026-07-16: 'Repo id must be in the form repo_name or
+    namespace/repo_name' on every remote worker, immediately downstream of
+    exactly this. pp_size stays in the hash so a differently-sized run gets
+    its own directory rather than racing a concurrent, differently-shaped
+    stage under the same name."""
     h = hashlib.sha256()
     h.update(os.path.abspath(source_dir).encode("utf-8"))
     h.update(index_bytes)
-    h.update(f"pp{pp_rank}of{pp_size}".encode("utf-8"))
+    h.update(f"pp_size{pp_size}".encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -70,7 +85,6 @@ def _is_complete(dest_dir: str, weight_map: dict[str, str], needs_copy: dict[str
 def stage_shards(
     source_dir: str,
     dest_root: str,
-    pp_rank: int,
     pp_size: int,
     local_layer_range: tuple[int, int] | None,
 ) -> str:
@@ -84,7 +98,7 @@ def stage_shards(
 
     needs_copy = classify_shards(weight_map, local_layer_range)
 
-    cache_key = compute_cache_key(source_dir, index_bytes, pp_rank, pp_size)
+    cache_key = compute_cache_key(source_dir, index_bytes, pp_size)
     dest_dir = destination_dir(dest_root, cache_key)
 
     if _is_complete(dest_dir, weight_map, needs_copy):
@@ -152,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         args.source_dir, args.pp_rank, args.pp_size, args.trust_remote_code
     )
     dest_dir = stage_shards(
-        args.source_dir, args.dest_root, args.pp_rank, args.pp_size, local_layer_range
+        args.source_dir, args.dest_root, args.pp_size, local_layer_range
     )
     print(dest_dir)
     return 0
