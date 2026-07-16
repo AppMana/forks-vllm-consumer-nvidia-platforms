@@ -18,11 +18,15 @@ import regex as re
 
 # Matches the standard vLLM per-layer weight naming convention produced by
 # vllm.model_executor.models.utils.make_layers(prefix=f"{prefix}.layers"):
-# e.g. "model.layers.18.self_attn.q_proj.weight" or
-# "model.layers.18.mlp.experts.42.gate_proj.weight". Deliberately anchored
-# on ".layers." (not a bare "layers.") to avoid matching unrelated
-# substrings; this mirrors ep_weight_filter's ".experts." anchor.
-_LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
+# e.g. "model.layers.18.self_attn.q_proj.weight" (nested under a model
+# prefix) or "layers.18.attn.attn_sink" (DeepSeek-V4's int4/int8 checkpoint,
+# which has NO leading "model." prefix -- "layers.N." starts the string
+# directly). Anchored on "layers." preceded by either a literal dot or the
+# start of the string -- NOT a bare "layers." substring match, which would
+# also false-match an unrelated identifier like "sublayers.0.x". This mirrors
+# ep_weight_filter's ".experts." anchor, generalized to also cover the
+# start-of-string case.
+_LAYER_ID_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 def parse_layer_id(weight_name: str) -> int | None:

@@ -53,10 +53,26 @@ class TestParseLayerId:
         assert parse_layer_id(name) is None
 
     def test_bare_layers_without_dot_not_matched(self):
-        # Anchored on ".layers." (leading dot) so an unrelated substring
-        # like a top-level "layers" attribute name doesn't false-match.
+        # "layers" must be followed immediately by ".N." -- an unrelated
+        # identifier like "layers_norm" must not false-match.
         name = "layers_norm.weight"
         assert parse_layer_id(name) is None
+
+    def test_no_model_prefix(self):
+        # DeepSeek-V4's int4/int8 checkpoint has NO leading "model." prefix
+        # -- tensor names start directly with "layers.N.". Regression test
+        # for a real bug: the original regex required a leading dot before
+        # "layers", which never matches at the start of a string, so this
+        # checkpoint's weights were never actually filtered despite the
+        # computed layer range being logged correctly.
+        assert parse_layer_id("layers.18.attn.attn_sink") == 18
+        assert parse_layer_id("layers.0.ffn.experts.0.w1.weight") == 0
+
+    def test_no_model_prefix_dense_weights(self):
+        # Real DeepSeek-V4 int4/int8 checkpoint dense weight names.
+        assert parse_layer_id("embed.weight") is None
+        assert parse_layer_id("head.weight") is None
+        assert parse_layer_id("hc_head_base") is None
 
 
 # ---------------------------------------------------------------------------
@@ -209,3 +225,47 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
         )
         for name, tensor in filtered.items():
             assert torch.equal(tensor, all_weights[name]), f"Tensor mismatch for {name}"
+
+
+class TestSafetensorsWeightsIteratorNoModelPrefix:
+    """Regression coverage for the real DeepSeek-V4 int4/int8 checkpoint
+    naming convention: tensor names start directly with "layers.N." with no
+    "model." prefix. This exact shape previously slipped through
+    should_skip_pp_weight silently (parse_layer_id always returned None),
+    so the filter never actually skipped anything even though the computed
+    layer range was correct and logged."""
+
+    @staticmethod
+    def _make_synthetic_files(tmp_path, num_layers: int):
+        from safetensors.torch import save_file
+
+        tensors = {}
+        tensors["embed.weight"] = torch.randn(100, 64)
+        tensors["head.weight"] = torch.randn(100, 64)
+        for layer_id in range(num_layers):
+            tensors[f"layers.{layer_id}.attn.wq_a.weight"] = torch.randn(64, 64)
+            tensors[f"layers.{layer_id}.attn_norm.weight"] = torch.randn(64)
+
+        filepath = str(tmp_path / "model-00001-of-00001.safetensors")
+        save_file(tensors, filepath)
+        return [filepath], tensors
+
+    def test_pp_filter_keeps_only_local_layers(self, tmp_path):
+        files, expected = self._make_synthetic_files(tmp_path, num_layers=10)
+        local_range = (3, 6)
+        loaded = dict(
+            safetensors_weights_iterator(files, False, local_layer_range=local_range)
+        )
+
+        for name in loaded:
+            lid = parse_layer_id(name)
+            if lid is not None:
+                assert 3 <= lid < 6, f"Non-local layer {lid} was loaded"
+
+        layer_names = [n for n in loaded if parse_layer_id(n) is not None]
+        assert len(layer_names) == 3 * 2, (
+            f"expected 6 local-layer tensors, got {len(layer_names)}: "
+            f"{layer_names} -- filter is not actually skipping anything"
+        )
+        assert "embed.weight" in loaded
+        assert "head.weight" in loaded
