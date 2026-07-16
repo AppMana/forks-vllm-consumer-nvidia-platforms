@@ -5,6 +5,8 @@
 import importlib.util
 import json
 import os
+import sys
+import types
 from pathlib import Path
 
 _TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
@@ -185,3 +187,50 @@ class TestStageShards:
         assert os.path.isfile(
             os.path.join(result, prep_pp_shards.COMPLETE_MARKER)
         )
+
+
+class TestResolveLocalLayerRangeStdoutIsolation:
+    """Regression test for a real deployed bug: constructing ModelConfig
+    logs to stdout via vLLM's own logger, and this script's contract is
+    that stdout is exactly the staged path -- callers commonly do
+    `path=$(prep_pp_shards.py ...)`. Noise leaking onto stdout silently
+    corrupts the captured path with embedded newlines, which broke
+    `vllm serve --model "$path"` downstream with an HFValidationError."""
+
+    def test_pp_size_one_short_circuits_without_importing_vllm(self):
+        # No vllm import needed at all when PP isn't active -- confirms the
+        # cheap path doesn't touch any of this machinery.
+        assert prep_pp_shards._resolve_local_layer_range("/nonexistent", 0, 1) is None
+
+    def test_noisy_model_config_construction_does_not_leak_to_stdout(
+        self, capsys, monkeypatch
+    ):
+        fake_config_mod = types.ModuleType("vllm.config")
+
+        class FakeModelConfig:
+            def __init__(self, model, trust_remote_code):
+                print("INFO [model.py:619] Resolved architecture: Fake")
+                print("INFO [model.py:1772] Using max model len 12345")
+
+            def get_total_num_hidden_layers(self):
+                return 10
+
+        fake_config_mod.ModelConfig = FakeModelConfig
+
+        fake_dist_utils_mod = types.ModuleType("vllm.distributed.utils")
+        fake_dist_utils_mod.get_pp_indices = lambda total, rank, size: (
+            rank * (total // size),
+            (rank + 1) * (total // size),
+        )
+
+        monkeypatch.setitem(sys.modules, "vllm.config", fake_config_mod)
+        monkeypatch.setitem(sys.modules, "vllm.distributed.utils", fake_dist_utils_mod)
+
+        result = prep_pp_shards._resolve_local_layer_range(
+            "/fake/src", pp_rank=1, pp_size=2, trust_remote_code=True
+        )
+
+        assert result == (5, 10)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Resolved architecture" in captured.err

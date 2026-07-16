@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -126,8 +127,15 @@ def _resolve_local_layer_range(
     from vllm.config import ModelConfig
     from vllm.distributed.utils import get_pp_indices
 
-    model_config = ModelConfig(model=source_dir, trust_remote_code=trust_remote_code)
-    total_num_hidden_layers = model_config.get_total_num_hidden_layers()
+    # Constructing ModelConfig logs (architecture resolution, tokenizer
+    # mode, max model len, ...) straight to stdout via vLLM's own logger --
+    # this script's contract is "stdout is exactly the staged path, nothing
+    # else" (callers commonly do `path=$(prep_pp_shards.py ...)`), so divert
+    # that incidental logging to stderr rather than letting it silently
+    # corrupt the captured path with embedded newlines.
+    with contextlib.redirect_stdout(sys.stderr):
+        model_config = ModelConfig(model=source_dir, trust_remote_code=trust_remote_code)
+        total_num_hidden_layers = model_config.get_total_num_hidden_layers()
     return get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
 
 
