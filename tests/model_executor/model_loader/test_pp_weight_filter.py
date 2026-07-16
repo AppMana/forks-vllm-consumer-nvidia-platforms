@@ -5,6 +5,7 @@
 import torch
 
 from vllm.model_executor.model_loader.pp_weight_filter import (
+    classify_shards,
     parse_layer_id,
     should_skip_pp_weight,
 )
@@ -135,6 +136,67 @@ class TestShouldSkipPpWeight:
         assert should_skip_pp_weight(
             "model.layers.5.ffn.experts.42.w1.weight", local_range
         )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for classify_shards
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyShards:
+    def test_shard_with_local_layer_needs_copy(self):
+        weight_map = {
+            "model.layers.15.self_attn.q_proj.weight": "shard-a.safetensors",
+        }
+        result = classify_shards(weight_map, local_layer_range=(10, 20))
+        assert result == {"shard-a.safetensors": True}
+
+    def test_shard_with_only_nonlocal_layers_symlink_only(self):
+        weight_map = {
+            "model.layers.5.self_attn.q_proj.weight": "shard-a.safetensors",
+            "model.layers.25.self_attn.q_proj.weight": "shard-a.safetensors",
+        }
+        result = classify_shards(weight_map, local_layer_range=(10, 20))
+        assert result == {"shard-a.safetensors": False}
+
+    def test_mixed_shard_needs_copy_if_any_tensor_local(self):
+        # One shard holding both a local and a non-local layer's tensors --
+        # must be real-copied, since the local tensor's bytes are needed.
+        weight_map = {
+            "model.layers.5.self_attn.q_proj.weight": "shard-a.safetensors",
+            "model.layers.15.self_attn.q_proj.weight": "shard-a.safetensors",
+        }
+        result = classify_shards(weight_map, local_layer_range=(10, 20))
+        assert result == {"shard-a.safetensors": True}
+
+    def test_dense_weight_forces_copy_of_its_shard(self):
+        weight_map = {
+            "model.embed_tokens.weight": "shard-a.safetensors",
+            "model.layers.5.self_attn.q_proj.weight": "shard-b.safetensors",
+        }
+        result = classify_shards(weight_map, local_layer_range=(10, 20))
+        assert result == {"shard-a.safetensors": True, "shard-b.safetensors": False}
+
+    def test_no_filter_all_shards_need_copy(self):
+        weight_map = {
+            "model.layers.5.self_attn.q_proj.weight": "shard-a.safetensors",
+            "model.layers.25.self_attn.q_proj.weight": "shard-b.safetensors",
+        }
+        result = classify_shards(weight_map, local_layer_range=None)
+        assert result == {"shard-a.safetensors": True, "shard-b.safetensors": True}
+
+    def test_no_model_prefix_checkpoint_shape(self):
+        weight_map = {
+            "layers.5.attn.wq_a.weight": "shard-a.safetensors",
+            "layers.15.attn.wq_a.weight": "shard-b.safetensors",
+            "embed.weight": "shard-c.safetensors",
+        }
+        result = classify_shards(weight_map, local_layer_range=(10, 20))
+        assert result == {
+            "shard-a.safetensors": False,
+            "shard-b.safetensors": True,
+            "shard-c.safetensors": True,
+        }
 
 
 # ---------------------------------------------------------------------------

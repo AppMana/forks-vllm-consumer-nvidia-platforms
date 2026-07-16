@@ -58,3 +58,24 @@ def should_skip_pp_weight(
         return False
     start, end = local_layer_range
     return not (start <= lid < end)
+
+
+def classify_shards(
+    weight_map: dict[str, str],
+    local_layer_range: tuple[int, int] | None,
+) -> dict[str, bool]:
+    """Given a safetensors index's ``weight_map`` (tensor name -> shard
+    filename), return ``{shard_filename: needs_real_copy}`` for staging a
+    PP-local subset of a checkpoint onto local disk (see
+    ``tools/prep_pp_shards.py``).
+
+    A shard needs a real copy if it holds at least one tensor that
+    ``should_skip_pp_weight`` does NOT skip for this rank; every other shard
+    can be a symlink back to the source, since safetensors only reads a
+    shard's header until a skipped tensor's data would otherwise be
+    fetched with ``get_tensor()`` -- which never happens for skipped names."""
+    result: dict[str, bool] = {}
+    for weight_name, shard_filename in weight_map.items():
+        needs_copy = not should_skip_pp_weight(weight_name, local_layer_range)
+        result[shard_filename] = result.get(shard_filename, False) or needs_copy
+    return result
