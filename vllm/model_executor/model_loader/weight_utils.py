@@ -43,6 +43,9 @@ from vllm.model_executor.layers.quantization import (
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
 )
+from vllm.model_executor.model_loader.pp_weight_filter import (
+    should_skip_pp_weight,
+)
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import hf_api, hf_fs
@@ -861,6 +864,7 @@ def safetensors_weights_iterator(
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None = None,
     local_expert_ids: set[int] | None = None,
+    local_layer_range: tuple[int, int] | None = None,
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
@@ -869,7 +873,12 @@ def safetensors_weights_iterator(
 
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
-    reduces storage I/O for MoE models under EP.
+    reduces storage I/O for MoE models under EP. When *local_layer_range*
+    is provided (pipeline parallelism active), per-layer weights outside
+    this rank's ``[start, end)`` hidden-layer range are likewise skipped
+    before reading -- see pp_weight_filter.py. Without this, every PP rank
+    would read every layer's weights from every shard regardless of which
+    pipeline stage it owns.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -952,7 +961,9 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
+                if not should_skip_weight(
+                    name, local_expert_ids
+                ) and not should_skip_pp_weight(name, local_layer_range):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -969,7 +980,9 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if should_skip_weight(
+                        name, local_expert_ids
+                    ) or should_skip_pp_weight(name, local_layer_range):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -987,7 +1000,9 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
+                    if should_skip_weight(
+                        name, local_expert_ids
+                    ) or should_skip_pp_weight(name, local_layer_range):
                         continue
                     param = f.get_tensor(name)
                     yield name, param

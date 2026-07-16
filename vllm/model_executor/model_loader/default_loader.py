@@ -74,6 +74,7 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         self.local_expert_ids: set[int] | None = None
+        self.local_layer_range: tuple[int, int] | None = None
 
         extra_config = load_config.model_loader_extra_config
         if not isinstance(extra_config, dict):
@@ -289,6 +290,7 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        local_layer_range=self.local_layer_range,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -411,6 +413,38 @@ class DefaultModelLoader(BaseModelLoader):
                 num_experts,
             )
 
+    def _init_pp_weight_filter(self, model_config: ModelConfig) -> None:
+        """Compute this rank's local hidden-layer range for PP weight
+        filtering.
+
+        Each PP rank only holds a contiguous slice of the model's hidden
+        layers (vllm.model_executor.models.utils.make_layers). Without this,
+        safetensors_weights_iterator reads every layer's weights from every
+        shard on every rank -- for a pp_size-way split that means each rank
+        downloads close to the *entire* checkpoint instead of its own
+        1/pp_size share. Computing the range upfront and passing it to the
+        iterator lets us skip non-local per-layer tensors *before* reading
+        them from disk, mirroring _init_ep_weight_filter's expert-level
+        filtering.
+        """
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config
+
+        if parallel_config.pipeline_parallel_size <= 1:
+            return
+
+        start, end = model_config.get_layers_start_end_indices(parallel_config)
+        self.local_layer_range = (start, end)
+        logger.info_once(
+            "PP weight filter: pp_size=%d, loading layers [%d, %d) of %d",
+            parallel_config.pipeline_parallel_size,
+            start,
+            end,
+            model_config.get_total_num_hidden_layers(),
+        )
+
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         if model_config.quantization == "torchao":
@@ -423,6 +457,7 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.safetensors_load_strategy = "torchao"
 
         self._init_ep_weight_filter(model_config)
+        self._init_pp_weight_filter(model_config)
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
