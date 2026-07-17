@@ -23,6 +23,8 @@ casts (WS6), so no override is needed. INT8 FP8 tensor cores are absent on
 Ampere; the Triton kernels upcast FP8 inputs to bf16 internally.
 """
 
+import os
+
 import torch
 
 # HARD dependencies: Ampere sm_86 sparse-MLA decode/prefill run through
@@ -486,6 +488,50 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
             if extra_cache is not None:
                 extra_rows, extra_scales = get_int8_ds_mla_cache_views(
                     extra_cache, compressed_block_size
+                )
+            dump_dir = os.environ.get("APPMANA_DSV4_PREFILL_DUMP_DIR")
+            if dump_dir:
+                # Diagnostic capture for the deterministic first-prefill IMA on
+                # the PP=10 chain (2026-07-17): synthetic replays of this call
+                # pass, so save the REAL argument tensors and cache-view
+                # geometry before the kernel launch. The last dump written
+                # before the fault identifies the faulting call exactly; the
+                # saved payload replays locally against zero caches of
+                # identical geometry (IMA is addressing, not values).
+                idx = getattr(self, "_prefill_dump_idx", 0)
+                self._prefill_dump_idx = idx + 1
+                torch.cuda.synchronize()
+                payload = {
+                    "prefix": self.prefix if hasattr(self, "prefix") else "?",
+                    "q": q.cpu(),
+                    "swa_indices": swa_indices.cpu(),
+                    "swa_lens": swa_lens.cpu(),
+                    "extra_indices": None if extra_indices is None else extra_indices.cpu(),
+                    "extra_lens": None if extra_lens is None else extra_lens.cpu(),
+                    "attn_sink": self.attn_sink.cpu(),
+                    "scale": self.scale,
+                    "swa_rows_shape": tuple(swa_rows.shape),
+                    "swa_rows_stride": tuple(swa_rows.stride()),
+                    "swa_scales_shape": tuple(swa_scales.shape),
+                    "swa_scales_stride": tuple(swa_scales.stride()),
+                    "extra_rows_shape": None if extra_rows is None else tuple(extra_rows.shape),
+                    "extra_rows_stride": None if extra_rows is None else tuple(extra_rows.stride()),
+                    "extra_scales_shape": None if extra_scales is None else tuple(extra_scales.shape),
+                    "extra_scales_stride": None if extra_scales is None else tuple(extra_scales.stride()),
+                    "q_stride": tuple(q.stride()),
+                    "output_shape": tuple(output.shape),
+                    "output_stride": tuple(output.stride()),
+                }
+                pod = os.environ.get("POD_NAME", "pod")
+                torch.save(payload, f"{dump_dir}/prefill-{pod}-{idx:03d}.pt")
+                print(
+                    f"[prefill-dump] idx={idx} prefix={payload['prefix']} "
+                    f"q={tuple(q.shape)}/{tuple(q.stride())} "
+                    f"swa_idx={tuple(swa_indices.shape)} "
+                    f"swa_rows={payload['swa_rows_shape']}/{payload['swa_rows_stride']} "
+                    f"extra_rows={payload['extra_rows_shape']}/{payload['extra_rows_stride']} "
+                    f"out={payload['output_shape']}/{payload['output_stride']}",
+                    flush=True,
                 )
             out = sparse_int8_mla_prefill(
                 q=q,
