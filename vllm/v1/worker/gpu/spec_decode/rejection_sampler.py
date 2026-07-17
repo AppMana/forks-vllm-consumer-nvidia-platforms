@@ -230,6 +230,24 @@ class RejectionSampler:
 
         deferred = prev_sampled_tokens is not None
         if deferred:
+            import os as _os
+
+            if _os.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1":
+                from vllm.logger import init_logger as _il
+
+                li = input_batch.logits_indices
+                raw_in = input_batch.input_ids[li]
+                raw_pos = input_batch.positions[li]
+                tl = self.sampler.req_states.total_len.gpu[input_batch.idx_mapping]
+                _il(__name__).warning(
+                    "dspark-sync-debug RAW cu=%s raw_input=%s raw_pos=%s "
+                    "total_len=%s prev=%s",
+                    input_batch.cu_num_logits_np.tolist(),
+                    raw_in.tolist(),
+                    raw_pos.tolist(),
+                    tl.tolist(),
+                    prev_sampled_tokens[input_batch.idx_mapping].reshape(-1).tolist(),
+                )
             (
                 logits_in,
                 draft_sampled,
