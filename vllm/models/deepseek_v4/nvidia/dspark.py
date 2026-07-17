@@ -179,6 +179,16 @@ class DSparkDeepseekV4Model(nn.Module):
 
         ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
         """
+        expected = self.hidden_size * len(self.target_layer_ids)
+        if aux_hidden_states.shape[-1] != expected:
+            raise ValueError(
+                f"DSpark aux hidden states are {aux_hidden_states.shape[-1]} wide, "
+                f"expected {expected} ({len(self.target_layer_ids)} aux layers x "
+                f"hidden_size {self.hidden_size}). Under PP, ALL dspark target "
+                f"layers {self.target_layer_ids} must be on the last rank -- a "
+                "custom VLLM_PP_LAYER_PARTITION whose last chunk is smaller than "
+                "the aux layer count captures only the local subset."
+            )
         return self.main_norm(self.main_proj(aux_hidden_states))
 
     @torch.inference_mode()
