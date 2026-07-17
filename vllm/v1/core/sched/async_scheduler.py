@@ -41,15 +41,11 @@ class AsyncScheduler(Scheduler):
             # anchor position too (query == drafts + 1) and verifies
             # classically with its bonus.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
-            num_sched = scheduler_output.num_scheduled_tokens[req_id]
-            if self.pp_deferred_spec and num_sched < cur_num_spec_tokens:
-                # Stale-spec step (scheduled shorter than its spec ids): the
-                # worker runs it as a plain placeholder step with zero drafts.
-                cur_num_spec_tokens = 0
             deferred_verify = (
                 self.pp_deferred_spec
                 and cur_num_spec_tokens > 0
-                and num_sched == cur_num_spec_tokens
+                and scheduler_output.num_scheduled_tokens[req_id]
+                == cur_num_spec_tokens
             )
             bonus_placeholders = (
                 0 if deferred_verify else self.num_sampled_tokens_per_step

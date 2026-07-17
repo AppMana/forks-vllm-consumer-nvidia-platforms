@@ -942,20 +942,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # classically against the real anchor row. Draft-less decode
                 # requests keep their single placeholder logit.
                 num_bonus_tokens = 0
-                # A step scheduled SHORTER than its attached spec ids carries
-                # stale drafts that never got positions (post-rewind
-                # scheduler anomaly): treat it as a plain step -- zero drafts,
-                # bonus placeholder rewritten from last_sampled. Feeding the
-                # stale count to the combine kernel makes the bonus count
-                # negative and writes draft tokens over OTHER positions
-                # (observed: the anchor slot read a stale draft token,
-                # deriving the wrong distribution and corrupting output).
-                num_draft_tokens_per_req = np.where(
-                    num_scheduled_tokens >= num_draft_tokens_per_req,
-                    num_draft_tokens_per_req,
-                    0,
-                ).astype(np.int32)
-                total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
                 num_logits = np.minimum(
                     num_scheduled_tokens, num_draft_tokens_per_req + 1
                 ).astype(np.int32)
