@@ -1133,6 +1133,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
             post_mix = intermediate_tensors["post_mix"]
             res_mix = intermediate_tensors["res_mix"]
+            import os as _osmhc
+            if _osmhc.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1" and get_pp_group().is_last_rank and hidden_states.shape[0] > 1:
+                def _rv(t):
+                    tf = t.float().reshape(t.shape[0], -1)
+                    return float(tf.var(dim=0).mean().item())
+                logger.warning(
+                    "dspark-mhc-recv n=%s hs_rowvar=%.3e res_rowvar=%.3e postmix_rowvar=%.3e resmix_rowvar=%.3e",
+                    hidden_states.shape[0], _rv(hidden_states), _rv(residual), _rv(post_mix), _rv(res_mix))
         # Aux boundary j is the post-mhc state after layer j-1 (see
         # _aux_relay_keys for the PP relay contract). Boundaries this rank
         # cannot compute arrive relayed from earlier ranks; the boundary
