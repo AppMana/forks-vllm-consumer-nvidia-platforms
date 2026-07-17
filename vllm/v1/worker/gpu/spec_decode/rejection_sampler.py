@@ -239,14 +239,21 @@ class RejectionSampler:
                 raw_in = input_batch.input_ids[li]
                 raw_pos = input_batch.positions[li]
                 tl = self.sampler.req_states.total_len.gpu[input_batch.idx_mapping]
+                # The TARGET's own greedy argmax on the RAW logits, before any
+                # spec/rejection processing. If this is already wrong for a
+                # correct input+position, the bug is the target forward; if it
+                # is correct but the emitted token differs, spec processing
+                # corrupts.
+                raw_argmax = logits.argmax(dim=-1)
                 _il(__name__).warning(
                     "dspark-sync-debug RAW cu=%s raw_input=%s raw_pos=%s "
-                    "total_len=%s prev=%s",
+                    "total_len=%s prev=%s target_argmax=%s",
                     input_batch.cu_num_logits_np.tolist(),
                     raw_in.tolist(),
                     raw_pos.tolist(),
                     tl.tolist(),
                     prev_sampled_tokens[input_batch.idx_mapping].reshape(-1).tolist(),
+                    raw_argmax.tolist(),
                 )
             (
                 logits_in,
