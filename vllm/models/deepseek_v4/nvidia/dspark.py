@@ -463,9 +463,15 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 ckpt_up_proj_name="w3",
                 num_experts=self.config.n_routed_experts,
             )
+        # Mirror the target model's weights mapper (model.py
+        # _make_deepseek_v4_weights_mapper): fp4 AND int4 experts register
+        # ".weight_scale"; only block-fp8 experts use ".weight_scale_inv".
+        # The int4 case was missing here, so loading the dsv4_int (W4A16
+        # Marlin) MTP graft looked up w13_weight_scale_inv params that the
+        # draft's quantized MoE never registers -> KeyError at init.
         expert_scale_suffix = (
             ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+            if getattr(self.config, "expert_dtype", "fp4") in ("fp4", "int4")
             else ".weight_scale_inv"
         )
 
