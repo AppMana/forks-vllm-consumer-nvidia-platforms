@@ -605,6 +605,13 @@ class Dsv4IntConfig(QuantizationConfig):
         ".ffn.shared_experts.down_proj",
         ".e_proj",
         ".h_proj",
+        # DSpark's 3-stage MTP restructure fused mtp.0's e_proj/h_proj pair
+        # into a single main_proj (U8 AllSpark channelwise in the rebuilt
+        # checkpoint). Without this entry the draft built it as an
+        # unquantized bf16 linear and draft loading died with
+        # KeyError: model.main_proj.weight_scale_inv. Backbone layers have
+        # no main_proj, so this cannot misclassify target-model linears.
+        ".main_proj",
     )
 
     def __init__(
