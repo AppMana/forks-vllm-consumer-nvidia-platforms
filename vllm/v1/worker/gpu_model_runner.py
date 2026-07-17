@@ -3327,7 +3327,18 @@ class GPUModelRunner(
         intermediate_tensors: IntermediateTensors | None,
         sync_self: bool,
     ) -> IntermediateTensors:
-        assert self.intermediate_tensors is not None
+        if self.intermediate_tensors is None:
+            # Allocated lazily on first use. The cudagraph-capture warmup's
+            # _dummy_run used to be the only allocation site, so any
+            # deployment that skips that warmup (enforce_eager /
+            # compilation NONE) hit `assert intermediate_tensors is not
+            # None` on the first real batch of every non-first PP rank --
+            # confirmed live 2026-07-17 on the PP=10 chain.
+            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                batch_size=self.max_num_tokens,
+                dtype=self.model_config.dtype,
+                device=self.device,
+            )
 
         tp = self.vllm_config.parallel_config.tensor_parallel_size
         is_rs = is_residual_scattered_for_sp(self.vllm_config, num_tokens)
@@ -6057,15 +6068,6 @@ class GPUModelRunner(
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
-                if self.intermediate_tensors is None:
-                    self.intermediate_tensors = (
-                        self.model.make_empty_intermediate_tensors(
-                            batch_size=self.max_num_tokens,
-                            dtype=self.model_config.dtype,
-                            device=self.device,
-                        )
-                    )
-
                 intermediate_tensors = self.sync_and_gather_intermediate_tensors(
                     num_tokens_padded, None, False
                 )
