@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -637,6 +638,20 @@ class Scheduler(SchedulerInterface):
                     - request.num_tokens
                     - request.num_output_placeholders
                 )
+                if self.pp_deferred_spec and os.environ.get(
+                    "APPMANA_SCHED_SPEC_DEBUG"
+                ) == "1":
+                    logger.warning(
+                        "sched-spec-debug attach req=%s num_new=%d C=%d N=%d "
+                        "P=%d n_spec_avail=%d n_spec_sched=%d",
+                        request.request_id,
+                        num_new_tokens,
+                        request.num_computed_tokens,
+                        request.num_tokens,
+                        request.num_output_placeholders,
+                        len(request.spec_token_ids),
+                        num_scheduled_spec_tokens,
+                    )
                 if num_scheduled_spec_tokens > 0:
                     spec_token_ids = request.spec_token_ids
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
