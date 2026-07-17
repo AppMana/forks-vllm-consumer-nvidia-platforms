@@ -1128,6 +1128,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             res_mix = intermediate_tensors["res_mix"]
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        if (
+            not get_pp_group().is_first_rank
+            and self.start_layer in self.aux_hidden_state_layers
+        ):
+            # Aux boundary j is the post-mhc state after layer j-1. When the
+            # boundary sits exactly at this rank's PP cut, layer j-1 ran on
+            # the previous rank, but its full MHC stream (hidden_states,
+            # residual, post_mix, res_mix) is what we just received -- collapse
+            # it locally. This lets DSpark's last-rank chunk hold one layer
+            # fewer than the aux count (e.g. 2 target layers + draft instead
+            # of 3, which does not fit next to the ~12 GiB draft on 24 GiB).
+            aux_recon = self.mhc_post(hidden_states, residual, post_mix, res_mix)
+            aux_hidden_states.append(aux_recon.mean(dim=1))
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
