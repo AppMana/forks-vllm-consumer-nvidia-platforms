@@ -1120,6 +1120,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
+        import os as _os4
+
+        if (
+            _os4.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1"
+            and sample_hidden_states.shape[0] > 1
+        ):
+            _shv = sample_hidden_states.float()
+            _hsv = hidden_states.float()
+            logger.warning(
+                "dspark-hidden-debug sample_hs.shape=%s sample_hs_rowvar=%.3e "
+                "sample_hs_identical=%s full_hs.shape=%s full_hs_rowvar=%.3e "
+                "logits_indices=%s",
+                tuple(sample_hidden_states.shape),
+                float(_shv.var(dim=0).mean()),
+                bool((sample_hidden_states == sample_hidden_states[0]).all()),
+                tuple(hidden_states.shape),
+                float(_hsv.var(dim=0).mean()) if _hsv.shape[0] > 1 else 0.0,
+                input_batch.logits_indices.tolist(),
+            )
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
