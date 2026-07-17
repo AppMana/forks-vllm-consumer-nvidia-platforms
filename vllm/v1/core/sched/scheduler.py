@@ -1659,12 +1659,24 @@ class Scheduler(SchedulerInterface):
                 and request.async_tokens_to_discard == 0
             ):
                 num_draft_tokens = len(scheduled_spec_token_ids)
+                if (
+                    self.pp_deferred_spec
+                    and scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                    < num_draft_tokens
+                ):
+                    # Stale-spec step: the step was scheduled SHORTER than
+                    # its attached spec ids, so the worker ran zero drafts
+                    # (plain placeholder step). Counting the stale ids as
+                    # rejected would rewind num_computed below what was
+                    # actually scheduled.
+                    num_draft_tokens = 0
                 # Deferred verify emits [d2..dA, correction/bonus]: A entries
                 # for A accepted drafts, no anchor bonus.
                 num_sampled = (
                     0 if was_deferred_verify else self.num_sampled_tokens_per_step
                 )
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                num_accepted = min(num_accepted, num_draft_tokens)
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
