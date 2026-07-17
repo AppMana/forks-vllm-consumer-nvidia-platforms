@@ -246,8 +246,9 @@ class RejectionSampler:
                 # corrupts.
                 raw_argmax = logits.argmax(dim=-1)
                 _il(__name__).warning(
-                    "dspark-sync-debug RAW cu=%s raw_input=%s raw_pos=%s "
+                    "dspark-sync-debug RAW req=%s cu=%s raw_input=%s raw_pos=%s "
                     "total_len=%s prev=%s target_argmax=%s",
+                    [r[-6:] for r in input_batch.req_ids],
                     input_batch.cu_num_logits_np.tolist(),
                     raw_in.tolist(),
                     raw_pos.tolist(),
