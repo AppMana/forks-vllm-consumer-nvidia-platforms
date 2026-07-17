@@ -68,7 +68,7 @@ COMMON_KWARGS = dict(
     enforce_eager=True,
     gpu_memory_utilization=float(os.environ.get("DSPARK_SMOKE_GPU_UTIL", "0.7")),
     tensor_parallel_size=1,
-    kv_cache_memory_bytes=10 * 1024 * 1024 * 1024,
+    kv_cache_memory_bytes=int(os.environ.get("DSPARK_SMOKE_KV_BYTES", str(10 * 1024 * 1024 * 1024))),
 )
 
 PROMPTS = ["Hello world", "The capital of France is", "def fibonacci(n):"]

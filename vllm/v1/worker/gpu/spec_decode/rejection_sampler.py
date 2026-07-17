@@ -133,13 +133,24 @@ class RejectionSampler:
         num_reqs = input_batch.idx_mapping.shape[0]
         cu_np = input_batch.cu_num_logits_np
         counts_np = np.diff(cu_np)
-        ndpr = input_batch.num_draft_tokens_per_req
-        assert ndpr is not None
-        # A request needs a virtual anchor row only when its verify batch is
-        # drafts-only (steady-state deferred). The first verify after a
-        # prefill schedules the anchor position itself, so its real anchor
-        # row is present (counts == ndpr + 1) and it verifies classically.
-        has_virtual_np = ((ndpr > 0) & (counts_np == ndpr)).astype(np.int64)
+        # A request needs a virtual anchor row iff its FIRST logit position is
+        # a draft position -- i.e. the real anchor (the last known token) was
+        # NOT scheduled in this step. Decide this from the SAME GPU token
+        # boundary the combine kernel used to write inputs (total_len = count
+        # of known tokens), not from scheduler draft counts: under PP those
+        # counts lag the boundary, and the count heuristic (counts == ndpr)
+        # wrongly prepended a virtual anchor on the first post-prefill verify
+        # -- which DOES schedule the real anchor -- duplicating it (the
+        # observed alternating-token output). Row 0's absolute position is
+        # seq_len - num_logits; it is a real known token iff that position is
+        # below total_len, exactly matching the combine kernel's per-position
+        # known/draft split.
+        counts_g = torch.as_tensor(counts_np, device=device, dtype=torch.int64)
+        first_pos = input_batch.seq_lens[:num_reqs].to(torch.int64) - counts_g
+        total_len_g = self.sampler.req_states.total_len.gpu[input_batch.idx_mapping]
+        has_virtual_np = (
+            (first_pos >= total_len_g.to(torch.int64)).to(torch.int64).cpu().numpy()
+        )
         if not has_virtual_np.any():
             # Classic-only batch: nothing to expand.
             return (
