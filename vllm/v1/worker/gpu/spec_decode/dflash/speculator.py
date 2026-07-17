@@ -314,6 +314,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
+            if _SYNC_DEBUG:
+                norms = [float(t[:num_target_tokens].float().norm()) for t in aux_hidden_states]
+                logger.warning("dspark-sync-debug aux norms=%s", norms)
             hidden_states = self.model.combine_hidden_states(
                 torch.cat(aux_hidden_states, dim=-1)
             )

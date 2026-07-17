@@ -271,6 +271,21 @@ class RejectionSampler:
             ).clamp_max_(steps1 - 1)
             sampled = torch.gather(sampled, 1, gather_idx)
             num_sampled = num_sampled - has_virtual.to(num_sampled.dtype)
+            import os as _os
+
+            if _os.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1":
+                from vllm.logger import init_logger as _il
+
+                _il(__name__).warning(
+                    "dspark-sync-debug verify drafts=%s prev=%s sampled=%s "
+                    "num_sampled=%s",
+                    draft_sampled.tolist(),
+                    prev_sampled_tokens[input_batch.idx_mapping]
+                    .reshape(-1)
+                    .tolist(),
+                    sampled.tolist(),
+                    num_sampled.tolist(),
+                )
         if deferred:
             # The expanded logits layout does not match input_batch.cu_num_logits.
             if (
