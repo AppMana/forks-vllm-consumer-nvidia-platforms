@@ -319,10 +319,21 @@ def _reshape_kv_cache(
                 # kv_quant_mode IS populated per-layer (from self.kv_cache_dtype,
                 # which the skip-layers check already resolves to "auto"), so it
                 # is the correct source of truth here.
+                #
+                # EXCEPT int8_ds_mla: appmana-only packed layout that
+                # upstream's get_kv_quant_mode maps to NONE. Passing "auto"
+                # makes get_kv_cache_shape fall through to
+                # (nb, bs, head_size=512) instead of the packed 528-byte
+                # rows, and get_int8_ds_mla_cache_views then slices a
+                # ZERO-width fp32 scale view whose dangling pointer the
+                # kernels dereference. Same bug and fix as the v1 runner's
+                # initialize_kv_cache (2026-07-17, f3c6e73eb5).
                 layer_cache_dtype = (
                     "auto"
                     if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                     and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+                    and getattr(kv_cache_spec, "cache_dtype_str", None)
+                    != "int8_ds_mla"
                     else cache_dtype
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
@@ -482,13 +493,15 @@ def _update_hybrid_attention_layout(
         if not isinstance(kv_cache_spec, AttentionSpec):
             continue
         # Mirror the per-layer dtype selection used when building the shape
-        # above. The block-dim index is dtype-independent for current backends
+        # above (including the int8_ds_mla packed-layout exception). The
+        # block-dim index is dtype-independent for current backends
         # (quantization only changes the last dim), so this is a no-op today,
         # but it keeps both call sites consistent for skip layers.
         layer_cache_dtype = (
             "auto"
             if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
             and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+            and getattr(kv_cache_spec, "cache_dtype_str", None) != "int8_ds_mla"
             else cache_dtype
         )
         block_dim = group.backend.get_kv_cache_block_dim(
