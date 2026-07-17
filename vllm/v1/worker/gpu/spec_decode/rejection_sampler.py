@@ -140,6 +140,17 @@ class RejectionSampler:
         # prefill schedules the anchor position itself, so its real anchor
         # row is present (counts == ndpr + 1) and it verifies classically.
         has_virtual_np = ((ndpr > 0) & (counts_np == ndpr)).astype(np.int64)
+        if not has_virtual_np.any():
+            # Classic-only batch: nothing to expand.
+            return (
+                logits,
+                input_batch.input_ids[input_batch.logits_indices],
+                input_batch.positions[input_batch.logits_indices],
+                input_batch.cu_num_logits,
+                input_batch.expanded_idx_mapping,
+                input_batch.expanded_local_pos,
+                torch.zeros(num_reqs, dtype=torch.int64, device=device),
+            )
         new_cu_np = np.zeros(num_reqs + 1, dtype=np.int32)
         np.cumsum(counts_np + has_virtual_np, out=new_cu_np[1:])
         new_n = int(new_cu_np[-1])
@@ -156,7 +167,8 @@ class RejectionSampler:
         virt = torch.from_numpy(virt_np).to(device, non_blocking=True)
         virt_reqs = torch.from_numpy(virt_reqs_np).to(device, non_blocking=True)
 
-        prev_tok = prev_sampled_tokens[input_batch.idx_mapping]
+        # last_sampled_tokens is [max_num_reqs, 1]; flatten after the gather.
+        prev_tok = prev_sampled_tokens[input_batch.idx_mapping].reshape(-1)
         virt_tok = prev_tok[virt_reqs]
 
         new_logits = logits.new_full((new_n, logits.shape[1]), float("-inf"))
