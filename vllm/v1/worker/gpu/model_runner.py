@@ -1454,9 +1454,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import sync_debug
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+            _SYNC_DEBUG,
+            sync_debug,
+        )
 
         sync_debug("runner_pre_sample")
+        if _SYNC_DEBUG:
+            li = input_batch.logits_indices
+            ndpr = input_batch.num_draft_tokens_per_req
+            logger.warning(
+                "dspark-sync-debug logits_indices min=%d max=%d num_tokens=%d "
+                "num_scheduled=%s num_draft_per_req=%s",
+                int(li.min()),
+                int(li.max()),
+                input_batch.num_tokens,
+                input_batch.num_scheduled_tokens.tolist(),
+                ndpr.tolist() if ndpr is not None else None,
+            )
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
