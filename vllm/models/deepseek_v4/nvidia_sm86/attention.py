@@ -190,6 +190,25 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         extra_idx = None
         if topk_indices is not None:
             extra_idx = topk_indices.reshape(num_decode_tokens, -1)
+        import os as _os2
+
+        if (
+            _os2.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1"
+            and num_decode_tokens > 1
+            and extra_idx is not None
+        ):
+            from vllm.logger import init_logger as _il2
+
+            ei = extra_idx[:num_decode_tokens]
+            _il2(__name__).warning(
+                "dspark-extra-debug prefix=%s cratio=%s extra_idx.shape=%s "
+                "extra_rows_identical=%s topk_lens=%s",
+                getattr(self, "prefix", "?"),
+                getattr(self, "compress_ratio", "?"),
+                tuple(ei.shape),
+                bool((ei == ei[0]).all()),
+                (topk_lens[:num_decode_tokens].tolist() if topk_lens is not None else None),
+            )
         if self.kv_cache_dtype == "int8_ds_mla":
             swa_rows, swa_scales = get_int8_ds_mla_cache_views(
                 swa_k_cache, swa_metadata.block_size
