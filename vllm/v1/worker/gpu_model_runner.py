@@ -7292,15 +7292,33 @@ class GPUModelRunner(
                     # not the per-layer skip-aware value, so it silently
                     # ignores --kv-cache-dtype-skip-layers for DeepSeek V4's
                     # MLA attention. kv_quant_mode IS populated per-layer.
+                    #
+                    # EXCEPT int8_ds_mla: it is an appmana-only packed layout
+                    # that upstream's get_kv_quant_mode does not know, so its
+                    # kv_quant_mode is NONE -- but its allocation IS packed
+                    # 528-byte rows (spec real_page_size_bytes, insert kernel
+                    # token_stride, get_int8_ds_mla_cache_views all agree).
+                    # Passing "auto" here made get_kv_cache_shape fall through
+                    # to (nb, bs, head_size=512), viewing every int8 cache
+                    # 512B-wide: get_int8_ds_mla_cache_views then sliced a
+                    # ZERO-width fp32 scale view out of it, whose dangling
+                    # pointer+strides the native prefill/decode kernels
+                    # dereferenced (deterministic illegal memory access on the
+                    # first prefill, 2026-07-17, captured via the prefill
+                    # argument dump) and whose garbage scales the Triton
+                    # kernels consumed (the 2026-07-15 "decode corruption").
+                    # Regression came in with the 2026-07-14 upstream merge:
+                    # upstream #47716 fixed this reshape for fp8_ds_mla (whose
+                    # quant mode is non-NONE via the "fp8*" prefix rule) but
+                    # could not know about int8_ds_mla.
+                    spec_cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
                     layer_cache_dtype_str = (
                         "auto"
-                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                        else getattr(
-                            kv_cache_spec,
-                            "cache_dtype_str",
-                            None,
+                        if (
+                            kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                            and spec_cache_dtype != "int8_ds_mla"
                         )
-                        or self.cache_config.cache_dtype
+                        else spec_cache_dtype or self.cache_config.cache_dtype
                     )
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
