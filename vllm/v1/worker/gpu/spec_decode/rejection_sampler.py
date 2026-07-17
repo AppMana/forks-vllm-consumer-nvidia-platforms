@@ -245,6 +245,16 @@ class RejectionSampler:
                 # is correct but the emitted token differs, spec processing
                 # corrupts.
                 raw_argmax = logits.argmax(dim=-1)
+                _lg = logits.float()
+                _rowvar = float(_lg.var(dim=0).mean()) if _lg.shape[0] > 1 else 0.0
+                _ident = bool((logits == logits[0]).all()) if logits.shape[0] > 1 else False
+                _il(__name__).warning(
+                    "dspark-sync-debug LOGIT rows_identical=%s row_var=%.3e "
+                    "logit0_top2=%s",
+                    _ident,
+                    _rowvar,
+                    _lg[0].topk(2).indices.tolist() if _lg.shape[0] else [],
+                )
                 _il(__name__).warning(
                     "dspark-sync-debug RAW req=%s cu=%s raw_input=%s raw_pos=%s "
                     "total_len=%s prev=%s target_argmax=%s",
