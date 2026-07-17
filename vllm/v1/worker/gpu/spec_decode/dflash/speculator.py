@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -28,6 +29,20 @@ from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+_SYNC_DEBUG = bool(int(os.environ.get("APPMANA_DSPARK_SYNC_DEBUG", "0")))
+
+
+def sync_debug(tag: str) -> None:
+    """Env-gated hard sync between draft stages (APPMANA_DSPARK_SYNC_DEBUG=1).
+
+    A device-side assert in an async draft kernel poisons the CUDA context and
+    surfaces later through the NCCL watchdog with no useful stack (even under
+    CUDA_LAUNCH_BLOCKING). With this enabled, the first stage containing the
+    faulty kernel raises HERE with a named tag in the worker traceback."""
+    if _SYNC_DEBUG:
+        torch.cuda.synchronize()
+        logger.warning("dspark-sync-debug ok: %s", tag)
 
 
 class DFlashSpeculator(DraftModelSpeculator):
@@ -305,6 +320,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+        sync_debug("combine_hidden_states")
 
         self._copy_request_inputs(
             num_reqs,
@@ -312,6 +328,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             temperature,
             seeds,
         )
+        sync_debug("copy_request_inputs")
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -362,6 +379,20 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+        sync_debug("prepare_dflash_inputs")
+        if _SYNC_DEBUG:
+            ids = self.input_buffers.input_ids[:num_query_tokens]
+            si = self.sample_indices[: num_reqs * self.num_speculative_steps]
+            logger.warning(
+                "dspark-sync-debug input_ids min=%d max=%d (vocab=%d) "
+                "sample_indices min=%d max=%d (num_query_tokens=%d)",
+                int(ids.min()),
+                int(ids.max()),
+                self.vocab_size,
+                int(si.min()),
+                int(si.max()),
+                num_query_tokens,
+            )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -381,6 +412,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.context_positions[:num_target_tokens],
             context_slots,
         )
+        sync_debug("precompute_and_store_context_kv")
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
@@ -424,6 +456,15 @@ class DFlashSpeculator(DraftModelSpeculator):
                 draft_slot_mappings_by_layer,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
+            )
+        sync_debug("generate_draft")
+        if _SYNC_DEBUG:
+            dt = self.draft_tokens[:num_reqs]
+            logger.warning(
+                "dspark-sync-debug draft_tokens min=%d max=%d (vocab=%d)",
+                int(dt.min()),
+                int(dt.max()),
+                self.vocab_size,
             )
 
         return self.draft_tokens[:num_reqs]

@@ -29,9 +29,16 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    _SYNC_DEBUG,
+    DFlashSpeculator,
+    sync_debug,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+
+logger = init_logger(__name__)
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -104,10 +111,12 @@ class DSparkSpeculator(DFlashSpeculator):
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        sync_debug("dspark_sample_hidden_gather")
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+        sync_debug("dspark_compute_draft_logits")
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
@@ -115,6 +124,16 @@ class DSparkSpeculator(DFlashSpeculator):
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        if _SYNC_DEBUG:
+            logger.warning(
+                "dspark-sync-debug base_logits finite=%s min=%.3f max=%.3f "
+                "anchor_prev min=%d max=%d",
+                bool(torch.isfinite(base_logits).all()),
+                float(base_logits.float().min()),
+                float(base_logits.float().max()),
+                int(prev.min()),
+                int(prev.max()),
+            )
 
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
@@ -167,4 +186,6 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+        sync_debug("dspark_run_model")
         self._sample_sequential(num_reqs, head_hidden)
+        sync_debug("dspark_sample_sequential")
