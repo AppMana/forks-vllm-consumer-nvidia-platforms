@@ -726,6 +726,10 @@ class GPUModelRunner(
         self.async_output_copy_stream: torch.cuda.Stream | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
+        # Single event fencing reuse of the pinned CPU input tensors between
+        # steps; see synchronize_input_prep for semantics and history.
+        self.prepare_inputs_event: torch.Event = torch.cuda.Event(blocking=True)
+
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
             self.compilation_config.cudagraph_capture_sizes
@@ -3798,44 +3802,36 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
-        # Ensure prior steps have finished with the reused pinned CPU input
-        # tensors before this step mutates them. Required in EVERY
+        # Ensure the previous step has finished with the reused pinned CPU
+        # input tensors before this step mutates them. Required in EVERY
         # configuration, not only async scheduling: on a non-last PP rank
         # execute_model returns right after enqueueing the forward (async
         # isend, no device sync), so a later step's _update_states /
-        # _prepare_inputs can mutate the shared pinned buffers (e.g.
-        # input_batch.num_computed_tokens_cpu_tensor) while an earlier
-        # step's non_blocking H2D copies are still queued behind its forward
-        # kernels; the DMA then reads the FUTURE value and device-side state
-        # (seq_lens, block tables, cudagraph static inputs) diverges from
-        # what the CPU sized/scheduled, ending in out-of-bounds kernel
-        # accesses.
+        # _prepare_inputs can mutate the shared pinned buffers while an
+        # earlier step's non_blocking H2D copies are still queued behind
+        # its forward kernels.
         #
-        # Fence history, all verified on the PP=10 chain (do not re-land
-        # the failed variants without new hardware evidence):
-        # - Single reusable torch.cuda.Event: decode corruption, 20/20
-        #   repro on 2026-07-15.
-        # - Pool of max_concurrent_batches events, rotating slot per step
-        #   (55751a8030): waits on the event recorded by step N-P instead
-        #   of step N-1, leaving steps N-1..N-P+1 unfenced on the SHARED
-        #   buffers -- strictly weaker than the single event. Deterministic
-        #   "illegal memory access" inside the FULL_DECODE_ONLY cudagraph
-        #   replay on the first real request, 3/3 hardware repros
-        #   (2026-07-15 pooled-fix-020, 2026-07-16/17 dsv4-bench-proof-010;
-        #   localized to torch.cuda.graphs.replay via CUDA_LAUNCH_BLOCKING=1).
-        # - Full device synchronize (below): 20/20 clean on 2026-07-15.
-        #   Costs pipeline overlap on the input-prep path; a correct
-        #   cheaper fence must wait on work recorded by the IMMEDIATELY
-        #   PREVIOUS step, and explain the single-event corruption above,
-        #   before it replaces this.
+        # Fence history on the PP=10 chain: the single reusable event was
+        # blamed for the 2026-07-15 decode corruption and replaced first by
+        # a pooled variant (55751a8030 -- genuinely wrong, waited on step
+        # N-P instead of N-1) and then by a full device synchronize. The
+        # corruption's actual root cause was the int8_ds_mla KV-cache
+        # reshape bug (see the int8_ds_mla comment in initialize_kv_cache),
+        # NOT this fence: with that fixed, sanity is clean and the
+        # single-event fence is restored. Worker steps are CPU-serialized,
+        # so record-at-exit / synchronize-at-entry always waits on exactly
+        # the immediately previous step's copies -- sufficient, since
+        # stream order chains everything older behind them. Blocking
+        # (sleep) event to avoid busy-polling the CUDA driver lock.
         torch.cuda.nvtx.range_push("prepare_inputs_wait")
-        torch.cuda.synchronize()
+        self.prepare_inputs_event.synchronize()
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_push("prepare_inputs_body")
         try:
             yield
         finally:
             torch.cuda.nvtx.range_pop()
+            self.prepare_inputs_event.record()
 
     def _model_forward(
         self,
