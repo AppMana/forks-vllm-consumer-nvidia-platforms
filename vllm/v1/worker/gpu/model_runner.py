@@ -1454,9 +1454,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import sync_debug
+
+        sync_debug("runner_pre_sample")
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        sync_debug("runner_sample")
 
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
@@ -1508,6 +1512,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected,
             input_batch.query_start_loc,
         )
+        sync_debug("runner_postprocess_sampled")
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -1534,6 +1539,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            sync_debug("runner_post_propose_scatter")
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks: this step's verified sampled
@@ -1550,6 +1556,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if self.speculator is not None
                 else None,
             )
+            sync_debug("runner_pp_broadcast")
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
