@@ -326,6 +326,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             2 if (spec_config is not None and spec_config.parallel_drafting) else 1
         )
         self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
+        # See backend._init_reorder_batch_threshold: route multi-token verify
+        # to the prefill (causal multi-query) path to bypass the s_q-templated
+        # sparse decode kernel that collapses the first post-prefill verify.
+        import os as _os
+
+        if _os.environ.get("APPMANA_DSPARK_SPEC_AS_PREFILL") == "1":
+            self.decode_threshold = 1
         self.reorder_batch_threshold = None
 
         hf_config = self.vllm_config.model_config.hf_config

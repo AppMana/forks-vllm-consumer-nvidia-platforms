@@ -644,6 +644,18 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         supports_spec_as_decode: bool = False,
         supports_dcp_with_varlen: bool = False,
     ) -> None:
+        # Diagnostic/fix toggle: route multi-token spec-verify steps to the
+        # PREFILL attention path (proper causal multi-query) instead of the
+        # spec-as-decode kernel. The DSV4 sparse decode kernel is parameterized
+        # by s_q (query width per request) and collapses all query positions to
+        # one logit on the first post-prefill verify (see the dspark PP=10
+        # bring-up). Forcing the threshold to 1 makes only true single-token
+        # steps take the decode path.
+        import os as _os
+
+        if _os.environ.get("APPMANA_DSPARK_SPEC_AS_PREFILL") == "1":
+            self.reorder_batch_threshold = 1
+            return
         self.reorder_batch_threshold = reorder_batch_threshold
         if self.reorder_batch_threshold is not None and supports_spec_as_decode:
             # If the backend supports spec-as-decode kernels, then we can set
