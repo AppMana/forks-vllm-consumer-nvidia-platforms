@@ -1114,6 +1114,13 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         size_k: int,
         is_a_8bit: bool = False,
     ) -> torch.Tensor:
+        """Repack checkpoint-layout int4 experts into Marlin layout.
+
+        CONSUMES ``weight``: the returned tensor aliases its storage and the
+        original payload is overwritten (see the storage-reuse note below).
+        Callers must treat the input as dead, as
+        process_weights_after_loading does via replace_parameter.
+        """
         num_experts = weight.shape[0]
         device = weight.device
         perm = torch.empty(0, dtype=torch.int, device=device)
@@ -1131,16 +1138,22 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
             )
 
         first = pack_one(weight[0])
-        out = torch.empty(
-            num_experts,
-            *first.shape,
-            dtype=first.dtype,
-            device=first.device,
+        # The repacked payload is a permutation of the same 4-bit data, so it
+        # has identical bytes per expert. Reuse the source tensor's storage as
+        # the output instead of allocating a second full tensor: the peak
+        # extra memory is one expert's scratch, not another ~2 GiB, which is
+        # the difference between fitting and OOM when the DSpark draft loads
+        # next to the target on the last PP rank. Safe because expert e's
+        # slot is only overwritten after pack_one has copied it out.
+        assert first.nbytes == weight[0].nbytes, (
+            f"marlin repack changed payload size: {first.nbytes} != "
+            f"{weight[0].nbytes}"
         )
-        out[0].copy_(first)
+        storage = weight.view(num_experts, -1).view(first.dtype)
+        storage[0].copy_(first.view(-1))
         for expert in range(1, num_experts):
-            out[expert].copy_(pack_one(weight[expert]))
-        return out
+            storage[expert].copy_(pack_one(weight[expert]).view(-1))
+        return storage.view(num_experts, *first.shape)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         hidden_size = self.hidden_size

@@ -1512,6 +1512,42 @@ def test_int4_moe_marlin_repack_smoke():
     assert repacked.is_cuda
 
 
+def test_int4_moe_marlin_repack_reuses_source_storage():
+    """The repack must not allocate a second full-size tensor: the DSpark
+    draft loads next to the target on the last PP rank, where a duplicated
+    ~2 GiB fused expert tensor is the difference between fitting and OOM."""
+    torch.manual_seed(3)
+    num_experts = 4
+    size_k = 256
+    size_n = 512
+    weight = torch.randint(
+        0,
+        256,
+        (num_experts, size_n, size_k // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.int8)
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+
+    repacked = Dsv4Int4MoEMethod._repack_int4_for_marlin(
+        weight,
+        size_n=size_n,
+        size_k=size_k,
+    )
+    torch.cuda.synchronize()
+
+    assert repacked.untyped_storage().data_ptr() == weight.untyped_storage().data_ptr()
+    peak_over_base = torch.cuda.max_memory_allocated() - base
+    # Scratch is one expert (transpose copy + kernel output), not all experts.
+    assert peak_over_base < weight.nbytes, (
+        f"repack transient {peak_over_base} bytes >= full duplicate "
+        f"{weight.nbytes} bytes"
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("input_dtype", [None, torch.int8])
 def test_int4_moe_marlin_matches_dequant_reference(input_dtype):
@@ -1567,14 +1603,16 @@ def test_int4_moe_marlin_matches_dequant_reference(input_dtype):
 
     w13_q = torch.cat([w1_q, w3_q], dim=1).contiguous()
     w13_s = torch.cat([w1_s, w3_s], dim=1).contiguous()
+    # _repack_int4_for_marlin consumes its input (in-place storage reuse);
+    # clone so the dequant reference below still sees the original payload.
     w13_marlin = Dsv4Int4MoEMethod._repack_int4_for_marlin(
-        w13_q,
+        w13_q.clone(),
         size_n=2 * intermediate_size,
         size_k=hidden_size,
         is_a_8bit=is_a_8bit,
     )
     w2_marlin = Dsv4Int4MoEMethod._repack_int4_for_marlin(
-        w2_q,
+        w2_q.clone(),
         size_n=hidden_size,
         size_k=intermediate_size,
         is_a_8bit=is_a_8bit,
