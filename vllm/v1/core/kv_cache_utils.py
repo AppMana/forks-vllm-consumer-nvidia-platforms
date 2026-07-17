@@ -2140,9 +2140,39 @@ def get_kv_cache_configs(
         )
 
     # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+    for worker_idx, (groups, avail_mem) in enumerate(
+        zip(projected_groups_per_worker, available_memory)
+    ):
         if not groups:
             continue
+        needed = _max_memory_usage_bytes_from_groups(vllm_config, groups)
+        if needed > avail_mem:
+            # The admission error below only reports totals; name the groups
+            # so undersized workers are diagnosable without guesswork.
+            for group in groups:
+                spec = group.kv_cache_spec
+                logger.error(
+                    "KV sizing worker %d: group spec=%s layers=%d (%s) "
+                    "page_size=%d max_memory=%.3f GiB",
+                    worker_idx,
+                    type(spec).__name__,
+                    len(group.layer_names),
+                    ", ".join(group.layer_names[:4])
+                    + ("..." if len(group.layer_names) > 4 else ""),
+                    spec.page_size_bytes,
+                    spec.max_memory_usage_bytes(vllm_config) / 2**30,
+                )
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    for layer_name, inner in spec.kv_cache_specs.items():
+                        logger.error(
+                            "KV sizing worker %d:   layer %s spec=%s "
+                            "page_size=%d max_memory=%.3f GiB",
+                            worker_idx,
+                            layer_name,
+                            type(inner).__name__,
+                            inner.page_size_bytes,
+                            inner.max_memory_usage_bytes(vllm_config) / 2**30,
+                        )
         _check_enough_kv_cache_memory(
             avail_mem,
             partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
