@@ -911,6 +911,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_draft_tokens_per_req = None
         if not draft_tokens:
             # No draft token scheduled (common case).
+            num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+            num_draft_per_req_gpu = None
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
@@ -927,10 +929,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=np.int32,
                 count=num_reqs,
             )
-            num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
-            total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
-            num_logits = num_draft_tokens_per_req + num_bonus_tokens
+            if self.pp_handler is not None:
+                # PP-deferred scheduling: a verify batch holds ONLY the draft
+                # positions -- the bonus position was already scheduled as a
+                # placeholder in a prior in-flight step, so draft-carrying
+                # requests contribute no bonus logit (counting one shifts
+                # logits_start negative: an OOB gather). Draft-less decode
+                # requests in the same batch still carry their placeholder
+                # logit.
+                num_bonus_tokens = 0
+                num_logits = num_draft_tokens_per_req + (
+                    num_draft_tokens_per_req == 0
+                ).astype(np.int32)
+                num_draft_per_req_gpu = async_copy_to_gpu(
+                    num_draft_tokens_per_req, device=self.device
+                )
+            else:
+                num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+                num_logits = num_draft_tokens_per_req + num_bonus_tokens
+                num_draft_per_req_gpu = None
+            total_num_logits = int(num_logits.sum())
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
@@ -1005,7 +1024,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.draft_tokens,
             cu_num_logits,
             total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
+            num_bonus_tokens,
+            num_draft_per_req=num_draft_per_req_gpu,
         )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
@@ -1118,6 +1138,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
+                # PP-deferred verify: the anchor position's sample stands in
+                # for its (unavailable) distribution -- see
+                # RejectionSampler._expand_for_deferred.
+                prev_sampled_tokens=self.req_states.last_sampled_tokens
+                if self.pp_handler is not None
+                else None,
             )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected

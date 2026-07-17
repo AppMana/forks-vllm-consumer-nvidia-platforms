@@ -312,8 +312,10 @@ def _combine_sampled_and_draft_tokens_kernel(
     draft_tokens_stride,
     cu_num_logits_ptr,
     logits_indices_ptr,
+    num_draft_per_req_ptr,
     BLOCK_SIZE: tl.constexpr,
     NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
+    HAS_PER_REQ_DRAFTS: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
@@ -322,7 +324,16 @@ def _combine_sampled_and_draft_tokens_kernel(
     cu_num_logits_start = tl.load(cu_num_logits_ptr + batch_idx)
     cu_num_logits_end = tl.load(cu_num_logits_ptr + batch_idx + 1)
     num_logits = cu_num_logits_end - cu_num_logits_start
-    num_draft_tokens = num_logits - NUM_NEW_SAMPLED_TOKENS
+    if HAS_PER_REQ_DRAFTS:
+        # PP-deferred: verify batches hold ONLY draft positions (no bonus
+        # logit), while draft-less decode requests in the same batch still
+        # carry their single placeholder logit whose input id must be
+        # rewritten from last_sampled. The bonus count is per request.
+        num_draft_tokens = tl.load(num_draft_per_req_ptr + batch_idx)
+        num_bonus_tokens = num_logits - num_draft_tokens
+    else:
+        num_draft_tokens = num_logits - NUM_NEW_SAMPLED_TOKENS
+        num_bonus_tokens = NUM_NEW_SAMPLED_TOKENS
 
     # Compute the logits indices.
     block = tl.arange(0, BLOCK_SIZE)
@@ -342,7 +353,7 @@ def _combine_sampled_and_draft_tokens_kernel(
 
     # Keep prompt-tail slots intact; only rewrite generated-token slots.
     first_logit_seq_pos = seq_len - num_logits
-    if NUM_NEW_SAMPLED_TOKENS > 0 and first_logit_seq_pos >= prefill_len:
+    if num_bonus_tokens > 0 and first_logit_seq_pos >= prefill_len:
         # Write the last sampled token ID to input_ids.
         last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
         tl.store(input_ids_ptr + logits_start, last_token_id)
@@ -372,6 +383,7 @@ def combine_sampled_and_draft_tokens(
     cu_num_logits: torch.Tensor,
     num_logits: int,
     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
+    num_draft_per_req: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert num_new_sampled_tokens in (0, 1), (
         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
@@ -396,11 +408,15 @@ def combine_sampled_and_draft_tokens(
         draft_tokens.stride(0),
         cu_num_logits,
         logits_indices,
+        num_draft_per_req,
         NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
+        HAS_PER_REQ_DRAFTS=num_draft_per_req is not None,
         # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
-        # last sampled token in addition to all draft tokens.
+        # last sampled token in addition to all draft tokens. +1 covers the
+        # per-req-drafts mode, where a draft-less request in the batch still
+        # has its bonus logit even when num_new_sampled_tokens is 0.
         BLOCK_SIZE=triton.next_power_of_2(
-            num_speculative_steps + num_new_sampled_tokens
+            num_speculative_steps + max(num_new_sampled_tokens, 1)
         ),
     )
     return logits_indices
