@@ -162,6 +162,25 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         # q arrives padded to self.padded_heads as (num_decode_tokens, H, D);
         # the FP8 caches are consumed directly (dequantized inside the kernel).
         q_rows = q[:, 0] if q.dim() == 4 else q
+        import os as _os
+
+        if _os.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1" and num_decode_tokens > 1:
+            from vllm.logger import init_logger as _il
+
+            qr = q_rows[:num_decode_tokens].float()
+            swa_i = swa_indices[:num_decode_tokens]
+            _il(__name__).warning(
+                "dspark-decode-debug q.shape=%s ndt=%d q_row_var=%.3e "
+                "q_rows_identical=%s swa_idx.shape=%s swa_rows_identical=%s "
+                "swa_lens=%s",
+                tuple(q.shape),
+                num_decode_tokens,
+                float(qr.var(dim=0).mean()),
+                bool((q_rows[:num_decode_tokens] == q_rows[0]).all()),
+                tuple(swa_i.shape),
+                bool((swa_i == swa_i[0]).all()),
+                swa_lens[:num_decode_tokens].tolist(),
+            )
 
         # Precompiled Ampere CUDA sparse-MLA decode: ONE launch for all decode tokens
         # (the old Triton path looped per row), ~4.4x faster, no Triton JIT/recompile.
