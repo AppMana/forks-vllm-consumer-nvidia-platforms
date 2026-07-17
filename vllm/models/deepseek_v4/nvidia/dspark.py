@@ -38,6 +38,9 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
+from vllm.models.deepseek_v4.attention import (
+    fused_qnorm_rope_kv_int8_ds_mla_insert,
+)
 from vllm.sequence import IntermediateTensors
 
 from .model import (
@@ -280,7 +283,26 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
-    if cache_dtype == torch.uint8:
+    if cache_dtype == torch.uint8 and getattr(attn, "kv_cache_dtype", None) == "int8_ds_mla":
+        # int8_ds_mla paged layout: 512 signed-int8 bytes + fp32 row scale per
+        # token (528B stride). MUST NOT fall through to the csrc fp8_ds_mla
+        # writer below: both caches are uint8-typed, but that kernel writes
+        # the 576/584-byte UE8M0 layout -- the draft's attention then reads
+        # the rows back as int8 garbage. This was the DSpark bring-up's
+        # collapsed/input-insensitive draft logits: every context row the
+        # draft attended over was format-corrupted.
+        fused_qnorm_rope_kv_int8_ds_mla_insert(
+            dummy_q,
+            kv,
+            swa_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            attn.padded_heads,
+            attn.eps,
+            block_size,
+        )
+    elif cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
