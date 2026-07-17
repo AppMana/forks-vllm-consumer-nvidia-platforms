@@ -313,6 +313,9 @@ def _combine_sampled_and_draft_tokens_kernel(
     cu_num_logits_ptr,
     logits_indices_ptr,
     num_draft_per_req_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    total_len_ptr,
     BLOCK_SIZE: tl.constexpr,
     NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
     HAS_PER_REQ_DRAFTS: tl.constexpr = False,
@@ -351,6 +354,39 @@ def _combine_sampled_and_draft_tokens_kernel(
         # Handling prefill tokens. No sampled or draft tokens.
         return
 
+    if HAS_PER_REQ_DRAFTS:
+        # PP path: write each generated-token query slot by POSITION against
+        # the request's known-token boundary (total_len = tokens whose ids
+        # are known: prompt + emitted outputs incl last_sampled). Positions
+        # below the boundary take their KNOWN id from all_token_ids -- this
+        # covers the anchor slot AND any deeper post-rewind resume; positions
+        # at/above it are draft slots with draft index = position - boundary.
+        # Deriving the split from counts instead (bonus = logits - drafts)
+        # mis-writes when the scheduler's spec attachment disagrees with the
+        # scheduled window (observed: d1 written into the anchor slot).
+        total_len = tl.load(total_len_ptr + req_state_idx)
+        # The last BLOCK_SIZE query slots cover every draft/known rewrite
+        # (drafts <= num_speculative_steps, resume depth <= drafts + 1).
+        j = query_end - 1 - block
+        pos = seq_len - 1 - block
+        in_window = (j >= query_end - num_logits) & (pos >= prefill_len)
+        is_known = in_window & (pos < total_len)
+        known_tok = tl.load(
+            all_token_ids_ptr + req_state_idx * all_token_ids_stride + pos,
+            mask=is_known,
+            other=0,
+        )
+        tl.store(input_ids_ptr + j, known_tok, mask=is_known)
+        didx = pos - total_len
+        is_draft = in_window & (pos >= total_len) & (didx < num_draft_tokens)
+        dtok = tl.load(
+            draft_tokens_ptr + req_state_idx * draft_tokens_stride + didx,
+            mask=is_draft,
+            other=0,
+        )
+        tl.store(input_ids_ptr + j, dtok, mask=is_draft)
+        return
+
     # Keep prompt-tail slots intact; only rewrite generated-token slots.
     first_logit_seq_pos = seq_len - num_logits
     if num_bonus_tokens > 0 and first_logit_seq_pos >= prefill_len:
@@ -384,6 +420,8 @@ def combine_sampled_and_draft_tokens(
     num_logits: int,
     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
     num_draft_per_req: torch.Tensor | None = None,
+    all_token_ids: torch.Tensor | None = None,
+    total_len: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert num_new_sampled_tokens in (0, 1), (
         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
@@ -409,6 +447,9 @@ def combine_sampled_and_draft_tokens(
         cu_num_logits,
         logits_indices,
         num_draft_per_req,
+        all_token_ids,
+        all_token_ids.stride(0) if all_token_ids is not None else 0,
+        total_len,
         NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
         HAS_PER_REQ_DRAFTS=num_draft_per_req is not None,
         # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the

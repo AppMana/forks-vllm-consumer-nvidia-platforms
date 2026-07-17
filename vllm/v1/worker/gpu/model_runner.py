@@ -1029,6 +1029,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
             num_bonus_tokens,
             num_draft_per_req=num_draft_per_req_gpu,
+            all_token_ids=self.req_states.all_token_ids.gpu,
+            total_len=self.req_states.total_len.gpu,
         )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
