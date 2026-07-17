@@ -569,6 +569,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
 
+        import os as _os3
+
+        if _os3.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1":
+            sm = swa_metadata.slot_mapping
+            if sm is not None and sm.numel() > 1 and sm.numel() <= 16:
+                from vllm.logger import init_logger as _il3
+
+                _il3(__name__).warning(
+                    "dspark-slot-debug prefix=%s slot_mapping=%s positions=%s "
+                    "distinct_slots=%d/%d",
+                    getattr(self, "prefix", "?"),
+                    sm.tolist(),
+                    positions[: sm.numel()].tolist(),
+                    int(sm.unique().numel()),
+                    int(sm.numel()),
+                )
+
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8 and self.kv_cache_dtype == "int8_ds_mla":
             # int8_ds_mla paged path: 512 signed-int8 bytes + fp32 row scale
