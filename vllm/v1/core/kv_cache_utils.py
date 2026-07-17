@@ -1854,6 +1854,12 @@ def _max_memory_usage_bytes_from_groups(
     model has 8 full attention layers and 9 sliding window layers, they will
     be padded to 9 full + 9 sliding window for uniform group sizes.
     """
+    # PP projection keeps groups a worker owns no layer of (the scheduler
+    # needs the global group structure), but they retain the GLOBAL spec with
+    # every remote layer. The allocator ignores them (it lays out
+    # layer_names), so sizing must too: counting them budgets other ranks'
+    # layers and inflates num_layer_tuples in the all-uniform branch.
+    kv_cache_groups = [group for group in kv_cache_groups if group.layer_names]
     if not kv_cache_groups:
         return 0
 

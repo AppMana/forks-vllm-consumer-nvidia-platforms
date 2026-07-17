@@ -1254,6 +1254,56 @@ def test_project_kv_cache_groups_to_worker():
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
 
+def test_max_memory_usage_ignores_empty_projected_groups():
+    """PP projection keeps groups a worker owns no layer of (the scheduler
+    needs the global group structure), but they keep the GLOBAL spec with all
+    inner layers. The packed allocator ignores them (it buckets layer_names),
+    so the admission sizing must too — otherwise a worker budgets other ranks'
+    layers and inflates num_layer_tuples (observed: a PP=10 last rank
+    "needing" ~5.4 GiB of which ~5.3 GiB was a phantom group of 20 non-local
+    sliding-window state caches)."""
+    model_config = ModelConfig(max_model_len=1024)
+    vllm_config = VllmConfig(model_config=model_config)
+
+    local_spec_a = new_kv_cache_spec(head_size=64)
+    local_spec_b = new_kv_cache_spec(head_size=128)
+    local_uniform = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={"layer_local_a": local_spec_a, "layer_local_b": local_spec_b},
+    )
+    local_group = KVCacheGroupSpec(["layer_local_a", "layer_local_b"], local_uniform)
+
+    baseline = kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config, [local_group]
+    )
+    assert baseline > 0
+
+    # A projected group with no local layers, still carrying the global spec
+    # with many remote sliding-window layers (as _project_kv_cache_groups_to_worker
+    # emits for a worker that owns none of the group's layers).
+    remote_uniform = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={
+            f"layer_remote_{i}": new_sliding_window_spec(sliding_window=256)
+            for i in range(20)
+        },
+    )
+    phantom_group = KVCacheGroupSpec([], remote_uniform)
+
+    with_phantom = kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config, [local_group, phantom_group]
+    )
+    assert with_phantom == baseline
+
+    # A worker that owns no layers at all sizes to zero.
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(
+            vllm_config, [phantom_group]
+        )
+        == 0
+    )
+
+
 def test_merge_kv_cache_spec():
     same_layer_specs = [
         new_kv_cache_spec(num_kv_heads=32),
