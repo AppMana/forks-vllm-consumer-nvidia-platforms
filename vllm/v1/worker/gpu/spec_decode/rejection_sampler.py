@@ -163,7 +163,7 @@ class RejectionSampler:
         old_pos = input_batch.positions[input_batch.logits_indices]
         draft_sampled = old_draft_sampled.new_empty(new_n)
         draft_sampled.index_copy_(0, dest, old_draft_sampled)
-        draft_sampled[virt] = virt_tok
+        draft_sampled[virt] = virt_tok.to(draft_sampled.dtype)
 
         pos = old_pos.new_empty(new_n)
         pos.index_copy_(0, dest, old_pos)
