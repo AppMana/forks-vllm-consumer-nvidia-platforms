@@ -1115,6 +1115,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            import os as _osr0
+            if _osr0.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1" and input_ids is not None and 1 < input_ids.shape[0] <= 16:
+                _emb = hidden_states.float().reshape(hidden_states.shape[0], -1)
+                _embrv = float(_emb.var(dim=0).mean().item())
+                _ids = input_ids.detach().flatten().tolist()
+                _pos = positions.detach().flatten().tolist() if positions is not None else None
+                print("dspark-rank0-input n=%s input_ids=%s positions=%s embed_rowvar=%.3e" % (
+                    input_ids.shape[0], _ids[:12], (_pos[:12] if _pos else None), _embrv), flush=True)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
