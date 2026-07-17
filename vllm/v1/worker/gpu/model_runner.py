@@ -1490,6 +1490,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         sync_debug("runner_pre_sample")
         if _SYNC_DEBUG:
+            imnp = input_batch.idx_mapping_np
+            logger.warning(
+                "dspark-sync-debug step-state seq_upper=%s prefill_len=%s "
+                "computed=%s",
+                input_batch.seq_lens_cpu_upper_bound[
+                    : input_batch.num_reqs
+                ].tolist(),
+                self.req_states.prefill_len.np[imnp].tolist(),
+                self.req_states.num_computed_tokens_np[imnp].tolist(),
+            )
             li = input_batch.logits_indices
             ndpr = input_batch.num_draft_tokens_per_req
             logger.warning(
