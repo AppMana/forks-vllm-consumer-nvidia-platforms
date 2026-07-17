@@ -135,7 +135,11 @@ class RejectionSampler:
         counts_np = np.diff(cu_np)
         ndpr = input_batch.num_draft_tokens_per_req
         assert ndpr is not None
-        has_virtual_np = (ndpr > 0).astype(np.int64)
+        # A request needs a virtual anchor row only when its verify batch is
+        # drafts-only (steady-state deferred). The first verify after a
+        # prefill schedules the anchor position itself, so its real anchor
+        # row is present (counts == ndpr + 1) and it verifies classically.
+        has_virtual_np = ((ndpr > 0) & (counts_np == ndpr)).astype(np.int64)
         new_cu_np = np.zeros(num_reqs + 1, dtype=np.int32)
         np.cumsum(counts_np + has_virtual_np, out=new_cu_np[1:])
         new_n = int(new_cu_np[-1])

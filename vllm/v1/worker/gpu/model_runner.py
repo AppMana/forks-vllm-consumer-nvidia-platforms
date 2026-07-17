@@ -931,16 +931,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             if self.pp_handler is not None:
-                # PP-deferred scheduling: a verify batch holds ONLY the draft
-                # positions -- the bonus position was already scheduled as a
-                # placeholder in a prior in-flight step, so draft-carrying
-                # requests contribute no bonus logit (counting one shifts
-                # logits_start negative: an OOB gather). Draft-less decode
-                # requests in the same batch still carry their placeholder
-                # logit.
+                # PP-deferred scheduling: a steady-state verify batch holds
+                # ONLY the draft positions -- the anchor/bonus position was
+                # scheduled in a prior in-flight step, so such requests
+                # contribute no bonus logit (counting one shifts logits_start
+                # negative: an OOB gather). The FIRST verify after a prefill
+                # still schedules the anchor position itself (its KV was never
+                # computed), making the scheduled query one longer than the
+                # drafts: that request keeps its bonus logit and verifies
+                # classically against the real anchor row. Draft-less decode
+                # requests keep their single placeholder logit.
                 num_bonus_tokens = 0
-                num_logits = num_draft_tokens_per_req + (
-                    num_draft_tokens_per_req == 0
+                num_logits = np.minimum(
+                    num_scheduled_tokens, num_draft_tokens_per_req + 1
                 ).astype(np.int32)
                 num_draft_per_req_gpu = async_copy_to_gpu(
                     num_draft_tokens_per_req, device=self.device

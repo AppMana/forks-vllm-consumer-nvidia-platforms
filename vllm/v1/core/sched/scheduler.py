@@ -67,6 +67,10 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Class-level default: some tests construct schedulers through partial
+    # init paths; __init__ overrides this from the parallel config.
+    pp_deferred_spec = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -120,6 +124,16 @@ class Scheduler(SchedulerInterface):
         # Diffusion models may not sample any tokens for a denoising step.
         self.num_sampled_tokens_per_step = (
             1 if not vllm_config.model_config.is_diffusion else 0
+        )
+        # PP-deferred speculative decoding: a verify step schedules ONLY the
+        # draft positions (the bonus/anchor position was already scheduled as
+        # a placeholder in a prior in-flight step, and its token was emitted
+        # by the step that sampled it). Such steps therefore materialize at
+        # most num_draft tokens -- possibly ZERO when the first draft is
+        # rejected -- and the accounting below must not assume the +1 bonus.
+        self.pp_deferred_spec = (
+            vllm_config.parallel_config.pipeline_parallel_size > 1
+            and self.num_sampled_tokens_per_step > 0
         )
 
         # Create KVConnector for the Scheduler. Note that each Worker
@@ -1625,13 +1639,31 @@ class Scheduler(SchedulerInterface):
             )
             # Skip a stale frame still pending discard (async_tokens_to_discard
             # > 0): its pre-reset rejection count would underflow the counters.
+            was_deferred_verify = (
+                self.pp_deferred_spec
+                and scheduled_spec_token_ids is not None
+                and len(scheduled_spec_token_ids) > 0
+                and scheduler_output.num_scheduled_tokens.get(req_id)
+                == len(scheduled_spec_token_ids)
+            )
             if (
                 scheduled_spec_token_ids
-                and (generated_token_ids or self.num_sampled_tokens_per_step == 0)
+                and (
+                    generated_token_ids
+                    or self.num_sampled_tokens_per_step == 0
+                    # A deferred verify legitimately emits zero tokens when
+                    # the first draft is rejected; the rejection rewind below
+                    # must still run or num_computed_tokens/placeholders leak.
+                    or was_deferred_verify
+                )
                 and request.async_tokens_to_discard == 0
             ):
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_sampled = self.num_sampled_tokens_per_step
+                # Deferred verify emits [d2..dA, correction/bonus]: A entries
+                # for A accepted drafts, no anchor bonus.
+                num_sampled = (
+                    0 if was_deferred_verify else self.num_sampled_tokens_per_step
+                )
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
