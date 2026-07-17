@@ -170,9 +170,11 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
             qr = q_rows[:num_decode_tokens].float()
             swa_i = swa_indices[:num_decode_tokens]
             _il(__name__).warning(
-                "dspark-decode-debug q.shape=%s ndt=%d q_row_var=%.3e "
-                "q_rows_identical=%s swa_idx.shape=%s swa_rows_identical=%s "
-                "swa_lens=%s",
+                "dspark-decode-debug prefix=%s cratio=%s q.shape=%s ndt=%d "
+                "q_row_var=%.3e q_rows_identical=%s swa_idx.shape=%s "
+                "swa_rows_identical=%s swa_lens=%s",
+                getattr(self, "prefix", "?"),
+                getattr(self, "compress_ratio", "?"),
                 tuple(q.shape),
                 num_decode_tokens,
                 float(qr.var(dim=0).mean()),
