@@ -1076,24 +1076,31 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # re-derives the compression state from scratch and corrupts the
         # residual stream (NaN after enough boundaries).
         h = self.config.hidden_size
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
+        tensors = {
+            "hidden_states": torch.zeros((batch_size, h), dtype=dtype, device=device),
+            "residual": torch.zeros(
+                (batch_size, self.hc_mult, h), dtype=dtype, device=device
+            ),
+            "post_mix": torch.zeros(
+                (batch_size, self.hc_mult, 1), dtype=torch.float32, device=device
+            ),
+            "res_mix": torch.zeros(
+                (batch_size, self.hc_mult, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        # Relayed aux boundaries (see forward): the previous rank sends every
+        # boundary strictly below this rank's start_layer; the boundary AT
+        # start_layer is reconstructed locally from the MHC stream. Must be
+        # called after set_aux_hidden_state_layers (the runner allocates
+        # intermediate tensors after the speculator loads).
+        for j in sorted(self.aux_hidden_state_layers):
+            if j < self.start_layer:
+                tensors[f"aux_hidden_{j}"] = torch.zeros(
                     (batch_size, h), dtype=dtype, device=device
-                ),
-                "residual": torch.zeros(
-                    (batch_size, self.hc_mult, h), dtype=dtype, device=device
-                ),
-                "post_mix": torch.zeros(
-                    (batch_size, self.hc_mult, 1), dtype=torch.float32, device=device
-                ),
-                "res_mix": torch.zeros(
-                    (batch_size, self.hc_mult, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
-        )
+                )
+        return IntermediateTensors(tensors)
 
     def forward(
         self,
@@ -1126,21 +1133,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
             post_mix = intermediate_tensors["post_mix"]
             res_mix = intermediate_tensors["res_mix"]
-        aux_hidden_states: list[torch.Tensor] = []
+        # Aux boundary j is the post-mhc state after layer j-1 (see
+        # _aux_relay_keys for the PP relay contract). Boundaries this rank
+        # cannot compute arrive relayed from earlier ranks; the boundary
+        # exactly at this rank's cut is reconstructed from the received MHC
+        # stream (layer j-1 ran on the previous rank, but its full stream --
+        # hidden_states, residual, post_mix, res_mix -- is what we just
+        # received). This keeps aux capture correct under ANY contiguous
+        # partition: DSpark's last-rank chunk can hold a single layer next to
+        # the ~12 GiB draft instead of all three aux layers (impossible on
+        # 24 GiB cards).
+        aux_by_boundary: dict[int, torch.Tensor] = {}
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
-        if (
-            not get_pp_group().is_first_rank
-            and self.start_layer in self.aux_hidden_state_layers
-        ):
-            # Aux boundary j is the post-mhc state after layer j-1. When the
-            # boundary sits exactly at this rank's PP cut, layer j-1 ran on
-            # the previous rank, but its full MHC stream (hidden_states,
-            # residual, post_mix, res_mix) is what we just received -- collapse
-            # it locally. This lets DSpark's last-rank chunk hold one layer
-            # fewer than the aux count (e.g. 2 target layers + draft instead
-            # of 3, which does not fit next to the ~12 GiB draft on 24 GiB).
-            aux_recon = self.mhc_post(hidden_states, residual, post_mix, res_mix)
-            aux_hidden_states.append(aux_recon.mean(dim=1))
+        if not get_pp_group().is_first_rank and self.aux_hidden_state_layers:
+            assert intermediate_tensors is not None
+            for j in self.aux_hidden_state_layers:
+                key = f"aux_hidden_{j}"
+                if key in intermediate_tensors.tensors:
+                    aux_by_boundary[j] = intermediate_tensors[key]
+            if self.start_layer in self.aux_hidden_state_layers:
+                aux_recon = self.mhc_post(hidden_states, residual, post_mix, res_mix)
+                aux_by_boundary[self.start_layer] = aux_recon.mean(dim=1)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1156,20 +1169,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
                 aux_recon = self.mhc_post(hidden_states, residual, post_mix, res_mix)
-                aux_hidden_states.append(aux_recon.mean(dim=1))
+                aux_by_boundary[idx + 1] = aux_recon.mean(dim=1)
                 final_aux_recon = aux_recon
 
         if not get_pp_group().is_last_rank:
             # Pass the full MHC stream forward; mhc_post (the final collapse)
-            # runs only on the last rank below.
-            return IntermediateTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                    "post_mix": post_mix,
-                    "res_mix": res_mix,
-                }
-            )
+            # runs only on the last rank below. Relay every aux boundary the
+            # next rank cannot compute itself (its own cut, == this rank's
+            # end_layer, is reconstructible from the stream -- don't send it).
+            out_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+                "post_mix": post_mix,
+                "res_mix": res_mix,
+            }
+            for j, aux in aux_by_boundary.items():
+                if j < self.end_layer:
+                    out_tensors[f"aux_hidden_{j}"] = aux
+            return IntermediateTensors(out_tensors)
+        aux_hidden_states = [aux_by_boundary[j] for j in sorted(aux_by_boundary)]
 
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
