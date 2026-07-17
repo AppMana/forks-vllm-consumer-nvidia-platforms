@@ -331,9 +331,13 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
     is a hygiene/consistency match, not a deeper correctness guarantee.
     """
 
-    # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
-    # load_dspark_model always aliases the target's (PP=1 only -- see
-    # dspark/utils.py's PP>1 gate on embed_tokens aliasing).
+    # Draft weights ship in the target checkpoint (mtp.*). Grafted checkpoints
+    # carry per-stage embed/head copies identical to the target's: stage 0's
+    # embedding loads into the draft's own VocabParallelEmbedding (required
+    # under PP>1, where dspark/utils.py skips target-aliasing because target
+    # embed and draft live on different ranks); lm_head is always aliased from
+    # the target (same last rank). Flag stays False so PP=1 still aliases the
+    # target embedding and frees the duplicate.
     has_own_embed_tokens = False
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
@@ -583,6 +587,19 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         rest = m.group(2)
         # The confidence head is not wired into inference yet; drop its weights.
         if rest.startswith("confidence_head."):
+            return None
+        # Rebuilt Base+DSpark grafts ship per-stage emb.tok_emb/head copies
+        # that are byte-identical to the target's embed/head (verified against
+        # appmana/deepseek-v4-int4-int8). The draft has ONE model-level
+        # VocabParallelEmbedding, which under PP>1 is deliberately NOT aliased
+        # from the target (target embed lives on the first rank, draft on the
+        # last -- see dspark/utils.py), so it must load from the checkpoint:
+        # take stage 0's copy, drop the redundant ones. lm_head IS aliased
+        # from the target on the same last rank under any PP, so all head
+        # copies are dropped.
+        if rest == "emb.tok_emb.weight":
+            return "model.embed_tokens.weight" if stage == 0 else None
+        if rest == "head.weight":
             return None
         # Head-stack params live at model level (mtp.last), context combiner at
         # model level (mtp.0); everything else is a per-layer decoder block.

@@ -483,6 +483,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # The confidence head is not wired into inference yet; drop its weights.
         if rest.startswith("confidence_head."):
             return None
+        # Rebuilt Base+DSpark grafts ship per-stage emb.tok_emb/head copies
+        # byte-identical to the target's embed/head. Load stage 0's embedding
+        # into the draft's own VocabParallelEmbedding (not target-aliased
+        # under PP>1); drop the redundant copies and the target-aliased head.
+        # Mirrors nvidia/dspark.py.
+        if rest == "emb.tok_emb.weight":
+            return "model.embed_tokens.weight" if stage == 0 else None
+        if rest == "head.weight":
+            return None
         # Head-stack params live at model level (mtp.last), context combiner at
         # model level (mtp.0); everything else is a per-layer decoder block.
         head_prefixes = (
