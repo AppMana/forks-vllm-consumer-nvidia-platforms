@@ -127,12 +127,13 @@ class DSparkSpeculator(DFlashSpeculator):
         if _SYNC_DEBUG:
             logger.warning(
                 "dspark-sync-debug base_logits finite=%s min=%.3f max=%.3f "
-                "anchor_prev min=%d max=%d",
+                "anchor_prev min=%d max=%d base_argmax=%s",
                 bool(torch.isfinite(base_logits).all()),
                 float(base_logits.float().min()),
                 float(base_logits.float().max()),
                 int(prev.min()),
                 int(prev.max()),
+                base_logits[0].argmax(dim=-1).tolist(),
             )
 
         for i in range(n_spec):

@@ -63,10 +63,10 @@ COMMON_KWARGS = dict(
     max_model_len=2048,
     max_num_batched_tokens=2048,
     max_num_seqs=1,
-    kv_cache_dtype="fp8",
+    kv_cache_dtype=os.environ.get("DSPARK_SMOKE_KV_DTYPE", "fp8"),
     load_format="dummy",
     enforce_eager=True,
-    gpu_memory_utilization=0.7,
+    gpu_memory_utilization=float(os.environ.get("DSPARK_SMOKE_GPU_UTIL", "0.7")),
     tensor_parallel_size=1,
     kv_cache_memory_bytes=10 * 1024 * 1024 * 1024,
 )
@@ -75,12 +75,19 @@ PROMPTS = ["Hello world", "The capital of France is", "def fibonacci(n):"]
 MAX_TOKENS = 12
 
 
-def _generate(model_dir: str, speculative_config: dict | None) -> list[list[int]]:
+def _generate(
+    model_dir: str, speculative_config: dict | None, pp: int = 1
+) -> list[list[int]]:
     from vllm import LLM, SamplingParams
 
     kwargs = dict(COMMON_KWARGS)
     if speculative_config is not None:
         kwargs["speculative_config"] = speculative_config
+    if pp > 1:
+        # PP exercises the deferred-verify path: aux boundary relay across the
+        # cut, drafts-only verify batches, and the async scheduler accounting.
+        kwargs["pipeline_parallel_size"] = pp
+        kwargs["distributed_executor_backend"] = "mp"
 
     llm = LLM(model=model_dir, **kwargs)
     params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.0)
@@ -89,9 +96,11 @@ def _generate(model_dir: str, speculative_config: dict | None) -> list[list[int]
 
 
 def main() -> int:
-    gpu = os.environ.get("CUDA_VISIBLE_DEVICES") or _choose_gpu()
-    if gpu is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+    pp = int(os.environ.get("DSPARK_SMOKE_PP", "1"))
+    if pp == 1:
+        gpu = os.environ.get("CUDA_VISIBLE_DEVICES") or _choose_gpu()
+        if gpu is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu
 
     real_config_path = find_real_dspark_config()
     cfg = build_shrunk_config(real_config_path, num_layers=6, n_routed_experts=8)
@@ -104,7 +113,7 @@ def main() -> int:
     # deterministic dummy-weight init (same seed=1234, same tensor shapes).
     spec_off = json.loads(
         subprocess.run(
-            [sys.executable, __file__, "--role", "spec-off", "--model-dir", model_dir],
+            [sys.executable, __file__, "--role", "spec-off", "--model-dir", model_dir, "--pp", str(pp)],
             check=True,
             text=True,
             capture_output=True,
@@ -113,7 +122,7 @@ def main() -> int:
     )
     spec_on = json.loads(
         subprocess.run(
-            [sys.executable, __file__, "--role", "spec-on", "--model-dir", model_dir],
+            [sys.executable, __file__, "--role", "spec-on", "--model-dir", model_dir, "--pp", str(pp)],
             check=True,
             text=True,
             capture_output=True,
@@ -142,13 +151,15 @@ def _subprocess_role() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--role", choices=["spec-off", "spec-on"], required=True)
     parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--pp", type=int, default=1)
     args = parser.parse_args()
 
     if args.role == "spec-off":
-        tokens = _generate(args.model_dir, speculative_config=None)
+        tokens = _generate(args.model_dir, speculative_config=None, pp=args.pp)
     else:
         tokens = _generate(
             args.model_dir,
+            pp=args.pp,
             speculative_config={
                 "method": "dspark",
                 "num_speculative_tokens": 5,
