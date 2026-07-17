@@ -27,10 +27,12 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             self,
             messages: list["ChatCompletionMessageParam"],
             tools: list[dict[str, Any]] | None = None,
+            thinking: bool = False,
+            enable_thinking: bool = False,
+            reasoning_effort: str | None = None,
+            drop_thinking: bool = True,
             **kwargs,
         ) -> str | list[int]:
-            thinking = kwargs.get("thinking", False)
-            enable_thinking = kwargs.get("enable_thinking", False)
             thinking = thinking or enable_thinking
             thinking_mode = "thinking" if thinking else "chat"
 
@@ -40,7 +42,6 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 messages.insert(0, {"role": "system"})
                 messages[0]["tools"] = tools  # type: ignore[typeddict-unknown-key]
 
-            reasoning_effort = kwargs.get("reasoning_effort")
             if not isinstance(reasoning_effort, str):
                 reasoning_effort = None
             elif reasoning_effort == "none":
@@ -53,7 +54,7 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
 
             encode_config = dict(
                 thinking_mode=thinking_mode,
-                drop_thinking=kwargs.get("drop_thinking", True),
+                drop_thinking=drop_thinking,
                 reasoning_effort=reasoning_effort,
             )
 
