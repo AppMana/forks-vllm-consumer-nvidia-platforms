@@ -522,13 +522,26 @@ def _prepare_dflash_inputs_kernel(
     valid_ctx_end = ctx_end - num_rejected
 
     num_sampled = tl.load(num_sampled_ptr + req_idx)
-    if num_sampled > 0:
+    if num_sampled > 0 or num_rejected > 0:
+        # Decode/verify step. A fully-rejected PP-deferred verify emits ZERO
+        # tokens (num_sampled == 0 with num_rejected > 0): the anchor is
+        # still the previously sampled token, NOT a prefill splice.
         bonus_token = tl.load(last_sampled_ptr + req_state_idx).to(tl.int32)
     else:
         # Chunked prefilling: splice in the next prefill token.
         bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
 
-    last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+    if valid_ctx_end > ctx_start:
+        last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+    else:
+        # Fully-rejected step: every context row of this batch was rejected,
+        # so there is no valid row to read. The anchor sits immediately
+        # before this step's first (rejected) position. Reading
+        # target_positions[ctx_start - 1] would index another request's data
+        # (or out of bounds for request 0) and poison the query positions and
+        # slots -- observed as the draft proposing a fixed garbage sequence
+        # on every propose that followed a fully-rejected deferred verify.
+        last_valid_pos = tl.load(target_positions_ptr + ctx_start) - 1
     query_base = req_idx * num_query_per_req
 
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
