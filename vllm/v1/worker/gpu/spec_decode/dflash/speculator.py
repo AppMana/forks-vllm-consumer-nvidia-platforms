@@ -45,6 +45,8 @@ class _ProposePhaseProfiler:
         self.pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
         self.calls = 0
         self.tokens = 0
+        self._last_wall: float | None = None
+        self._intervals: list[float] = []
 
     class _Phase:
         def __init__(self, prof: "_ProposePhaseProfiler", name: str) -> None:
@@ -66,6 +68,12 @@ class _ProposePhaseProfiler:
         return self._Phase(self, name)
 
     def step(self, num_target_tokens: int) -> None:
+        import time as _time
+
+        now = _time.monotonic()
+        if self._last_wall is not None:
+            self._intervals.append(now - self._last_wall)
+        self._last_wall = now
         self.calls += 1
         self.tokens += num_target_tokens
         if self.calls % _PROF_LOG_EVERY != 0:
@@ -75,6 +83,12 @@ class _ProposePhaseProfiler:
         for name, pairs in self.pairs.items():
             total_ms = sum(s.elapsed_time(e) for s, e in pairs)
             parts.append(f"{name}={total_ms / len(pairs):.3f}ms(x{len(pairs)})")
+        if self._intervals:
+            iv = sorted(self._intervals)
+            parts.append(
+                f"inter_propose_ms=min{iv[0] * 1e3:.0f}"
+                f"/med{iv[len(iv) // 2] * 1e3:.0f}/max{iv[-1] * 1e3:.0f}"
+            )
         logger.info(
             "dspark-prof propose avg over %d calls (%d target tokens): %s",
             _PROF_LOG_EVERY,
@@ -83,6 +97,7 @@ class _ProposePhaseProfiler:
         )
         self.pairs.clear()
         self.tokens = 0
+        self._intervals.clear()
 
 
 def sync_debug(tag: str) -> None:
