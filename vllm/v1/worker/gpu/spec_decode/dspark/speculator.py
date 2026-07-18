@@ -56,6 +56,13 @@ class DSparkSpeculator(DFlashSpeculator):
             self.num_query_per_req = self.num_speculative_steps
         else:
             self.num_query_per_req = 1 + self.num_speculative_steps
+        logger.info(
+            "DSpark layout: sample_from_anchor=%s num_query_per_req=%d "
+            "num_speculative_steps=%d",
+            self.sample_from_anchor,
+            self.num_query_per_req,
+            self.num_speculative_steps,
+        )
 
         # DSpark consumes mean-pooled target aux hidden states at the target
         # layers, combined to hidden_size via main_proj. Store that combined

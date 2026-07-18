@@ -601,8 +601,18 @@ class SpeculativeConfig:
         return target_hf_overrides(hf_config)
 
     @staticmethod
+    def _apply_dict_hf_override(
+        dict_overrides: dict,
+        hf_config: PretrainedConfig,
+    ) -> PretrainedConfig:
+        hf_config = SpeculativeConfig.hf_config_override(hf_config)
+        hf_config.update(dict_overrides)
+        return hf_config
+
+    @staticmethod
     def compose_draft_hf_overrides(
         target_hf_overrides: HfOverrides | None,
+        same_model: bool = False,
     ) -> Callable[[PretrainedConfig], PretrainedConfig]:
         """Build the ``hf_overrides`` for the draft ``ModelConfig``.
 
@@ -610,8 +620,11 @@ class SpeculativeConfig:
         (e.g. test harnesses shrinking ``num_hidden_layers``) and must also
         reach the draft config — otherwise a draft belonging to a large
         target is instantiated at full size even when the target is shrunk.
-        Dict overrides are target-specific key patches and are not applied
-        to the draft.
+        Dict overrides are target-specific key patches; they only apply to
+        the draft when the draft IS the target checkpoint (``same_model``,
+        e.g. dspark/dflash whose weights ship in the target repo) — a
+        separate draft checkpoint must not inherit patches meant for the
+        target's own config keys.
 
         The composed override must stay picklable: the draft ``ModelConfig``
         is sent to spawned engine-core processes, so a local closure would
@@ -620,6 +633,11 @@ class SpeculativeConfig:
         method instead.
         """
         if not callable(target_hf_overrides):
+            if same_model and target_hf_overrides:
+                return functools.partial(
+                    SpeculativeConfig._apply_dict_hf_override,
+                    dict(target_hf_overrides),
+                )
             return SpeculativeConfig.hf_config_override
 
         return functools.partial(
@@ -792,9 +810,14 @@ class SpeculativeConfig:
                 else:
                     # Compose any callable hf_overrides set on the target so the
                     # draft config receives the same transform (e.g. the test
-                    # shrink). Dict overrides stay target-only.
+                    # shrink). Dict overrides additionally reach the draft when
+                    # it is the SAME checkpoint as the target (dspark/dflash):
+                    # keys like dspark_bonus_anchor are read from the draft
+                    # hf_config and silently reverted to checkpoint defaults
+                    # if dropped here.
                     draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
-                        self.target_model_config.hf_overrides
+                        self.target_model_config.hf_overrides,
+                        same_model=(self.model == self.target_model_config.model),
                     )
                 self.draft_model_config = ModelConfig(
                     model=self.model,
