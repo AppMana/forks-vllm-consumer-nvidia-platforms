@@ -1472,6 +1472,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
         )
 
+        if _STEP_TRACE and num_toks >= 500:
+            print(
+                f"dspark-step-trace exec_end num_toks={num_toks} "
+                f"t={time.monotonic():.3f}",
+                flush=True,
+            )
+
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors
