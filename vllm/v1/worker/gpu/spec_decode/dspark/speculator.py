@@ -118,6 +118,15 @@ class DSparkSpeculator(DFlashSpeculator):
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        if _SYNC_DEBUG and num_reqs <= 2:
+            logger.warning(
+                "dspark-sync-debug sample_map indices=%s pos=%s "
+                "head_hidden_row_norms=%s",
+                self.sample_indices[:num_sample].tolist(),
+                self.sample_pos[:num_sample].tolist(),
+                [round(float(head_hidden[r].float().norm()), 1)
+                 for r in range(min(head_hidden.shape[0], num_reqs * self.num_query_per_req))],
+            )
         sync_debug("dspark_sample_hidden_gather")
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         base_logits = self.model.compute_draft_logits(sample_hidden)
@@ -148,6 +157,27 @@ class DSparkSpeculator(DFlashSpeculator):
             markov_embed = self.model.markov_embed(prev)
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
+            if _SYNC_DEBUG and i < 2 and num_reqs <= 2:
+                _b0 = base_logits[0, i].float()
+                _bi0 = bias[0].float()
+                _c0 = logits_i[0].float()
+                _bt = _b0.topk(5)
+                _bit = _bi0.topk(5)
+                _ct = _c0.topk(5)
+                logger.warning(
+                    "dspark-sync-debug markov i=%d prev=%d "
+                    "base_top=%s base_vals=%s bias_top=%s bias_vals=%s "
+                    "bias_at_base_top=%.2f combined_top=%s combined_vals=%s",
+                    i,
+                    int(prev[0]),
+                    _bt.indices.tolist(),
+                    [round(v, 2) for v in _bt.values.tolist()],
+                    _bit.indices.tolist(),
+                    [round(v, 2) for v in _bit.values.tolist()],
+                    float(_bi0[_bt.indices[0]]),
+                    _ct.indices.tolist(),
+                    [round(v, 2) for v in _ct.values.tolist()],
+                )
             if self.draft_logits is not None:
                 # Probabilistic: sample in target vocab (a reduced draft vocab is
                 # scattered into its target columns; full vocab is already there).
