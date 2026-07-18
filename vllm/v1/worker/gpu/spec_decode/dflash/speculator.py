@@ -391,9 +391,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions.
         with self._prof_phase("combine_hidden"):
             if aux_hidden_states:
-                if _SYNC_DEBUG:
-                    norms = [float(t[:num_target_tokens].float().norm()) for t in aux_hidden_states]
-                    logger.warning("dspark-sync-debug aux norms=%s", norms)
                 hidden_states = self.model.combine_hidden_states(
                     torch.cat(aux_hidden_states, dim=-1)
                 )
@@ -466,19 +463,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         prof_prepare.__exit__(None, None, None)
         sync_debug("prepare_dflash_inputs")
-        if _SYNC_DEBUG:
-            ids = self.input_buffers.input_ids[:num_query_tokens]
-            si = self.sample_indices[: num_reqs * self.num_speculative_steps]
-            logger.warning(
-                "dspark-sync-debug input_ids min=%d max=%d (vocab=%d) "
-                "sample_indices min=%d max=%d (num_query_tokens=%d)",
-                int(ids.min()),
-                int(ids.max()),
-                self.vocab_size,
-                int(si.min()),
-                int(si.max()),
-                num_query_tokens,
-            )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -549,14 +533,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         if self._prof is not None:
             self._prof.step(num_target_tokens)
         sync_debug("generate_draft")
-        if _SYNC_DEBUG:
-            dt = self.draft_tokens[:num_reqs]
-            logger.warning(
-                "dspark-sync-debug draft_tokens min=%d max=%d (vocab=%d)",
-                int(dt.min()),
-                int(dt.max()),
-                self.vocab_size,
-            )
 
         return self.draft_tokens[:num_reqs]
 

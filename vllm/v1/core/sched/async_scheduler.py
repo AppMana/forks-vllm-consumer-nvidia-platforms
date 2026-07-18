@@ -53,23 +53,6 @@ class AsyncScheduler(Scheduler):
             request.num_output_placeholders += (
                 bonus_placeholders + cur_num_spec_tokens
             )
-            import os as _os
-
-            if self.pp_deferred_spec and _os.environ.get(
-                "APPMANA_SCHED_SPEC_DEBUG"
-            ) == "1":
-                logger.warning(
-                    "sched-spec-debug post req=%s sched=%d spec=%d bonus_ph=%d "
-                    "P=%d C=%d N=%d prefill_chunk=%s",
-                    req_id,
-                    scheduler_output.num_scheduled_tokens[req_id],
-                    cur_num_spec_tokens,
-                    bonus_placeholders,
-                    request.num_output_placeholders,
-                    request.num_computed_tokens,
-                    request.num_tokens,
-                    request.is_prefill_chunk,
-                )
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = self._spec_token_placeholders

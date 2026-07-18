@@ -230,42 +230,6 @@ class RejectionSampler:
 
         deferred = prev_sampled_tokens is not None
         if deferred:
-            import os as _os
-
-            if _os.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1":
-                from vllm.logger import init_logger as _il
-
-                li = input_batch.logits_indices
-                raw_in = input_batch.input_ids[li]
-                raw_pos = input_batch.positions[li]
-                tl = self.sampler.req_states.total_len.gpu[input_batch.idx_mapping]
-                # The TARGET's own greedy argmax on the RAW logits, before any
-                # spec/rejection processing. If this is already wrong for a
-                # correct input+position, the bug is the target forward; if it
-                # is correct but the emitted token differs, spec processing
-                # corrupts.
-                raw_argmax = logits.argmax(dim=-1)
-                _lg = logits.float()
-                _rowvar = float(_lg.var(dim=0).mean()) if _lg.shape[0] > 1 else 0.0
-                _ident = bool((logits == logits[0]).all()) if logits.shape[0] > 1 else False
-                _il(__name__).warning(
-                    "dspark-sync-debug LOGIT rows_identical=%s row_var=%.3e "
-                    "logit0_top2=%s",
-                    _ident,
-                    _rowvar,
-                    _lg[0].topk(2).indices.tolist() if _lg.shape[0] else [],
-                )
-                _il(__name__).warning(
-                    "dspark-sync-debug RAW req=%s cu=%s raw_input=%s raw_pos=%s "
-                    "total_len=%s prev=%s target_argmax=%s",
-                    [r[-6:] for r in input_batch.req_ids],
-                    input_batch.cu_num_logits_np.tolist(),
-                    raw_in.tolist(),
-                    raw_pos.tolist(),
-                    tl.tolist(),
-                    prev_sampled_tokens[input_batch.idx_mapping].reshape(-1).tolist(),
-                    raw_argmax.tolist(),
-                )
             (
                 logits_in,
                 draft_sampled,
@@ -318,21 +282,6 @@ class RejectionSampler:
             ).clamp_max_(steps1 - 1)
             sampled = torch.gather(sampled, 1, gather_idx)
             num_sampled = num_sampled - has_virtual.to(num_sampled.dtype)
-            import os as _os
-
-            if _os.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1":
-                from vllm.logger import init_logger as _il
-
-                _il(__name__).warning(
-                    "dspark-sync-debug verify drafts=%s prev=%s sampled=%s "
-                    "num_sampled=%s",
-                    draft_sampled.tolist(),
-                    prev_sampled_tokens[input_batch.idx_mapping]
-                    .reshape(-1)
-                    .tolist(),
-                    sampled.tolist(),
-                    num_sampled.tolist(),
-                )
         if deferred:
             # The expanded logits layout does not match input_batch.cu_num_logits.
             if (

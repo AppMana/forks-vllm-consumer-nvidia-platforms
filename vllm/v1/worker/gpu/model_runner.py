@@ -19,12 +19,9 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
-import os as _os_step_trace
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
-
-_STEP_TRACE = _os_step_trace.environ.get("APPMANA_DSPARK_STEP_TRACE") == "1"
 
 import numpy as np
 import torch
@@ -1251,12 +1248,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
-        if _STEP_TRACE and num_toks >= 500:
-            print(
-                f"dspark-step-trace exec_start num_toks={num_toks} "
-                f"t={time.monotonic():.3f}",
-                flush=True,
-            )
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
 
@@ -1472,13 +1463,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
         )
 
-        if _STEP_TRACE and num_toks >= 500:
-            print(
-                f"dspark-step-trace exec_end num_toks={num_toks} "
-                f"t={time.monotonic():.3f}",
-                flush=True,
-            )
-
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors
@@ -1520,34 +1504,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
-            _SYNC_DEBUG,
-            sync_debug,
-        )
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import sync_debug
 
         sync_debug("runner_pre_sample")
-        if _SYNC_DEBUG:
-            imnp = input_batch.idx_mapping_np
-            logger.warning(
-                "dspark-sync-debug step-state seq_upper=%s prefill_len=%s "
-                "computed=%s",
-                input_batch.seq_lens_cpu_upper_bound[
-                    : input_batch.num_reqs
-                ].tolist(),
-                self.req_states.prefill_len.np[imnp].tolist(),
-                self.req_states.num_computed_tokens_np[imnp].tolist(),
-            )
-            li = input_batch.logits_indices
-            ndpr = input_batch.num_draft_tokens_per_req
-            logger.warning(
-                "dspark-sync-debug logits_indices min=%d max=%d num_tokens=%d "
-                "num_scheduled=%s num_draft_per_req=%s",
-                int(li.min()),
-                int(li.max()),
-                input_batch.num_tokens,
-                input_batch.num_scheduled_tokens.tolist(),
-                ndpr.tolist() if ndpr is not None else None,
-            )
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
