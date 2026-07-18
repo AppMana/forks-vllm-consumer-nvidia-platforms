@@ -927,10 +927,15 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        not self.parallel_drafting
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
-                        # Ensure divisibility for MTP module reuse.
+                        # Ensure divisibility for MTP module reuse. Parallel
+                        # block drafters (dflash/dspark) emit the whole block
+                        # in one pass: their n_predict counts draft DEPTH
+                        # (stacked decoder stages), not sequential module
+                        # reuse, so the block length owes it no divisibility.
                         raise ValueError(
                             f"num_speculative_tokens:{self.num_speculative_tokens}"
                             f" must be divisible by {n_predict=}"
