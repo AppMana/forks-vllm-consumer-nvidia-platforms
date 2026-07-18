@@ -162,6 +162,14 @@ class EngineCore:
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
         )
+        # Whether the most recently COMPLETED step could have produced new
+        # draft tokens (i.e. it sampled). take_draft_token_ids is a
+        # synchronous executor RPC: issuing it after steps that cannot have
+        # sampled (non-final prefill chunks) forces the engine core to drain
+        # the workers' queued steps once per iteration, which serializes
+        # chunked prefill under PP to one chunk in flight (observed:
+        # 1.24s/chunk vs 0.36s without spec at PP=10).
+        self._draft_fetch_pending = False
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -515,14 +523,41 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._draft_fetch_pending = self._step_may_sample(scheduler_output)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _step_may_sample(self, scheduler_output: SchedulerOutput) -> bool:
+        """Whether a just-scheduled step can produce sampled tokens (and hence
+        new draft proposals worth fetching). schedule() has already advanced
+        num_computed_tokens for this step, so a request samples iff its prompt
+        is fully covered. Non-final prefill chunks never sample; their draft
+        buffers are overwritten by the final chunk's propose anyway."""
+        requests = self.scheduler.requests
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = requests.get(req_id)
+            if (
+                request is not None
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                return True
+        return False
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
+        # Only fetch after a COMPLETED step that could have sampled: the
+        # take_draft_token_ids RPC is synchronous and forces the core to
+        # drain the workers' queued steps, so issuing it per-submission (or
+        # after sample-less prefill chunks) serializes PP chunked prefill.
+        if (
+            self.check_for_draft_tokens
+            and not self.async_scheduling
+            and model_executed
+            and self._draft_fetch_pending
+        ):
+            self._draft_fetch_pending = False
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
@@ -556,6 +591,10 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            # Stamp at schedule time (num_computed_tokens just advanced for
+            # this step): consumed when this step is POPPED, to decide whether
+            # the draft-token fetch RPC is worth its pipeline drain.
+            scheduler_output.step_may_sample = self._step_may_sample(scheduler_output)  # type: ignore[attr-defined]
             if _CORE_STEP_TRACE:
                 logger.info(
                     "core-step-trace sched toks=%d qdepth=%d t=%.3f",
@@ -632,6 +671,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._draft_fetch_pending = getattr(scheduler_output, "step_may_sample", True)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
