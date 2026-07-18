@@ -391,8 +391,17 @@ def _combine_sampled_and_draft_tokens_kernel(
             other=0,
         )
         tl.store(input_ids_ptr + j, known_tok, mask=is_known)
-        draft_base = tl.where(has_anchor, total_len + 1, total_len)
-        didx = pos - draft_base
+        # Draft tokens occupy the LAST num_draft_tokens scheduled positions of
+        # the window -- a structural fact of the schedule, independent of the
+        # request's commit state. Deriving the base from total_len instead
+        # (total_len + 1 when an anchor logit is present) double-counted the
+        # anchor once the defer-first-verify scheduler gate guaranteed the
+        # anchor is ALREADY committed at verify time (total_len includes it):
+        # the first draft slot's index came out -1, was never written, and a
+        # stale token id sat in that input row every step -- a guaranteed
+        # position-0 rejection (observed as EXACTLY 0% acceptance with the
+        # real drafts shifted one row deeper).
+        didx = pos - (seq_len - num_draft_tokens)
         is_draft = in_window & (~is_anchor) & (~is_known) & (didx >= 0) & (
             didx < num_draft_tokens
         )
