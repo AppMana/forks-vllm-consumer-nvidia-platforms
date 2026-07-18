@@ -504,6 +504,25 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                self.pp_deferred_spec
+                and request.spec_token_ids
+                and not request.is_prefill_chunk
+                and request.num_tokens <= request.num_prompt_tokens
+            ):
+                # First spec verify after a prefill: the prefill's sampled anchor
+                # has NOT been committed to this request yet (async apply is
+                # deferred by the PP pipeline), so num_tokens still == prompt len
+                # and the scheduler would attach only draft positions with no
+                # committed anchor. On non-last PP ranks those draft/anchor tokens
+                # are still zero (the prefill broadcast is not yet consumed),
+                # collapsing the first-step input embedding -> garbage generation.
+                # Defer until the anchor commits (num_tokens advances past the
+                # prompt). The prefill output applies independently of this
+                # request being scheduled, so this cannot deadlock.
+                req_index += 1
+                continue
+
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
