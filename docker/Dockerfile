@@ -1256,10 +1256,15 @@ for name in (
 for dist in ("vllm",):
     importlib.metadata.version(dist)
 flash_mla = importlib.import_module("flash_mla")
-if not hasattr(flash_mla, "flash_sparse_mla_prefill"):
-    raise AttributeError("flash_mla.flash_sparse_mla_prefill")
-if not hasattr(flash_mla, "triton_sparse_int8_mla_decode"):
-    raise AttributeError("flash_mla.triton_sparse_int8_mla_decode")
+for kernel in (
+    "sparse_mla_prefill",
+    "sparse_mla_prefill_int8",
+    "sparse_mla_decode_fp8",
+    "sparse_mla_decode_int8",
+    "sparse_mla_decode_int8_triton",
+):
+    if not hasattr(flash_mla, kernel):
+        raise AttributeError(f"flash_mla.{kernel}")
 
 site_paths = {
     pathlib.Path(sysconfig.get_paths()["purelib"]),
