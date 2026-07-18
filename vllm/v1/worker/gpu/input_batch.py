@@ -370,15 +370,32 @@ def _combine_sampled_and_draft_tokens_kernel(
         j = query_end - 1 - block
         pos = seq_len - 1 - block
         in_window = (j >= query_end - num_logits) & (pos >= prefill_len)
-        is_known = in_window & (pos < total_len)
+        # First verify after a prefill carries a bonus/anchor logit
+        # (num_bonus_tokens==1; steady-state verify batches are drafts-only,
+        # num_bonus_tokens==0). On a NON-last PP rank the anchor's just-sampled
+        # token has NOT yet been committed to all_token_ids/total_len at combine
+        # time -- the prefill broadcast that carries it is consumed a pipeline
+        # step later. Read the anchor from last_sampled_tokens (as the non-PP
+        # branch does), and shift draft indexing so drafts start one position
+        # AFTER the uncommitted anchor. On the last rank last_sampled_tokens
+        # already holds this same value, so the path is uniform and safe.
+        has_anchor = num_bonus_tokens > 0
+        anchor_pos = seq_len - num_logits
+        is_anchor = in_window & has_anchor & (pos == anchor_pos)
+        anchor_tok = tl.load(last_sampled_tokens_ptr + req_state_idx)
+        tl.store(input_ids_ptr + j, anchor_tok, mask=is_anchor)
+        is_known = in_window & (pos < total_len) & (~is_anchor)
         known_tok = tl.load(
             all_token_ids_ptr + req_state_idx * all_token_ids_stride + pos,
             mask=is_known,
             other=0,
         )
         tl.store(input_ids_ptr + j, known_tok, mask=is_known)
-        didx = pos - total_len
-        is_draft = in_window & (pos >= total_len) & (didx < num_draft_tokens)
+        draft_base = tl.where(has_anchor, total_len + 1, total_len)
+        didx = pos - draft_base
+        is_draft = in_window & (~is_anchor) & (~is_known) & (didx >= 0) & (
+            didx < num_draft_tokens
+        )
         dtok = tl.load(
             draft_tokens_ptr + req_state_idx * draft_tokens_stride + didx,
             mask=is_draft,
