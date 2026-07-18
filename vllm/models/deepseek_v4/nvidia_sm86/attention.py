@@ -6,7 +6,7 @@ Subclasses ``DeepseekV4FlashMLAAttention`` to reuse all projection / metadata /
 indexer / o_proj machinery, and overrides only the two backend-specific
 sparse-attention kernel calls:
 
-- decode: the precompiled ``flash_mla.flash_sparse_mla_decode`` CUDA kernel — one
+- decode: the precompiled ``flash_mla.sparse_mla_decode_fp8`` CUDA kernel — one
   launch for the whole decode batch, ~4.4x faster than the per-row Triton path it
   replaced, and a ``.so`` (no Triton JIT / recompile-wedge / warmup). It is a HARD
   dependency (imported at module top, no fallback): a missing kernel fails loudly
@@ -30,11 +30,11 @@ import torch
 # HARD dependencies: Ampere sm_86 sparse-MLA decode/prefill run through
 # explicit flash_mla symbols. No try/except, no env gate, no silent fallback.
 from flash_mla import (
-    flash_sparse_mla_decode,
-    flash_sparse_mla_prefill,
-    sparse_int8_mla_decode,
-    sparse_int8_mla_prefill,
-    triton_sparse_int8_mla_decode,
+    sparse_mla_decode_fp8,
+    sparse_mla_prefill,
+    sparse_mla_decode_int8,
+    sparse_mla_prefill_int8,
+    sparse_mla_decode_int8_triton,
 )
 
 from vllm.logger import init_logger
@@ -182,7 +182,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                     kv_cache, attn_metadata.block_size // self.compress_ratio
                 )
             if self.int8_decode_symbol == SPARSE_MLA_DECODE_INT8_FLASH:
-                out = sparse_int8_mla_decode(
+                out = sparse_mla_decode_int8(
                     q=q_rows,
                     swa_cache=swa_rows,
                     swa_scale=swa_scales,
@@ -196,7 +196,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                     extra_lens=None if topk_lens is None else topk_lens,
                 )
             elif self.int8_decode_symbol == SPARSE_MLA_DECODE_INT8_TRITON:
-                out = triton_sparse_int8_mla_decode(
+                out = sparse_mla_decode_int8_triton(
                     q=q_rows,
                     swa_cache=swa_rows,
                     swa_scale=swa_scales,
@@ -216,7 +216,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 )
         elif self.kv_cache_dtype == "fp8_ds_mla":
             if self.fp8_decode_symbol == SPARSE_MLA_DECODE_FP8_FLASH:
-                out = flash_sparse_mla_decode(
+                out = sparse_mla_decode_fp8(
                     q=q_rows,
                     swa_cache=swa_k_cache,
                     swa_indices=swa_indices,
@@ -383,7 +383,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
     ) -> None:
         """Native flash_mla fused sparse-MLA prefill (whole-cache dequant + tensor cores).
 
-        ``flash_mla.flash_sparse_mla_prefill`` mirrors the decode interface:
+        ``flash_mla.sparse_mla_prefill`` mirrors the decode interface:
         it consumes the paged fp8_ds_mla caches directly with per-query-token
         GLOBAL slot indices (compact-left, -1 padded). The adapter below
         builds those indices from the block tables — reusing the mixed
@@ -533,7 +533,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                     f"out={payload['output_shape']}/{payload['output_stride']}",
                     flush=True,
                 )
-            out = sparse_int8_mla_prefill(
+            out = sparse_mla_prefill_int8(
                 q=q,
                 swa_cache=swa_rows,
                 swa_scale=swa_scales,
@@ -547,7 +547,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 extra_lens=extra_lens,
             )
         else:
-            out = flash_sparse_mla_prefill(
+            out = sparse_mla_prefill(
                 q=q,
                 swa_cache=swa_k_cache,
                 swa_indices=swa_indices,

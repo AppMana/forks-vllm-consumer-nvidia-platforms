@@ -92,7 +92,7 @@ def test_registry_covers_all_roles_with_expected_symbols():
     assert (
         KERNEL_REGISTRY[SPARSE_MLA_DECODE_INT8_FLASH] == ROLE_SPARSE_MLA_DECODE_INT8
     )
-    assert SPARSE_MLA_DECODE_INT8_FLASH == "flash_mla.sparse_int8_mla_decode"
+    assert SPARSE_MLA_DECODE_INT8_FLASH == "flash_mla.sparse_mla_decode_int8"
     assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_TRITON] == ROLE_SPARSE_MLA_PREFILL
     assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_FLASH] == ROLE_SPARSE_MLA_PREFILL
     assert KERNEL_REGISTRY[INDEXER_CACHE_INT8_WRITER] == ROLE_INDEXER_CACHE_INT8
@@ -547,14 +547,14 @@ def test_sm86_attention_dispatches_all_registered_prefill_symbols():
     assert "sparse_attention_triton" in source
     assert "_forward_prefill_flash" in source
     native = inspect.getsource(DeepseekV4SM86Attention._forward_prefill_flash)
-    assert "flash_sparse_mla_prefill(" in native
+    assert "sparse_mla_prefill(" in native
     # int8_ds_mla caches dispatch to the fused int8 variant of the SAME native
     # prefill (528B strided views), still selected by SPARSE_MLA_PREFILL_FLASH.
-    assert "sparse_int8_mla_prefill(" in native
+    assert "sparse_mla_prefill_int8(" in native
     decode = inspect.getsource(DeepseekV4SM86Attention._forward_decode)
     assert "SPARSE_MLA_DECODE_INT8_FLASH" in decode
-    assert "sparse_int8_mla_decode(" in decode
-    assert "triton_sparse_int8_mla_decode(" in decode
+    assert "sparse_mla_decode_int8(" in decode
+    assert "sparse_mla_decode_int8_triton(" in decode
 
 
 # ---------------------------------------------------------------------------

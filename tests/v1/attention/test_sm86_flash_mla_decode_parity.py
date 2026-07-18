@@ -15,7 +15,7 @@ import pytest
 import torch
 
 flash_mla = pytest.importorskip("flash_mla")
-from flash_mla import flash_sparse_mla_decode, flash_sparse_mla_prefill  # noqa: E402
+from flash_mla import sparse_mla_decode_fp8, sparse_mla_prefill  # noqa: E402
 
 from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (  # noqa: E402
     decode_sparse_attention_triton,
@@ -83,7 +83,7 @@ def test_flash_mla_decode_matches_triton(topk: int, num_tokens: int) -> None:
     )
     sink = torch.randn(H, device=dev, dtype=torch.float32) * 0.1
 
-    flash_out = flash_sparse_mla_decode(
+    flash_out = sparse_mla_decode_fp8(
         q=q, swa_cache=cache, swa_indices=idx, swa_lens=lens, scale=scale, attn_sink=sink
     )
     tri_out = torch.empty_like(q)
@@ -144,7 +144,7 @@ def test_flash_mla_decode_matches_triton_with_extra_cache() -> None:
     )
     sink = torch.randn(H, device=dev, dtype=torch.float32) * 0.1
 
-    flash_out = flash_sparse_mla_decode(
+    flash_out = sparse_mla_decode_fp8(
         q=q,
         swa_cache=swa_cache,
         swa_indices=swa_idx,
@@ -198,7 +198,7 @@ def test_flash_mla_prefill_rejects_or_matches_real_swa_metadata_shape() -> None:
     lens = torch.full((T,), topk, dtype=torch.int32, device=dev)
     sink = torch.randn(H, device=dev, dtype=torch.float32) * 0.1
 
-    expected = flash_sparse_mla_prefill(
+    expected = sparse_mla_prefill(
         q=q,
         swa_cache=cache,
         swa_indices=idx_2d,
@@ -206,7 +206,7 @@ def test_flash_mla_prefill_rejects_or_matches_real_swa_metadata_shape() -> None:
         scale=scale,
         attn_sink=sink,
     )
-    actual = flash_sparse_mla_prefill(
+    actual = sparse_mla_prefill(
         q=q,
         swa_cache=cache,
         swa_indices=idx_real,
@@ -226,7 +226,7 @@ def test_sm86_prefill_dispatches_triton_and_native() -> None:
     assert "sparse_attention_triton" in source
     assert "_forward_prefill_flash" in source
     native = inspect.getsource(DeepseekV4SM86Attention._forward_prefill_flash)
-    assert "flash_sparse_mla_prefill(" in native
+    assert "sparse_mla_prefill(" in native
 
 
 def test_sm86_int8_dispatch_supports_native_and_triton_fqns() -> None:
@@ -238,15 +238,15 @@ def test_sm86_int8_dispatch_supports_native_and_triton_fqns() -> None:
         SPARSE_MLA_DECODE_INT8_TRITON,
     )
 
-    assert SPARSE_MLA_DECODE_INT8_FLASH == "flash_mla.sparse_int8_mla_decode"
-    assert SPARSE_MLA_DECODE_INT8_TRITON == "flash_mla.triton_sparse_int8_mla_decode"
+    assert SPARSE_MLA_DECODE_INT8_FLASH == "flash_mla.sparse_mla_decode_int8"
+    assert SPARSE_MLA_DECODE_INT8_TRITON == "flash_mla.sparse_mla_decode_int8_triton"
     source = inspect.getsource(DeepseekV4SM86Attention._forward_decode)
     assert "SPARSE_MLA_DECODE_INT8_FLASH" in source
     assert "SPARSE_MLA_DECODE_INT8_TRITON" in source
-    assert "sparse_int8_mla_decode(" in source
-    assert "triton_sparse_int8_mla_decode(" in source
+    assert "sparse_mla_decode_int8(" in source
+    assert "sparse_mla_decode_int8_triton(" in source
     native = inspect.getsource(DeepseekV4SM86Attention._forward_prefill_flash)
-    assert "sparse_int8_mla_prefill(" in native
+    assert "sparse_mla_prefill_int8(" in native
     assert "get_int8_ds_mla_cache_views(" in native
 
 
@@ -260,9 +260,9 @@ def test_flash_mla_int8_native_matches_triton_on_vllm_528B_views() -> None:
     ``get_int8_ds_mla_cache_views`` strided views. Native int8 decode and
     native fused int8 prefill vs the incumbent Triton int8 decode."""
     from flash_mla import (
-        sparse_int8_mla_decode,
-        sparse_int8_mla_prefill,
-        triton_sparse_int8_mla_decode,
+        sparse_mla_decode_int8,
+        sparse_mla_prefill_int8,
+        sparse_mla_decode_int8_triton,
     )
 
     from vllm.models.deepseek_v4.common.ops.cache_utils import (
@@ -345,13 +345,13 @@ def test_flash_mla_int8_native_matches_triton_on_vllm_528B_views() -> None:
         extra_indices=extra_idx,
         extra_lens=extra_lens,
     )
-    tri = triton_sparse_int8_mla_decode(
+    tri = sparse_mla_decode_int8_triton(
         q, swa_rows, swa_scales, swa_idx, swa_lens, **kwargs
     )
-    native_decode = sparse_int8_mla_decode(
+    native_decode = sparse_mla_decode_int8(
         q, swa_rows, swa_scales, swa_idx, swa_lens, **kwargs
     )
-    native_prefill = sparse_int8_mla_prefill(
+    native_prefill = sparse_mla_prefill_int8(
         q, swa_rows, swa_scales, swa_idx, swa_lens, **kwargs
     )
 
@@ -371,7 +371,7 @@ def test_flash_mla_int8_native_matches_triton_on_vllm_528B_views() -> None:
 
 def test_sm86_fp8_decode_dispatch_supports_native_and_triton_fqns() -> None:
     assert DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8 == (
-        "flash_mla.flash_sparse_mla_decode"
+        "flash_mla.sparse_mla_decode_fp8"
     )
     assert DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON == (
         "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels."
@@ -380,7 +380,7 @@ def test_sm86_fp8_decode_dispatch_supports_native_and_triton_fqns() -> None:
     source = inspect.getsource(DeepseekV4SM86Attention._forward_decode)
     assert "SPARSE_MLA_DECODE_FP8_FLASH" in source
     assert "SPARSE_MLA_DECODE_FP8_TRITON" in source
-    assert "flash_sparse_mla_decode(" in source
+    assert "sparse_mla_decode_fp8(" in source
     assert "decode_sparse_attention_triton(" in source
 
 
@@ -439,7 +439,7 @@ def test_flash_mla_prefill_matches_triton_reference_with_extra_cache() -> None:
         ].to(torch.int32)
     sink = torch.randn(H, device=dev, dtype=torch.float32) * 0.1
 
-    flash_out = flash_sparse_mla_prefill(
+    flash_out = sparse_mla_prefill(
         q=q,
         swa_cache=swa_cache,
         swa_indices=swa_idx,

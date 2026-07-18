@@ -6,7 +6,7 @@ A single ``"appmana"`` block at the top level of the checkpoint's
 ``config.json`` selects every fork-specific kernel path::
 
     "appmana": {
-      "kernels": ["flash_mla.flash_sparse_mla_decode",
+      "kernels": ["flash_mla.sparse_mla_decode_fp8",
                   "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels"
                   ".sparse_attention_triton",
                   "vllm._custom_ops.indexer_k_quant_and_cache_int8",
@@ -89,17 +89,17 @@ ROLE_DENSE_EXPERTS_INT8_ACTIVATION = "dense_experts_int8_activation"
 # Symbols (importable FQNs; each is the most salient callable activated)
 # ---------------------------------------------------------------------------
 
-SPARSE_MLA_DECODE_FP8_FLASH = "flash_mla.flash_sparse_mla_decode"
+SPARSE_MLA_DECODE_FP8_FLASH = "flash_mla.sparse_mla_decode_fp8"
 SPARSE_MLA_DECODE_FP8_TRITON = (
     "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels."
     "decode_sparse_attention_triton"
 )
-SPARSE_MLA_DECODE_INT8_TRITON = "flash_mla.triton_sparse_int8_mla_decode"
-SPARSE_MLA_DECODE_INT8_FLASH = "flash_mla.sparse_int8_mla_decode"
+SPARSE_MLA_DECODE_INT8_TRITON = "flash_mla.sparse_mla_decode_int8_triton"
+SPARSE_MLA_DECODE_INT8_FLASH = "flash_mla.sparse_mla_decode_int8"
 SPARSE_MLA_PREFILL_TRITON = (
     "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels.sparse_attention_triton"
 )
-SPARSE_MLA_PREFILL_FLASH = "flash_mla.flash_sparse_mla_prefill"
+SPARSE_MLA_PREFILL_FLASH = "flash_mla.sparse_mla_prefill"
 INDEXER_CACHE_INT8_WRITER = "vllm._custom_ops.indexer_k_quant_and_cache_int8"
 INDEXER_QUERY_INT8_QUANT = (
     "vllm.models.deepseek_v4.common.ops.fused_indexer_q."
