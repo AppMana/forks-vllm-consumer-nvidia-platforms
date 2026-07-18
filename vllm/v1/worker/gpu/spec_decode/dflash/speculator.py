@@ -32,6 +32,58 @@ logger = init_logger(__name__)
 
 _SYNC_DEBUG = bool(int(os.environ.get("APPMANA_DSPARK_SYNC_DEBUG", "0")))
 
+# Env-gated per-phase timing of propose() (APPMANA_DSPARK_PROF=1). CUDA events
+# bracket each phase; sums are drained and logged every _PROF_LOG_EVERY propose
+# calls (one synchronize per drain). Phases also emit NVTX ranges so an nsys
+# capture shows the same segmentation alongside the MTP dense layers.
+_PROF = bool(int(os.environ.get("APPMANA_DSPARK_PROF", "0")))
+_PROF_LOG_EVERY = int(os.environ.get("APPMANA_DSPARK_PROF_LOG_EVERY", "50"))
+
+
+class _ProposePhaseProfiler:
+    def __init__(self) -> None:
+        self.pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+        self.calls = 0
+        self.tokens = 0
+
+    class _Phase:
+        def __init__(self, prof: "_ProposePhaseProfiler", name: str) -> None:
+            self.prof = prof
+            self.name = name
+
+        def __enter__(self) -> None:
+            torch.cuda.nvtx.range_push(f"dspark_propose/{self.name}")
+            self.start = torch.cuda.Event(enable_timing=True)
+            self.start.record()
+
+        def __exit__(self, *exc: Any) -> None:
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            torch.cuda.nvtx.range_pop()
+            self.prof.pairs.setdefault(self.name, []).append((self.start, end))
+
+    def phase(self, name: str) -> "_ProposePhaseProfiler._Phase":
+        return self._Phase(self, name)
+
+    def step(self, num_target_tokens: int) -> None:
+        self.calls += 1
+        self.tokens += num_target_tokens
+        if self.calls % _PROF_LOG_EVERY != 0:
+            return
+        torch.cuda.synchronize()
+        parts = []
+        for name, pairs in self.pairs.items():
+            total_ms = sum(s.elapsed_time(e) for s, e in pairs)
+            parts.append(f"{name}={total_ms / len(pairs):.3f}ms(x{len(pairs)})")
+        logger.info(
+            "dspark-prof propose avg over %d calls (%d target tokens): %s",
+            _PROF_LOG_EVERY,
+            self.tokens,
+            " ".join(parts),
+        )
+        self.pairs.clear()
+        self.tokens = 0
+
 
 def sync_debug(tag: str) -> None:
     """Env-gated hard sync between draft stages (APPMANA_DSPARK_SYNC_DEBUG=1).
@@ -98,6 +150,15 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+
+        self._prof = _ProposePhaseProfiler() if _PROF else None
+
+    def _prof_phase(self, name: str) -> Any:
+        if self._prof is None:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return self._prof.phase(name)
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # PIECEWISE cudagraphs are not supported for dflash
@@ -313,24 +374,28 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            if _SYNC_DEBUG:
-                norms = [float(t[:num_target_tokens].float().norm()) for t in aux_hidden_states]
-                logger.warning("dspark-sync-debug aux norms=%s", norms)
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+        with self._prof_phase("combine_hidden"):
+            if aux_hidden_states:
+                if _SYNC_DEBUG:
+                    norms = [float(t[:num_target_tokens].float().norm()) for t in aux_hidden_states]
+                    logger.warning("dspark-sync-debug aux norms=%s", norms)
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
+            else:
+                hidden_states = last_hidden_states
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
             )
-        else:
-            hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
         sync_debug("combine_hidden_states")
 
-        self._copy_request_inputs(
-            num_reqs,
-            input_batch.idx_mapping,
-            temperature,
-            seeds,
-        )
+        with self._prof_phase("copy_req_inputs"):
+            self._copy_request_inputs(
+                num_reqs,
+                input_batch.idx_mapping,
+                temperature,
+                seeds,
+            )
         sync_debug("copy_request_inputs")
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -358,6 +423,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
         # Support multiple draft KV cache groups by preparing inputs once for each
+        prof_prepare = self._prof_phase("prepare_inputs")
+        prof_prepare.__enter__()
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
             prepare_dflash_inputs(
                 self.input_buffers,
@@ -382,6 +449,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+        prof_prepare.__exit__(None, None, None)
         sync_debug("prepare_dflash_inputs")
         if _SYNC_DEBUG:
             ids = self.input_buffers.input_ids[:num_query_tokens]
@@ -410,56 +478,61 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
+        with self._prof_phase("context_kv"):
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
         sync_debug("precompute_and_store_context_kv")
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.query_cudagraph_manager,
-            num_reqs,
-            num_query_tokens,
-            uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=is_profile,
-        )
-
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
-        num_tokens_padded = batch_desc.num_tokens
-
-        # Rebuild the draft attention metadata even when replaying the FULL
-        # graph so that any attention metadata builder state is updated.
-        draft_attn_metadata = self._build_draft_attn_metadata(
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_padded=num_tokens_padded,
-            causal=self._group_causal,
-        )
-        draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
-            self.block_tables.slot_mappings[:, :num_tokens_padded],
-            self.kv_cache_config,
-        )
-
-        # DFlash processes all speculative tokens in one forward pass,
-        # so the real token count is num_query_tokens.
-        self._prepare_eplb_forward(num_query_tokens)
-
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            assert self.query_cudagraph_manager is not None
-            self.query_cudagraph_manager.run_fullgraph(batch_desc)
-        else:
-            self._generate_draft(
+        with self._prof_phase("attn_meta"):
+            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                self.query_cudagraph_manager,
                 num_reqs,
-                num_tokens_padded,
-                draft_attn_metadata,
-                draft_slot_mappings_by_layer,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
+                num_query_tokens,
+                uniform_token_count=self.num_query_per_req,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+                need_eager=is_profile,
             )
+
+            num_reqs_padded = batch_desc.num_reqs or num_reqs
+            num_tokens_padded = batch_desc.num_tokens
+
+            # Rebuild the draft attention metadata even when replaying the FULL
+            # graph so that any attention metadata builder state is updated.
+            draft_attn_metadata = self._build_draft_attn_metadata(
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_padded=num_tokens_padded,
+                causal=self._group_causal,
+            )
+            draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+                self.block_tables.slot_mappings[:, :num_tokens_padded],
+                self.kv_cache_config,
+            )
+
+            # DFlash processes all speculative tokens in one forward pass,
+            # so the real token count is num_query_tokens.
+            self._prepare_eplb_forward(num_query_tokens)
+
+        with self._prof_phase("draft_forward"):
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                assert self.query_cudagraph_manager is not None
+                self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            else:
+                self._generate_draft(
+                    num_reqs,
+                    num_tokens_padded,
+                    draft_attn_metadata,
+                    draft_slot_mappings_by_layer,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                )
+        if self._prof is not None:
+            self._prof.step(num_target_tokens)
         sync_debug("generate_draft")
         if _SYNC_DEBUG:
             dt = self.draft_tokens[:num_reqs]

@@ -173,6 +173,146 @@ def run_mixed_prefill_decode_warmup(
     return True
 
 
+def run_spec_verify_warmup(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+    *,
+    req_id_prefix: str = "_v2_spec_warmup",
+) -> bool:
+    """Run one prefill + both speculative verify shapes through the worker.
+
+    With a speculator enabled, the first live request pays a burst of Triton
+    JIT compiles that this warmup exists to absorb: the combine kernel's
+    HAS_PER_REQ_DRAFTS specialization, the spec variants of the prepare/
+    post-update kernels, the multi-token verify attention metadata kernels,
+    and (on the last PP rank) the draft-propose + rejection-sampling stack.
+
+    Two decode steps cover the two verify layouts the scheduler emits under
+    PP-deferred verification: the FIRST verify after a prefill schedules the
+    anchor position plus the drafts (1 + T query tokens), while steady-state
+    verify batches hold ONLY the draft positions (T query tokens). Both are
+    distinct kernel specializations. State bookkeeping for the synthetic
+    request only needs to be internally consistent enough to reach the
+    kernels; the request is finished and its blocks dropped afterwards.
+    """
+    num_spec = model_runner.num_speculative_steps
+    if num_spec <= 0 or model_runner.is_pooling_model:
+        return False
+
+    req_id = f"{req_id_prefix}_req_"
+    prompt_len = 2
+    prompt_token_ids = list(range(prompt_len))
+    # Prefill + anchor + two rounds of drafts, with slack.
+    max_len = prompt_len + 2 * (num_spec + 1)
+
+    kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
+    num_kv_cache_groups = len(kv_cache_groups)
+    group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
+    prefill_block_counts = [
+        cdiv(prompt_len, block_size) for block_size in group_block_sizes
+    ]
+    full_block_counts = [cdiv(max_len, block_size) for block_size in group_block_sizes]
+    block_deltas = [
+        full - prefill for full, prefill in zip(full_block_counts, prefill_block_counts)
+    ]
+    if model_runner.kv_cache_config.num_blocks <= sum(full_block_counts):
+        logger.warning(
+            "Skipping V2 spec verify warmup: only %d KV blocks available for "
+            "%d required warmup blocks.",
+            model_runner.kv_cache_config.num_blocks,
+            sum(full_block_counts),
+        )
+        return False
+
+    next_block_id = 1
+
+    def _alloc_blocks(num_blocks: int) -> list[int]:
+        nonlocal next_block_id
+        block_ids = list(range(next_block_id, next_block_id + num_blocks))
+        next_block_id += num_blocks
+        return block_ids
+
+    sampling_params = SamplingParams(max_tokens=max_len, temperature=0.0)
+
+    prefill_output = SchedulerOutput.make_empty()
+    prefill_output.scheduled_new_reqs = [
+        NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=prompt_token_ids,
+            mm_features=[],
+            sampling_params=sampling_params,
+            pooling_params=None,
+            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            num_computed_tokens=0,
+            lora_request=None,
+            prefill_token_ids=prompt_token_ids,
+        ),
+    ]
+    prefill_output.num_scheduled_tokens = {req_id: prompt_len}
+    prefill_output.total_num_scheduled_tokens = prompt_len
+    prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+
+    new_blocks = tuple(_alloc_blocks(n) for n in block_deltas)
+    has_new_blocks = any(block_deltas)
+
+    def _cached_step(
+        num_computed: int, num_output: int, blocks_first: bool
+    ) -> CachedRequestData:
+        cached = CachedRequestData.make_empty()
+        cached.req_ids = [req_id]
+        cached.num_computed_tokens = [num_computed]
+        cached.num_output_tokens = [num_output]
+        cached.new_block_ids = [new_blocks if (has_new_blocks and blocks_first) else None]
+        return cached
+
+    # First verify after prefill: anchor position + T drafts (1 + T tokens).
+    first_verify = SchedulerOutput.make_empty()
+    first_verify.scheduled_cached_reqs = _cached_step(prompt_len, 1, True)
+    first_verify.num_scheduled_tokens = {req_id: 1 + num_spec}
+    first_verify.total_num_scheduled_tokens = 1 + num_spec
+    first_verify.scheduled_spec_decode_tokens = {req_id: [0] * num_spec}
+    first_verify.num_common_prefix_blocks = [0] * num_kv_cache_groups
+
+    # Steady-state PP-deferred verify: drafts only (T tokens).
+    steady_verify = SchedulerOutput.make_empty()
+    steady_verify.scheduled_cached_reqs = _cached_step(prompt_len + 1, 2, False)
+    steady_verify.num_scheduled_tokens = {req_id: num_spec}
+    steady_verify.total_num_scheduled_tokens = num_spec
+    steady_verify.scheduled_spec_decode_tokens = {req_id: [0] * num_spec}
+    steady_verify.num_common_prefix_blocks = [0] * num_kv_cache_groups
+
+    cleanup_output = SchedulerOutput.make_empty()
+    cleanup_output.finished_req_ids = {req_id}
+
+    pp_size = getattr(
+        getattr(model_runner, "parallel_config", None), "pipeline_parallel_size", 1
+    )
+
+    model_runner.kv_connector.set_disabled(True)
+    try:
+        worker_execute_model(prefill_output)
+        worker_sample_tokens(None)
+        worker_execute_model(first_verify)
+        worker_sample_tokens(None)
+        worker_execute_model(steady_verify)
+        worker_sample_tokens(None)
+        # Async PP defers sampled-token postprocessing by one pipeline depth.
+        # Drain those slots so the deferred post_update path is JIT-warmed
+        # while the synthetic request's state is still valid.
+        for _ in range(max(0, pp_size)):
+            worker_execute_model(SchedulerOutput.make_empty())
+        worker_execute_model(cleanup_output)
+    finally:
+        model_runner.kv_connector.set_disabled(False)
+    logger.info(
+        "V2 spec verify warmup completed (first-verify %d tokens, steady %d tokens).",
+        1 + num_spec,
+        num_spec,
+    )
+    return True
+
+
 def warmup_long_prefill_kernels(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -433,6 +573,12 @@ def warmup_kernels(
             pp_size,
         )
         warmup_long_prefill_kernels(
+            model_runner, worker_execute_model, worker_sample_tokens
+        )
+        # With a speculator, the verify shapes (anchor+drafts and drafts-only)
+        # and the draft-propose stack otherwise JIT-compile on the first live
+        # request (observed: 19 distinct kernels, ~20s of first-request TTFT).
+        run_spec_verify_warmup(
             model_runner, worker_execute_model, worker_sample_tokens
         )
         torch.accelerator.synchronize()
