@@ -88,6 +88,8 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+_CORE_STEP_TRACE = os.environ.get("APPMANA_DSPARK_STEP_TRACE") == "1"
+
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
@@ -554,6 +556,13 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            if _CORE_STEP_TRACE:
+                logger.info(
+                    "core-step-trace sched toks=%d qdepth=%d t=%.3f",
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(batch_queue),
+                    time.monotonic(),
+                )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -597,11 +606,20 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        _blk_t0 = time.monotonic() if _CORE_STEP_TRACE else 0.0
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
+        if _CORE_STEP_TRACE:
+            logger.info(
+                "core-step-trace popped toks=%d blocked=%.3fs qdepth=%d t=%.3f",
+                scheduler_output.total_num_scheduled_tokens,
+                time.monotonic() - _blk_t0,
+                len(batch_queue),
+                time.monotonic(),
+            )
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
