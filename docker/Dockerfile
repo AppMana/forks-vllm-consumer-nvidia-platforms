@@ -41,7 +41,7 @@ ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 # Using cuda base image with minimal dependencies necessary for JIT compilation (FlashInfer, DeepGEMM, EP kernels)
 ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
-ARG APPMANA_NCCL_GIT_REF=b8fabdc5145fab760c1a9acce2892ac6077b1679
+ARG APPMANA_NCCL_GIT_REF=22355b63ea9ffd869e208e4f6d381e6f31b471d9
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
 ARG USB4_RDMA_PROVIDER_VERSION=0.2.20
@@ -1265,6 +1265,19 @@ for kernel in (
 ):
     if not hasattr(flash_mla, kernel):
         raise AttributeError(f"flash_mla.{kernel}")
+
+# The tb-chain webhook injects NCCL_IB_SUBNET_AWARE_ROUTING=prefer_hca[...];
+# a libnccl built from a fork ref that predates the self-inferring
+# rail/fallback selection silently degrades that contract (non-adjacent ring
+# hops keep a usb4 rail and the collective hangs -- world-12 bring-up,
+# 2026-07-19). The implementation's log format strings live in .rodata, so
+# their absence proves the stale build.
+nccl = pathlib.Path("/usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7")
+if b"rail routing:" not in nccl.read_bytes():
+    raise AssertionError(
+        "libnccl lacks the prefer_hca rail/fallback selection "
+        "(APPMANA_NCCL_GIT_REF predates forks-nccl-rdma-routing 22355b6)"
+    )
 
 site_paths = {
     pathlib.Path(sysconfig.get_paths()["purelib"]),
