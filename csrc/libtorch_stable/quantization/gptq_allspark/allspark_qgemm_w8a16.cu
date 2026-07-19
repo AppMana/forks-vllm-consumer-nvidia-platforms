@@ -10,7 +10,6 @@
 #include "core/registration.h"
 #include "libtorch_stable/torch_utils.h"
 
-torch::stable::Tensor as_g_workspace;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
@@ -988,13 +987,24 @@ torch::stable::Tensor allspark_w8a16_gemm(
         m, n, k, sm_count, fused_gemm_params);
   }
 
-  if (as_g_workspace.numel() <
-      ws_size) {  // ws_options: kChar, so numel() is bytes
-    as_g_workspace = torch::stable::empty({static_cast<int64_t>(ws_size)},
-                                          torch::headeronly::ScalarType::Char,
-                                          std::nullopt, a.device());
+  // Allocate the split-k workspace per call instead of caching it in a
+  // global. A global grow-on-demand tensor is CUDA-graph-unsafe: a capture
+  // bakes the workspace address into the graph, and any later eager call
+  // that needs a larger workspace reallocates the global and frees the old
+  // tensor, leaving every captured graph writing through a dangling
+  // pointer (silent corruption or Xid 31 depending on what the caching
+  // allocator does with the freed block). A per-call allocation is served
+  // by the caching allocator in eager mode and by the graph's private
+  // memory pool during capture, which keeps the baked address alive for
+  // the lifetime of the graph.
+  torch::stable::Tensor ws_tensor;
+  void* ws = nullptr;
+  if (ws_size > 0) {
+    ws_tensor = torch::stable::empty({static_cast<int64_t>(ws_size)},
+                                     torch::headeronly::ScalarType::Char,
+                                     std::nullopt, a.device());
+    ws = reinterpret_cast<void*>(ws_tensor.data_ptr());
   }
-  void* ws = reinterpret_cast<void*>(as_g_workspace.data_ptr());
 
   if (a.scalar_type() == torch::headeronly::ScalarType::Half) {
     allspark::allspark_qgemm_w8a16_perc_ampere<__half, uint8_t>(
