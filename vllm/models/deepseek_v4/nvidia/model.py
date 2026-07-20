@@ -1154,6 +1154,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.start_layer in self.aux_hidden_state_layers:
                 aux_recon = self.mhc_post(hidden_states, residual, post_mix, res_mix)
                 aux_by_boundary[self.start_layer] = aux_recon.mean(dim=1)
+                if self.start_layer == self.end_layer:
+                    # Zero-layer rank (VLLM_PP_LAYER_PARTITION entry 0): the
+                    # cut reconstruction is also the final collapse of the
+                    # received stream; reuse it below instead of re-running
+                    # mhc_post on the same inputs.
+                    final_aux_recon = aux_recon
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1189,14 +1195,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return IntermediateTensors(out_tensors)
         aux_hidden_states = [aux_by_boundary[j] for j in sorted(aux_by_boundary)]
 
-        if layer is not None:
-            # Reuse if the last layer was captured as an aux hidden state
-            if self.end_layer in self.aux_hidden_state_layers:
-                hidden_states = final_aux_recon
-            else:
-                hidden_states = self.mhc_post(
-                    hidden_states, residual, post_mix, res_mix
-                )
+        # Final MHC collapse (deferred by the fused layer path). Reuse the
+        # boundary-end_layer reconstruction when it was already collapsed:
+        # by the in-loop aux capture, or -- on a rank that owns zero decoder
+        # layers, where the layer loop never ran -- by the start_layer cut
+        # reconstruction above (start_layer == end_layer there).
+        if self.end_layer in self.aux_hidden_state_layers:
+            assert final_aux_recon is not None
+            hidden_states = final_aux_recon
+        else:
+            hidden_states = self.mhc_post(hidden_states, residual, post_mix, res_mix)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
