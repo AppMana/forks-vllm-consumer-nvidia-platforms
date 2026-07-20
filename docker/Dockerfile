@@ -44,9 +44,12 @@ ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 ARG APPMANA_NCCL_GIT_REF=22355b63ea9ffd869e208e4f6d381e6f31b471d9
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
-ARG USB4_RDMA_PROVIDER_VERSION=0.2.37
+# 0.2.20 is the proven pairing with kernel 0.2.37: provider 0.2.37 hangs the
+# NCCL communicator-init all-reduce on the TB chain (raw RC verbs are fine,
+# ibv_rc_pingpong passes) -- root-cause before bumping again.
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.20
 # release tag carrying the provider deb (tag scheme decoupled from provider version)
-ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v2.13.1
+ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v0.2.20
 
 # OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
 # Python bootstrap. Set to "manylinux" alongside a manylinux build base such
