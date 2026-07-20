@@ -1,39 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Stage a PP-rank-local subset of a safetensors checkpoint onto local disk.
+"""Stage a PP-rank-local subset of a safetensors checkpoint as a partial
+local HF cache.
 
 Each PP rank only needs its own contiguous slice of hidden layers (see
 vllm.model_executor.model_loader.pp_weight_filter). Reading the rest of the
 checkpoint every load is wasted I/O against a shared, network-backed mount
 (e.g. a SeaweedFS PVC), so the owned shards are brought onto local disk and
-the rest are symlinked back to --source-dir -- safetensors only reads a
+the rest resolve back to the shared cache -- safetensors only reads a
 shard's header until get_tensor() is called for a specific name, and
 should_skip_pp_weight already causes the loader to skip get_tensor() for
 every tensor in a foreign shard, so its bulk data is never read over the
 network.
 
-Layout (two-level, content-addressed):
+The local cache is a standard HF hub cache, not a bespoke layout:
 
-- ``<dest-root>/store/<checkpoint_id>/<shard>``: every real-copied shard
-  exists exactly once per checkpoint here, shared by all configs. A new
-  partition/pp_size only copies shards the store does not already hold --
-  for most config changes, nothing.
-- ``<dest-root>/<config_key>/``: cheap per-config directory: real copies of
-  the small metadata files (config.json, tokenizer, the original unmodified
-  index.json), plus one symlink per shard -- owned shards resolve into the
-  store, foreign shards resolve into --source-dir.
+    <dest-root>/hub/models--<org>--<name>/
+        blobs/<etag>                  # content-addressed; owned shards only
+        snapshots/<rev>/<filename>    # symlinks: owned -> local blob,
+                                      #           foreign -> source blob
+        refs/main                     # <rev>
 
-The config_key hashes the checkpoint identity plus pp_size plus the layer
-partition string -- deliberately NOT pp_rank (vLLM's Ray executor resolves
-one --model path string independently on every worker's own node, so every
-rank must produce the identical path; the partition string is identical on
-all ranks, a rank's layer range is not). Confirmed live 2026-07-16: a
-rank-dependent path makes every remote worker fall through to 'Repo id must
-be in the form repo_name or namespace/repo_name'.
+Blob names are the source cache's own content hashes, so "copy only what is
+missing" across partition/pp_size changes is inherited from the HF layout
+rather than reinvented: an ownership change repoints snapshot symlinks in
+place and copies just the blobs the local blobs/ directory lacks. The staged
+model path is the snapshot directory -- identical on every rank (vLLM's Ray
+executor resolves one --model path string independently on each worker's
+node; confirmed live 2026-07-16 that a rank-dependent path breaks remote
+workers), with per-node divergence living entirely in which blobs are local.
 
-``--gc`` prunes every other config directory and any store shard no longer
-referenced by the surviving config -- run it after staging to keep the
-node-local PVC from accumulating dead configs.
+``--gc`` prunes snapshots of other revisions, local blobs the current
+snapshot does not reference, and directories left by the older staging
+layouts (16-hex config dirs, store/) -- their real files are harvested into
+blobs/ by hardlink during staging first, so reclaiming them never re-reads
+the network.
 
 Usage:
     python prep_pp_shards.py --source-dir /hf-cache/.../snapshots/<rev> \
@@ -44,182 +45,205 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 COMPLETE_MARKER = ".prep-complete"
-STORE_DIR_NAME = "store"
+_LEGACY_CONFIG_DIR_RE = re.compile(r"^[0-9a-f]{16}$")
+_LEGACY_STORE_DIR = "store"
 
 
-def compute_checkpoint_id(source_dir: str, index_bytes: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(os.path.abspath(source_dir).encode("utf-8"))
-    h.update(index_bytes)
-    return h.hexdigest()[:16]
+def _parse_source_snapshot(source_dir: str) -> tuple[str, str]:
+    """Return (repo_dir_name, revision) from an HF-cache snapshot path
+    ``.../hub/models--org--name/snapshots/<rev>``."""
+    source_dir = os.path.abspath(source_dir)
+    rev = os.path.basename(source_dir)
+    snapshots = os.path.dirname(source_dir)
+    repo = os.path.dirname(snapshots)
+    repo_name = os.path.basename(repo)
+    if os.path.basename(snapshots) != "snapshots" or not repo_name.startswith(
+        "models--"
+    ):
+        raise ValueError(
+            f"--source-dir must be an HF cache snapshot directory "
+            f"(.../hub/models--*/snapshots/<rev>), got {source_dir}"
+        )
+    return repo_name, rev
 
 
-def compute_config_key(
-    source_dir: str, index_bytes: bytes, pp_size: int, partition: str | None
-) -> str:
-    h = hashlib.sha256()
-    h.update(os.path.abspath(source_dir).encode("utf-8"))
-    h.update(index_bytes)
-    h.update(f"pp_size{pp_size}".encode("utf-8"))
-    h.update(f"partition{partition or 'default'}".encode("utf-8"))
-    return h.hexdigest()[:16]
+def _local_repo_dir(dest_root: str, repo_name: str) -> str:
+    return os.path.join(dest_root, "hub", repo_name)
 
 
-def _store_dir(dest_root: str, checkpoint_id: str) -> str:
-    return os.path.join(dest_root, STORE_DIR_NAME, checkpoint_id)
+def _source_blob(source_dir: str, filename: str) -> str:
+    """Resolve a snapshot entry to its blob (or to itself if not a link)."""
+    return os.path.realpath(os.path.join(source_dir, filename))
 
 
 def _is_complete(
-    dest_dir: str,
+    snap_dir: str,
     source_dir: str,
-    store_dir: str,
+    blobs_dir: str,
     needs_copy: dict[str, bool],
 ) -> bool:
-    if not os.path.exists(os.path.join(dest_dir, COMPLETE_MARKER)):
+    if not os.path.exists(os.path.join(snap_dir, COMPLETE_MARKER)):
         return False
+    blobs_real = os.path.realpath(blobs_dir)
     for shard_filename, owned in needs_copy.items():
-        path = os.path.join(dest_dir, shard_filename)
+        path = os.path.join(snap_dir, shard_filename)
         if not os.path.islink(path) or not os.path.exists(path):
             return False
         target = os.path.realpath(path)
+        src_blob = _source_blob(source_dir, shard_filename)
         if owned:
-            expected = os.path.realpath(os.path.join(store_dir, shard_filename))
-            src_path = os.path.join(source_dir, shard_filename)
-            if target != expected:
+            if os.path.dirname(target) != blobs_real:
                 return False
-            if os.path.getsize(target) != os.path.getsize(src_path):
+            if os.path.getsize(target) != os.path.getsize(src_blob):
                 return False
         else:
-            if target != os.path.realpath(os.path.join(source_dir, shard_filename)):
+            if target != src_blob:
                 return False
     return True
 
 
-def _adopt_or_copy_into_store(
-    dest_root: str,
-    store_dir: str,
-    source_dir: str,
-    shard_filename: str,
+def _ensure_local_blob(
+    dest_root: str, blobs_dir: str, source_dir: str, shard_filename: str
 ) -> str:
-    """Ensure the shard exists in the store; return its store path.
+    """Ensure the shard's blob exists locally; return its path.
 
-    Prefer hardlinking an existing real copy from any sibling directory on
-    the same filesystem (legacy pre-store config dirs, or another
-    checkpoint's leftovers with the same name and size) over re-copying
-    bulk data from the network-backed source.
+    Prefer hardlinking a real copy left behind by the older staging layouts
+    (16-hex config dirs, store/<ckpt>/) on the same filesystem over
+    re-copying bulk data from the network-backed source.
     """
-    store_path = os.path.join(store_dir, shard_filename)
-    src_path = os.path.join(source_dir, shard_filename)
-    src_size = os.path.getsize(src_path)
-    if os.path.exists(store_path):
-        if os.path.getsize(store_path) == src_size:
-            return store_path
-        os.remove(store_path)
+    src_blob = _source_blob(source_dir, shard_filename)
+    etag = os.path.basename(src_blob)
+    blob_path = os.path.join(blobs_dir, etag)
+    src_size = os.path.getsize(src_blob)
+    if os.path.exists(blob_path):
+        if os.path.getsize(blob_path) == src_size:
+            return blob_path
+        os.remove(blob_path)
 
-    os.makedirs(store_dir, exist_ok=True)
+    os.makedirs(blobs_dir, exist_ok=True)
 
-    for entry in sorted(os.listdir(dest_root)):
-        if entry == STORE_DIR_NAME:
-            continue
-        candidate = os.path.join(dest_root, entry, shard_filename)
+    legacy_candidates = []
+    with contextlib.suppress(FileNotFoundError):
+        for entry in sorted(os.listdir(dest_root)):
+            if _LEGACY_CONFIG_DIR_RE.match(entry):
+                legacy_candidates.append(
+                    os.path.join(dest_root, entry, shard_filename)
+                )
+        store_root = os.path.join(dest_root, _LEGACY_STORE_DIR)
+        if os.path.isdir(store_root):
+            for ckpt in sorted(os.listdir(store_root)):
+                legacy_candidates.append(
+                    os.path.join(store_root, ckpt, shard_filename)
+                )
+    for candidate in legacy_candidates:
         if (
             os.path.isfile(candidate)
             and not os.path.islink(candidate)
             and os.path.getsize(candidate) == src_size
         ):
             try:
-                os.link(candidate, store_path)
-                return store_path
+                os.link(candidate, blob_path)
+                return blob_path
             except OSError:
                 break
 
-    tmp_path = store_path + ".tmp"
-    shutil.copy2(src_path, tmp_path)
-    os.replace(tmp_path, store_path)
-    return store_path
+    tmp_path = blob_path + ".tmp"
+    shutil.copy2(src_blob, tmp_path)
+    os.replace(tmp_path, blob_path)
+    return blob_path
 
 
 def stage_shards(
     source_dir: str,
     dest_root: str,
-    pp_size: int,
     local_layer_range: tuple[int, int] | None,
-    partition: str | None = None,
 ) -> str:
     from vllm.model_executor.model_loader.pp_weight_filter import classify_shards
 
+    source_dir = os.path.abspath(source_dir)
     index_path = os.path.join(source_dir, SAFE_WEIGHTS_INDEX_NAME)
     with open(index_path, "rb") as f:
         index_bytes = f.read()
-    index = json.loads(index_bytes)
-    weight_map: dict[str, str] = index["weight_map"]
+    weight_map: dict[str, str] = json.loads(index_bytes)["weight_map"]
 
     needs_copy = classify_shards(weight_map, local_layer_range)
 
-    checkpoint_id = compute_checkpoint_id(source_dir, index_bytes)
-    store_dir = _store_dir(dest_root, checkpoint_id)
-    config_key = compute_config_key(source_dir, index_bytes, pp_size, partition)
-    dest_dir = os.path.join(dest_root, config_key)
+    repo_name, rev = _parse_source_snapshot(source_dir)
+    repo_dir = _local_repo_dir(dest_root, repo_name)
+    blobs_dir = os.path.join(repo_dir, "blobs")
+    snap_dir = os.path.join(repo_dir, "snapshots", rev)
 
-    if _is_complete(dest_dir, source_dir, store_dir, needs_copy):
-        return dest_dir
+    if _is_complete(snap_dir, source_dir, blobs_dir, needs_copy):
+        return snap_dir
 
-    os.makedirs(dest_dir, exist_ok=True)
+    os.makedirs(snap_dir, exist_ok=True)
+    os.makedirs(os.path.join(repo_dir, "refs"), exist_ok=True)
+    with open(os.path.join(repo_dir, "refs", "main"), "w") as f:
+        f.write(rev)
 
     for entry in os.listdir(source_dir):
         src_path = os.path.join(source_dir, entry)
         if entry.endswith(".safetensors") or not os.path.isfile(src_path):
             continue
-        shutil.copy2(src_path, os.path.join(dest_dir, entry))
+        dst_path = os.path.join(snap_dir, entry)
+        if os.path.islink(dst_path):
+            os.remove(dst_path)
+        shutil.copy2(src_path, dst_path)
 
     # Original, unmodified index -- every shard filename it references must
-    # exist in dest_dir (as a resolvable symlink) or vLLM's
-    # filter_duplicate_safetensors_files raises FileNotFoundError.
-    shutil.copy2(index_path, os.path.join(dest_dir, SAFE_WEIGHTS_INDEX_NAME))
+    # resolve in snap_dir or vLLM's filter_duplicate_safetensors_files
+    # raises FileNotFoundError.
+    shutil.copy2(index_path, os.path.join(snap_dir, SAFE_WEIGHTS_INDEX_NAME))
 
     for shard_filename, owned in needs_copy.items():
-        dst_path = os.path.join(dest_dir, shard_filename)
+        dst_path = os.path.join(snap_dir, shard_filename)
         if os.path.islink(dst_path) or os.path.exists(dst_path):
             os.remove(dst_path)
         if owned:
-            target = _adopt_or_copy_into_store(
-                dest_root, store_dir, source_dir, shard_filename
+            target = _ensure_local_blob(
+                dest_root, blobs_dir, source_dir, shard_filename
             )
         else:
-            target = os.path.join(source_dir, shard_filename)
+            target = _source_blob(source_dir, shard_filename)
         os.symlink(target, dst_path)
 
-    with open(os.path.join(dest_dir, COMPLETE_MARKER), "w") as f:
+    with open(os.path.join(snap_dir, COMPLETE_MARKER), "w") as f:
         f.write("")
 
-    return dest_dir
+    return snap_dir
 
 
 def gc_dest_root(dest_root: str, keep_dir: str) -> dict[str, int]:
-    """Remove every config directory except ``keep_dir`` and every store
-    shard no longer referenced by it. Legacy (pre-store) config dirs full of
-    real copies are removed the same way -- their contents were already
-    adopted into the store by hardlink during staging, so their space is
-    reclaimed here without losing the harvested bytes."""
+    """Prune everything the surviving snapshot does not need: legacy layout
+    directories, other snapshots of the same repo, and local blobs no
+    snapshot symlink references."""
     keep_dir = os.path.realpath(keep_dir)
-    removed = {"config_dirs": 0, "store_files": 0}
+    removed = {"legacy_dirs": 0, "snapshots": 0, "blobs": 0}
 
     for entry in sorted(os.listdir(dest_root)):
         path = os.path.join(dest_root, entry)
-        if entry == STORE_DIR_NAME or not os.path.isdir(path):
+        if not os.path.isdir(path):
             continue
-        if os.path.realpath(path) == keep_dir:
-            continue
-        shutil.rmtree(path)
-        removed["config_dirs"] += 1
+        if _LEGACY_CONFIG_DIR_RE.match(entry) or entry == _LEGACY_STORE_DIR:
+            shutil.rmtree(path)
+            removed["legacy_dirs"] += 1
+
+    repo_dir = os.path.dirname(os.path.dirname(keep_dir))
+    snapshots_dir = os.path.join(repo_dir, "snapshots")
+    if os.path.isdir(snapshots_dir):
+        for entry in sorted(os.listdir(snapshots_dir)):
+            path = os.path.join(snapshots_dir, entry)
+            if os.path.realpath(path) != keep_dir:
+                shutil.rmtree(path)
+                removed["snapshots"] += 1
 
     referenced: set[str] = set()
     for name in os.listdir(keep_dir):
@@ -227,16 +251,13 @@ def gc_dest_root(dest_root: str, keep_dir: str) -> dict[str, int]:
         if os.path.islink(path):
             referenced.add(os.path.realpath(path))
 
-    store_root = os.path.join(dest_root, STORE_DIR_NAME)
-    if os.path.isdir(store_root):
-        for root, _dirs, files in os.walk(store_root, topdown=False):
-            for name in files:
-                path = os.path.join(root, name)
-                if os.path.realpath(path) not in referenced:
-                    os.remove(path)
-                    removed["store_files"] += 1
-            if root != store_root and not os.listdir(root):
-                os.rmdir(root)
+    blobs_dir = os.path.join(repo_dir, "blobs")
+    if os.path.isdir(blobs_dir):
+        for name in sorted(os.listdir(blobs_dir)):
+            path = os.path.join(blobs_dir, name)
+            if os.path.realpath(path) not in referenced:
+                os.remove(path)
+                removed["blobs"] += 1
 
     return removed
 
@@ -271,29 +292,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--gc",
         action="store_true",
-        help="after staging, prune stale config dirs and orphaned store shards",
+        help="after staging, prune legacy layouts, other snapshots, and "
+        "unreferenced local blobs",
     )
     args = parser.parse_args(argv)
 
     local_layer_range = _resolve_local_layer_range(
         args.source_dir, args.pp_rank, args.pp_size, args.trust_remote_code
     )
-    partition = os.environ.get("VLLM_PP_LAYER_PARTITION")
-    dest_dir = stage_shards(
-        args.source_dir,
-        args.dest_root,
-        args.pp_size,
-        local_layer_range,
-        partition=partition,
-    )
+    snap_dir = stage_shards(args.source_dir, args.dest_root, local_layer_range)
     if args.gc:
-        removed = gc_dest_root(args.dest_root, keep_dir=dest_dir)
+        removed = gc_dest_root(args.dest_root, keep_dir=snap_dir)
         print(
-            f"[prep-gc] removed {removed['config_dirs']} config dirs, "
-            f"{removed['store_files']} orphaned store shards",
+            f"[prep-gc] removed {removed['legacy_dirs']} legacy dirs, "
+            f"{removed['snapshots']} stale snapshots, "
+            f"{removed['blobs']} unreferenced blobs",
             file=sys.stderr,
         )
-    print(dest_dir)
+    print(snap_dir)
     return 0
 
 
