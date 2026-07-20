@@ -25,7 +25,6 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
-import math
 import pickle
 import weakref
 from collections import namedtuple
@@ -139,42 +138,6 @@ def _select_recv_tensor(
     return tensor[slices]
 
 
-# byte alignment of each tensor's span inside a packed PP message; keeps
-# dtype-cast views at the computed offsets legal for any dtype we ship.
-_PP_PACK_ALIGN = 16
-# sentinel appended to the pickled metadata list when the tensors travel as
-# one packed uint8 message; carries the total packed size as a cross-check.
-_PP_PACKED_NBYTES_KEY = "__pp_packed_nbytes__"
-
-
-def _packed_tensor_layout(
-    metadata_list: list[tuple[str, Any]],
-) -> tuple[list[tuple[str, TensorMetadata, int, int]], int]:
-    """Byte layout of a packed PP message.
-
-    Tensors are packed in metadata (= dict) order, each span padded to
-    _PP_PACK_ALIGN bytes. Returns one (key, metadata, offset, nbytes) entry
-    per non-empty tensor plus the total packed size in bytes.
-    """
-    layout: list[tuple[str, TensorMetadata, int, int]] = []
-    offset = 0
-    for key, value in metadata_list:
-        if not isinstance(value, TensorMetadata):
-            continue
-        nbytes = value.dtype.itemsize * math.prod(value.size)
-        if nbytes == 0:
-            continue
-        layout.append((key, value, offset, nbytes))
-        offset += (nbytes + _PP_PACK_ALIGN - 1) // _PP_PACK_ALIGN * _PP_PACK_ALIGN
-    return layout, offset
-
-
-def _packed_view(
-    staging: torch.Tensor, offset: int, nbytes: int, metadata: TensorMetadata
-) -> torch.Tensor:
-    return staging[offset : offset + nbytes].view(metadata.dtype).view(metadata.size)
-
-
 # tags for the PP tensor-dict metadata channel: a "full" message carries the
 # complete metadata list, a "cached" message only names the epoch of the last
 # full schema sent to the same peer.
@@ -192,28 +155,9 @@ def _tensor_dict_schema_key(metadata_list: list[tuple[str, Any]]) -> tuple | Non
     for key, value in metadata_list:
         if isinstance(value, TensorMetadata):
             key_parts.append((key, value.device, value.dtype, tuple(value.size)))
-        elif key == _PP_PACKED_NBYTES_KEY:
-            key_parts.append((key, value))
         else:
             return None
     return tuple(key_parts)
-
-
-def _appmana_pp_pack_override() -> bool | None:
-    """The process-wide appmana.pp_transport.pack override, or None if unset.
-
-    Defensive lazy import: the appmana config module is import-light, but this
-    keeps parallel_state usable if it is ever unavailable (non-DSV4 / blockless
-    runs), in which case the caller falls back to the env var exactly as before.
-    """
-    try:
-        from vllm.transformers_utils.configs.deepseek_v4_appmana import (
-            pp_pack_override,
-        )
-
-        return pp_pack_override()
-    except Exception:
-        return None
 
 
 def _appmana_pp_cache_metadata_override() -> bool | None:
@@ -1081,69 +1025,6 @@ class GroupCoordinator:
             use_all_gather = all_gather_tensors.get(key, use_all_gather)
         return use_all_gather
 
-    def _pp_pack_enabled(self) -> bool:
-        # Resolve once per group; workers stash the appmana override before the
-        # first hop. Precedence: explicit appmana.pp_transport.pack value >
-        # VLLM_PP_PACK_TENSOR_DICT env (deprecated fallback) > built-in default
-        # (the env default, True). The appmana value rides VllmConfig to every
-        # Ray worker; the env var is only forwarded via a fixed allowlist.
-        enabled: bool | None = getattr(self, "_pp_pack_tensor_dict", None)
-        if enabled is None:
-            enabled = _appmana_pp_pack_override()
-            if enabled is None:
-                enabled = envs.VLLM_PP_PACK_TENSOR_DICT
-            self._pp_pack_tensor_dict = enabled
-        return enabled
-
-    def _use_packed_tensor_dict(
-        self,
-        tensor_dict: dict[str, torch.Tensor | Any],
-        all_gather_group: "GroupCoordinator | None",
-        all_gather_tensors: dict[str, bool] | None,
-    ) -> bool:
-        if not self._pp_pack_enabled():
-            return False
-        tensors = [
-            v
-            for v in tensor_dict.values()
-            if isinstance(v, torch.Tensor) and v.numel() > 0
-        ]
-        if len(tensors) < 2:
-            return False
-        if any(not t.is_cuda for t in tensors):
-            return False
-        if len({t.device for t in tensors}) > 1:
-            return False
-        if all_gather_group is not None and all_gather_group.world_size > 1:
-            # the packed wire format carries full tensors, not per-rank
-            # slices, so it cannot compose with the all-gather optimization.
-            if any(
-                self._should_use_all_gather(
-                    k, v.numel(), all_gather_group, all_gather_tensors
-                )
-                for k, v in tensor_dict.items()
-                if isinstance(v, torch.Tensor) and v.numel() > 0
-            ):
-                return False
-        return True
-
-    def _packed_staging_buffer(
-        self, attr: str, peer: int, nbytes: int, device: torch.device
-    ) -> torch.Tensor:
-        """Persistent per-peer uint8 staging buffer, grown geometrically."""
-        buffers: dict[int, torch.Tensor] | None = getattr(self, attr, None)
-        if buffers is None:
-            buffers = {}
-            setattr(self, attr, buffers)
-        buf = buffers.get(peer)
-        if buf is not None and buf.device != device:
-            buf = None
-        if buf is None or buf.numel() < nbytes:
-            numel = nbytes if buf is None else max(nbytes, 2 * buf.numel())
-            buf = torch.empty(numel, dtype=torch.uint8, device=device)
-            buffers[peer] = buf
-        return buf
-
     def _pp_metadata_cache_enabled(self) -> bool:
         # Resolve once per group; workers stash the appmana override before the
         # first hop. Precedence: explicit appmana.pp_transport.cache_metadata
@@ -1274,26 +1155,6 @@ class GroupCoordinator:
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
 
-        if self._use_packed_tensor_dict(
-            tensor_dict, all_gather_group, all_gather_tensors
-        ):
-            layout, total_nbytes = _packed_tensor_layout(metadata_list)
-            self._send_tensor_dict_metadata(
-                [*metadata_list, (_PP_PACKED_NBYTES_KEY, total_nbytes)], dst
-            )
-            device = tensor_dict[layout[0][0]].device
-            staging = self._packed_staging_buffer(
-                "_packed_send_buffers", dst, total_nbytes, device
-            )
-            for key, metadata, offset, nbytes in layout:
-                _packed_view(staging, offset, nbytes, metadata).copy_(
-                    tensor_dict[key]
-                )
-            packed = staging[:total_nbytes]
-            handle = torch.distributed.isend(packed, dst=self.ranks[dst], group=group)
-            packed.record_stream(torch.cuda.current_stream(device))
-            return [handle]
-
         self._send_tensor_dict_metadata(metadata_list, dst)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
@@ -1396,41 +1257,6 @@ class GroupCoordinator:
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []
-
-        packed_nbytes: int | None = None
-        if recv_metadata_list and recv_metadata_list[-1][0] == _PP_PACKED_NBYTES_KEY:
-            packed_nbytes = recv_metadata_list[-1][1]
-            recv_metadata_list = recv_metadata_list[:-1]
-
-        if packed_nbytes is not None:
-            layout, total_nbytes = _packed_tensor_layout(recv_metadata_list)
-            assert total_nbytes == packed_nbytes, (
-                f"Packed PP payload mismatch: sender packed {packed_nbytes} "
-                f"bytes, receiver computed {total_nbytes}"
-            )
-            for key, value in recv_metadata_list:
-                if isinstance(value, TensorMetadata):
-                    tensor_dict[key] = _select_recv_tensor(
-                        key, value, recv_tensor_dict
-                    )
-                else:
-                    tensor_dict[key] = value
-            device = tensor_dict[layout[0][0]].device
-            staging = self._packed_staging_buffer(
-                "_packed_recv_buffers", src, total_nbytes, device
-            )
-            packed = staging[:total_nbytes]
-            handle = torch.distributed.irecv(packed, src=self.ranks[src], group=group)
-            handles.append(handle)
-
-            def _unpack() -> None:
-                for key, metadata, offset, nbytes in layout:
-                    tensor_dict[key].copy_(
-                        _packed_view(staging, offset, nbytes, metadata)
-                    )
-
-            postprocess.append(_unpack)
-            return tensor_dict, handles, postprocess
 
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):

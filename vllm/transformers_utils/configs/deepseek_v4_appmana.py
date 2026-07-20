@@ -60,12 +60,9 @@ _ALLOWED_BLOCK_KEYS = frozenset({"kernels", "cache_type", "pp_transport"})
 # Sub-keys of the "pp_transport" block. Each toggles a PP intermediate-tensor
 # transport optimization. Absent (None) means "not specified": the coordinator
 # falls back to the env var, then the built-in default. See parallel_state's
-# _pp_pack_enabled / _pp_metadata_cache_enabled.
-_PP_TRANSPORT_PACK_KEY = "pack"
+# _pp_metadata_cache_enabled.
 _PP_TRANSPORT_CACHE_METADATA_KEY = "cache_metadata"
-_ALLOWED_PP_TRANSPORT_KEYS = frozenset(
-    {_PP_TRANSPORT_PACK_KEY, _PP_TRANSPORT_CACHE_METADATA_KEY}
-)
+_ALLOWED_PP_TRANSPORT_KEYS = frozenset({_PP_TRANSPORT_CACHE_METADATA_KEY})
 
 LEGACY_IMMA_CONFIG_KEY = (
     "__experimental_enable_imma_from_https://github.com/appMana/forks-vllm-ampere"
@@ -172,7 +169,6 @@ class ResolvedAppmanaKernelConfig:
     # the built-in default (both effectively on today). An explicit bool here
     # rides VllmConfig to every Ray worker, unlike the env var (which is only
     # forwarded to workers via a fixed allowlist).
-    pp_pack: bool | None = None
     pp_cache_metadata: bool | None = None
 
     def symbol(self, role: str) -> str | None:
@@ -216,7 +212,6 @@ def resolve_appmana_kernel_config(
     explicit = False
     kernels: list[str] = []
     cache_type: str | None = None
-    pp_pack: bool | None = None
     pp_cache_metadata: bool | None = None
 
     if block is not None:
@@ -275,7 +270,6 @@ def resolve_appmana_kernel_config(
                         f'"{APPMANA_CONFIG_KEY}.pp_transport.{pp_key}" must be '
                         f"a boolean, got {value!r}"
                     )
-            pp_pack = raw_pp_transport.get(_PP_TRANSPORT_PACK_KEY)
             pp_cache_metadata = raw_pp_transport.get(
                 _PP_TRANSPORT_CACHE_METADATA_KEY
             )
@@ -348,7 +342,6 @@ def resolve_appmana_kernel_config(
         roles=roles,
         cache_type=cache_type,
         legacy_dense_flag=bool(legacy_dense_flag),
-        pp_pack=pp_pack,
         pp_cache_metadata=pp_cache_metadata,
     )
 
@@ -387,27 +380,17 @@ _ACTIVE_CONFIG: ResolvedAppmanaKernelConfig | None = None
 # built-in default. Set at worker init (init_worker_distributed_environment,
 # where vllm_config is definitely in hand) AND on every kernel-config
 # activation, so the value is stashed before the first PP hop regardless of
-# path. The GroupCoordinator reads these via pp_pack_override() /
-# pp_cache_metadata_override().
-_PP_PACK_OVERRIDE: bool | None = None
+# path. The GroupCoordinator reads it via pp_cache_metadata_override().
 _PP_CACHE_METADATA_OVERRIDE: bool | None = None
 
 
-def stash_pp_transport_overrides(
-    pp_pack: bool | None, pp_cache_metadata: bool | None
-) -> None:
-    """Set the process-wide PP transport overrides (set-once semantics: only a
+def stash_pp_transport_overrides(pp_cache_metadata: bool | None) -> None:
+    """Set the process-wide PP transport override (set-once semantics: only a
     non-None value replaces an already-stashed value, so a later blockless
     activation cannot clobber a value resolved from the checkpoint block)."""
-    global _PP_PACK_OVERRIDE, _PP_CACHE_METADATA_OVERRIDE
-    if pp_pack is not None:
-        _PP_PACK_OVERRIDE = pp_pack
+    global _PP_CACHE_METADATA_OVERRIDE
     if pp_cache_metadata is not None:
         _PP_CACHE_METADATA_OVERRIDE = pp_cache_metadata
-
-
-def pp_pack_override() -> bool | None:
-    return _PP_PACK_OVERRIDE
 
 
 def pp_cache_metadata_override() -> bool | None:
@@ -427,7 +410,7 @@ def activate_appmana_kernel_config(
     _ACTIVE_CONFIG = resolved
     # Propagate PP transport overrides so the coordinator sees them even when
     # activation happens via the model build / Ray unpickle path.
-    stash_pp_transport_overrides(resolved.pp_pack, resolved.pp_cache_metadata)
+    stash_pp_transport_overrides(resolved.pp_cache_metadata)
 
 
 def active_appmana_kernel_config() -> ResolvedAppmanaKernelConfig | None:

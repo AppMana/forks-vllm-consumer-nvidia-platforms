@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_PP_MAX_CONCURRENT_BATCHES: int | None = None
-    VLLM_PP_PACK_TENSOR_DICT: bool = False
     VLLM_PP_CACHE_TENSOR_DICT_METADATA: bool = True
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -855,16 +854,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_PP_MAX_CONCURRENT_BATCHES"])
         if "VLLM_PP_MAX_CONCURRENT_BATCHES" in os.environ
         else None
-    ),
-    # Pack the PP intermediate-tensor dict into a single NCCL message per hop
-    # instead of one message per tensor. Cuts per-hop latency on links where
-    # per-message cost dominates (e.g. Thunderbolt rails).
-    # Default off: the packed path deterministically wedges long chunked
-    # prefill on deep PP rings (12-rank chain stalls after a few hundred
-    # steps; unpacked path verified to 990k tokens). Re-enable only once the
-    # desync is root-caused and fixed.
-    "VLLM_PP_PACK_TENSOR_DICT": lambda: bool(
-        int(os.getenv("VLLM_PP_PACK_TENSOR_DICT", "0"))
     ),
     # Skip re-sending the pickled PP tensor-dict metadata when the schema
     # (keys, dtypes, shapes) matches the previous send to the same peer;

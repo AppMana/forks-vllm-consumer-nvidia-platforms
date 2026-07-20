@@ -562,50 +562,46 @@ def test_sm86_attention_dispatches_all_registered_prefill_symbols():
 # ---------------------------------------------------------------------------
 
 
-def test_pp_transport_absent_leaves_overrides_none():
-    """No pp_transport key -> both overrides None (fall back to env/default)."""
+def test_pp_transport_absent_leaves_override_none():
+    """No pp_transport key -> override None (fall back to env/default)."""
     resolved = resolve_appmana_kernel_config({"kernels": []})
-    assert resolved.pp_pack is None
     assert resolved.pp_cache_metadata is None
     resolved = resolve_appmana_kernel_config(None)
-    assert resolved.pp_pack is None
     assert resolved.pp_cache_metadata is None
 
 
 def test_pp_transport_round_trips_booleans():
     resolved = resolve_appmana_kernel_config(
-        {"kernels": [], "pp_transport": {"pack": False, "cache_metadata": True}}
+        {"kernels": [], "pp_transport": {"cache_metadata": True}}
     )
-    assert resolved.pp_pack is False
     assert resolved.pp_cache_metadata is True
 
     resolved = resolve_appmana_kernel_config(
-        {"kernels": [], "pp_transport": {"pack": True, "cache_metadata": False}}
+        {"kernels": [], "pp_transport": {"cache_metadata": False}}
     )
-    assert resolved.pp_pack is True
     assert resolved.pp_cache_metadata is False
 
 
-def test_pp_transport_partial_specification_leaves_unset_none():
-    """Only one subkey specified -> the other stays None."""
+def test_pp_transport_empty_block_leaves_override_none():
     resolved = resolve_appmana_kernel_config(
-        {"kernels": [], "pp_transport": {"pack": False}}
+        {"kernels": [], "pp_transport": {}}
     )
-    assert resolved.pp_pack is False
     assert resolved.pp_cache_metadata is None
 
 
 def test_pp_transport_unknown_subkey_is_hard_error():
+    # "pack" was removed with the packed wire format; it must now be
+    # rejected like any other unknown key.
     with pytest.raises(ValueError, match="pp_transport"):
         resolve_appmana_kernel_config(
-            {"kernels": [], "pp_transport": {"pack": True, "packk": False}}
+            {"kernels": [], "pp_transport": {"pack": True}}
         )
 
 
 def test_pp_transport_non_bool_value_is_hard_error():
     with pytest.raises(ValueError, match="pp_transport"):
         resolve_appmana_kernel_config(
-            {"kernels": [], "pp_transport": {"pack": 1}}
+            {"kernels": [], "pp_transport": {"cache_metadata": 1}}
         )
 
 
@@ -616,32 +612,26 @@ def test_pp_transport_non_dict_is_hard_error():
 
 def test_pp_transport_resolves_from_hf_config():
     hf_config = SimpleNamespace(
-        appmana={"kernels": [], "pp_transport": {"pack": False}},
+        appmana={"kernels": [], "pp_transport": {"cache_metadata": False}},
         quantization_config={"quant_method": "dsv4_int"},
     )
     resolved = resolve_appmana_kernel_config_from_hf_config(hf_config)
-    assert resolved.pp_pack is False
-    assert resolved.pp_cache_metadata is None
+    assert resolved.pp_cache_metadata is False
 
 
 def test_pp_transport_stash_and_precedence_over_env(monkeypatch):
     """The stashed appmana override wins over the env var; None falls back."""
     import vllm.transformers_utils.configs.deepseek_v4_appmana as appmana_mod
 
-    monkeypatch.setattr(appmana_mod, "_PP_PACK_OVERRIDE", None)
     monkeypatch.setattr(appmana_mod, "_PP_CACHE_METADATA_OVERRIDE", None)
 
-    # Nothing stashed -> both overrides report None.
-    assert appmana_mod.pp_pack_override() is None
+    # Nothing stashed -> the override reports None.
     assert appmana_mod.pp_cache_metadata_override() is None
 
     resolved = resolve_appmana_kernel_config(
-        {"kernels": [], "pp_transport": {"pack": False, "cache_metadata": True}}
+        {"kernels": [], "pp_transport": {"cache_metadata": True}}
     )
-    appmana_mod.stash_pp_transport_overrides(
-        resolved.pp_pack, resolved.pp_cache_metadata
-    )
-    assert appmana_mod.pp_pack_override() is False
+    appmana_mod.stash_pp_transport_overrides(resolved.pp_cache_metadata)
     assert appmana_mod.pp_cache_metadata_override() is True
 
 
@@ -650,14 +640,12 @@ def test_activate_stashes_pp_transport_overrides(monkeypatch):
     (covers the model-build and Ray-unpickle activation paths)."""
     import vllm.transformers_utils.configs.deepseek_v4_appmana as appmana_mod
 
-    monkeypatch.setattr(appmana_mod, "_PP_PACK_OVERRIDE", None)
     monkeypatch.setattr(appmana_mod, "_PP_CACHE_METADATA_OVERRIDE", None)
     resolved = resolve_appmana_kernel_config(
-        {"kernels": [], "pp_transport": {"pack": False}}
+        {"kernels": [], "pp_transport": {"cache_metadata": False}}
     )
     activate_appmana_kernel_config(resolved)
-    assert appmana_mod.pp_pack_override() is False
-    assert appmana_mod.pp_cache_metadata_override() is None
+    assert appmana_mod.pp_cache_metadata_override() is False
 
 
 def test_sm86_native_prefill_supports_fp8_and_int8_caches():

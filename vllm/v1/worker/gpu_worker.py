@@ -1368,7 +1368,7 @@ def _stash_appmana_pp_transport_overrides(vllm_config: VllmConfig) -> None:
         if hf_config is None or getattr(hf_config, APPMANA_CONFIG_KEY, None) is None:
             return
         resolved = resolve_appmana_kernel_config_from_hf_config(hf_config)
-        stash_pp_transport_overrides(resolved.pp_pack, resolved.pp_cache_metadata)
+        stash_pp_transport_overrides(resolved.pp_cache_metadata)
     except Exception:
         logger.exception(
             "Failed to stash appmana PP transport overrides; falling back to "
@@ -1392,8 +1392,8 @@ def init_worker_distributed_environment(
     # AppMana DSV4: stash the PP transport overrides from the checkpoint's
     # "appmana.pp_transport" block. This is the robust plumbing point: every
     # worker (including remote Ray workers) has vllm_config in hand here, well
-    # before the first PP hop, so the GroupCoordinator's _pp_pack_enabled /
-    # _pp_metadata_cache_enabled see the value that rode VllmConfig rather than
+    # before the first PP hop, so the GroupCoordinator's
+    # _pp_metadata_cache_enabled sees the value that rode VllmConfig rather than
     # relying on env-var forwarding (which is allowlist-limited to the driver).
     _stash_appmana_pp_transport_overrides(vllm_config)
     override_envs_for_eplb(
