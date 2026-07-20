@@ -30,11 +30,14 @@ executor resolves one --model path string independently on each worker's
 node; confirmed live 2026-07-16 that a rank-dependent path breaks remote
 workers), with per-node divergence living entirely in which blobs are local.
 
-``--gc`` prunes snapshots of other revisions, local blobs the current
-snapshot does not reference, and directories left by the older staging
+``--gc`` prunes snapshots of other revisions, local blobs that do not
+belong to the current checkpoint, and directories left by the older staging
 layouts (16-hex config dirs, store/) -- their real files are harvested into
 blobs/ by hardlink during staging first, so reclaiming them never re-reads
-the network.
+the network. Blobs of the current checkpoint are kept even when the current
+partition does not reference them: partitions are additive against one
+checkpoint, so a partition change never re-copies a blob any earlier
+partition already staged.
 
 Usage:
     python prep_pp_shards.py --source-dir /hf-cache/.../snapshots/<rev> \
@@ -221,10 +224,14 @@ def stage_shards(
     return snap_dir
 
 
-def gc_dest_root(dest_root: str, keep_dir: str) -> dict[str, int]:
-    """Prune everything the surviving snapshot does not need: legacy layout
-    directories, other snapshots of the same repo, and local blobs no
-    snapshot symlink references."""
+def gc_dest_root(
+    dest_root: str, keep_dir: str, source_dir: str | None = None
+) -> dict[str, int]:
+    """Prune legacy layout directories, snapshots of other revisions, and
+    blobs from other checkpoints. Blobs belonging to the current checkpoint
+    (present in the source snapshot's etag set) are kept even when the
+    current partition does not reference them -- partitions add onto each
+    other against one checkpoint."""
     keep_dir = os.path.realpath(keep_dir)
     removed = {"legacy_dirs": 0, "snapshots": 0, "blobs": 0}
 
@@ -245,18 +252,25 @@ def gc_dest_root(dest_root: str, keep_dir: str) -> dict[str, int]:
                 shutil.rmtree(path)
                 removed["snapshots"] += 1
 
-    referenced: set[str] = set()
-    for name in os.listdir(keep_dir):
-        path = os.path.join(keep_dir, name)
-        if os.path.islink(path):
-            referenced.add(os.path.realpath(path))
+    keep_etags: set[str] = set()
+    if source_dir is not None:
+        for name in os.listdir(source_dir):
+            path = os.path.join(source_dir, name)
+            if name.endswith(".safetensors") and os.path.exists(path):
+                keep_etags.add(os.path.basename(os.path.realpath(path)))
+    else:
+        # No source to define the checkpoint: fall back to keeping what the
+        # surviving snapshot references.
+        for name in os.listdir(keep_dir):
+            path = os.path.join(keep_dir, name)
+            if os.path.islink(path):
+                keep_etags.add(os.path.basename(os.path.realpath(path)))
 
     blobs_dir = os.path.join(repo_dir, "blobs")
     if os.path.isdir(blobs_dir):
         for name in sorted(os.listdir(blobs_dir)):
-            path = os.path.join(blobs_dir, name)
-            if os.path.realpath(path) not in referenced:
-                os.remove(path)
+            if name not in keep_etags:
+                os.remove(os.path.join(blobs_dir, name))
                 removed["blobs"] += 1
 
     return removed
@@ -302,7 +316,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     snap_dir = stage_shards(args.source_dir, args.dest_root, local_layer_range)
     if args.gc:
-        removed = gc_dest_root(args.dest_root, keep_dir=snap_dir)
+        removed = gc_dest_root(
+            args.dest_root, keep_dir=snap_dir, source_dir=args.source_dir
+        )
         print(
             f"[prep-gc] removed {removed['legacy_dirs']} legacy dirs, "
             f"{removed['snapshots']} stale snapshots, "

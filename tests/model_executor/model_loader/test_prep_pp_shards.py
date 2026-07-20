@@ -172,7 +172,7 @@ def test_adopts_legacy_real_files_by_hardlink(tmp_path):
     assert copies["n"] > 0  # metadata still copied; but not the adopted shard
 
 
-def test_gc_absorbs_legacy_layouts_and_orphaned_blobs(tmp_path):
+def test_gc_absorbs_legacy_layouts_and_foreign_blobs(tmp_path):
     src = _make_source_hf_cache(tmp_path)
     dest_root = tmp_path / "local"
     # legacy layouts from previous designs
@@ -185,18 +185,49 @@ def test_gc_absorbs_legacy_layouts_and_orphaned_blobs(tmp_path):
     d_narrow = _stage(src, dest_root, (0, 1))
     assert d_wide == d_narrow
 
-    removed = prep.gc_dest_root(str(dest_root), keep_dir=d_narrow)
+    # a blob from some other checkpoint/revision
+    local_blobs = os.path.join(_local_repo(dest_root), "blobs")
+    with open(os.path.join(local_blobs, "otherckpt" + "f" * 50), "w") as f:
+        f.write("stale")
+
+    removed = prep.gc_dest_root(str(dest_root), keep_dir=d_narrow, source_dir=src)
     assert not os.path.exists(dest_root / "deadbeefdeadbeef")
     assert not os.path.exists(dest_root / "store")
-    local_blobs = os.path.join(_local_repo(dest_root), "blobs")
-    # only blobs referenced by current ownership (layer 0 + shared) survive
+    # partitions are ADDITIVE: blobs staged by the wider ownership survive
+    # even though the current partition references only layer 0 + shared
     assert set(os.listdir(local_blobs)) == {
         "etag" + "0" * 56,
+        "etag" + "0" * 55 + "1",
+        "etag" + "0" * 55 + "2",
+        "etag" + "0" * 55 + "3",
         "etagshared" + "0" * 50,
     }
-    assert removed["blobs"] >= 3
+    assert removed["blobs"] == 1  # only the foreign-checkpoint blob
     # surviving snapshot still verifies complete
     assert _stage(src, dest_root, (0, 1)) == d_narrow
+
+
+def test_partition_flip_after_gc_copies_nothing(tmp_path):
+    src = _make_source_hf_cache(tmp_path)
+    dest_root = tmp_path / "local"
+    d = _stage(src, dest_root, (0, 4))
+    _stage(src, dest_root, (0, 1))
+    prep.gc_dest_root(str(dest_root), keep_dir=d, source_dir=src)
+
+    copies = {"n": 0}
+    real_copy = prep.shutil.copy2
+
+    def counting_copy(a, b, **kw):
+        if "blobs" in str(b):
+            copies["n"] += 1
+        return real_copy(a, b, **kw)
+
+    prep.shutil.copy2 = counting_copy
+    try:
+        _stage(src, dest_root, (0, 4))
+    finally:
+        prep.shutil.copy2 = real_copy
+    assert copies["n"] == 0
 
 
 def test_metadata_real_copies_and_index_untouched(tmp_path):
