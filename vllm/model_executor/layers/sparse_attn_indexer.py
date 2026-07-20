@@ -60,6 +60,217 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
+# ---------------------------------------------------------------------------
+# Activation chunking (streaming top-k) for the prefill indexer.
+#
+# The one-shot prefill path materializes logits[M, N] fp32 with N = the whole
+# gathered compressed context, i.e. O(chunk x window) peak memory (~1 GiB per
+# sub-chunk at chunk 1024 / 1M-token window / CSA-4; the chunk loop keeps the
+# previous sub-chunk's logits referenced while the next one is computed, so up
+# to two are live). The streaming path tiles N into slabs and maintains a
+# running top-k merged through a strict total order over (score, column)
+# packed into UNIQUE int64 keys:
+#
+#   key = (order_preserving_u32(score_bits) - 2^31) * 2^32
+#         + (2^32 - 1 - global_column)
+#
+# Uniqueness (the column is part of the key) means top-k over keys has no
+# ties, and top-k of a totally ordered set is associative:
+# topk(A u B) == topk(topk(A) u B). The per-slab scores are bit-identical to
+# the corresponding one-shot columns because the sm86 logits kernel computes
+# every output column independently (per-(row, n-block) program, fixed
+# BLOCK_H/BLOCK_D accumulation order, no atomics). Hence the streamed
+# selection is EXACTLY the one-shot selection -- no approximation.
+#
+# Tie semantics: among equal scores the key order selects the SMALLER column
+# first. The production one-shot kernel (top_k_per_row_prefill) resolves ties
+# at the k-th boundary in an unspecified order (atomicAdd collection order in
+# shared memory), so on data with boundary ties its selected set is not even
+# deterministic run-to-run; the key order is a deterministic refinement.
+#
+# TODO(prototype): gate via the checkpoint "appmana" kernel-config block
+# (vllm/transformers_utils/configs/deepseek_v4_appmana.py) as a toggle role,
+# e.g. symbol "indexer_streaming_topk_prefill", instead of this module
+# constant.
+INDEXER_PREFILL_STREAMING_TOPK = False
+# Context-slab width in K rows (compressed tokens). At M=1024, K=2048,
+# slab=16384 the transient footprint is ~231 MiB (64 MiB slab logits fp32 +
+# 144 MiB int64 candidate keys + topk temporaries) vs O(M x window) one-shot.
+INDEXER_PREFILL_TOPK_SLAB_ROWS = 16384
+
+# Centered order-preserving key of float32 -inf (bits 0xFF800000): columns
+# masked out by the logits kernel are exactly -inf; every in-range score is a
+# finite sum, so "key value-part > this" <=> "column is selectable".
+_NEG_INF_CENTERED_KEY = (1 << 31) - 1 - 0xFF800000  # == -2139095041
+
+
+@triton.jit(do_not_specialize=["num_cols", "col_offset", "stride_lm", "stride_om"])
+def _pack_sort_keys_kernel(
+    logits_ptr,
+    out_ptr,
+    num_cols,
+    col_offset,
+    stride_lm: tl.int64,
+    stride_om: tl.int64,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < num_cols
+    bits32 = tl.load(
+        logits_ptr + row * stride_lm + offs, mask=mask, other=0.0
+    ).to(tl.int32, bitcast=True)
+    bits = bits32.to(tl.int64) & 0xFFFFFFFF
+    c = tl.where(bits < (1 << 31), bits, (1 << 31) - 1 - bits)
+    key = (c << 32) + ((1 << 32) - 1 - (col_offset + offs).to(tl.int64))
+    tl.store(out_ptr + row * stride_om + offs, key, mask=mask)
+
+
+def _fp32_sort_keys_into(
+    logits: torch.Tensor,  # [M, S] fp32
+    col_offset: int,
+    out: torch.Tensor,  # [M, S] int64
+) -> None:
+    """Pack fp32 scores and global column ids into strictly ordered, unique
+    int64 keys (score-major descending float order, then ascending column).
+
+    Order-preserving uint32 map of the IEEE-754 bit pattern:
+    positive floats:  u = bits + 2^31   (in [2^31, 2^32))
+    negative floats:  u = ~bits         (in [0, 2^31))
+    centered to c = u - 2^31 so the packed key fits int64 exactly.
+    """
+    m, s = logits.shape
+    assert out.shape[0] == m and out.shape[1] == s
+    assert logits.stride(1) == 1 and out.stride(1) == 1
+    if m == 0 or s == 0:
+        return
+    BLOCK_N = 1024
+    _pack_sort_keys_kernel[(m, triton.cdiv(s, BLOCK_N))](
+        logits,
+        out,
+        s,
+        col_offset,
+        logits.stride(0),
+        out.stride(0),
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
+
+
+def oneshot_prefill_topk_reference(
+    q_cast: torch.Tensor,  # [M, H, D] fp8-bytes or int8
+    kv: tuple[torch.Tensor, torch.Tensor],  # ([N, D], [N] fp32 scale)
+    weights: torch.Tensor,  # [M, H] fp32
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_tokens: int,
+    qk_int8: bool = False,
+) -> torch.Tensor:
+    """One-shot reference: full [M, N] logits, single top-k over the same
+    unique-key total order as the streaming path. Returns [M, topk] int32
+    request-LOCAL indices (column - cu_seqlen_ks), -1 padded."""
+    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        mqa_logits_workspace_triton,
+    )
+
+    m = q_cast.shape[0]
+    n = kv[0].shape[0]
+    logits = mqa_logits_workspace_triton(
+        q_cast, kv, weights, cu_seqlen_ks, cu_seqlen_ke, qk_int8=qk_int8
+    )
+    keys = torch.empty((m, n), dtype=torch.int64, device=q_cast.device)
+    _fp32_sort_keys_into(logits, 0, keys)
+    top_keys, _ = torch.topk(keys, topk_tokens, dim=1, largest=True, sorted=True)
+    return _decode_topk_keys(top_keys, cu_seqlen_ks)
+
+
+def _decode_topk_keys(
+    top_keys: torch.Tensor,  # [M, K] int64
+    cu_seqlen_ks: torch.Tensor,  # [M]
+) -> torch.Tensor:
+    """Unpack selected keys into request-local int32 columns; -1 where the
+    key's value part is -inf / sentinel (row shorter than top-k)."""
+    value_part = top_keys >> 32
+    cols = ((1 << 32) - 1 - (top_keys & 0xFFFFFFFF)).to(torch.int32)
+    local = cols - cu_seqlen_ks.to(torch.int32).unsqueeze(1)
+    return torch.where(
+        value_part > _NEG_INF_CENTERED_KEY, local, local.new_tensor(-1)
+    )
+
+
+def streaming_prefill_topk(
+    q_cast: torch.Tensor,  # [M, H, D] fp8-bytes or int8
+    kv: tuple[torch.Tensor, torch.Tensor],  # ([N, D], [N] fp32 scale)
+    weights: torch.Tensor,  # [M, H] fp32
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_indices_out: torch.Tensor,  # [M, topk] int32, written in place
+    topk_tokens: int,
+    slab_rows: int | None = None,
+    qk_int8: bool | None = None,
+) -> None:
+    """Exact slab-tiled replacement for full-logits + top_k_per_row_prefill.
+
+    Peak memory is O(M x slab_rows) instead of O(M x N): per slab it holds
+    the slab logits [M, S] fp32, the candidate keys [M, topk + S] int64, and
+    the top-k temporaries. Selection is bit-identical to
+    oneshot_prefill_topk_reference (see module comment for the proof).
+    """
+    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        indexer_imma_enabled,
+        mqa_logits_workspace_triton,
+    )
+
+    k_values, k_scales = kv
+    m = q_cast.shape[0]
+    n = k_values.shape[0]
+    k_top = topk_tokens
+    if qk_int8 is None:
+        qk_int8 = (
+            q_cast.dtype == torch.int8
+            and k_values.dtype == torch.int8
+            and indexer_imma_enabled()
+        )
+    if slab_rows is None:
+        slab_rows = INDEXER_PREFILL_TOPK_SLAB_ROWS
+    device = q_cast.device
+    ks32 = cu_seqlen_ks.to(torch.int32)
+    ke32 = cu_seqlen_ke.to(torch.int32)
+
+    # Candidate buffer: running top-k keys in [:, :k_top], slab keys after.
+    # int64.min is below every real key (real column ids are < 2^31), so
+    # unfilled running slots never win a merge.
+    cand = torch.full(
+        (m, k_top + slab_rows),
+        torch.iinfo(torch.int64).min,
+        dtype=torch.int64,
+        device=device,
+    )
+    for n0 in range(0, n, slab_rows):
+        n1 = min(n0 + slab_rows, n)
+        s = n1 - n0
+        ks_local = torch.clamp(ks32 - n0, 0, s)
+        ke_local = torch.clamp(ke32 - n0, 0, s)
+        slab_logits = mqa_logits_workspace_triton(
+            q_cast,
+            (k_values[n0:n1], k_scales[n0:n1]),
+            weights,
+            ks_local,
+            ke_local,
+            qk_int8=qk_int8,
+        )
+        _fp32_sort_keys_into(slab_logits, n0, cand[:, k_top : k_top + s])
+        # sorted=False: the merge invariant only needs the running SET of the
+        # k_top largest keys; order is imposed once at the end.
+        merged, _ = torch.topk(
+            cand[:, : k_top + s], k_top, dim=1, largest=True, sorted=False
+        )
+        cand[:, :k_top] = merged
+
+    final, _ = torch.topk(cand[:, :k_top], k_top, dim=1, largest=True, sorted=True)
+    topk_indices_out.copy_(_decode_topk_keys(final, ks32))
+
 
 def _assert_cutedsl_dcp_merge_supported(
     logits: torch.Tensor,
@@ -509,7 +720,35 @@ def sparse_attn_indexer(
                         k_quant.view(torch.int8) if _indexer_int8 else k_quant
                     )
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-                if current_platform.is_xpu():
+                use_streaming_topk = (
+                    INDEXER_PREFILL_STREAMING_TOPK
+                    and dcp_world_size <= 1
+                    and not use_fp4_cache
+                    and current_platform.is_cuda()
+                    and (
+                        current_platform.is_device_capability_family(80)
+                        or current_platform.is_device_capability_family(120)
+                    )
+                )
+                if use_streaming_topk:
+                    # Activation chunking: O(M x slab) streaming top-k instead
+                    # of the O(M x window) logits materialization below. Exact
+                    # selection (see the module comment for the argument).
+                    streaming_prefill_topk(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        topk_tokens,
+                    )
+                    # DCP merge below is a no-op at dcp_world_size <= 1; give
+                    # it an empty logits tensor.
+                    logits = q_slice.new_empty(
+                        (q_slice.shape[0], 0), dtype=torch.float32
+                    )
+                elif current_platform.is_xpu():
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
                     logits = torch.ops.vllm.xpu_fp8_mqa_logits(
@@ -529,17 +768,18 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                         clean_logits=False,
                     )
-                num_rows = logits.shape[0]
-                ops.top_k_per_row_prefill(
-                    logits,
-                    cu_seqlen_ks,
-                    cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
+                if not use_streaming_topk:
+                    num_rows = logits.shape[0]
+                    ops.top_k_per_row_prefill(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
             _merge_dcp_topk_global(
                 logits,
@@ -550,6 +790,10 @@ def sparse_attn_indexer(
                 cp_kv_cache_interleave_size,
                 row_starts=chunk.cu_seqlen_ks,
             )
+            # Release before the next chunk's kernel allocates its logits;
+            # otherwise two window-proportional [M, N] fp32 buffers are live
+            # at once during every prefill step.
+            logits = None
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
