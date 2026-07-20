@@ -182,6 +182,11 @@ class SchedulerStats:
 
     kv_cache_usage: float = 0.0
 
+    # Prompt tokens scheduled in the step this stats snapshot was taken for.
+    # Unlike first-token-based prompt counters, this advances every chunked
+    # prefill step, so it exposes prefill progress live.
+    num_scheduled_prefill_tokens: int = 0
+
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None
 
