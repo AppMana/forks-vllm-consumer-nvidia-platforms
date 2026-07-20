@@ -44,7 +44,9 @@ ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 ARG APPMANA_NCCL_GIT_REF=22355b63ea9ffd869e208e4f6d381e6f31b471d9
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
-ARG USB4_RDMA_PROVIDER_VERSION=0.2.20
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.37
+# release tag carrying the provider deb (tag scheme decoupled from provider version)
+ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v2.13.1
 
 # OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
 # Python bootstrap. Set to "manylinux" alongside a manylinux build base such
@@ -730,6 +732,7 @@ ARG GET_PIP_URL
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO
 ARG INSTALL_USB4_RDMA_PROVIDER
 ARG USB4_RDMA_PROVIDER_VERSION
+ARG APPMANA_THUNDERBOLT_RELEASE_TAG
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /vllm-workspace
@@ -828,7 +831,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
             libibverbs1 \
             rdma-core; \
         curl -fsSL -o /tmp/usb4-rdma-provider.deb \
-            "${APPMANA_THUNDERBOLT_RELEASE_REPO}/releases/download/v${USB4_RDMA_PROVIDER_VERSION}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
+            "${APPMANA_THUNDERBOLT_RELEASE_REPO}/releases/download/${APPMANA_THUNDERBOLT_RELEASE_TAG}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
         apt-get install -y --no-install-recommends --allow-change-held-packages \
             /tmp/usb4-rdma-provider.deb; \
         dpkg-query -W -f='${Package} ${Version}\n' usb4-rdma-provider; \

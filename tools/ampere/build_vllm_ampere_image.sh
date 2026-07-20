@@ -47,7 +47,8 @@ lmcache_git_ref="${LMCACHE_GIT_REF:-cd51f3a15766e326f92998c072264a5a6caa4efe}"
 appmana_nccl_git_repo="${APPMANA_NCCL_GIT_REPO:-https://github.com/AppMana/forks-nccl-rdma-routing.git}"
 appmana_nccl_git_ref="${APPMANA_NCCL_GIT_REF:-22355b63ea9ffd869e208e4f6d381e6f31b471d9}"
 install_usb4_rdma_provider="${INSTALL_USB4_RDMA_PROVIDER:-true}"
-usb4_rdma_provider_version="${USB4_RDMA_PROVIDER_VERSION:-0.2.20}"
+usb4_rdma_provider_version="${USB4_RDMA_PROVIDER_VERSION:-0.2.37}"
+appmana_thunderbolt_release_tag="${APPMANA_THUNDERBOLT_RELEASE_TAG:-v2.13.1}"
 appmana_thunderbolt_release_repo="${APPMANA_THUNDERBOLT_RELEASE_REPO:-https://github.com/AppMana/forks-thunderbolt}"
 vllm_source_repo="${VLLM_SOURCE_REPO:-https://github.com/AppMana/forks-vllm-ampere}"
 flashmla_wheel_url="${FLASHMLA_WHEEL_URL:-}"
@@ -118,6 +119,7 @@ docker buildx build "${repo_root}" \
   --build-arg "APPMANA_NCCL_GIT_REF=${appmana_nccl_git_ref}" \
   --build-arg "INSTALL_USB4_RDMA_PROVIDER=${install_usb4_rdma_provider}" \
   --build-arg "USB4_RDMA_PROVIDER_VERSION=${usb4_rdma_provider_version}" \
+  --build-arg "APPMANA_THUNDERBOLT_RELEASE_TAG=${appmana_thunderbolt_release_tag}" \
   --build-arg "APPMANA_THUNDERBOLT_RELEASE_REPO=${appmana_thunderbolt_release_repo}" \
   --build-arg "VLLM_BUILD_COMMIT=${build_commit}" \
   --build-arg "VLLM_SOURCE_REPO=${vllm_source_repo}" \
