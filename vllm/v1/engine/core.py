@@ -120,6 +120,8 @@ class EngineCore:
         self.log_stats = log_stats
 
         # Setup Model.
+        # Covers distributed (e.g. NCCL) init and weight loading.
+        self._report_startup_stage("executor_init")
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
@@ -236,6 +238,12 @@ class EngineCore:
         # environment variable overrides after this point)
         enable_envs_cache()
 
+    def _report_startup_stage(self, stage: str, detail: str = "") -> None:
+        """Report engine init progress. Overridden by EngineCoreProc to
+        stream PROGRESS messages to the front-end over the startup
+        handshake socket, so /health can expose init stages."""
+        logger.debug("Engine init stage: %s %s", stage, detail)
+
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
@@ -280,6 +288,7 @@ class EngineCore:
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
+                self._report_startup_stage("kv_cache_profiling")
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
@@ -318,6 +327,8 @@ class EngineCore:
         vllm_config.validate_block_size()
 
         # Initialize kv cache and warmup the execution
+        # (includes CUDA graph capture).
+        self._report_startup_stage("graph_capture")
         self.model_executor.initialize_from_config(kv_cache_configs)
 
         elapsed = time.time() - start
@@ -1128,7 +1139,13 @@ class EngineCoreProc(EngineCore):
             addresses = self.startup_handshake(
                 handshake_socket, local_client, headless, parallel_config_to_update
             )
-            yield addresses
+            # While initializing, stream init-stage PROGRESS messages to the
+            # front-end over the handshake socket.
+            self._startup_handshake = (handshake_socket, local_client, headless)
+            try:
+                yield addresses
+            finally:
+                self._startup_handshake = None
 
             # Send ready message.
             ready_msg = {
@@ -1181,6 +1198,32 @@ class EngineCoreProc(EngineCore):
                 setattr(parallel_config, key, value)
 
         return init_message.addresses
+
+    _startup_handshake: tuple[zmq.Socket, bool, bool] | None = None
+
+    def _report_startup_stage(self, stage: str, detail: str = "") -> None:
+        """Stream an init-stage PROGRESS message to the front-end during the
+        startup handshake (no-op outside the handshake window)."""
+        handshake = self._startup_handshake
+        if handshake is None:
+            return
+        handshake_socket, local_client, headless = handshake
+        try:
+            handshake_socket.send(
+                msgspec.msgpack.encode(
+                    {
+                        "status": "PROGRESS",
+                        "local": local_client,
+                        "headless": headless,
+                        "stage": stage,
+                        "detail": detail,
+                    }
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Failed to send startup PROGRESS message.", exc_info=True
+            )
 
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):

@@ -30,6 +30,7 @@ from vllm.utils.network_utils import (
 )
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
+from vllm.v1.engine.health import record_startup_stage
 from vllm.v1.executor import Executor
 from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS
 from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
@@ -1308,7 +1309,16 @@ def wait_for_engine_startup(
                     f"dp lb mode"
                 )
 
+        if status == "PROGRESS" and engine.state == CoreEngineState.CONNECTED:
+            # Engine init progress for the startup probe (/health during
+            # engine initialization). No state transition.
+            record_startup_stage(
+                msg.get("stage", "engine_init"), msg.get("detail", "")
+            )
+            continue
+
         if status == "HELLO" and engine.state == CoreEngineState.NEW:
+            record_startup_stage("engine_core_connected", f"engine {eng_index}")
             # Send init message with DP config info.
             init_message = msgspec.msgpack.encode(
                 EngineHandshakeMetadata(

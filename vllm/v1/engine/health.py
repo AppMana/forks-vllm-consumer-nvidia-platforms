@@ -9,8 +9,50 @@ heartbeats: when requests are outstanding but no heartbeat arrives within the
 stall timeout, the engine is considered stalled and health checks must fail.
 """
 
+import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
+
+
+@dataclass
+class _StartupProgress:
+    stage: str = "starting"
+    detail: str = ""
+    started_at: float = field(default_factory=time.monotonic)
+
+
+_startup_progress = _StartupProgress()
+_startup_progress_lock = threading.Lock()
+
+
+def reset_startup_progress() -> None:
+    """Restart startup progress tracking (also restarts the elapsed clock)."""
+    global _startup_progress
+    with _startup_progress_lock:
+        _startup_progress = _StartupProgress()
+
+
+def record_startup_stage(stage: str, detail: str = "") -> None:
+    """Record the current server startup stage for this process.
+
+    Read by the startup probe HTTP server to answer /health with init
+    progress while the engine initializes. Thread-safe; last writer wins.
+    """
+    with _startup_progress_lock:
+        _startup_progress.stage = stage
+        _startup_progress.detail = detail
+
+
+def startup_progress_snapshot() -> dict[str, str | float]:
+    with _startup_progress_lock:
+        return {
+            "stage": _startup_progress.stage,
+            "detail": _startup_progress.detail,
+            "elapsed_s": round(
+                time.monotonic() - _startup_progress.started_at, 1
+            ),
+        }
 
 
 class EngineStepMonitor:

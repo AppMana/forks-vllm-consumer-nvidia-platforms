@@ -11,7 +11,7 @@ import socket
 import tempfile
 import warnings
 from argparse import Namespace
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
@@ -32,6 +32,7 @@ from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.elastic_ep.middleware import ScalingMiddleware
+from vllm.entrypoints.serve.instrumentator.startup import StartupProbeServer
 from vllm.entrypoints.serve.sagemaker.api_router import sagemaker_standards_bootstrap
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import (
@@ -68,6 +69,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import is_valid_ipv6_address
 from vllm.utils.system_utils import decorate_logs, set_ulimit
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.v1.engine.health import record_startup_stage, reset_startup_progress
 from vllm.version import __version__ as VLLM_VERSION
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -159,6 +161,8 @@ async def build_async_engine_client_from_engine_args(
     Returns the Client or None if the creation failed.
     """
 
+    record_startup_stage("engine_config")
+
     # Create the EngineConfig (determines if we can use V1).
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
 
@@ -172,6 +176,7 @@ async def build_async_engine_client_from_engine_args(
     client_index = client_config.pop("client_index", 0)
 
     try:
+        record_startup_stage("engine_core_launch")
         async_llm = AsyncLLM.from_vllm_config(
             vllm_config=vllm_config,
             usage_context=usage_context,
@@ -655,9 +660,14 @@ async def build_and_serve(
     listen_address: str,
     sock: socket.socket,
     args: Namespace,
+    before_serve: Callable[[], None] | None = None,
     **uvicorn_kwargs,
 ) -> asyncio.Task:
     """Build FastAPI app, initialize state, and start serving.
+
+    `before_serve` runs after app state is initialized, right before the
+    HTTP server starts (used to stop the startup probe server so the real
+    server can take over the listening socket).
 
     Returns the shutdown task for the caller to await.
     """
@@ -667,6 +677,7 @@ async def build_and_serve(
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
+    record_startup_stage("api_server_init")
     supported_tasks = await engine_client.get_supported_tasks()
     model_config = engine_client.model_config
 
@@ -675,6 +686,10 @@ async def build_and_serve(
     await init_app_state(engine_client, app.state, args, supported_tasks)
 
     logger.info("Starting vLLM server on %s", listen_address)
+
+    record_startup_stage("ready")
+    if before_serve is not None:
+        before_serve()
 
     return await serve_http(
         app,
@@ -770,13 +785,33 @@ async def run_server_worker(
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
-    async with build_async_engine_client(
-        args,
-        client_config=client_config,
-    ) as engine_client:
-        shutdown_task = await build_and_serve(
-            engine_client, listen_address, sock, args, **uvicorn_kwargs
-        )
+    # Serve /health and /metrics from the already-bound socket during engine
+    # initialization. Only when this worker owns the socket exclusively
+    # (multi-API-server workers share a reuse-port socket).
+    probe: StartupProbeServer | None = None
+    if client_config is None:
+        reset_startup_progress()
+        probe = StartupProbeServer(sock, args)
+        probe.start()
+
+    try:
+        async with build_async_engine_client(
+            args,
+            client_config=client_config,
+        ) as engine_client:
+            shutdown_task = await build_and_serve(
+                engine_client,
+                listen_address,
+                sock,
+                args,
+                before_serve=probe.stop if probe is not None else None,
+                **uvicorn_kwargs,
+            )
+    except Exception as e:
+        # Keep the probe answering with the failure while teardown runs; the
+        # daemon thread exits with the process.
+        record_startup_stage("failed", str(e))
+        raise
     # NB: Await server shutdown only after the backend context is exited
     try:
         await shutdown_task
