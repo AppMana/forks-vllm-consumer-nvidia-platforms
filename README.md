@@ -112,7 +112,7 @@ replacements validated by parity tests:
 #### Other major additions (non-kernel)
 
 - **`appmana` checkpoint config block** — fail-closed, checkpoint-driven kernel
-  selection, `cache_type` default, and `pp_transport` toggles (details below).
+  selection and `cache_type` default (details below).
 - **`dsv4_int` quant method** — INT4 Marlin experts (group 32, MSE scales) +
   INT8 AllSpark dense + optional W4A8 activations, wiring upstream Marlin /
   AllSpark GEMMs; produced by `tools/ampere/dsv4_requant_checkpoint.py`.
@@ -125,9 +125,9 @@ replacements validated by parity tests:
   corrupting the residual stream (PP=N != PP=1). All four tensors now cross via
   the async `isend/irecv_tensor_dict` path and `mhc_post` runs only on the last
   rank, so PP=N is token-identical to PP=1.
-- **PP transport** — pack the PP intermediate-tensor dict into one NCCL message
-  per hop (`624d5e1263`) and cache the pickled metadata schema across steps
-  (`626da25f1c`); toggled via `appmana.pp_transport`.
+- **Streaming indexer top-k** — activation-chunked prefill top-k over the
+  sparse-MLA indexer's compressed KV, bit-identical to the one-shot path with
+  bounded (not context-scaled) memory; gated by `appmana.kernels`.
 - **`VLLM_RAY_WORKER_IP_ORDER`** (`v1/executor/ray_utils.py`) — binds vLLM PP
   ranks to the chain-index IP order injected by the `tb-chain-webhook`. Without
   it `RayExecutorV2` ranks were scrambled vs per-rank shard materialization, so
@@ -157,41 +157,23 @@ through the LWS at `appmana-cluster/.../inference/lws-vllm-deepseek-v4.yaml` (Gi
 `tb-chain-webhook` injects `NCCL_SOCKET_IFNAME` + `VLLM_RAY_WORKER_IP_ORDER`; the leader/
 worker commands materialize each rank's shards by pod ordinal.
 
-**Measured (single-user, PP=12 TB chain, int4/int8 checkpoint, image `225f0ade8`,
-2026-07-21):**
+**Measured** (`vllm bench serve`, single request, C=1, PP=12 TB chain,
+`appmana/deepseek-v4-int4-int8`, image `225f0ade8`, `--async-scheduling`,
+2026-07-21):
 
-| | `--no-async-scheduling` | `--async-scheduling` |
-|---|---|---|
-| Decode, nonspec (C=1, 4k ctx) | 29.8–30.9 tok/s | **36.0 tok/s** |
-| Decode, DSpark spec (C=1, 4k ctx) | 54.2–57.8 tok/s | **65.3–67.2 tok/s** |
+| Input len | Output len | Speculative decoding | Output token throughput (tok/s) | Mean TTFT (ms) | Mean TPOT (ms) | PP partition |
+| ---: | ---: | --- | ---: | ---: | ---: | --- |
+| 4,000 | 1,024 | off | 33.25 | 2,106.54 | 28.05 | `3,4,4,4,4,4,4,4,4,4,3,1` |
+| 4,000 | 1,024 | DSpark | 56.07 | 1,994.15 | 15.90 | `3,4,4,4,4,4,4,4,4,4,3,1` |
+| 620,004 | 32 | off | — | 191,908.13 | 21.05 | `3,4,4,4,4,4,4,4,4,4,3,1` |
+| 620,004 | 32 | DSpark | — | 182,800.20 | 25.33 | `3,4,4,4,4,4,4,4,4,4,3,1` |
 
-Async scheduling was disabled fleet-wide from 2026-06-30 (a C=2 PP-hang
-workaround, appmana-cluster `c5c226da`/`349b56c5`) through 2026-07-20; it is
-safe again as of the packed-PP-transport removal (`0ee7e9f50c`) and is now the
-default. Re-enabling it is worth +17–20% decode throughput on its own — verify
-against the current image before assuming either column.
-
-**Long-context prefill** (same config, 650k–1M `max_model_len`, chunked
-prefill, chunk 1024): needle retrieval verbatim at 620k, 950k, and the 1M
-window edge; **~3,000–4,100 tok/s** prefill depending on depth and whether
-`indexer_streaming_topk_prefill` is enabled (required above ~700k for the
-one-shot indexer logits to fit in VRAM; costs ~17% prefill throughput below
-that, so leave it off for shorter windows — see the `appmana` block below).
-**1M window + DSpark speculative decoding together** is supported: the last PP
-rank can carry zero target-model layers (`VLLM_PP_LAYER_PARTITION` tail
-`...,0`) and only the MTP draft stages, freeing enough VRAM for the KV pool at
-that depth (fix for the zero-layer weight-loader crash: `f67f53db71`).
-
-The single largest prefill win this session: the sparse int8 prefill kernel's
-whole-KV-pool bf16 dequant buffer (2.25 GiB per call, independent of how much
-of the pool a call actually touched) was replaced with in-kernel dequant
-(`forks-flash-mla-ampere-dsv4` `5966fcc`/`8465684`) — bit-exact, op peak memory
-2314→64 MiB, +23% at the kernel, +37% end-to-end at a 620k-token prefill. Two
-more allocation reclaims of the same shape landed the same night: the
-indexer's prefill gather workspace budget (was `max_model_len × 40`, now
-scheduler-derived — reclaims ~1.26 GiB/rank at 1M context) and per-decode-step
-scratch (indexer logits and the C128A gather were sized by `max_model_len`
-instead of the batch's actual context; `225f0ade82`).
+Needle retrieval is verbatim at 620k, 950k, and the 1M window edge (1M run
+uses `indexer_streaming_topk_prefill` and a zero-target-layer last PP rank,
+partition `3,4,4,4,4,4,4,4,4,4,4,0` — see the `appmana` block below for both).
+Chunked prefill, pipeline parallelism, and speculative decoding are all
+upstream mechanisms; the streaming indexer top-k and the zero-layer rank are
+fork-specific and are what make the 1M row possible on 24 GB GPUs.
 
 ### Configuration: the `appmana` checkpoint-config block
 
@@ -213,33 +195,24 @@ checkpoint's `config.json` carries one block, overridable wholesale via
 }
 ```
 
-The `pp_transport` sub-block (`pack`, `cache_metadata`) has been **removed** —
-the packed intermediate-tensor wire format caused a deterministic ~507k-token
-chunked-prefill stall on the chain transport and was deleted, not disabled
-(`0ee7e9f50c`). Do not re-add it.
-
-A separate role, `indexer_streaming_topk_prefill`, gates the prefill indexer's
-activation-chunked top-k (bit-identical selection, ~231 MiB slab vs. the
-one-shot path's ~1 GiB+ logits tensor at long context) — add
-`"vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk"` to
-`kernels` to enable it; default off. `--hf-overrides` **replaces** the whole
-`appmana` dict rather than merging, so build the override from the
-checkpoint's own `config.json` block plus the one symbol you're adding, never
-a hand-curated list — a dropped kernel entry degrades silently (same
-`--hf-overrides` payload, no error) and is only caught by comparing the
-temperature-0 sanity completion against a known-good baseline byte-for-byte.
-
 Every value is the exact importable symbol that gets activated; the role is
 inferred from a registry. Unknown symbols, duplicate roles, and invalid
 `cache_type` values fail closed at startup. A `kernels` list is authoritative
 for toggles (unlisted = off), which is what makes the int8 indexer independent
 of the dense IMMA runtime. `cache_type` sets the default KV dtype only when the
 CLI passes `--kv-cache-dtype auto`; an explicit CLI value always wins. The
-optional `pp_transport` sub-block toggles the PP intermediate-tensor transport
-optimizations (`pack`, `cache_metadata`); unlike env vars it reliably reaches
-remote Ray workers. The resolved configuration prints once at startup as
-`appmana kernels resolved: ...`
+resolved configuration prints once at startup as `appmana kernels resolved: ...`
 — treat that line as the validity gate for any benchmark row.
+
+Add `vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk` to
+`kernels` to enable the prefill indexer's activation-chunked top-k (bit-
+identical selection to the one-shot path, bounded memory instead of growing
+with context) — default off, and required above ~700k context for the
+one-shot logits tensor to fit in VRAM. `--hf-overrides` replaces the whole
+`appmana` dict rather than merging it, so build overrides from the
+checkpoint's own `config.json` block plus whatever you're adding, not a
+hand-curated list — a dropped kernel entry degrades silently (no error, same
+resolved-config line) and only shows up as a changed sanity completion.
 
 Legacy role-keyed `--hf-overrides` keys
 (`deepseek_v4_sm86_sparse_mla_decode_fp8`, `..._decode_int8`, `..._prefill`) and
