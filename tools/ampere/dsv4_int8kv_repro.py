@@ -78,7 +78,7 @@ def main() -> int:
     parser.add_argument(
         "--hf-overrides",
         default=None,
-        help='JSON dict merged into the HF config, e.g. \'{"appmana": {...}}\' '
+        help='JSON dict merged into the HF config, e.g. \'{"vllm": {...}}\' '
         "to activate the unified kernel-config block on a checkpoint that "
         "predates it.",
     )

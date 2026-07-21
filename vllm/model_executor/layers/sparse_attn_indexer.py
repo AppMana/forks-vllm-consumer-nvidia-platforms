@@ -17,7 +17,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
-from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+from vllm.transformers_utils.configs.dsv4.kernel_config import (
     indexer_prefill_topk_slab_rows_override,
     indexer_streaming_topk_prefill_enabled,
 )
@@ -113,14 +113,14 @@ MXFP4_BLOCK_SIZE = 32
 # shared memory), so on data with boundary ties its selected set is not even
 # deterministic run-to-run; the key order is a deterministic refinement.
 #
-# Gated by the checkpoint "appmana" kernel-config block
-# (vllm/transformers_utils/configs/deepseek_v4_appmana.py): toggle role
+# Gated by the checkpoint "vllm" kernel-config block
+# (vllm/transformers_utils/configs/dsv4/kernel_config.py): toggle role
 # "indexer_streaming_topk_prefill", activated by listing the symbol
 # "vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk" in
-# "appmana.kernels". Absent block/symbol = OFF (one-shot path, bit-for-bit).
+# "vllm.kernels". Absent block/symbol = OFF (one-shot path, bit-for-bit).
 #
 # Default context-slab width in K rows (compressed tokens); override via the
-# "appmana.indexer_prefill_topk_slab_rows" config key. At M=1024, K=2048,
+# "vllm.indexer_prefill_topk_slab_rows" config key. At M=1024, K=2048,
 # slab=16384 the transient footprint is ~231 MiB (64 MiB slab logits fp32 +
 # 144 MiB int64 candidate keys + topk temporaries) vs O(M x window) one-shot.
 INDEXER_PREFILL_TOPK_SLAB_ROWS = 16384
@@ -137,7 +137,7 @@ def should_use_prefill_streaming_topk(
 ) -> bool:
     """Gate for the streaming prefill top-k path.
 
-    The toggle comes from the checkpoint "appmana" kernel-config block
+    The toggle comes from the checkpoint "vllm" kernel-config block
     (indexer_streaming_topk_prefill role); the remaining guards are the
     DCP/FP4/platform constraints of the streaming implementation.
     """

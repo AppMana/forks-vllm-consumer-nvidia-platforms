@@ -19,11 +19,11 @@ FP8_DS_MLA_TOKEN_BYTES = 576
 def indexer_imma_enabled() -> bool:
     """True when the indexer logits run as int8 integer MMA (q quantized to
     symmetric INT8 with its scale folded into weights by the caller; requires
-    the INT8 indexer cache). Selected by the ``"appmana"`` checkpoint config
+    the INT8 indexer cache). Selected by the ``"vllm"`` checkpoint config
     block (role ``indexer_query_int8``, symbol
     ``fused_indexer_q_rope_quant_int8``); legacy checkpoints without a block
     ride the experimental dense-runtime flag."""
-    from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
         indexer_query_int8_enabled,
     )
 
@@ -33,10 +33,10 @@ def indexer_imma_enabled() -> bool:
 def indexer_cache_is_int8() -> bool:
     """True when the indexer K cache stores symmetric INT8 (via
     ``indexer_k_quant_and_cache_int8``) instead of FP8 e4m3. Selected by the
-    ``"appmana"`` checkpoint config block (role ``indexer_cache_int8``);
+    ``"vllm"`` checkpoint config block (role ``indexer_cache_int8``);
     legacy checkpoints without a block ride the experimental dense-runtime
     flag. Gate-1 recall study: tools/ampere/dsv4_indexer_int8_recall.py."""
-    from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
         indexer_cache_int8_enabled,
     )
 

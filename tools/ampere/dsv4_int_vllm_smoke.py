@@ -70,7 +70,7 @@ def main() -> int:
         default="fp8",
         help=(
             "kv cache dtype; pass 'auto' to take the checkpoint's "
-            "appmana.cache_type default"
+            "vllm.cache_type default"
         ),
     )
     parser.add_argument(
@@ -78,7 +78,7 @@ def main() -> int:
         default=None,
         help=(
             "JSON dict merged into the HF config; a dict-valued key like "
-            '\'{"appmana": {...}}\' replaces the whole block'
+            '\'{"vllm": {...}}\' replaces the whole block'
         ),
     )
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)

@@ -184,7 +184,7 @@ def test_sm86_flash_prefill_warmup_skips_bf16_gather_workspace(monkeypatch):
     from vllm.models.deepseek_v4.nvidia_sm86.attention import (
         DeepseekV4TritonSM86Attention,
     )
-    from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
         SPARSE_MLA_PREFILL_FLASH,
     )
 
@@ -230,7 +230,7 @@ def test_gather_prefill_warmup_still_reserves_bf16_workspace(
         from vllm.models.deepseek_v4.nvidia_sm86.attention import (
             DeepseekV4TritonSM86Attention,
         )
-        from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+        from vllm.transformers_utils.configs.dsv4.kernel_config import (
             SPARSE_MLA_PREFILL_TRITON,
         )
 
@@ -269,7 +269,7 @@ def test_workspace_arena_accounting_at_production_geometry(monkeypatch):
     The arena grows to the max ever *requested*, so this asserts on the
     requested sizes routed through a real WorkspaceManager.
     """
-    from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
         SPARSE_MLA_PREFILL_FLASH,
     )
     from vllm.models.deepseek_v4.nvidia_sm86.attention import (

@@ -943,14 +943,14 @@ class VllmConfig:
             self.parallel_config.is_moe_model = self.model_config.is_moe
 
             # AppMana DSV4 unified kernel config: validate the checkpoint's
-            # "appmana" block (fail closed at startup) and apply its
+            # "vllm" block (fail closed at startup) and apply its
             # cache_type as the default kv-cache dtype when the CLI left
             # --kv-cache-dtype at "auto". An explicit CLI value always wins.
-            from vllm.transformers_utils.configs.deepseek_v4_appmana import (
-                apply_appmana_checkpoint_config,
+            from vllm.transformers_utils.configs.dsv4.kernel_config import (
+                apply_checkpoint_config,
             )
 
-            apply_appmana_checkpoint_config(self.model_config, self.cache_config)
+            apply_checkpoint_config(self.model_config, self.cache_config)
 
         if (
             self.model_config is not None

@@ -221,7 +221,7 @@ def test_flash_mla_prefill_rejects_or_matches_real_swa_metadata_shape() -> None:
 
 def test_sm86_prefill_dispatches_triton_and_native() -> None:
     """The prefill role selects between the Triton staging path and the
-    native flash_mla prefill via the appmana kernel config."""
+    native flash_mla prefill via the vllm kernel config."""
     source = inspect.getsource(DeepseekV4SM86Attention._forward_prefill)
     assert "sparse_attention_triton" in source
     assert "_forward_prefill_flash" in source
@@ -233,7 +233,7 @@ def test_sm86_int8_dispatch_supports_native_and_triton_fqns() -> None:
     """int8_ds_mla: the decode role selects between the Triton int8 decode and
     the native flash_mla int8 decode; the FLASH prefill symbol dispatches to
     the fused int8 prefill on int8 caches."""
-    from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
         SPARSE_MLA_DECODE_INT8_FLASH,
         SPARSE_MLA_DECODE_INT8_TRITON,
     )

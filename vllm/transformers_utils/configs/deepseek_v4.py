@@ -4,7 +4,7 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
-from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+from vllm.transformers_utils.configs.dsv4.kernel_config import (
     SPARSE_MLA_DECODE_FP8_FLASH,
     SPARSE_MLA_DECODE_FP8_TRITON,
     SPARSE_MLA_DECODE_INT8_TRITON,
@@ -12,8 +12,8 @@ from vllm.transformers_utils.configs.deepseek_v4_appmana import (
 )
 
 # Deprecated aliases for the role-keyed HF override strings. The canonical
-# symbol constants (and the "appmana" config block that replaces these
-# per-role keys) live in deepseek_v4_appmana.py.
+# symbol constants (and the "vllm" config block that replaces these
+# per-role keys) live in dsv4/kernel_config.py.
 DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8 = SPARSE_MLA_DECODE_FP8_FLASH
 DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON = SPARSE_MLA_DECODE_FP8_TRITON
 DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_INT8 = SPARSE_MLA_DECODE_INT8_TRITON
@@ -38,7 +38,7 @@ class DeepseekV4Config(PretrainedConfig):
         deepseek_v4_sm86_sparse_mla_prefill: str = (
             DEEPSEEK_V4_SM86_SPARSE_MLA_PREFILL
         ),
-        appmana: dict[str, Any] | None = None,
+        vllm: dict[str, Any] | None = None,
         **kwargs,
     ):
         self.max_position_embeddings = max_position_embeddings
@@ -55,6 +55,6 @@ class DeepseekV4Config(PretrainedConfig):
             deepseek_v4_sm86_sparse_mla_prefill
         )
         # Unified checkpoint-config-driven kernel selection block; see
-        # deepseek_v4_appmana.py for the schema and registry.
-        self.appmana = appmana
+        # dsv4/kernel_config.py for the schema and registry.
+        self.vllm = vllm
         super().__init__(**kwargs)

@@ -160,10 +160,10 @@ def _tensor_dict_schema_key(metadata_list: list[tuple[str, Any]]) -> tuple | Non
     return tuple(key_parts)
 
 
-def _appmana_pp_cache_metadata_override() -> bool | None:
-    """The process-wide appmana.pp_transport.cache_metadata override, or None."""
+def _pp_cache_metadata_override() -> bool | None:
+    """The process-wide vllm.pp_transport.cache_metadata override, or None."""
     try:
-        from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+        from vllm.transformers_utils.configs.dsv4.kernel_config import (
             pp_cache_metadata_override,
         )
 
@@ -1026,13 +1026,13 @@ class GroupCoordinator:
         return use_all_gather
 
     def _pp_metadata_cache_enabled(self) -> bool:
-        # Resolve once per group; workers stash the appmana override before the
-        # first hop. Precedence: explicit appmana.pp_transport.cache_metadata
+        # Resolve once per group; workers stash the override before the
+        # first hop. Precedence: explicit vllm.pp_transport.cache_metadata
         # value > VLLM_PP_CACHE_TENSOR_DICT_METADATA env (deprecated fallback) >
         # built-in default (the env default, True).
         enabled: bool | None = getattr(self, "_pp_cache_tensor_dict_metadata", None)
         if enabled is None:
-            enabled = _appmana_pp_cache_metadata_override()
+            enabled = _pp_cache_metadata_override()
             if enabled is None:
                 enabled = envs.VLLM_PP_CACHE_TENSOR_DICT_METADATA
             self._pp_cache_tensor_dict_metadata = enabled

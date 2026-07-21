@@ -2810,9 +2810,9 @@ def indexer_k_quant_and_cache_int8(
     +/-127, fp32 absmax/127 scales in the fp8 scale slots).
 
     This is the registry symbol for the ``indexer_cache_int8`` role of the
-    AppMana DSV4 kernel config block (``"appmana"`` in the checkpoint
+    AppMana DSV4 kernel config block (``"vllm"`` in the checkpoint
     config.json); membership of ``vllm._custom_ops.indexer_k_quant_and_cache_int8``
-    in ``appmana.kernels`` activates the INT8 indexer cache.
+    in ``vllm.kernels`` activates the INT8 indexer cache.
     """
     torch.ops._C_cache_ops.indexer_k_quant_and_cache(
         k, kv_cache, slot_mapping, quant_block_size, "int8"

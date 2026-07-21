@@ -56,9 +56,9 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
 )
-from vllm.transformers_utils.configs.deepseek_v4_appmana import (
-    activate_appmana_kernel_config,
-    resolve_appmana_kernel_config_from_hf_config,
+from vllm.transformers_utils.configs.dsv4.kernel_config import (
+    activate_kernel_config,
+    resolve_kernel_config_from_hf_config,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import (
@@ -180,12 +180,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         layer_id = extract_layer_index(prefix)
 
         self.config = config
-        # Resolve + activate the unified AppMana kernel config ("appmana"
+        # Resolve + activate the unified AppMana kernel config ("vllm"
         # block in the checkpoint config.json) before any consumer (indexer,
         # compressor, backend dispatch) reads the kernel gates. Runs in every
         # worker process at model build; idempotent by value.
-        activate_appmana_kernel_config(
-            resolve_appmana_kernel_config_from_hf_config(config)
+        activate_kernel_config(
+            resolve_kernel_config_from_hf_config(config)
         )
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size

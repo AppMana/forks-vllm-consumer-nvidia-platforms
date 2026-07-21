@@ -132,7 +132,7 @@ def test_dsv4_int_top_level_imma_config_enables_runtime(monkeypatch):
     hf_config = SimpleNamespace(quantization_config=quantization_config)
     setattr(
         hf_config,
-        dsv4_int_module._APPMANA_EXPERIMENTAL_IMMA_CONFIG_KEY,
+        dsv4_int_module._EXPERIMENTAL_IMMA_CONFIG_KEY,
         True,
     )
     model_config = SimpleNamespace(
@@ -144,7 +144,7 @@ def test_dsv4_int_top_level_imma_config_enables_runtime(monkeypatch):
 
     cfg = get_quant_config(model_config, SimpleNamespace())
 
-    assert cfg.appmana_experimental_int8_runtime
+    assert cfg.experimental_int8_runtime
     assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
 
 
@@ -152,7 +152,7 @@ def test_dsv4_int_pickle_restores_imma_runtime_gate(monkeypatch):
     cfg = Dsv4IntConfig.from_config(
         {
             "quant_method": "dsv4_int",
-            dsv4_int_module._APPMANA_EXPERIMENTAL_IMMA_CONFIG_KEY: True,
+            dsv4_int_module._EXPERIMENTAL_IMMA_CONFIG_KEY: True,
             "config_groups": {
                 "experts_w4a16": {
                     "weights": {
@@ -170,7 +170,7 @@ def test_dsv4_int_pickle_restores_imma_runtime_gate(monkeypatch):
             },
         }
     )
-    assert cfg.appmana_experimental_int8_runtime
+    assert cfg.experimental_int8_runtime
     payload = pickle.dumps(cfg)
     monkeypatch.setattr(
         dsv4_int_module,
@@ -180,7 +180,7 @@ def test_dsv4_int_pickle_restores_imma_runtime_gate(monkeypatch):
 
     restored = pickle.loads(payload)
 
-    assert restored.appmana_experimental_int8_runtime
+    assert restored.experimental_int8_runtime
     assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
 
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unified checkpoint-config-driven kernel configuration for AppMana DSV4.
 
-Covers the ``"appmana"`` config.json block: symbol-list resolution to roles,
+Covers the ``"vllm"`` config.json block: symbol-list resolution to roles,
 fail-closed validation, defaults, legacy alias/flag compatibility, indexer
 int8 independence from the dense runtime, cache_type defaulting, and Ray
 unpickle gate propagation.
@@ -16,10 +16,10 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.quantization.dsv4_int as dsv4_int_module
-import vllm.transformers_utils.configs.deepseek_v4_appmana as appmana
+import vllm.transformers_utils.configs.dsv4.kernel_config as kernel_config
 from vllm.model_executor.layers.quantization.dsv4_int import Dsv4IntConfig
-from vllm.transformers_utils.configs.deepseek_v4_appmana import (
-    APPMANA_CONFIG_KEY,
+from vllm.transformers_utils.configs.dsv4.kernel_config import (
+    VLLM_CONFIG_KEY,
     DENSE_EXPERTS_INT8_ACTIVATION,
     INDEXER_CACHE_INT8_WRITER,
     INDEXER_QUERY_INT8_QUANT,
@@ -39,14 +39,14 @@ from vllm.transformers_utils.configs.deepseek_v4_appmana import (
     SPARSE_MLA_DECODE_INT8_TRITON,
     SPARSE_MLA_PREFILL_FLASH,
     SPARSE_MLA_PREFILL_TRITON,
-    activate_appmana_kernel_config,
-    apply_appmana_checkpoint_config,
+    activate_kernel_config,
+    apply_checkpoint_config,
     indexer_cache_int8_enabled,
     indexer_prefill_topk_slab_rows_override,
     indexer_query_int8_enabled,
     indexer_streaming_topk_prefill_enabled,
-    resolve_appmana_kernel_config,
-    resolve_appmana_kernel_config_from_hf_config,
+    resolve_kernel_config,
+    resolve_kernel_config_from_hf_config,
     resolved_proof_line,
 )
 
@@ -64,8 +64,8 @@ _INT_GROUPS = {
 
 
 @pytest.fixture(autouse=True)
-def _reset_appmana_globals(monkeypatch):
-    monkeypatch.setattr(appmana, "_ACTIVE_CONFIG", None)
+def _reset_kernel_config_globals(monkeypatch):
+    monkeypatch.setattr(kernel_config, "_ACTIVE_CONFIG", None)
     monkeypatch.setattr(
         dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False
     )
@@ -113,7 +113,7 @@ def test_registry_covers_all_roles_with_expected_symbols():
 
 
 def test_symbol_list_resolves_roles():
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {
             "kernels": [
                 SPARSE_MLA_DECODE_FP8_FLASH,
@@ -143,14 +143,14 @@ def test_symbol_list_resolves_roles():
 
 def test_unknown_symbol_is_hard_error():
     with pytest.raises(ValueError, match="[Uu]nknown"):
-        resolve_appmana_kernel_config(
+        resolve_kernel_config(
             {"kernels": ["flash_mla.no_such_kernel"], "cache_type": "fp8_ds_mla"}
         )
 
 
 def test_duplicate_role_is_hard_error():
     with pytest.raises(ValueError, match="same role"):
-        resolve_appmana_kernel_config(
+        resolve_kernel_config(
             {
                 "kernels": [
                     SPARSE_MLA_DECODE_FP8_FLASH,
@@ -162,21 +162,21 @@ def test_duplicate_role_is_hard_error():
 
 def test_unknown_block_key_is_hard_error():
     with pytest.raises(ValueError, match="key"):
-        resolve_appmana_kernel_config({"kernels": [], "cachetype": "fp8_ds_mla"})
+        resolve_kernel_config({"kernels": [], "cachetype": "fp8_ds_mla"})
 
 
 def test_invalid_cache_type_is_hard_error():
     with pytest.raises(ValueError, match="cache_type"):
-        resolve_appmana_kernel_config({"kernels": [], "cache_type": "fp7_ds_mla"})
+        resolve_kernel_config({"kernels": [], "cache_type": "fp7_ds_mla"})
 
 
 def test_indexer_query_int8_requires_cache_int8():
     with pytest.raises(ValueError, match="indexer_cache_int8"):
-        resolve_appmana_kernel_config({"kernels": [INDEXER_QUERY_INT8_QUANT]})
+        resolve_kernel_config({"kernels": [INDEXER_QUERY_INT8_QUANT]})
 
 
 def test_defaults_when_absent():
-    resolved = resolve_appmana_kernel_config(None)
+    resolved = resolve_kernel_config(None)
     assert not resolved.explicit
     assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_FLASH
     assert (
@@ -193,7 +193,7 @@ def test_defaults_when_absent():
 
 
 def test_legacy_alias_keys_still_work_and_log_deprecation(caplog_vllm):
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         None,
         legacy_aliases={
             "deepseek_v4_sm86_sparse_mla_decode_fp8": SPARSE_MLA_DECODE_FP8_TRITON,
@@ -209,7 +209,7 @@ def test_legacy_alias_keys_still_work_and_log_deprecation(caplog_vllm):
 
 def test_legacy_alias_invalid_value_is_hard_error():
     with pytest.raises(ValueError, match="deepseek_v4_sm86_sparse_mla_decode_fp8"):
-        resolve_appmana_kernel_config(
+        resolve_kernel_config(
             None,
             legacy_aliases={
                 # A real symbol, but for the wrong role: fail closed.
@@ -219,7 +219,7 @@ def test_legacy_alias_invalid_value_is_hard_error():
 
 
 def test_block_wins_over_legacy_alias():
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [SPARSE_MLA_DECODE_FP8_FLASH]},
         legacy_aliases={
             "deepseek_v4_sm86_sparse_mla_decode_fp8": SPARSE_MLA_DECODE_FP8_TRITON,
@@ -230,10 +230,10 @@ def test_block_wins_over_legacy_alias():
 
 def test_resolve_from_hf_config_reads_block_aliases_and_flag():
     hf_config = SimpleNamespace(
-        appmana={"kernels": [INDEXER_CACHE_INT8_WRITER], "cache_type": "fp8_ds_mla"},
+        vllm={"kernels": [INDEXER_CACHE_INT8_WRITER], "cache_type": "fp8_ds_mla"},
         quantization_config={"quant_method": "dsv4_int"},
     )
-    resolved = resolve_appmana_kernel_config_from_hf_config(hf_config)
+    resolved = resolve_kernel_config_from_hf_config(hf_config)
     assert resolved.explicit
     assert resolved.roles[ROLE_INDEXER_CACHE_INT8] == INDEXER_CACHE_INT8_WRITER
     assert resolved.cache_type == "fp8_ds_mla"
@@ -242,7 +242,7 @@ def test_resolve_from_hf_config_reads_block_aliases_and_flag():
         deepseek_v4_sm86_sparse_mla_decode_fp8=SPARSE_MLA_DECODE_FP8_TRITON,
     )
     setattr(legacy_hf_config, LEGACY_IMMA_CONFIG_KEY, True)
-    resolved = resolve_appmana_kernel_config_from_hf_config(legacy_hf_config)
+    resolved = resolve_kernel_config_from_hf_config(legacy_hf_config)
     assert not resolved.explicit
     assert resolved.legacy_dense_flag
     assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_TRITON
@@ -263,7 +263,7 @@ def test_legacy_url_flag_still_enables_dense_runtime_and_indexer_int8():
             "config_groups": _INT_GROUPS,
         }
     )
-    assert cfg.appmana_experimental_int8_runtime
+    assert cfg.experimental_int8_runtime
     assert cfg.expert_input_dtype is torch.int8
     assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
     assert indexer_cache_int8_enabled()
@@ -272,7 +272,7 @@ def test_legacy_url_flag_still_enables_dense_runtime_and_indexer_int8():
     assert dsv4_sm86.indexer_imma_enabled()
 
 
-def test_appmana_block_enables_indexer_int8_without_legacy_flag():
+def test_vllm_block_enables_indexer_int8_without_legacy_flag():
     """Indexer int8 is activatable on a checkpoint WITHOUT the legacy flag."""
     from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
 
@@ -280,13 +280,13 @@ def test_appmana_block_enables_indexer_int8_without_legacy_flag():
         {
             "quant_method": "dsv4_int",
             "config_groups": _INT_GROUPS,
-            APPMANA_CONFIG_KEY: {
+            VLLM_CONFIG_KEY: {
                 "kernels": [INDEXER_CACHE_INT8_WRITER, INDEXER_QUERY_INT8_QUANT],
             },
         }
     )
     # Dense/W4A8 runtime stays OFF: the block did not list its symbol.
-    assert not cfg.appmana_experimental_int8_runtime
+    assert not cfg.experimental_int8_runtime
     assert cfg.expert_input_dtype is None
     assert not dsv4_int_module.dsv4_int4_experts_int8_dense_active()
     # Indexer int8 is ON, independent of the dense flag.
@@ -296,7 +296,7 @@ def test_appmana_block_enables_indexer_int8_without_legacy_flag():
     assert dsv4_sm86.indexer_imma_enabled()
 
 
-def test_appmana_block_disables_indexer_int8_despite_legacy_flag():
+def test_vllm_block_disables_indexer_int8_despite_legacy_flag():
     """Indexer int8 is deactivatable on a checkpoint WITH the legacy flag by
     overriding the block (e.g. via --hf-overrides)."""
     from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
@@ -306,13 +306,13 @@ def test_appmana_block_disables_indexer_int8_despite_legacy_flag():
             "quant_method": "dsv4_int",
             LEGACY_IMMA_CONFIG_KEY: True,
             "config_groups": _INT_GROUPS,
-            APPMANA_CONFIG_KEY: {
+            VLLM_CONFIG_KEY: {
                 "kernels": [DENSE_EXPERTS_INT8_ACTIVATION],
             },
         }
     )
     # Dense runtime stays on (listed), but the indexer no longer rides it.
-    assert cfg.appmana_experimental_int8_runtime
+    assert cfg.experimental_int8_runtime
     assert cfg.expert_input_dtype is torch.int8
     assert not indexer_cache_int8_enabled()
     assert not indexer_query_int8_enabled()
@@ -325,7 +325,7 @@ def test_dense_symbol_requires_int_weight_groups():
         Dsv4IntConfig.from_config(
             {
                 "quant_method": "dsv4_int",
-                APPMANA_CONFIG_KEY: {"kernels": [DENSE_EXPERTS_INT8_ACTIVATION]},
+                VLLM_CONFIG_KEY: {"kernels": [DENSE_EXPERTS_INT8_ACTIVATION]},
             }
         )
 
@@ -334,16 +334,16 @@ def test_vanilla_checkpoint_block_enables_indexer_int8_without_quant_config():
     """The kernels list works on vanilla-weights deployments (no dsv4_int)."""
     from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
 
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [INDEXER_CACHE_INT8_WRITER, INDEXER_QUERY_INT8_QUANT]}
     )
-    activate_appmana_kernel_config(resolved)
+    activate_kernel_config(resolved)
     assert dsv4_sm86.indexer_cache_is_int8()
     assert dsv4_sm86.indexer_imma_enabled()
 
 
 # ---------------------------------------------------------------------------
-# Marlin input dtype: appmana block > VLLM_MARLIN_INPUT_DTYPE env > default
+# Marlin input dtype: vllm block > VLLM_MARLIN_INPUT_DTYPE env > default
 # ---------------------------------------------------------------------------
 
 
@@ -355,7 +355,7 @@ def test_marlin_input_dtype_from_block_with_env_unset(monkeypatch):
         {
             "quant_method": "dsv4_int",
             "config_groups": _INT_GROUPS,
-            APPMANA_CONFIG_KEY: {"kernels": [DENSE_EXPERTS_INT8_ACTIVATION]},
+            VLLM_CONFIG_KEY: {"kernels": [DENSE_EXPERTS_INT8_ACTIVATION]},
         }
     )
     assert cfg.resolve_marlin_input_dtype() is torch.int8
@@ -381,7 +381,7 @@ def test_marlin_input_dtype_block_overrides_env(monkeypatch):
             "quant_method": "dsv4_int",
             "config_groups": _INT_GROUPS,
             # Explicit block WITHOUT the dense symbol: W4A16, env ignored.
-            APPMANA_CONFIG_KEY: {"kernels": []},
+            VLLM_CONFIG_KEY: {"kernels": []},
         }
     )
     assert cfg.resolve_marlin_input_dtype() is None
@@ -392,12 +392,12 @@ def test_marlin_input_dtype_block_overrides_env(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_dsv4_int_pickle_restores_appmana_block_gates(monkeypatch):
+def test_dsv4_int_pickle_restores_kernel_block_gates(monkeypatch):
     cfg = Dsv4IntConfig.from_config(
         {
             "quant_method": "dsv4_int",
             "config_groups": _INT_GROUPS,
-            APPMANA_CONFIG_KEY: {
+            VLLM_CONFIG_KEY: {
                 "kernels": [INDEXER_CACHE_INT8_WRITER, INDEXER_QUERY_INT8_QUANT],
             },
         }
@@ -405,7 +405,7 @@ def test_dsv4_int_pickle_restores_appmana_block_gates(monkeypatch):
     assert indexer_cache_int8_enabled()
     payload = pickle.dumps(cfg)
 
-    monkeypatch.setattr(appmana, "_ACTIVE_CONFIG", None)
+    monkeypatch.setattr(kernel_config, "_ACTIVE_CONFIG", None)
     monkeypatch.setattr(
         dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False
     )
@@ -413,7 +413,7 @@ def test_dsv4_int_pickle_restores_appmana_block_gates(monkeypatch):
 
     restored = pickle.loads(payload)
 
-    assert not restored.appmana_experimental_int8_runtime
+    assert not restored.experimental_int8_runtime
     assert indexer_cache_int8_enabled()
     assert indexer_query_int8_enabled()
 
@@ -427,7 +427,7 @@ def test_dsv4_int_pickle_restores_legacy_imma_runtime_gate(monkeypatch):
             "config_groups": _INT_GROUPS,
         }
     )
-    assert cfg.appmana_experimental_int8_runtime
+    assert cfg.experimental_int8_runtime
     payload = pickle.dumps(cfg)
     monkeypatch.setattr(
         dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False
@@ -435,7 +435,7 @@ def test_dsv4_int_pickle_restores_legacy_imma_runtime_gate(monkeypatch):
 
     restored = pickle.loads(payload)
 
-    assert restored.appmana_experimental_int8_runtime
+    assert restored.experimental_int8_runtime
     assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
 
 
@@ -444,9 +444,9 @@ def test_dsv4_int_pickle_restores_legacy_imma_runtime_gate(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _fake_model_config(appmana_block, quant_method="dsv4_int"):
+def _fake_model_config(vllm_block, quant_method="dsv4_int"):
     hf_config = SimpleNamespace(
-        appmana=appmana_block,
+        vllm=vllm_block,
         quantization_config={"quant_method": quant_method},
     )
     return SimpleNamespace(hf_config=hf_config, quantization=quant_method)
@@ -455,7 +455,7 @@ def _fake_model_config(appmana_block, quant_method="dsv4_int"):
 def test_cache_type_sets_default_when_cli_is_auto():
     model_config = _fake_model_config({"kernels": [], "cache_type": "fp8_ds_mla"})
     cache_config = SimpleNamespace(cache_dtype="auto")
-    apply_appmana_checkpoint_config(model_config, cache_config)
+    apply_checkpoint_config(model_config, cache_config)
     assert cache_config.cache_dtype == "fp8_ds_mla"
 
 
@@ -463,33 +463,33 @@ def test_explicit_cli_kv_cache_dtype_wins_over_cache_type():
     """Docs rule: if the user explicitly asks for fp8, it must stay fp8."""
     model_config = _fake_model_config({"kernels": [], "cache_type": "int8_ds_mla"})
     cache_config = SimpleNamespace(cache_dtype="fp8")
-    apply_appmana_checkpoint_config(model_config, cache_config)
+    apply_checkpoint_config(model_config, cache_config)
     assert cache_config.cache_dtype == "fp8"
 
 
 def test_apply_is_a_noop_without_block():
     model_config = _fake_model_config(None)
     cache_config = SimpleNamespace(cache_dtype="auto")
-    apply_appmana_checkpoint_config(model_config, cache_config)
+    apply_checkpoint_config(model_config, cache_config)
     assert cache_config.cache_dtype == "auto"
 
 
 def test_apply_fails_closed_on_dense_symbol_with_vanilla_weights():
     hf_config = SimpleNamespace(
-        appmana={"kernels": [DENSE_EXPERTS_INT8_ACTIVATION]},
+        vllm={"kernels": [DENSE_EXPERTS_INT8_ACTIVATION]},
         quantization_config=None,
     )
     model_config = SimpleNamespace(hf_config=hf_config, quantization=None)
     cache_config = SimpleNamespace(cache_dtype="auto")
     with pytest.raises(ValueError, match="dense_experts_int8_activation"):
-        apply_appmana_checkpoint_config(model_config, cache_config)
+        apply_checkpoint_config(model_config, cache_config)
 
 
 def test_apply_fails_closed_on_bad_block_at_startup():
     model_config = _fake_model_config({"kernels": ["not.a.symbol"]})
     cache_config = SimpleNamespace(cache_dtype="auto")
     with pytest.raises(ValueError, match="[Uu]nknown"):
-        apply_appmana_checkpoint_config(model_config, cache_config)
+        apply_checkpoint_config(model_config, cache_config)
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +498,7 @@ def test_apply_fails_closed_on_bad_block_at_startup():
 
 
 def test_resolved_proof_line_is_single_stable_line():
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {
             "kernels": [
                 SPARSE_MLA_DECODE_FP8_FLASH,
@@ -510,11 +510,11 @@ def test_resolved_proof_line_is_single_stable_line():
             "cache_type": "fp8_ds_mla",
         }
     )
-    activate_appmana_kernel_config(resolved)
+    activate_kernel_config(resolved)
     line = resolved_proof_line(resolved, kv_cache_dtype="fp8_ds_mla")
     assert "\n" not in line
     assert line == (
-        "appmana kernels resolved:"
+        "vllm kernels resolved:"
         f" sparse_mla_decode_fp8={SPARSE_MLA_DECODE_FP8_FLASH}"
         f" sparse_mla_decode_int8={SPARSE_MLA_DECODE_INT8_TRITON}"
         f" sparse_mla_prefill={SPARSE_MLA_PREFILL_FLASH}"
@@ -527,8 +527,8 @@ def test_resolved_proof_line_is_single_stable_line():
 
 
 def test_resolved_proof_line_marks_inactive_toggles_off():
-    resolved = resolve_appmana_kernel_config(None)
-    activate_appmana_kernel_config(resolved)
+    resolved = resolve_kernel_config(None)
+    activate_kernel_config(resolved)
     line = resolved_proof_line(resolved, kv_cache_dtype="fp8_ds_mla")
     assert "indexer_cache_int8=off" in line
     assert "indexer_query_int8=off" in line
@@ -570,26 +570,26 @@ def test_sm86_attention_dispatches_all_registered_prefill_symbols():
 
 def test_pp_transport_absent_leaves_override_none():
     """No pp_transport key -> override None (fall back to env/default)."""
-    resolved = resolve_appmana_kernel_config({"kernels": []})
+    resolved = resolve_kernel_config({"kernels": []})
     assert resolved.pp_cache_metadata is None
-    resolved = resolve_appmana_kernel_config(None)
+    resolved = resolve_kernel_config(None)
     assert resolved.pp_cache_metadata is None
 
 
 def test_pp_transport_round_trips_booleans():
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [], "pp_transport": {"cache_metadata": True}}
     )
     assert resolved.pp_cache_metadata is True
 
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [], "pp_transport": {"cache_metadata": False}}
     )
     assert resolved.pp_cache_metadata is False
 
 
 def test_pp_transport_empty_block_leaves_override_none():
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [], "pp_transport": {}}
     )
     assert resolved.pp_cache_metadata is None
@@ -599,59 +599,59 @@ def test_pp_transport_unknown_subkey_is_hard_error():
     # "pack" was removed with the packed wire format; it must now be
     # rejected like any other unknown key.
     with pytest.raises(ValueError, match="pp_transport"):
-        resolve_appmana_kernel_config(
+        resolve_kernel_config(
             {"kernels": [], "pp_transport": {"pack": True}}
         )
 
 
 def test_pp_transport_non_bool_value_is_hard_error():
     with pytest.raises(ValueError, match="pp_transport"):
-        resolve_appmana_kernel_config(
+        resolve_kernel_config(
             {"kernels": [], "pp_transport": {"cache_metadata": 1}}
         )
 
 
 def test_pp_transport_non_dict_is_hard_error():
     with pytest.raises(ValueError, match="pp_transport"):
-        resolve_appmana_kernel_config({"kernels": [], "pp_transport": [1, 2]})
+        resolve_kernel_config({"kernels": [], "pp_transport": [1, 2]})
 
 
 def test_pp_transport_resolves_from_hf_config():
     hf_config = SimpleNamespace(
-        appmana={"kernels": [], "pp_transport": {"cache_metadata": False}},
+        vllm={"kernels": [], "pp_transport": {"cache_metadata": False}},
         quantization_config={"quant_method": "dsv4_int"},
     )
-    resolved = resolve_appmana_kernel_config_from_hf_config(hf_config)
+    resolved = resolve_kernel_config_from_hf_config(hf_config)
     assert resolved.pp_cache_metadata is False
 
 
 def test_pp_transport_stash_and_precedence_over_env(monkeypatch):
-    """The stashed appmana override wins over the env var; None falls back."""
-    import vllm.transformers_utils.configs.deepseek_v4_appmana as appmana_mod
+    """The stashed override wins over the env var; None falls back."""
+    import vllm.transformers_utils.configs.dsv4.kernel_config as kernel_config_mod
 
-    monkeypatch.setattr(appmana_mod, "_PP_CACHE_METADATA_OVERRIDE", None)
+    monkeypatch.setattr(kernel_config_mod, "_PP_CACHE_METADATA_OVERRIDE", None)
 
     # Nothing stashed -> the override reports None.
-    assert appmana_mod.pp_cache_metadata_override() is None
+    assert kernel_config_mod.pp_cache_metadata_override() is None
 
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [], "pp_transport": {"cache_metadata": True}}
     )
-    appmana_mod.stash_pp_transport_overrides(resolved.pp_cache_metadata)
-    assert appmana_mod.pp_cache_metadata_override() is True
+    kernel_config_mod.stash_pp_transport_overrides(resolved.pp_cache_metadata)
+    assert kernel_config_mod.pp_cache_metadata_override() is True
 
 
 def test_activate_stashes_pp_transport_overrides(monkeypatch):
-    """activate_appmana_kernel_config propagates pp_transport to the stash
+    """activate_kernel_config propagates pp_transport to the stash
     (covers the model-build and Ray-unpickle activation paths)."""
-    import vllm.transformers_utils.configs.deepseek_v4_appmana as appmana_mod
+    import vllm.transformers_utils.configs.dsv4.kernel_config as kernel_config_mod
 
-    monkeypatch.setattr(appmana_mod, "_PP_CACHE_METADATA_OVERRIDE", None)
-    resolved = resolve_appmana_kernel_config(
+    monkeypatch.setattr(kernel_config_mod, "_PP_CACHE_METADATA_OVERRIDE", None)
+    resolved = resolve_kernel_config(
         {"kernels": [], "pp_transport": {"cache_metadata": False}}
     )
-    activate_appmana_kernel_config(resolved)
-    assert appmana_mod.pp_cache_metadata_override() is False
+    activate_kernel_config(resolved)
+    assert kernel_config_mod.pp_cache_metadata_override() is False
 
 
 def test_sm86_native_prefill_supports_fp8_and_int8_caches():
@@ -662,7 +662,7 @@ def test_sm86_native_prefill_supports_fp8_and_int8_caches():
         validate_sm86_kernel_selection,
     )
 
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [SPARSE_MLA_PREFILL_FLASH]}
     )
     validate_sm86_kernel_selection(resolved, kv_cache_dtype="fp8_ds_mla")
@@ -675,7 +675,7 @@ def test_sm86_native_prefill_supports_fp8_and_int8_caches():
 def test_sm86_int8_decode_native_selectable_triton_default():
     """The native flash_mla int8 decode is SELECTABLE for the int8 decode role;
     the Triton int8 decode remains the documented default."""
-    from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
         SELECTOR_ROLE_DEFAULTS,
     )
 
@@ -683,13 +683,13 @@ def test_sm86_int8_decode_native_selectable_triton_default():
         SELECTOR_ROLE_DEFAULTS[ROLE_SPARSE_MLA_DECODE_INT8]
         == SPARSE_MLA_DECODE_INT8_TRITON
     )
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [SPARSE_MLA_DECODE_INT8_FLASH]}
     )
     assert resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_FLASH
     # Both int8 decode symbols claim one role: listing both is a hard error.
     with pytest.raises(ValueError, match="same role"):
-        resolve_appmana_kernel_config(
+        resolve_kernel_config(
             {
                 "kernels": [
                     SPARSE_MLA_DECODE_INT8_FLASH,
@@ -715,10 +715,10 @@ def test_streaming_topk_prefill_symbol_registered():
 
 
 def test_streaming_topk_prefill_on_when_listed():
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [INDEXER_STREAMING_TOPK_PREFILL]}
     )
-    activate_appmana_kernel_config(resolved)
+    activate_kernel_config(resolved)
     assert (
         resolved.roles[ROLE_INDEXER_STREAMING_TOPK_PREFILL]
         == INDEXER_STREAMING_TOPK_PREFILL
@@ -729,16 +729,16 @@ def test_streaming_topk_prefill_on_when_listed():
 
 
 def test_streaming_topk_prefill_off_when_unlisted():
-    resolved = resolve_appmana_kernel_config({"kernels": []})
-    activate_appmana_kernel_config(resolved)
+    resolved = resolve_kernel_config({"kernels": []})
+    activate_kernel_config(resolved)
     assert not indexer_streaming_topk_prefill_enabled()
 
 
 def test_streaming_topk_prefill_off_without_block_even_with_legacy_flag():
     """Default OFF: an absent block preserves the one-shot prefill path
     bit-for-bit, and the legacy dense flag never rides this toggle."""
-    resolved = resolve_appmana_kernel_config(None, legacy_dense_flag=True)
-    activate_appmana_kernel_config(resolved)
+    resolved = resolve_kernel_config(None, legacy_dense_flag=True)
+    activate_kernel_config(resolved)
     assert not indexer_streaming_topk_prefill_enabled()
 
 
@@ -748,10 +748,10 @@ def test_streaming_topk_prefill_off_with_no_active_config():
 
 def test_slab_rows_absent_is_none():
     assert (
-        resolve_appmana_kernel_config(None).indexer_prefill_topk_slab_rows is None
+        resolve_kernel_config(None).indexer_prefill_topk_slab_rows is None
     )
     assert (
-        resolve_appmana_kernel_config(
+        resolve_kernel_config(
             {"kernels": []}
         ).indexer_prefill_topk_slab_rows
         is None
@@ -759,7 +759,7 @@ def test_slab_rows_absent_is_none():
 
 
 def test_slab_rows_round_trips_int():
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {
             "kernels": [INDEXER_STREAMING_TOPK_PREFILL],
             "indexer_prefill_topk_slab_rows": 8192,
@@ -771,19 +771,19 @@ def test_slab_rows_round_trips_int():
 @pytest.mark.parametrize("bad", [True, False, "16384", 16384.0, 0, -1])
 def test_slab_rows_invalid_is_hard_error(bad):
     with pytest.raises(ValueError, match="indexer_prefill_topk_slab_rows"):
-        resolve_appmana_kernel_config(
+        resolve_kernel_config(
             {"kernels": [], "indexer_prefill_topk_slab_rows": bad}
         )
 
 
 def test_slab_rows_resolves_from_hf_config():
     hf_config = SimpleNamespace(
-        appmana={
+        vllm={
             "kernels": [INDEXER_STREAMING_TOPK_PREFILL],
             "indexer_prefill_topk_slab_rows": 4096,
         },
     )
-    resolved = resolve_appmana_kernel_config_from_hf_config(hf_config)
+    resolved = resolve_kernel_config_from_hf_config(hf_config)
     assert resolved.indexer_prefill_topk_slab_rows == 4096
     assert resolved.roles[ROLE_INDEXER_STREAMING_TOPK_PREFILL] == (
         INDEXER_STREAMING_TOPK_PREFILL
@@ -792,10 +792,10 @@ def test_slab_rows_resolves_from_hf_config():
 
 def test_slab_rows_override_reads_active_config():
     assert indexer_prefill_topk_slab_rows_override() is None
-    resolved = resolve_appmana_kernel_config(
+    resolved = resolve_kernel_config(
         {"kernels": [], "indexer_prefill_topk_slab_rows": 4096}
     )
-    activate_appmana_kernel_config(resolved)
+    activate_kernel_config(resolved)
     assert indexer_prefill_topk_slab_rows_override() == 4096
 
 
@@ -817,14 +817,14 @@ def test_indexer_gate_reads_toggle_from_config(monkeypatch):
     monkeypatch.setattr(indexer, "current_platform", _fake_platform())
     assert not indexer.should_use_prefill_streaming_topk(1, False)
 
-    activate_appmana_kernel_config(
-        resolve_appmana_kernel_config(
+    activate_kernel_config(
+        resolve_kernel_config(
             {"kernels": [INDEXER_STREAMING_TOPK_PREFILL]}
         )
     )
     assert indexer.should_use_prefill_streaming_topk(1, False)
 
-    activate_appmana_kernel_config(resolve_appmana_kernel_config({"kernels": []}))
+    activate_kernel_config(resolve_kernel_config({"kernels": []}))
     assert not indexer.should_use_prefill_streaming_topk(1, False)
 
 
@@ -833,8 +833,8 @@ def test_indexer_gate_guards_unchanged(monkeypatch):
     config toggle."""
     import vllm.model_executor.layers.sparse_attn_indexer as indexer
 
-    activate_appmana_kernel_config(
-        resolve_appmana_kernel_config(
+    activate_kernel_config(
+        resolve_kernel_config(
             {"kernels": [INDEXER_STREAMING_TOPK_PREFILL]}
         )
     )
@@ -882,8 +882,8 @@ def test_indexer_slab_rows_resolution():
         indexer._resolved_prefill_topk_slab_rows()
         == indexer.INDEXER_PREFILL_TOPK_SLAB_ROWS
     )
-    activate_appmana_kernel_config(
-        resolve_appmana_kernel_config(
+    activate_kernel_config(
+        resolve_kernel_config(
             {"kernels": [], "indexer_prefill_topk_slab_rows": 4096}
         )
     )

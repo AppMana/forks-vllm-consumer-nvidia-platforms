@@ -235,20 +235,20 @@ def test_multi_request_row_offsets():
     )
 
 
-def test_appmana_block_gates_streaming_and_sets_slab_rows(monkeypatch):
-    """The checkpoint "appmana" block turns the gate on and its
+def test_vllm_block_gates_streaming_and_sets_slab_rows(monkeypatch):
+    """The checkpoint "vllm" block turns the gate on and its
     indexer_prefill_topk_slab_rows key drives the default slab width, with the
     selection staying exact."""
     import vllm.model_executor.layers.sparse_attn_indexer as indexer_mod
-    import vllm.transformers_utils.configs.deepseek_v4_appmana as appmana
+    import vllm.transformers_utils.configs.dsv4.kernel_config as kernel_config
 
-    monkeypatch.setattr(appmana, "_ACTIVE_CONFIG", None)
+    monkeypatch.setattr(kernel_config, "_ACTIVE_CONFIG", None)
     assert not indexer_mod.should_use_prefill_streaming_topk(1, False)
 
-    appmana.activate_appmana_kernel_config(
-        appmana.resolve_appmana_kernel_config(
+    kernel_config.activate_kernel_config(
+        kernel_config.resolve_kernel_config(
             {
-                "kernels": [appmana.INDEXER_STREAMING_TOPK_PREFILL],
+                "kernels": [kernel_config.INDEXER_STREAMING_TOPK_PREFILL],
                 "indexer_prefill_topk_slab_rows": 5000,
             }
         )

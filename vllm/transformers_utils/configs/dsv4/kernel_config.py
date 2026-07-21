@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unified checkpoint-config-driven kernel configuration for AppMana DSV4.
 
-A single ``"appmana"`` block at the top level of the checkpoint's
+A single ``"vllm"`` block at the top level of the checkpoint's
 ``config.json`` selects every fork-specific kernel path::
 
-    "appmana": {
+    "vllm": {
       "kernels": ["flash_mla.sparse_mla_decode_fp8",
                   "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels"
                   ".sparse_attention_triton",
@@ -34,7 +34,7 @@ Principles:
    ``--hf-overrides`` entries by *replacing* the whole attribute
    (``ModelConfig._apply_dict_overrides`` does ``setattr`` for plain-dict
    attributes — it does NOT deep-merge), so one
-   ``--hf-overrides '{"appmana": {...}}'`` blob replaces the entire block.
+   ``--hf-overrides '{"vllm": {...}}'`` blob replaces the entire block.
 
 Legacy compatibility (deprecated, still honored when no block is present):
 
@@ -56,7 +56,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-APPMANA_CONFIG_KEY = "appmana"
+VLLM_CONFIG_KEY = "vllm"
 # Context-slab width (in compressed-token rows) for the streaming prefill
 # top-k path. A tuning key: only effective while the
 # ``indexer_streaming_topk_prefill`` toggle role is active; absent means the
@@ -166,10 +166,10 @@ _PROOF_ROLE_ORDER = (
 
 
 @dataclass(frozen=True)
-class ResolvedAppmanaKernelConfig:
+class ResolvedKernelConfig:
     """Validated role -> symbol assignment for one checkpoint."""
 
-    # True when an "appmana" block with a "kernels" list was present. When
+    # True when a "vllm" block with a "kernels" list was present. When
     # False, toggle roles fall back to legacy (URL-flag-derived) behavior at
     # query time via the gates below.
     explicit: bool
@@ -179,7 +179,7 @@ class ResolvedAppmanaKernelConfig:
     cache_type: str | None = None
     # Value of the legacy checkpoint flag, used for legacy toggle defaults.
     legacy_dense_flag: bool = False
-    # PP intermediate-tensor transport toggles from "appmana.pp_transport".
+    # PP intermediate-tensor transport toggles from "vllm.pp_transport".
     # None = "not specified": the coordinator falls back to the env var, then
     # the built-in default (both effectively on today). An explicit bool here
     # rides VllmConfig to every Ray worker, unlike the env var (which is only
@@ -216,13 +216,13 @@ def _allowed_cache_types() -> tuple[str, ...]:
     return tuple(_flatten(CacheDType))
 
 
-def resolve_appmana_kernel_config(
+def resolve_kernel_config(
     block: Any,
     *,
     legacy_aliases: Mapping[str, str] | None = None,
     legacy_dense_flag: bool = False,
-) -> ResolvedAppmanaKernelConfig:
-    """Resolve and validate the ``appmana`` block (fail closed).
+) -> ResolvedKernelConfig:
+    """Resolve and validate the ``vllm`` block (fail closed).
 
     ``legacy_aliases`` maps the deprecated role-keyed HF config attribute
     names to their values; they are honored only when no block is present and
@@ -237,13 +237,13 @@ def resolve_appmana_kernel_config(
     if block is not None:
         if not isinstance(block, dict):
             raise ValueError(
-                f'"{APPMANA_CONFIG_KEY}" config block must be a JSON object, '
+                f'"{VLLM_CONFIG_KEY}" config block must be a JSON object, '
                 f"got {type(block).__name__}"
             )
         unknown_keys = set(block) - _ALLOWED_BLOCK_KEYS
         if unknown_keys:
             raise ValueError(
-                f'Unknown "{APPMANA_CONFIG_KEY}" config key(s) '
+                f'Unknown "{VLLM_CONFIG_KEY}" config key(s) '
                 f"{sorted(unknown_keys)}; allowed: {sorted(_ALLOWED_BLOCK_KEYS)}"
             )
         raw_kernels = block.get("kernels")
@@ -252,7 +252,7 @@ def resolve_appmana_kernel_config(
                 isinstance(symbol, str) for symbol in raw_kernels
             ):
                 raise ValueError(
-                    f'"{APPMANA_CONFIG_KEY}.kernels" must be a list of '
+                    f'"{VLLM_CONFIG_KEY}.kernels" must be a list of '
                     f"symbol strings, got {raw_kernels!r}"
                 )
             explicit = True
@@ -262,20 +262,20 @@ def resolve_appmana_kernel_config(
             allowed = _allowed_cache_types()
             if cache_type not in allowed:
                 raise ValueError(
-                    f'Unsupported "{APPMANA_CONFIG_KEY}.cache_type" '
+                    f'Unsupported "{VLLM_CONFIG_KEY}.cache_type" '
                     f"{cache_type!r}; allowed: {list(allowed)}"
                 )
         raw_pp_transport = block.get("pp_transport")
         if raw_pp_transport is not None:
             if not isinstance(raw_pp_transport, dict):
                 raise ValueError(
-                    f'"{APPMANA_CONFIG_KEY}.pp_transport" must be a JSON '
+                    f'"{VLLM_CONFIG_KEY}.pp_transport" must be a JSON '
                     f"object, got {type(raw_pp_transport).__name__}"
                 )
             unknown_pp = set(raw_pp_transport) - _ALLOWED_PP_TRANSPORT_KEYS
             if unknown_pp:
                 raise ValueError(
-                    f'Unknown "{APPMANA_CONFIG_KEY}.pp_transport" key(s) '
+                    f'Unknown "{VLLM_CONFIG_KEY}.pp_transport" key(s) '
                     f"{sorted(unknown_pp)}; allowed: "
                     f"{sorted(_ALLOWED_PP_TRANSPORT_KEYS)}"
                 )
@@ -287,7 +287,7 @@ def resolve_appmana_kernel_config(
                 # fail-closed spirit of the rest of the parser).
                 if not isinstance(value, bool):
                     raise ValueError(
-                        f'"{APPMANA_CONFIG_KEY}.pp_transport.{pp_key}" must be '
+                        f'"{VLLM_CONFIG_KEY}.pp_transport.{pp_key}" must be '
                         f"a boolean, got {value!r}"
                     )
             pp_cache_metadata = raw_pp_transport.get(
@@ -303,7 +303,7 @@ def resolve_appmana_kernel_config(
                 or raw_slab_rows < 1
             ):
                 raise ValueError(
-                    f'"{APPMANA_CONFIG_KEY}.{_INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY}" '
+                    f'"{VLLM_CONFIG_KEY}.{_INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY}" '
                     f"must be a positive integer, got {raw_slab_rows!r}"
                 )
             indexer_prefill_topk_slab_rows = raw_slab_rows
@@ -313,7 +313,7 @@ def resolve_appmana_kernel_config(
         role = KERNEL_REGISTRY.get(symbol)
         if role is None:
             raise ValueError(
-                f'Unknown kernel symbol {symbol!r} in "{APPMANA_CONFIG_KEY}.'
+                f'Unknown kernel symbol {symbol!r} in "{VLLM_CONFIG_KEY}.'
                 f'kernels"; known symbols: {sorted(KERNEL_REGISTRY)}'
             )
         if role in roles:
@@ -334,7 +334,7 @@ def resolve_appmana_kernel_config(
                     '"%s" config block wins when both are present.',
                     alias,
                     value,
-                    APPMANA_CONFIG_KEY,
+                    VLLM_CONFIG_KEY,
                 )
     else:
         for alias, value in (legacy_aliases or {}).items():
@@ -353,7 +353,7 @@ def resolve_appmana_kernel_config(
                     '"%s": {"kernels": [...]} config block (or '
                     "--hf-overrides) instead.",
                     alias,
-                    APPMANA_CONFIG_KEY,
+                    VLLM_CONFIG_KEY,
                 )
             roles[role] = value
 
@@ -371,7 +371,7 @@ def resolve_appmana_kernel_config(
             "integer-MMA logits kernel consumes a symmetric INT8 K cache"
         )
 
-    return ResolvedAppmanaKernelConfig(
+    return ResolvedKernelConfig(
         explicit=explicit,
         roles=roles,
         cache_type=cache_type,
@@ -381,9 +381,9 @@ def resolve_appmana_kernel_config(
     )
 
 
-def resolve_appmana_kernel_config_from_hf_config(
+def resolve_kernel_config_from_hf_config(
     hf_config: Any,
-) -> ResolvedAppmanaKernelConfig:
+) -> ResolvedKernelConfig:
     """Resolve from an HF config object (block, legacy aliases, legacy flag)."""
     legacy_aliases: dict[str, str] = {}
     for alias in LEGACY_ALIAS_ROLES:
@@ -396,8 +396,8 @@ def resolve_appmana_kernel_config_from_hf_config(
         legacy_dense_flag = legacy_dense_flag or bool(
             quantization_config.get(LEGACY_IMMA_CONFIG_KEY, False)
         )
-    return resolve_appmana_kernel_config(
-        getattr(hf_config, APPMANA_CONFIG_KEY, None),
+    return resolve_kernel_config(
+        getattr(hf_config, VLLM_CONFIG_KEY, None),
         legacy_aliases=legacy_aliases,
         legacy_dense_flag=legacy_dense_flag,
     )
@@ -408,9 +408,9 @@ def resolve_appmana_kernel_config_from_hf_config(
 # Dsv4IntConfig.__setstate__ and model build via DeepseekV4Attention.__init__)
 # ---------------------------------------------------------------------------
 
-_ACTIVE_CONFIG: ResolvedAppmanaKernelConfig | None = None
+_ACTIVE_CONFIG: ResolvedKernelConfig | None = None
 
-# Process-wide PP transport overrides resolved from "appmana.pp_transport".
+# Process-wide PP transport overrides resolved from "vllm.pp_transport".
 # None = "not specified" -> the coordinator falls back to the env var, then the
 # built-in default. Set at worker init (init_worker_distributed_environment,
 # where vllm_config is definitely in hand) AND on every kernel-config
@@ -432,13 +432,13 @@ def pp_cache_metadata_override() -> bool | None:
     return _PP_CACHE_METADATA_OVERRIDE
 
 
-def activate_appmana_kernel_config(
-    resolved: ResolvedAppmanaKernelConfig,
+def activate_kernel_config(
+    resolved: ResolvedKernelConfig,
 ) -> None:
     global _ACTIVE_CONFIG
     if _ACTIVE_CONFIG is not None and _ACTIVE_CONFIG != resolved:
         logger.debug(
-            "Replacing active appmana kernel config %s with %s",
+            "Replacing active kernel config %s with %s",
             _ACTIVE_CONFIG,
             resolved,
         )
@@ -448,7 +448,7 @@ def activate_appmana_kernel_config(
     stash_pp_transport_overrides(resolved.pp_cache_metadata)
 
 
-def active_appmana_kernel_config() -> ResolvedAppmanaKernelConfig | None:
+def active_kernel_config() -> ResolvedKernelConfig | None:
     return _ACTIVE_CONFIG
 
 
@@ -508,7 +508,7 @@ def indexer_streaming_topk_prefill_enabled() -> bool:
 
 
 def indexer_prefill_topk_slab_rows_override() -> int | None:
-    """Streaming prefill top-k slab width from ``appmana.
+    """Streaming prefill top-k slab width from ``vllm.
     indexer_prefill_topk_slab_rows``; None = use the indexer module's
     documented default."""
     config = _ACTIVE_CONFIG
@@ -524,17 +524,17 @@ def indexer_prefill_topk_slab_rows_override() -> int | None:
 _DENSE_QUANT_METHODS = ("dsv4_int", "dsv4_mxfp4_int8")
 
 
-def apply_appmana_checkpoint_config(model_config: Any, cache_config: Any) -> None:
-    """Validate the checkpoint's ``appmana`` block at engine startup and apply
+def apply_checkpoint_config(model_config: Any, cache_config: Any) -> None:
+    """Validate the checkpoint's ``vllm`` block at engine startup and apply
     ``cache_type`` as the DEFAULT kv-cache dtype.
 
     An explicit ``--kv-cache-dtype`` always wins: the default is only applied
     when the CLI left ``cache_dtype`` at ``"auto"``.
     """
     hf_config = getattr(model_config, "hf_config", None)
-    if hf_config is None or getattr(hf_config, APPMANA_CONFIG_KEY, None) is None:
+    if hf_config is None or getattr(hf_config, VLLM_CONFIG_KEY, None) is None:
         return
-    resolved = resolve_appmana_kernel_config_from_hf_config(hf_config)
+    resolved = resolve_kernel_config_from_hf_config(hf_config)
 
     if resolved.has_role(ROLE_DENSE_EXPERTS_INT8_ACTIVATION):
         quantization_config = getattr(hf_config, "quantization_config", None)
@@ -556,13 +556,13 @@ def apply_appmana_checkpoint_config(model_config: Any, cache_config: Any) -> Non
             'Applying checkpoint default kv-cache dtype "%s" from the '
             '"%s.cache_type" config (pass --kv-cache-dtype to override).',
             resolved.cache_type,
-            APPMANA_CONFIG_KEY,
+            VLLM_CONFIG_KEY,
         )
         cache_config.cache_dtype = resolved.cache_type
 
 
 def resolved_proof_line(
-    resolved: ResolvedAppmanaKernelConfig, *, kv_cache_dtype: str
+    resolved: ResolvedKernelConfig, *, kv_cache_dtype: str
 ) -> str:
     """Single stable-format line stating every active role -> symbol plus the
     resolved kv-cache dtype. This is the benchmark validity check."""
@@ -587,7 +587,7 @@ def resolved_proof_line(
             symbol = resolved.roles[role]
         parts.append(f"{role}={symbol}")
     parts.append(f"cache_type={kv_cache_dtype}")
-    return "appmana kernels resolved: " + " ".join(parts)
+    return "vllm kernels resolved: " + " ".join(parts)
 
 
 _TOGGLE_ROLE_SYMBOLS: dict[str, str] = {

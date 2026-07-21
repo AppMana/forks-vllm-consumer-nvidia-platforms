@@ -54,7 +54,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     c128a_decode_topk_width,
 )
-from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+from vllm.transformers_utils.configs.dsv4.kernel_config import (
     ROLE_SPARSE_MLA_DECODE_FP8,
     ROLE_SPARSE_MLA_DECODE_INT8,
     ROLE_SPARSE_MLA_PREFILL,
@@ -63,8 +63,8 @@ from vllm.transformers_utils.configs.deepseek_v4_appmana import (
     SPARSE_MLA_DECODE_INT8_FLASH,
     SPARSE_MLA_DECODE_INT8_TRITON,
     SPARSE_MLA_PREFILL_FLASH,
-    ResolvedAppmanaKernelConfig,
-    resolve_appmana_kernel_config_from_hf_config,
+    ResolvedKernelConfig,
+    resolve_kernel_config_from_hf_config,
     resolved_proof_line,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -73,7 +73,7 @@ logger = init_logger(__name__)
 
 
 def validate_sm86_kernel_selection(
-    resolved: ResolvedAppmanaKernelConfig, *, kv_cache_dtype: str
+    resolved: ResolvedKernelConfig, *, kv_cache_dtype: str
 ) -> None:
     """SM86-specific cross-checks between kernel selection and cache dtype."""
     if kv_cache_dtype not in ("fp8_ds_mla", "int8_ds_mla"):
@@ -92,10 +92,10 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Unified kernel selection: the "appmana" checkpoint config block
+        # Unified kernel selection: the "vllm" checkpoint config block
         # (with the deprecated role-keyed HF override strings as fallback).
         # Resolution fails closed on unknown symbols / duplicate roles.
-        resolved = resolve_appmana_kernel_config_from_hf_config(self.config)
+        resolved = resolve_kernel_config_from_hf_config(self.config)
         validate_sm86_kernel_selection(resolved, kv_cache_dtype=self.kv_cache_dtype)
         self.fp8_decode_symbol = resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8]
         self.int8_decode_symbol = resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8]

@@ -67,7 +67,7 @@ from vllm.model_executor.layers.quantization.torchao import torchao_version_at_l
 
 logger = init_logger(__name__)
 
-_APPMANA_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY = (
+_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY = (
     "__experimental_enable_imma_from_https://github.com/appMana/forks-vllm-ampere"
 )
 
@@ -286,31 +286,31 @@ def get_quant_config(
         # (e.g. for activation overrides via the MXFP4 oracle).
         if (
             model_config.quantization == "dsv4_int"
-            and _APPMANA_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY not in hf_quant_config
+            and _DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY not in hf_quant_config
         ):
-            appmana_imma = getattr(
+            dsv4_imma = getattr(
                 model_config.hf_config,
-                _APPMANA_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY,
+                _DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY,
                 None,
             )
-            if appmana_imma is not None:
+            if dsv4_imma is not None:
                 hf_quant_config = dict(hf_quant_config)
-                hf_quant_config[_APPMANA_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY] = (
-                    appmana_imma
+                hf_quant_config[_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY] = (
+                    dsv4_imma
                 )
 
-        # Copy the unified AppMana kernel-config block ("appmana" at the top
+        # Copy the unified AppMana kernel-config block ("vllm" at the top
         # level of the checkpoint config.json) alongside the quantization
         # config so Dsv4IntConfig.from_config sees it and the block travels
         # with the pickled quant config into Ray workers.
         if (
             model_config.quantization in ("dsv4_int", "dsv4_mxfp4_int8")
-            and "appmana" not in hf_quant_config
+            and "vllm" not in hf_quant_config
         ):
-            appmana_block = getattr(model_config.hf_config, "appmana", None)
-            if appmana_block is not None:
+            vllm_block = getattr(model_config.hf_config, "vllm", None)
+            if vllm_block is not None:
                 hf_quant_config = dict(hf_quant_config)
-                hf_quant_config["appmana"] = appmana_block
+                hf_quant_config["vllm"] = vllm_block
 
         # For modelopt_mixed, config.json's quantization_config may or may
         # not contain the per-layer quantized_layers map.  Newer checkpoints

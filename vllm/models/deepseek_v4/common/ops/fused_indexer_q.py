@@ -411,10 +411,10 @@ def fused_indexer_q_rope_quant_int8(
     cuTeDSL/fp8 fast paths are fp8-only, so this always uses the Triton kernel.
 
     This is the registry symbol for the ``indexer_query_int8`` role of the
-    AppMana DSV4 kernel config block (``"appmana"`` in the checkpoint
+    AppMana DSV4 kernel config block (``"vllm"`` in the checkpoint
     config.json); membership of
     ``vllm.models.deepseek_v4.common.ops.fused_indexer_q.fused_indexer_q_rope_quant_int8``
-    in ``appmana.kernels`` activates the integer-MMA indexer query (and
+    in ``vllm.kernels`` activates the integer-MMA indexer query (and
     requires the INT8 indexer cache).
     """
     num_tokens, num_index_q_heads, index_q_head_dim = index_q.shape

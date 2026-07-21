@@ -21,19 +21,19 @@ import torch
 import torch.nn.functional as F
 
 from vllm.logger import init_logger as _dsv4_init_logger
-from vllm.transformers_utils.configs.deepseek_v4_appmana import (
-    APPMANA_CONFIG_KEY,
+from vllm.transformers_utils.configs.dsv4.kernel_config import (
     DENSE_EXPERTS_INT8_ACTIVATION,
     LEGACY_IMMA_CONFIG_KEY,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
-    activate_appmana_kernel_config,
-    resolve_appmana_kernel_config,
+    VLLM_CONFIG_KEY,
+    activate_kernel_config,
+    resolve_kernel_config,
 )
 
 _dsv4_logger = _dsv4_init_logger(__name__)
 _DSV4_KERNEL_PATHS: dict = {}
 _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE = False
-_APPMANA_EXPERIMENTAL_IMMA_CONFIG_KEY = LEGACY_IMMA_CONFIG_KEY
+_EXPERIMENTAL_IMMA_CONFIG_KEY = LEGACY_IMMA_CONFIG_KEY
 
 def _dsv4_log_path(path: str) -> None:
     _DSV4_KERNEL_PATHS[path] = _DSV4_KERNEL_PATHS.get(path, 0) + 1
@@ -618,20 +618,20 @@ class Dsv4IntConfig(QuantizationConfig):
         self,
         config_groups: dict[str, Any] | None = None,
         ignore_patterns: list[str] | None = None,
-        appmana_experimental_indexer_imma: bool = False,
-        appmana: dict[str, Any] | None = None,
+        experimental_indexer_imma: bool = False,
+        vllm: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.config_groups = config_groups or {}
         self.ignore_patterns = ignore_patterns or []
-        self.appmana_experimental_indexer_imma = appmana_experimental_indexer_imma
-        # Unified kernel-config block ("appmana" in the checkpoint config;
+        self.experimental_indexer_imma = experimental_indexer_imma
+        # Unified kernel-config block ("vllm" in the checkpoint config;
         # copied alongside quantization_config by get_quant_config). Resolving
         # here fails closed at startup and, together with __setstate__,
         # propagates the kernel gates into Ray workers on unpickle.
-        self.appmana = appmana
-        resolved = resolve_appmana_kernel_config(
-            appmana, legacy_dense_flag=appmana_experimental_indexer_imma
+        self.vllm = vllm
+        resolved = resolve_kernel_config(
+            vllm, legacy_dense_flag=experimental_indexer_imma
         )
         if resolved.explicit:
             dense_listed = resolved.has_role(ROLE_DENSE_EXPERTS_INT8_ACTIVATION)
@@ -641,22 +641,22 @@ class Dsv4IntConfig(QuantizationConfig):
                 raise ValueError(
                     f"{DENSE_EXPERTS_INT8_ACTIVATION!r} "
                     f"({ROLE_DENSE_EXPERTS_INT8_ACTIVATION}) is listed in "
-                    f'"{APPMANA_CONFIG_KEY}.kernels" but the checkpoint does '
+                    f'"{VLLM_CONFIG_KEY}.kernels" but the checkpoint does '
                     "not carry INT4 experts + INT8 dense weight groups"
                 )
-            self.appmana_experimental_int8_runtime = dense_listed
+            self.experimental_int8_runtime = dense_listed
         else:
-            self.appmana_experimental_int8_runtime = (
-                appmana_experimental_indexer_imma
+            self.experimental_int8_runtime = (
+                experimental_indexer_imma
                 and _has_int4_experts_int8_dense(self.config_groups)
             )
-        self.appmana_kernels_explicit = resolved.explicit
+        self.kernels_explicit = resolved.explicit
         _mark_dsv4_int4_experts_int8_dense_active(
-            self.appmana_experimental_int8_runtime
+            self.experimental_int8_runtime
         )
-        activate_appmana_kernel_config(resolved)
+        activate_kernel_config(resolved)
         self.expert_input_dtype = (
-            torch.int8 if self.appmana_experimental_int8_runtime else None
+            torch.int8 if self.experimental_int8_runtime else None
         )
         linears = self.config_groups.get("linears_w8a16", {})
         weights = linears.get("weights", {})
@@ -676,15 +676,15 @@ class Dsv4IntConfig(QuantizationConfig):
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         _mark_dsv4_int4_experts_int8_dense_active(
-            self.appmana_experimental_int8_runtime
+            self.experimental_int8_runtime
         )
         # Re-activate the unified kernel config in Ray workers (the module
         # global does not travel with the pickle).
-        activate_appmana_kernel_config(
-            resolve_appmana_kernel_config(
-                getattr(self, "appmana", None),
+        activate_kernel_config(
+            resolve_kernel_config(
+                getattr(self, "vllm", None),
                 legacy_dense_flag=getattr(
-                    self, "appmana_experimental_indexer_imma", False
+                    self, "experimental_indexer_imma", False
                 ),
             )
         )
@@ -710,10 +710,10 @@ class Dsv4IntConfig(QuantizationConfig):
         return cls(
             config_groups=config.get("config_groups", {}),
             ignore_patterns=config.get("ignore", []),
-            appmana_experimental_indexer_imma=config.get(
-                _APPMANA_EXPERIMENTAL_IMMA_CONFIG_KEY, False
+            experimental_indexer_imma=config.get(
+                _EXPERIMENTAL_IMMA_CONFIG_KEY, False
             ),
-            appmana=config.get(APPMANA_CONFIG_KEY),
+            vllm=config.get(VLLM_CONFIG_KEY),
         )
 
     @classmethod
@@ -730,14 +730,14 @@ class Dsv4IntConfig(QuantizationConfig):
     def resolve_marlin_input_dtype(self) -> torch.dtype | None:
         """Marlin routed-expert input dtype (W4A16 vs W4A8-INT8).
 
-        Precedence: ``appmana`` kernel block > ``VLLM_MARLIN_INPUT_DTYPE``
-        env > default (None = W4A16). An explicit ``appmana.kernels`` list is
+        Precedence: ``vllm`` kernel block > ``VLLM_MARLIN_INPUT_DTYPE``
+        env > default (None = W4A16). An explicit ``vllm.kernels`` list is
         authoritative: listing ``marlin_act_int8_process_scales`` selects the
         INT8 integer-MMA activation path, omitting it selects W4A16 even when
         the upstream env is set. Without a block, the legacy flag and then
         the upstream env apply (historical behavior).
         """
-        if getattr(self, "appmana_kernels_explicit", False):
+        if getattr(self, "kernels_explicit", False):
             return self.expert_input_dtype
         return self.expert_input_dtype or get_marlin_input_dtype()
 
@@ -776,7 +776,7 @@ class Dsv4Mxfp4Int8Config(Dsv4IntConfig):
         return cls(
             config_groups=config.get("config_groups", {}),
             ignore_patterns=config.get("ignore", []),
-            appmana=config.get(APPMANA_CONFIG_KEY),
+            vllm=config.get(VLLM_CONFIG_KEY),
         )
 
     @classmethod
@@ -1036,7 +1036,7 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         self.num_experts = 0
         self.hidden_size = 0
         self.intermediate_size = 0
-        # Marlin input dtype (W4A16 vs W4A8-INT8): appmana kernel block >
+        # Marlin input dtype (W4A16 vs W4A8-INT8): vllm kernel block >
         # VLLM_MARLIN_INPUT_DTYPE env > default. See
         # Dsv4IntConfig.resolve_marlin_input_dtype.
         self.input_dtype = quant_config.resolve_marlin_input_dtype()
