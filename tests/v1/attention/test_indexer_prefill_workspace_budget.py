@@ -327,4 +327,5 @@ def test_workspace_arena_accounting_at_production_geometry(monkeypatch):
     ) + RADIX_TOPK_WORKSPACE_SIZE
     old_flashmla_bytes = 4 * (rows + 128 + 8192) * 576 * 2
     old_arena_bytes = max(old_indexer_bytes, old_flashmla_bytes)
-    assert old_arena_bytes - arena_bytes > 1_300 * 1024 * 1024
+    # 1,349,517,312 bytes (~1.26 GiB) reclaimed at production geometry.
+    assert old_arena_bytes - arena_bytes == 1_349_517_312

@@ -226,17 +226,30 @@ class DeepseekV32IndexerMetadata:
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
 
 
-def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+def get_max_prefill_buffer_size(
+    vllm_config: VllmConfig, compress_ratio: int = 1
+) -> int:
+    """Prefill K-gather budget, in (compressed) indexer KV rows.
+
+    This bounds the total context one indexer prefill chunk may gather and is
+    exactly the number of rows the indexer layers reserve in the shared
+    workspace (132 bytes/row for the fp8/int8 layout), so the chunk planner
+    (split_indexer_prefill_chunks) and the workspace reservation always agree.
+
+    Derived from the scheduler's concurrent-prefill bound: at most
+    max_num_partial_prefills requests are mid-prefill in any scheduling step,
+    each gathering at most cdiv(max_model_len, compress_ratio) rows of
+    context. A chunk only packs multiple requests while it fits this budget
+    and a single request can never exceed it; additional prefill requests in
+    a batch are planned into further chunks. The budget is therefore a
+    throughput knob, not a correctness bound: raise scheduler
+    max_num_partial_prefills to pack more concurrent long prefills into one
+    chunk (the persistent per-rank workspace grows by 132 bytes x
+    cdiv(max_model_len, compress_ratio) per increment).
+    """
     max_model_len = vllm_config.model_config.max_model_len
-    # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
-    # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
-    # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.
-    # The memory usage of the workspace there is 576 * 2 bytes; so we size this as
-    # (576 * 2 // 132) * 5 = 40 to maximize this workspace size while still fitting
-    # within the flashmla_sparse workspace.
-    # For DeepSeek-V3.2, the max_model_len is 163840.
-    #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * 40
+    max_concurrent_prefills = vllm_config.scheduler_config.max_num_partial_prefills
+    return max_concurrent_prefills * cdiv(max_model_len, compress_ratio)
 
 
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
@@ -268,8 +281,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 f"cp_kv_cache_interleave_size=1 (got "
                 f"{self.cp_kv_cache_interleave_size})."
             )
-        # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
-        self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
             self.vllm_config.speculative_config.num_speculative_tokens
             if self.vllm_config.speculative_config
@@ -367,6 +378,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 "DCP is not supported with sparse indexer KV compression "
                 f"(compress_ratio={self.compress_ratio})."
             )
+
+        # Planner budget for split_indexer_prefill_chunks, in compressed rows;
+        # identical to the rows the indexer layers reserve in the shared
+        # workspace so no planned chunk can outgrow the reservation.
+        self.max_prefill_buffer_size = get_max_prefill_buffer_size(
+            self.vllm_config, self.compress_ratio
+        )
 
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:

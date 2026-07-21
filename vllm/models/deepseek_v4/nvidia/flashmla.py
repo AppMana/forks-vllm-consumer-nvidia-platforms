@@ -66,6 +66,14 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             )
         return 64 if num_heads <= 64 else 128
 
+    def _prefill_uses_gather_workspace(self) -> bool:
+        """Whether the resolved prefill path stages KV through the shared bf16
+        gather workspace (_forward_prefill's dequantize-and-gather). Subclasses
+        whose resolved prefill kernel consumes the paged caches directly
+        override this so warmup does not size the arena for an unused buffer.
+        """
+        return True
+
     def forward_mqa(
         self,
         q: torch.Tensor,
@@ -87,18 +95,21 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         if attn_metadata is None:
             # Warmup dummy run: no real metadata. Reserve the same bf16
             # gather workspace _forward_prefill would; the dequantize / topk
-            # / sparse_fwd kernels are skipped this step.
-            swa_only = self.compress_ratio <= 1
-            N = (
-                0
-                if swa_only
-                else (self.max_model_len + self.compress_ratio - 1)
-                // self.compress_ratio
-            )
-            M = N + self.window_size + self.max_num_batched_tokens
-            current_workspace_manager().get_simultaneous(
-                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )
+            # / sparse_fwd kernels are skipped this step. Prefill paths that
+            # consume the paged caches directly never touch this workspace,
+            # so don't grow the arena for them.
+            if self._prefill_uses_gather_workspace():
+                swa_only = self.compress_ratio <= 1
+                N = (
+                    0
+                    if swa_only
+                    else (self.max_model_len + self.compress_ratio - 1)
+                    // self.compress_ratio
+                )
+                M = N + self.window_size + self.max_num_batched_tokens
+                current_workspace_manager().get_simultaneous(
+                    ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                )
             output.zero_()
             return
 

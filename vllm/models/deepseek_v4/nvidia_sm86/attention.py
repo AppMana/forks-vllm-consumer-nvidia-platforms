@@ -121,6 +121,12 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         # the FlashMLA FP8 decode kernel).
         return num_heads
 
+    def _prefill_uses_gather_workspace(self) -> bool:
+        # The native fused flash_mla prefill (_forward_prefill_flash) consumes
+        # the paged fp8/int8 caches directly and stages internally; only the
+        # Triton gather prefill stages KV through the shared bf16 workspace.
+        return self.prefill_symbol != SPARSE_MLA_PREFILL_FLASH
+
     def _forward_decode(
         self,
         q: torch.Tensor,

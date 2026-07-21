@@ -780,8 +780,10 @@ class DeepseekV4Indexer(nn.Module):
         )
         self.prefix = prefix
 
-        self.max_total_seq_len = (
-            get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
+        # Rows reserved in the shared workspace for the prefill K-gather;
+        # matches the metadata builder's chunk-planner budget exactly.
+        self.max_total_seq_len = get_max_prefill_buffer_size(
+            vllm_config, self.compress_ratio
         )
 
         assert cache_config is not None, "Deepseek V4 indexer requires cache_config"
