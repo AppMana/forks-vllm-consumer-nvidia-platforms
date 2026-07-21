@@ -23,11 +23,13 @@ from vllm.transformers_utils.configs.deepseek_v4_appmana import (
     DENSE_EXPERTS_INT8_ACTIVATION,
     INDEXER_CACHE_INT8_WRITER,
     INDEXER_QUERY_INT8_QUANT,
+    INDEXER_STREAMING_TOPK_PREFILL,
     KERNEL_REGISTRY,
     LEGACY_IMMA_CONFIG_KEY,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
     ROLE_INDEXER_CACHE_INT8,
     ROLE_INDEXER_QUERY_INT8,
+    ROLE_INDEXER_STREAMING_TOPK_PREFILL,
     ROLE_SPARSE_MLA_DECODE_FP8,
     ROLE_SPARSE_MLA_DECODE_INT8,
     ROLE_SPARSE_MLA_PREFILL,
@@ -40,7 +42,9 @@ from vllm.transformers_utils.configs.deepseek_v4_appmana import (
     activate_appmana_kernel_config,
     apply_appmana_checkpoint_config,
     indexer_cache_int8_enabled,
+    indexer_prefill_topk_slab_rows_override,
     indexer_query_int8_enabled,
+    indexer_streaming_topk_prefill_enabled,
     resolve_appmana_kernel_config,
     resolve_appmana_kernel_config_from_hf_config,
     resolved_proof_line,
@@ -517,6 +521,7 @@ def test_resolved_proof_line_is_single_stable_line():
         f" indexer_cache_int8={INDEXER_CACHE_INT8_WRITER}"
         f" indexer_query_int8={INDEXER_QUERY_INT8_QUANT}"
         f" dense_experts_int8_activation={DENSE_EXPERTS_INT8_ACTIVATION}"
+        " indexer_streaming_topk_prefill=off"
         " cache_type=fp8_ds_mla"
     )
 
@@ -528,6 +533,7 @@ def test_resolved_proof_line_marks_inactive_toggles_off():
     assert "indexer_cache_int8=off" in line
     assert "indexer_query_int8=off" in line
     assert "dense_experts_int8_activation=off" in line
+    assert "indexer_streaming_topk_prefill=off" in line
 
 
 # ---------------------------------------------------------------------------
@@ -691,3 +697,194 @@ def test_sm86_int8_decode_native_selectable_triton_default():
                 ]
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# Indexer streaming top-k prefill (toggle role + slab-rows tuning key)
+# ---------------------------------------------------------------------------
+
+
+def test_streaming_topk_prefill_symbol_registered():
+    assert INDEXER_STREAMING_TOPK_PREFILL == (
+        "vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk"
+    )
+    assert (
+        KERNEL_REGISTRY[INDEXER_STREAMING_TOPK_PREFILL]
+        == ROLE_INDEXER_STREAMING_TOPK_PREFILL
+    )
+
+
+def test_streaming_topk_prefill_on_when_listed():
+    resolved = resolve_appmana_kernel_config(
+        {"kernels": [INDEXER_STREAMING_TOPK_PREFILL]}
+    )
+    activate_appmana_kernel_config(resolved)
+    assert (
+        resolved.roles[ROLE_INDEXER_STREAMING_TOPK_PREFILL]
+        == INDEXER_STREAMING_TOPK_PREFILL
+    )
+    assert indexer_streaming_topk_prefill_enabled()
+    line = resolved_proof_line(resolved, kv_cache_dtype="fp8_ds_mla")
+    assert f"indexer_streaming_topk_prefill={INDEXER_STREAMING_TOPK_PREFILL}" in line
+
+
+def test_streaming_topk_prefill_off_when_unlisted():
+    resolved = resolve_appmana_kernel_config({"kernels": []})
+    activate_appmana_kernel_config(resolved)
+    assert not indexer_streaming_topk_prefill_enabled()
+
+
+def test_streaming_topk_prefill_off_without_block_even_with_legacy_flag():
+    """Default OFF: an absent block preserves the one-shot prefill path
+    bit-for-bit, and the legacy dense flag never rides this toggle."""
+    resolved = resolve_appmana_kernel_config(None, legacy_dense_flag=True)
+    activate_appmana_kernel_config(resolved)
+    assert not indexer_streaming_topk_prefill_enabled()
+
+
+def test_streaming_topk_prefill_off_with_no_active_config():
+    assert not indexer_streaming_topk_prefill_enabled()
+
+
+def test_slab_rows_absent_is_none():
+    assert (
+        resolve_appmana_kernel_config(None).indexer_prefill_topk_slab_rows is None
+    )
+    assert (
+        resolve_appmana_kernel_config(
+            {"kernels": []}
+        ).indexer_prefill_topk_slab_rows
+        is None
+    )
+
+
+def test_slab_rows_round_trips_int():
+    resolved = resolve_appmana_kernel_config(
+        {
+            "kernels": [INDEXER_STREAMING_TOPK_PREFILL],
+            "indexer_prefill_topk_slab_rows": 8192,
+        }
+    )
+    assert resolved.indexer_prefill_topk_slab_rows == 8192
+
+
+@pytest.mark.parametrize("bad", [True, False, "16384", 16384.0, 0, -1])
+def test_slab_rows_invalid_is_hard_error(bad):
+    with pytest.raises(ValueError, match="indexer_prefill_topk_slab_rows"):
+        resolve_appmana_kernel_config(
+            {"kernels": [], "indexer_prefill_topk_slab_rows": bad}
+        )
+
+
+def test_slab_rows_resolves_from_hf_config():
+    hf_config = SimpleNamespace(
+        appmana={
+            "kernels": [INDEXER_STREAMING_TOPK_PREFILL],
+            "indexer_prefill_topk_slab_rows": 4096,
+        },
+    )
+    resolved = resolve_appmana_kernel_config_from_hf_config(hf_config)
+    assert resolved.indexer_prefill_topk_slab_rows == 4096
+    assert resolved.roles[ROLE_INDEXER_STREAMING_TOPK_PREFILL] == (
+        INDEXER_STREAMING_TOPK_PREFILL
+    )
+
+
+def test_slab_rows_override_reads_active_config():
+    assert indexer_prefill_topk_slab_rows_override() is None
+    resolved = resolve_appmana_kernel_config(
+        {"kernels": [], "indexer_prefill_topk_slab_rows": 4096}
+    )
+    activate_appmana_kernel_config(resolved)
+    assert indexer_prefill_topk_slab_rows_override() == 4096
+
+
+# ---------------------------------------------------------------------------
+# Indexer gate: the streaming decision reads the config, not a module constant
+# ---------------------------------------------------------------------------
+
+
+def _fake_platform(is_cuda=True, families=(80,)):
+    return SimpleNamespace(
+        is_cuda=lambda: is_cuda,
+        is_device_capability_family=lambda fam: fam in families,
+    )
+
+
+def test_indexer_gate_reads_toggle_from_config(monkeypatch):
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer
+
+    monkeypatch.setattr(indexer, "current_platform", _fake_platform())
+    assert not indexer.should_use_prefill_streaming_topk(1, False)
+
+    activate_appmana_kernel_config(
+        resolve_appmana_kernel_config(
+            {"kernels": [INDEXER_STREAMING_TOPK_PREFILL]}
+        )
+    )
+    assert indexer.should_use_prefill_streaming_topk(1, False)
+
+    activate_appmana_kernel_config(resolve_appmana_kernel_config({"kernels": []}))
+    assert not indexer.should_use_prefill_streaming_topk(1, False)
+
+
+def test_indexer_gate_guards_unchanged(monkeypatch):
+    """The pre-existing platform/DCP/FP4 guards still apply on top of the
+    config toggle."""
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer
+
+    activate_appmana_kernel_config(
+        resolve_appmana_kernel_config(
+            {"kernels": [INDEXER_STREAMING_TOPK_PREFILL]}
+        )
+    )
+    monkeypatch.setattr(indexer, "current_platform", _fake_platform())
+    assert indexer.should_use_prefill_streaming_topk(1, False)
+    # DCP > 1: off.
+    assert not indexer.should_use_prefill_streaming_topk(2, False)
+    # FP4 cache: off.
+    assert not indexer.should_use_prefill_streaming_topk(1, True)
+    # Non-CUDA: off.
+    monkeypatch.setattr(
+        indexer, "current_platform", _fake_platform(is_cuda=False)
+    )
+    assert not indexer.should_use_prefill_streaming_topk(1, False)
+    # Unsupported capability family: off; family 120 stays supported.
+    monkeypatch.setattr(
+        indexer, "current_platform", _fake_platform(families=(90,))
+    )
+    assert not indexer.should_use_prefill_streaming_topk(1, False)
+    monkeypatch.setattr(
+        indexer, "current_platform", _fake_platform(families=(120,))
+    )
+    assert indexer.should_use_prefill_streaming_topk(1, False)
+
+
+def test_indexer_forward_consumes_the_gate():
+    import inspect
+
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer
+
+    source = inspect.getsource(indexer.sparse_attn_indexer)
+    assert "should_use_prefill_streaming_topk(" in source
+
+
+def test_indexer_module_constant_retired():
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer
+
+    assert not hasattr(indexer, "INDEXER_PREFILL_STREAMING_TOPK")
+
+
+def test_indexer_slab_rows_resolution():
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer
+
+    assert (
+        indexer._resolved_prefill_topk_slab_rows()
+        == indexer.INDEXER_PREFILL_TOPK_SLAB_ROWS
+    )
+    activate_appmana_kernel_config(
+        resolve_appmana_kernel_config(
+            {"kernels": [], "indexer_prefill_topk_slab_rows": 4096}
+        )
+    )
+    assert indexer._resolved_prefill_topk_slab_rows() == 4096

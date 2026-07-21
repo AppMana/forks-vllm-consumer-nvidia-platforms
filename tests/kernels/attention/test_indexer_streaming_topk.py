@@ -233,3 +233,37 @@ def test_multi_request_row_offsets():
     _assert_sets_equal_mod_boundary_ties(
         out_glob, prod_glob, logits, ke, topk
     )
+
+
+def test_appmana_block_gates_streaming_and_sets_slab_rows(monkeypatch):
+    """The checkpoint "appmana" block turns the gate on and its
+    indexer_prefill_topk_slab_rows key drives the default slab width, with the
+    selection staying exact."""
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer_mod
+    import vllm.transformers_utils.configs.deepseek_v4_appmana as appmana
+
+    monkeypatch.setattr(appmana, "_ACTIVE_CONFIG", None)
+    assert not indexer_mod.should_use_prefill_streaming_topk(1, False)
+
+    appmana.activate_appmana_kernel_config(
+        appmana.resolve_appmana_kernel_config(
+            {
+                "kernels": [appmana.INDEXER_STREAMING_TOPK_PREFILL],
+                "indexer_prefill_topk_slab_rows": 5000,
+            }
+        )
+    )
+    assert indexer_mod.should_use_prefill_streaming_topk(1, False)
+    assert indexer_mod._resolved_prefill_topk_slab_rows() == 5000
+
+    m, n, topk = 128, 16384, 512
+    q, k, k_scale, weights, ks, ke = _make_inputs(m, n, qk_int8=True, seed=5)
+    ref = oneshot_prefill_topk_reference(
+        q, (k, k_scale), weights, ks, ke, topk, qk_int8=True
+    )
+    # No explicit slab_rows: the config-block value (5000, unaligned) is used.
+    out = torch.empty(m, topk, dtype=torch.int32, device="cuda")
+    streaming_prefill_topk(
+        q, (k, k_scale), weights, ks, ke, out, topk, qk_int8=True
+    )
+    assert torch.equal(out, ref)
