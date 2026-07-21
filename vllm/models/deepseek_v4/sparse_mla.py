@@ -32,6 +32,28 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 _C128A_TOPK_ALIGNMENT = 128
 
 
+def c128a_decode_topk_width(
+    max_seq_len: int, compress_ratio: int, full_width: int
+) -> int:
+    """Columns of the padded C128A decode index buffer the batch can actually
+    use: the max compressed context (max_seq_len // compress_ratio, matching
+    the builder kernel's (position + 1) // compress_ratio row counts) rounded
+    up to the FlashMLA alignment, clamped to [alignment, full_width].
+
+    Bounds the decode kernel's per-call sel_kv scratch
+    (T x (swa_topk + extra_topk) x head_dim bf16) instead of always paying the
+    full max_model_len-derived width. Cudagraph-safe: capture-time metadata is
+    built with max_seq_len == max_model_len
+    (gpu_model_runner._build_attention_metadata, for_cudagraph_capture=True),
+    so captured graphs keep the full width and replays serve any context.
+    """
+    return min(
+        cdiv(max(max_seq_len // compress_ratio, 1), _C128A_TOPK_ALIGNMENT)
+        * _C128A_TOPK_ALIGNMENT,
+        full_width,
+    )
+
+
 class DeepseekV4FlashMLABackend(AttentionBackend):
     """DeepSeek-V4 sparse-MLA backend.
 

@@ -28,6 +28,7 @@ from vllm.utils.deep_gemm import (
     has_deep_gemm,
 )
 from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -60,6 +61,26 @@ def _should_use_sm120_short_row_topk_decode(
 
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+
+# Column alignment for the per-step decode logits width. 128 is the Triton
+# paged-logits kernels' largest N tile (rowwise path), so an aligned
+# token_count keeps the sliced logits contiguous (stride(0) == shape[1]) for
+# the top-k kernels.
+DECODE_LOGITS_WIDTH_ALIGNMENT = 128
+
+
+def _decode_logits_token_count(max_context_len: int, max_model_len: int) -> int:
+    """Width of the decode logits scratch: the batch's max context rounded up
+    to the kernel tile, clamped to [alignment, max_model_len].
+
+    Cudagraph-safe: capture-time metadata carries max_context_len ==
+    max_model_len (see DeepSeekV32IndexerDecodeMetadata.max_context_len), so
+    captured graphs keep the full width and replays serve any context.
+    """
+    return min(
+        round_up(max(max_context_len, 1), DECODE_LOGITS_WIDTH_ALIGNMENT),
+        max_model_len,
+    )
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -887,6 +908,12 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
+            # Size the per-step logits scratch by the batch's actual max
+            # context (padded to the kernel tile) instead of max_model_len:
+            # the tail columns are all -inf and the top-k below is
+            # seq_lens-bounded, so narrowing cannot change the selection.
+            # Honored by the sm_8x/sm_12x Triton fallback; the Hopper
+            # DeepGEMM kernel keeps the full width.
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
@@ -896,6 +923,9 @@ def sparse_attn_indexer(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
                 clean_logits=False,
+                token_count=_decode_logits_token_count(
+                    decode_metadata.max_context_len, max_model_len
+                ),
             )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]

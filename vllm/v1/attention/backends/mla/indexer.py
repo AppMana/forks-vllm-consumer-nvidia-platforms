@@ -204,6 +204,14 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
+    # Host-side upper bound (in cache tokens, i.e. compressed units when
+    # compress_ratio > 1) for every entry of `seq_lens`. Used to size the
+    # per-step decode logits scratch by the batch's actual max context instead
+    # of max_model_len. Cudagraph-capture metadata is built with
+    # max_seq_len == max_model_len (gpu_model_runner._build_attention_metadata,
+    # for_cudagraph_capture=True), so widths derived from this bound are
+    # full-width inside captured graphs and replays serve any context length.
+    max_context_len: int
     global_seq_lens: torch.Tensor | None = None
 
 
@@ -760,6 +768,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
+                max_context_len=(
+                    common_attn_metadata.max_seq_len // self.compress_ratio
+                    if self.compress_ratio > 1
+                    else common_attn_metadata.max_seq_len
+                ),
                 global_seq_lens=global_seq_lens_for_decode,
             )
 

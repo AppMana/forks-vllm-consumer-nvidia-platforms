@@ -694,6 +694,7 @@ def fp8_fp4_paged_mqa_logits(
     schedule_metadata: torch.Tensor,
     max_model_len: int,
     clean_logits: bool,
+    token_count: int | None = None,
 ) -> torch.Tensor:
     """Compute MQA logits using a paged KV-cache.
 
@@ -718,10 +719,15 @@ def fp8_fp4_paged_mqa_logits(
             used to distribute work across SMs.
         max_model_len: Maximum sequence length used to size the logits output.
         clean_logits: Whether to clean the unfilled logits into `-inf`.
+        token_count: Optional width bound for the logits (columns [0,
+            token_count)). Must cover every entry of `context_lens`. Honored by
+            the Triton fallback (sm_8x / sm_12x), which sizes its scratch and
+            output by it instead of max_model_len; the Hopper DeepGEMM kernel
+            has no narrow-width entry point and keeps the full width.
 
     Returns:
-        Logits tensor of shape [B * next_n, max_model_len], dtype
-        `torch.float32`.
+        Logits tensor of shape [B * next_n, token_count or max_model_len],
+        dtype `torch.float32`.
     """
     # Ampere/Ada (sm_8x) and SM12x: DeepGEMM's paged-MQA-logits kernel is
     # Hopper-only, so route the FP8/INT8 indexer logits through the portable
@@ -738,7 +744,13 @@ def fp8_fp4_paged_mqa_logits(
         )
 
         return fp8_paged_mqa_logits_triton(
-            q_values, kv_cache, weights, context_lens, block_tables, max_model_len
+            q_values,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            token_count=token_count,
         )
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:

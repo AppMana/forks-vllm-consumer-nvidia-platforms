@@ -50,7 +50,10 @@ from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
     decode_sparse_attention_triton,
     sparse_attention_triton,
 )
-from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
+from vllm.models.deepseek_v4.sparse_mla import (
+    DeepseekV4FlashMLAMetadata,
+    c128a_decode_topk_width,
+)
 from vllm.transformers_utils.configs.deepseek_v4_appmana import (
     ROLE_SPARSE_MLA_DECODE_FP8,
     ROLE_SPARSE_MLA_DECODE_INT8,
@@ -160,6 +163,22 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
             else:
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices
                 topk_lens = attn_metadata.c128a_decode_topk_lens
+                if topk_indices is not None:
+                    # Narrow the padded C128A index width (8192 columns at 1M
+                    # max_model_len) to the batch's max compressed context:
+                    # the tail is all -1 and the per-token counts (topk_lens)
+                    # never reach it, while the decode kernel sizes its sel_kv
+                    # scratch as T x (swa_topk + extra_topk) x 512 bf16 from
+                    # this width. Capture-time metadata carries max_seq_len ==
+                    # max_model_len, so FULL cudagraphs keep the full width.
+                    topk_indices = topk_indices[
+                        ...,
+                        : c128a_decode_topk_width(
+                            attn_metadata.max_seq_len,
+                            self.compress_ratio,
+                            topk_indices.shape[-1],
+                        ),
+                    ]
 
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
@@ -174,7 +193,11 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         # Matches the Triton reference to ~1e-6 (test_sm86_flash_mla_decode_parity).
         extra_idx = None
         if topk_indices is not None:
-            extra_idx = topk_indices.reshape(num_decode_tokens, -1)
+            # contiguous(): the flash_mla kernels index extra_indices rows at
+            # stride extra_topk. A no-op except for the narrowed C128A view
+            # above (whose backing buffer keeps the full row stride), where it
+            # is a small int32 copy.
+            extra_idx = topk_indices.reshape(num_decode_tokens, -1).contiguous()
         if self.kv_cache_dtype == "int8_ds_mla":
             swa_rows, swa_scales = get_int8_ds_mla_cache_views(
                 swa_k_cache, swa_metadata.block_size
