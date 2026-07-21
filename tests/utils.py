@@ -695,6 +695,8 @@ class RemoteVLLMServer:
         )
         while True:
             try:
+                # The startup probe answers 503 with init-stage detail while
+                # the engine initializes; only 200 means ready.
                 if client.get(url).status_code == 200:
                     break
             except Exception:
@@ -706,9 +708,9 @@ class RemoteVLLMServer:
                 if result is not None and result != 0:
                     raise RuntimeError("Server exited unexpectedly.") from None
 
-                time.sleep(0.5)
-                if time.time() - start > timeout:
-                    raise RuntimeError("Server failed to start in time.") from None
+            time.sleep(0.5)
+            if time.time() - start > timeout:
+                raise RuntimeError("Server failed to start in time.") from None
 
     @property
     def url_root(self) -> str:
