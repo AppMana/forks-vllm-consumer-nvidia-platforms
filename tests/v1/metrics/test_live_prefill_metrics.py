@@ -26,9 +26,7 @@ def vllm_config() -> VllmConfig:
 
 
 def _sample(name: str) -> float | None:
-    return REGISTRY.get_sample_value(
-        name, {"model_name": MODEL_NAME, "engine": "0"}
-    )
+    return REGISTRY.get_sample_value(name, {"model_name": MODEL_NAME, "engine": "0"})
 
 
 def test_prometheus_scheduled_prefill_tokens_counter(vllm_config):

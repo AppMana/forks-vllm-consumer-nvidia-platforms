@@ -49,9 +49,7 @@ def startup_progress_snapshot() -> dict[str, str | float]:
         return {
             "stage": _startup_progress.stage,
             "detail": _startup_progress.detail,
-            "elapsed_s": round(
-                time.monotonic() - _startup_progress.started_at, 1
-            ),
+            "elapsed_s": round(time.monotonic() - _startup_progress.started_at, 1),
         }
 
 

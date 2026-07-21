@@ -39,6 +39,4 @@ async def health(raw_request: Request) -> Response:
             status_code=503,
         )
     except EngineDeadError as e:
-        return JSONResponse(
-            {"stage": "dead", "detail": str(e)}, status_code=503
-        )
+        return JSONResponse({"stage": "dead", "detail": str(e)}, status_code=503)

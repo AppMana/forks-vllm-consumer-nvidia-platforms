@@ -33,9 +33,7 @@ def test_health_ok():
 
 def test_health_stalled_returns_503_with_stage():
     client = _client(
-        _FakeEngineClient(
-            EngineStalledError(stalled_for_s=61.2, num_requests=1)
-        )
+        _FakeEngineClient(EngineStalledError(stalled_for_s=61.2, num_requests=1))
     )
     response = client.get("/health")
     assert response.status_code == 503
