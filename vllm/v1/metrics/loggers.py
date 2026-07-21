@@ -134,6 +134,7 @@ class LoggingStatLogger(StatLoggerBase):
 
         # Tracked stats over current local logging interval.
         self.num_prompt_tokens: int = 0
+        self.num_scheduled_prefill_tokens: int = 0
         self.num_generation_tokens: int = 0
         self.num_corrupted_reqs: int = 0
         self.num_preemptions: int = 0
@@ -172,6 +173,9 @@ class LoggingStatLogger(StatLoggerBase):
             self._track_iteration_stats(iteration_stats)
 
         if scheduler_stats is not None:
+            self.num_scheduled_prefill_tokens += (
+                scheduler_stats.num_scheduled_prefill_tokens
+            )
             self.prefix_caching_metrics.observe(scheduler_stats.prefix_cache_stats)
 
             if scheduler_stats.connector_prefix_cache_stats is not None:
@@ -197,11 +201,24 @@ class LoggingStatLogger(StatLoggerBase):
 
     def _update_stats(self):
         now = time.monotonic()
-        prompt_throughput = self._get_throughput(self.num_prompt_tokens, now)
+        # Scheduled prefill tokens advance on every engine step, including
+        # output-less chunked prefill steps, so they give a live prompt
+        # throughput. Fall back to first-token-based accounting when no
+        # scheduler stats carried them (they cover the same tokens, so never
+        # sum the two).
+        prompt_tokens = self.num_scheduled_prefill_tokens or self.num_prompt_tokens
+        prompt_throughput = self._get_throughput(prompt_tokens, now)
         generation_throughput = self._get_throughput(self.num_generation_tokens, now)
 
         self._reset(now)
-        self.engine_is_idle = not any(
+        # Requests running or waiting keep the engine non-idle even at zero
+        # throughput: a stalled engine must keep logging at INFO level.
+        has_requests = (
+            self.last_scheduler_stats.num_running_reqs
+            or self.last_scheduler_stats.num_waiting_reqs
+            or self.last_scheduler_stats.num_skipped_waiting_reqs
+        )
+        self.engine_is_idle = not has_requests and not any(
             (
                 prompt_throughput,
                 generation_throughput,
@@ -217,8 +234,9 @@ class LoggingStatLogger(StatLoggerBase):
         return
 
     def log(self):
-        self._update_stats()
+        # Aggregate first so _update_stats sees current scheduler state.
         self.aggregate_scheduler_stats()
+        self._update_stats()
         # Avoid log noise on an idle production system
         log_fn = logger.debug if self.engine_is_idle else logger.info
         # Format and print output.
@@ -664,6 +682,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_prompt_tokens_cached, per_engine_labelvalues
         )
 
+        counter_scheduled_prefill_tokens = self._counter_cls(
+            name="vllm:scheduled_prefill_tokens",
+            documentation=(
+                "Prompt tokens scheduled per engine step. Advances on every "
+                "chunked prefill step, before any output token is produced."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_scheduled_prefill_tokens = create_metric_per_engine(
+            counter_scheduled_prefill_tokens, per_engine_labelvalues
+        )
+
         counter_generation_tokens = self._counter_cls(
             name="vllm:generation_tokens",
             documentation="Number of generation tokens processed.",
@@ -1084,6 +1114,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+
+            if scheduler_stats.num_scheduled_prefill_tokens:
+                self.counter_scheduled_prefill_tokens[engine_idx].inc(
+                    scheduler_stats.num_scheduled_prefill_tokens
+                )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries
