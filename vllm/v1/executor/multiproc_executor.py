@@ -5,6 +5,7 @@ import os
 import pickle
 import queue
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -1020,11 +1021,37 @@ class WorkerProc:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
                     e.add_note(traceback.format_exc())
-                logger.exception("WorkerProc hit an exception.")
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
                 if output_rank is None or self.rank == output_rank:
+                    logger.exception("WorkerProc hit an exception.")
                     self.handle_output(e)
+                else:
+                    # This rank is not the reply rank for this RPC, so a
+                    # FAILURE response would never be dequeued by the driver
+                    # (and a stale message would corrupt response ordering
+                    # for a later RPC). Swallowing the error instead would
+                    # silently desynchronize the collective: e.g. a first
+                    # PP stage that fails mid-forward never sends its
+                    # intermediate tensors, pairing downstream recvs with
+                    # later steps while the engine keeps emitting garbage.
+                    # Fail the worker; the executor's worker monitor
+                    # detects the death and fails the engine promptly.
+                    # Hard-exit: the graceful teardown path can hang in
+                    # NCCL destroy while peer ranks are still blocked in
+                    # collectives for the failed step, and the monitor
+                    # only fires once the process actually dies.
+                    logger.exception(
+                        "WorkerProc hit an exception in %s on rank %d with "
+                        "no reply rank to report it to (output_rank=%d); "
+                        "failing fast to avoid silent desync.",
+                        method if isinstance(method, str) else "custom method",
+                        self.rank,
+                        output_rank,
+                    )
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os._exit(1)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
