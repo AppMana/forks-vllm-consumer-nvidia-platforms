@@ -40,7 +40,7 @@ def _fused_inv_rope_fp8_quant_per_head(
     USE_GDC: tl.constexpr,
     launch_pdl: tl.constexpr,  # triton metadata
 ):
-    # Cast every stride to int64 — without this, Python-int strides are
+    # Cast every stride to int64: without this, Python-int strides are
     # inferred as int32 and `pid_token(int64) × stride(int32)` can lower to
     # int32 arithmetic, wrapping past 2³¹ for large prefill batches → IMA.
     pid_token = tl.program_id(0).to(tl.int64)
@@ -233,7 +233,7 @@ def _supports_fp8e4nv_in_triton() -> bool:
 
     Fall back to a torch-only implementation that uses
     ``torch.float8_e4m3fn`` (PyTorch ships a software-emulated cast on
-    Ampere — bit-correct, slower than the native instruction).
+    Ampere: bit-correct, slower than the native instruction).
     """
     if not current_platform.is_cuda():
         return True  # ROCm / XPU keep the existing path; only sm_8x falls back
@@ -316,7 +316,7 @@ def _fused_inv_rope_fp8_quant_torch(
     fp8_buf = fp8_grouped.view(num_tokens, n_groups, d).transpose(0, 1).contiguous()
 
     # 4. Pack scales. The kernel writes scale_buf with stride layout:
-    #    (scale_inner * tma_aligned_T, 1, tma_aligned_T) — this is "scale-major"
+    #    (scale_inner * tma_aligned_T, 1, tma_aligned_T): this is "scale-major"
     #    along the token axis. We allocate the same flat buffer, fill it via
     #    the same as_strided, and write into the (G, T, scale_inner) view.
     scale_buf_dtype = torch.int32 if tma_aligned_scales else torch.float32
@@ -340,7 +340,7 @@ def _fused_inv_rope_fp8_quant_torch(
         # ceil(chunks_per_head / 4) int32 words. The kernel stores these at
         # `scale_addr = scale_ptr + g*sg + pid_token + head_in_group*ssk`,
         # which means scale_inner = packed_sf_k * heads_per_group only when
-        # chunks_per_head == 4 — see the kernel for the exact layout.
+        # chunks_per_head == 4, see the kernel for the exact layout.
         # In the typical V4 config (chunks_per_head=4), each head produces
         # exactly one int32 packed word per (token, head_in_group).
         assert chunks_per_head == 4, (

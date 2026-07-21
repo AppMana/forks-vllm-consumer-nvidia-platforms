@@ -1258,7 +1258,7 @@ def test_max_memory_usage_ignores_empty_projected_groups():
     """PP projection keeps groups a worker owns no layer of (the scheduler
     needs the global group structure), but they keep the GLOBAL spec with all
     inner layers. The packed allocator ignores them (it buckets layer_names),
-    so the admission sizing must too — otherwise a worker budgets other ranks'
+    so the admission sizing must too, otherwise a worker budgets other ranks'
     layers and inflates num_layer_tuples (observed: a PP=10 last rank
     "needing" ~5.4 GiB of which ~5.3 GiB was a phantom group of 20 non-local
     sliding-window state caches)."""

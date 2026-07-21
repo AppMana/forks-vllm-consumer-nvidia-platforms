@@ -918,7 +918,7 @@ class Worker(WorkerBase):
 
             trigger_inductor_lazy_init(self.device)
 
-        # All warmup is done — start monitoring for unexpected JIT
+        # All warmup is done, start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
 
@@ -932,7 +932,7 @@ class Worker(WorkerBase):
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
 
-        # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
+        # Warmup / first-compile is done, activate the `VLLM_GPU_SYNC_CHECK`
         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
         enable_gpu_sync_check()
 

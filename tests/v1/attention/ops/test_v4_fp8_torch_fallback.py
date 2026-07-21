@@ -3,7 +3,7 @@
 """sm_8x torch fallbacks for the V4 fp8e4nv-emitting Triton kernels.
 
 The V4-Flash attention path uses two Triton kernels that emit
-`tl.float8e4nv` casts — only available on sm_89+ (Ada/Hopper/Blackwell).
+`tl.float8e4nv` casts, only available on sm_89+ (Ada/Hopper/Blackwell).
 On sm_8x (Ampere) Triton refuses with::
 
     ValueError: type fp8e4nv not supported in this architecture.

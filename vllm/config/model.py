@@ -139,7 +139,7 @@ class ModelConfig:
 
     To swap the Rust BPE backend that powers HF fast tokenizers for the
     [fastokens](https://github.com/crusoecloud/fastokens) implementation, set
-    `VLLM_USE_FASTOKENS=1` instead — that override applies to any mode that
+    `VLLM_USE_FASTOKENS=1` instead, that override applies to any mode that
     loads an HF fast tokenizer (`hf`, `deepseek_v32`, `deepseek_v4`, …)."""
     trust_remote_code: bool = False
     """Trust remote code (e.g., from HuggingFace) when downloading the model

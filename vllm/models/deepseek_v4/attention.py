@@ -114,10 +114,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
     The platform-specific sparse-MLA forward (``forward_mqa`` /
     ``get_padded_num_q_heads`` / ``_o_proj`` / ``backend_cls``) is provided by a
-    subclass — ``DeepseekV4FlashMLAAttention`` /
+    subclass: ``DeepseekV4FlashMLAAttention`` /
     ``DeepseekV4FlashInferSM120Attention`` /
     ``DeepseekV4FlashInferMLAAttention`` (CUDA) or
-    ``DeepseekV4ROCMAiterMLAAttention`` (ROCm) — selected by the platform-specific
+    ``DeepseekV4ROCMAiterMLAAttention`` (ROCm), selected by the platform-specific
     deepseek_v4 model module. The base is never instantiated directly.
     """
 
@@ -823,7 +823,7 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4_cache=self.use_fp4_kv,
         )
 
-        # None on ROCm — maybe_execute_in_parallel falls back to sequential.
+        # None on ROCm: maybe_execute_in_parallel falls back to sequential.
         self.aux_stream = aux_stream
         self.ln_events: list[torch.cuda.Event] = [
             torch.cuda.Event(),

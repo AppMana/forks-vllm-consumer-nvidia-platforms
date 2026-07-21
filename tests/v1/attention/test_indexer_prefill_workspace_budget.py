@@ -73,7 +73,7 @@ def test_chunk_planner_never_plans_gather_larger_than_reservation():
     """
     cfg = _config(PRODUCTION_MAX_MODEL_LEN)
     planner_budget = get_max_prefill_buffer_size(cfg, COMPRESS_RATIO)
-    # What DeepseekV4Indexer reserves (rows) — must be the identical quantity.
+    # What DeepseekV4Indexer reserves (rows): must be the identical quantity.
     reservation_rows = get_max_prefill_buffer_size(cfg, COMPRESS_RATIO)
     assert planner_budget == reservation_rows
 

@@ -96,7 +96,7 @@ def test_global_slots_dequant_matches_gather() -> None:
 
     k = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
     k_cache = _make_empty_k_cache(num_blocks, block_size)
-    # Distribute tokens across two blocks — exercises block_idx arithmetic.
+    # Distribute tokens across two blocks: exercises block_idx arithmetic.
     slot_mapping = torch.tensor(
         [0, 1, 2, 3, 64, 65, 66, 67], dtype=torch.int64, device="cuda"
     )

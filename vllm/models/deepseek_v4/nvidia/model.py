@@ -1043,7 +1043,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # address (outside the cudagraph pool) so the copy_ in forward()
         # refreshes it correctly across captured shapes.
         # refreshes it correctly across captured shapes. Only allocated on
-        # the last PP rank — that's where MTP target hidden states are
+        # the last PP rank, that's where MTP target hidden states are
         # produced.
         if get_pp_group().is_last_rank:
             self._mtp_hidden_buffer = torch.empty(

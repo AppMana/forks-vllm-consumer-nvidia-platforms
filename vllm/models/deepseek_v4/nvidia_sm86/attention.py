@@ -6,7 +6,7 @@ Subclasses ``DeepseekV4FlashMLAAttention`` to reuse all projection / metadata /
 indexer / o_proj machinery, and overrides only the two backend-specific
 sparse-attention kernel calls:
 
-- decode: the precompiled ``flash_mla.sparse_mla_decode_fp8`` CUDA kernel — one
+- decode: the precompiled ``flash_mla.sparse_mla_decode_fp8`` CUDA kernel, one
   launch for the whole decode batch, ~4.4x faster than the per-row Triton path it
   replaced, and a ``.so`` (no Triton JIT / recompile-wedge / warmup). It is a HARD
   dependency (imported at module top, no fallback): a missing kernel fails loudly
@@ -415,8 +415,8 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         ``flash_mla.sparse_mla_prefill`` mirrors the decode interface:
         it consumes the paged fp8_ds_mla caches directly with per-query-token
         GLOBAL slot indices (compact-left, -1 padded). The adapter below
-        builds those indices from the block tables — reusing the mixed
-        sparse-index builder that already serves the FlashInfer backend —
+        builds those indices from the block tables, reusing the mixed
+        sparse-index builder that already serves the FlashInfer backend,
         instead of dequant+gather staging a bf16 workspace like the Triton
         path (the flash_mla op stages internally).
         """

@@ -4,7 +4,7 @@ into the FUSED/STACKED parameter names the upstream-rebased DeepseekV4 model
 expects, so weights load by direct name match (no expert-params-mapping).
 
 This is a pure tensor re-layout (concat along dim 0 + stack across experts);
-the quantized values are preserved byte-for-byte — no requantization. Verified
+the quantized values are preserved byte-for-byte, no requantization. Verified
 shape map (DeepSeek-V4, 256 experts, hidden 4096, moe_intermediate 2048):
 
   per-expert ffn.experts.N.w1[2048,2048] + .w3[2048,2048]  (int4-in-int8)

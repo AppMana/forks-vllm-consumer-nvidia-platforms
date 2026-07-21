@@ -33,7 +33,7 @@ class AsyncScheduler(Scheduler):
             )
             # The request will generate num_sampled_tokens_per_step new tokens
             # plus num_spec_tokens in this scheduling step. Diffusion has no AR
-            # bonus token (num_sampled_tokens_per_step == 0) — only the canvas
+            # bonus token (num_sampled_tokens_per_step == 0), only the canvas
             # (spec) tokens. A PP-deferred STEADY-STATE verify step (scheduled
             # query == drafts) emits at most num_draft tokens: no anchor bonus
             # (it was emitted by the step that sampled it), so no bonus

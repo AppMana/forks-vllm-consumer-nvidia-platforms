@@ -4,13 +4,13 @@
 
 DeepSeek V4-Flash builds `wo_a` as a fused per-group `ColumnParallelLinear`
 with `is_bmm=True` and consumes it directly via ``layer.weight`` /
-``layer.weight_scale_inv`` from a custom FP8 einsum kernel — its ``apply()``
+``layer.weight_scale_inv`` from a custom FP8 einsum kernel; its ``apply()``
 is never called.
 
 On sm_8x (Ampere) we lack native FP8 hardware, so the linear-method selector
 picks the Marlin FP8 kernel. Marlin's ``process_weights_after_loading``
 normally repacks the weight via ``gptq_marlin_repack`` into a
-``(size_k // 16, size_n * 16 // pack_factor)`` layout — which mangles the
+``(size_k // 16, size_n * 16 // pack_factor)`` layout, which mangles the
 ``(out, in)`` shape the V4 fp8 einsum reads. The bypass under test keeps
 ``is_bmm=True`` layers in canonical FP8 block-quant ``(out, in)`` form.
 """
@@ -97,7 +97,7 @@ def test_is_bmm_layer_keeps_canonical_shape(default_vllm_config) -> None:
         out_features // 128,
         in_features // 128,
     )
-    # No marlin workspace allocated — bypass took the early return path.
+    # No marlin workspace allocated: bypass took the early return path.
     assert not hasattr(layer, "workspace") or layer.workspace is None
 
 

@@ -321,7 +321,7 @@ class DeepseekCompressor(nn.Module):
         )
 
         # Store the KV and score (with fused APE addition) in the state.
-        # NOTE: PDL is disabled — both this kernel and the compress kernels
+        # NOTE: PDL is disabled: both this kernel and the compress kernels
         # below depend on preceding kernel outputs (kv/score from the cublas
         # GEMM; state_cache from this kernel) but neither emits/waits on PDL
         # grid dependency primitives, so launch_pdl=True caused a

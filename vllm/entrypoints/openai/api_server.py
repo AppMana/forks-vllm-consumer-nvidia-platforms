@@ -563,7 +563,7 @@ async def init_render_app_state(
     init_render_state(state, request_logger)
 
     state.vllm_config = vllm_config
-    # Disable stats logging — there is no engine to poll.
+    # Disable stats logging: there is no engine to poll.
     state.log_stats = False
     state.engine_client = None
     state.args = args

@@ -618,11 +618,11 @@ class SpeculativeConfig:
 
         Callable overrides on the target are config-to-config transforms
         (e.g. test harnesses shrinking ``num_hidden_layers``) and must also
-        reach the draft config — otherwise a draft belonging to a large
+        reach the draft config, otherwise a draft belonging to a large
         target is instantiated at full size even when the target is shrunk.
         Dict overrides are target-specific key patches; they only apply to
         the draft when the draft IS the target checkpoint (``same_model``,
-        e.g. dspark/dflash whose weights ship in the target repo) — a
+        e.g. dspark/dflash whose weights ship in the target repo): a
         separate draft checkpoint must not inherit patches meant for the
         target's own config keys.
 

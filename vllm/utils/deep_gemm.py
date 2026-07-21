@@ -397,7 +397,7 @@ def pack_ue8m0_to_int(x: torch.Tensor) -> torch.Tensor:
 
     DeepGEMM's SM100/SM120 FP8/FP4 kernels accept either ``float32`` scales
     (legacy format, 4 B/scale) or ``int32`` packed UE8M0 scales (1 B/scale
-    after 4:1 packing — 4× smaller than the legacy fp32 representation).
+    after 4:1 packing, 4× smaller than the legacy fp32 representation).
     """
     _lazy_init()
     if _pack_ue8m0_to_int_impl is None:
@@ -620,7 +620,7 @@ def fp8_fp4_mqa_logits(
 ) -> torch.Tensor:
     """Compute MQA logits for a single sequence without KV paging.
 
-    Unified FP8/FP4 dispatch — the underlying DeepGEMM kernel takes
+    Unified FP8/FP4 dispatch: the underlying DeepGEMM kernel takes
     ``q = (values, scales_or_None)`` where ``scales`` is None for FP8 Q
     (per-token scale is folded into ``weights``) and a packed block-scale
     tensor for MXFP4 Q.
@@ -630,7 +630,7 @@ def fp8_fp4_mqa_logits(
             float8_e4m3fn and q_scale is None (per-token scale is folded
             into ``weights``). FP4 path: q_values is packed uint8 and
             q_scale is the companion block-scale tensor.
-        kv: Tuple `(k_packed, k_scales)` — FP8 layout is [N, D]
+        kv: Tuple `(k_packed, k_scales)`, FP8 layout is [N, D]
             float8_e4m3fn plus fp32 scales [N]; FP4 layout is packed uint8.
         weights: weights of shape [M, H], dtype `torch.float32`.
         cu_seqlen_ks: Start indices (inclusive) for valid K per query
@@ -644,7 +644,7 @@ def fp8_fp4_mqa_logits(
     """
     _lazy_init()
     # Ampere/Ada (sm_8x) and consumer Blackwell (sm_12x) route through the
-    # portable Triton/torch sm12x path — DeepGEMM is sm_90+/sm_100+ only.
+    # portable Triton/torch sm12x path: DeepGEMM is sm_90+/sm_100+ only.
     if (
         current_platform.is_device_capability_family(120)
         or current_platform.is_device_capability_family(80)
@@ -698,7 +698,7 @@ def fp8_fp4_paged_mqa_logits(
 ) -> torch.Tensor:
     """Compute MQA logits using a paged KV-cache.
 
-    Unified FP8/FP4 dispatch — the underlying DeepGEMM kernel takes
+    Unified FP8/FP4 dispatch: the underlying DeepGEMM kernel takes
     ``q = (values, scales_or_None)``; pass ``(q_tensor, None)`` for the FP8
     path and ``(q_values, q_scale)`` for MXFP4.
 

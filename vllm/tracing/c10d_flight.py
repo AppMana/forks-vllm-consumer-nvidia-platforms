@@ -13,7 +13,7 @@ recordings into something actionable for multi-rank hang debugging:
   spans through vllm.tracing.otel, one span per collective, so the timeline
   is browsable in the existing trace backend.
 - CLI (``python -m vllm.tracing.c10d_flight <dump-dir>``): align dumps from
-  all ranks by (process group, seq id) and report the first divergence —
+  all ranks by (process group, seq id) and report the first divergence:
   the op some rank issued that its peer never matched.
 
 Enable recording with (must be set before process group init):
@@ -21,7 +21,7 @@ Enable recording with (must be set before process group init):
     TORCH_NCCL_DUMP_ON_TIMEOUT=1
 
 For cross-rank shape/op mismatch detection at issue time (abort instead of
-hang), additionally set TORCH_DISTRIBUTED_DEBUG=DETAIL — torch wraps every
+hang), additionally set TORCH_DISTRIBUTED_DEBUG=DETAIL: torch wraps every
 process group and fingerprints each collective across ranks.
 
 No new torch.distributed calls are made by this module; it only reads what
@@ -158,7 +158,7 @@ def _load_dumps(dump_dir: str) -> dict[int, list[dict[str, Any]]]:
 def analyze_divergence(dump_dir: str) -> list[str]:
     """Align per-rank dumps by (pg, seq) and report, per process group, the
     highest completed seq on each rank plus every op that is scheduled or
-    started but not completed — the frontier where a hang lives."""
+    started but not completed: the frontier where a hang lives."""
     dumps = _load_dumps(dump_dir)
     lines: list[str] = []
     if not dumps:

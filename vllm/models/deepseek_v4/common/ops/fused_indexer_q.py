@@ -185,7 +185,7 @@ def _fused_indexer_q_rope_quant_kernel(
     # FP8 weight-fold contract:
     #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
     # The per-token-per-head q_scale (fp32) IS folded into the output weights
-    # here because FP8 Q is stored WITHOUT a companion scale tensor — the
+    # here because FP8 Q is stored WITHOUT a companion scale tensor: the
     # downstream fp8_fp4_mqa_logits/fp8_fp4_paged_mqa_logits kernels use `weights` to
     # apply per-token Q scale inline. See the MXFP4 kernel below for the
     # contrasting convention (scales live with the Q values, weights are NOT
@@ -301,7 +301,7 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     # MXFP4 Q emits a separate ue8m0 scale tensor of shape
     # (T, H, HEAD_DIM // MXFP4_BLOCK) alongside the packed values, so each
     # per-block scale is applied by the downstream MXFP4 logits kernel when
-    # dequantizing Q — there is no per-token scalar to fold into `weights`.
+    # dequantizing Q: there is no per-token scalar to fold into `weights`.
     index_weights = tl.load(
         index_weights_ptr + tok_idx * index_weights_stride + head_idx
     ).to(tl.float32)
@@ -314,7 +314,7 @@ def _fused_indexer_q_rope_mxfp4_kernel(
 
 
 def _supports_fp8e4nv_in_triton() -> bool:
-    """Same gate as fused_inv_rope_fp8_quant — Triton's tl.float8e4nv requires
+    """Same gate as fused_inv_rope_fp8_quant. Triton's tl.float8e4nv requires
     sm_89+. Fall back to torch on sm_8x (Ampere)."""
     from vllm.platforms import current_platform
 
@@ -461,12 +461,12 @@ def fused_indexer_q_rope_quant(
 ]:
     """Fused RoPE + quantize Q for the sparse indexer.
 
-    Weight-fold semantics (important — the two paths differ):
+    Weight-fold semantics (important: the two paths differ):
 
     FP8 path (use_fp4=False, default):
         q_fp8      : (T, H, HEAD_DIM) platform fp8 (e4m3fnuz on gfx942,
                      e4m3fn elsewhere); per-token-per-head scalar scale
-                     (NOT stored — folded into weights below)
+                     (NOT stored, folded into weights below)
         weights_out = weights * q_scale * softmax_scale * head_scale
         Rationale: a single per-token q_scale is a scalar the downstream FP8
         logits kernel would otherwise multiply in. Folding it into `weights`
@@ -477,7 +477,7 @@ def fused_indexer_q_rope_quant(
         q_scale    : (T, H, HEAD_DIM // MXFP4_BLOCK_SIZE) uint8 ue8m0 bytes
         weights_out = weights * softmax_scale * head_scale
         Rationale: MXFP4 has PER-BLOCK (32-element) scales that live with
-        the Q values — they cannot be folded into a per-token weight
+        the Q values, they cannot be folded into a per-token weight
         scalar, so `weights` carries only the softmax and head scales.
 
     Returns (q_quant, weights_out) where q_quant is either a Tensor (FP8) or

@@ -603,7 +603,7 @@ def _gather_token_bytes(
     """Gather (fp8_bytes, bf16_bytes, scale_bytes) for N tokens from cache.
 
     `k_cache` may be 2D ``(num_blocks, block_stride)`` or 3D
-    ``(num_blocks, block_size, head_bytes)`` depending on the caller — the
+    ``(num_blocks, block_size, head_bytes)`` depending on the caller: the
     Triton kernel works on raw byte pointer math either way. We flatten to
     2D so per-row gather works regardless of input rank.
 
@@ -933,7 +933,7 @@ def quantize_and_insert_k_cache(
 # Triton specializes a separate JIT variant per pointer/stride ALIGNMENT class
 # (16-byte-aligned vs not). During prefill the gather output buffer and the cache /
 # index pointers take varying alignments, so without this pin Triton recompiles a new
-# variant per request — pinning one PP rank in compilation while the chain blocks on the
+# variant per request, pinning one PP rank in compilation while the chain blocks on the
 # collective (the "rank stuck at 100%, others 0%" wedge). Ported from pre-rebase 0565d010e.
 @triton.jit(
     do_not_specialize_on_alignment=[

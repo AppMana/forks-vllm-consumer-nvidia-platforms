@@ -247,7 +247,7 @@ def _reshape_attention_kv_cache(
             stride=tuple(strides),
         )
     else:
-        # No padding — safe to use a contiguous view.
+        # No padding, safe to use a contiguous view.
         kv_cache = kv_raw_tensor.view(dtype).view(permuted_kv_cache_shape)
 
     return kv_cache.permute(*inv_order)
@@ -285,7 +285,7 @@ def _reshape_kv_cache(
 
         for layer_name in group.layer_names:
             if layer_name in shared_kv_cache_layers:
-                # Shared layer — tensor will be aliased to its target later.
+                # Shared layer: tensor will be aliased to its target later.
                 continue
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
@@ -521,7 +521,7 @@ def _update_hybrid_attention_layout(
 
         for layer_name in group.layer_names:
             if layer_name not in kv_caches:
-                # Shared layer — will be aliased to its target after this pass.
+                # Shared layer: will be aliased to its target after this pass.
                 continue
 
             kv_cache = kv_caches[layer_name]

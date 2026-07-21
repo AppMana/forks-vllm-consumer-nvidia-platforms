@@ -1844,7 +1844,7 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
     The child resolves the test function by importing its module and looking
     it up by qualified name, rather than reconstructing it from a cloudpickle
     blob. Pickling the function by value would also pickle its ``__globals__``
-    by value — turning module-level singletons (e.g.
+    by value, turning module-level singletons (e.g.
     ``vllm.compilation.counter.compilation_counter``) into stale clones in
     the child, so increments performed by the production code in the child
     would never be observable to the test.
@@ -1852,7 +1852,7 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
     The child inherits the parent's stdout/stderr so its output (engine
     cores, NCCL, CUDA, ...) reaches the test runner live; the Python-level
     traceback is serialized to ``tb_file`` for structured re-raising. A
-    native crash leaves ``tb_file`` empty — the diagnostic is then only in
+    native crash leaves ``tb_file`` empty: the diagnostic is then only in
     the inherited subprocess output.
     """
 

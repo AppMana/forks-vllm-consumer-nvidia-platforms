@@ -2565,7 +2565,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
 
     - dense layer (``num_index_heads == 0``): ``[q | k | v]``;
     - sparse layer (``num_index_heads > 0``): ``[q | k | v | index_q |
-      index_k]`` — the index branch is read straight out of ``qkv``.
+      index_k]``: the index branch is read straight out of ``qkv``.
 
     When ``kv_cache`` is given (sparse serving), also scatter-inserts the
     normed/roped k & v into the paged KV cache by ``slot_mapping`` and the
@@ -2575,7 +2575,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
 
     If ``q_out`` / ``index_q_out`` (contiguous ``[N, nq*128]`` / ``[N,
     niq*128]``) are given, the normed/roped q / index_q are written there
-    instead of in place — folding the de-interleave into this kernel's store so
+    instead of in place, folding the de-interleave into this kernel's store so
     callers skip a separate ``.contiguous()`` copy before the SM100 sparse
     attention's flat TMA descriptor.
 

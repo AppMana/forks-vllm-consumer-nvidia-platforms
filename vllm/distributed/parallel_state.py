@@ -1479,7 +1479,7 @@ def _replace_active_groups(
 ) -> None:
     """Destroy the current DP/EP/WORLD/EPLB groups and replace them.
 
-    Destruction is collective — all ranks in the old groups must call this
+    Destruction is collective: all ranks in the old groups must call this
     function together.  Pass all-``None`` to tear down without replacement.
     """
     global _WORLD, _DP, _EP, _EPLB, _NODE_COUNT
@@ -1625,7 +1625,7 @@ def _init_process_group_for_split_group(
 def _validate_default_pg_for_split_group() -> None:
     """When an external launcher (e.g. ``torchrun``) initialized the default
     PG, ``GroupCoordinator`` cannot patch in additional backends or change
-    the eager-init behavior — ``split_group`` only selects subsets of an
+    the eager-init behavior; ``split_group`` only selects subsets of an
     existing parent. Validate that the parent has both ``device_id`` and a
     CPU (gloo) backend, and emit a descriptive error pointing at the exact
     init call to update otherwise.

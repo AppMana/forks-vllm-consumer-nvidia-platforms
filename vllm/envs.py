@@ -840,7 +840,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Useful for debugging
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
     # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
-    # by default when the hardware supports it — set to 0 to opt out
+    # by default when the hardware supports it; set to 0 to opt out
     # explicitly, which forces the PyTorch-native (Triton for bs>=8) path.
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: (
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
@@ -1012,7 +1012,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MAX_IMAGE_PIXELS": lambda: int(
         os.getenv("VLLM_MAX_IMAGE_PIXELS", "178956970")
     ),
-    # Backend for Video IO — selects the frame-sampling algorithm.
+    # Backend for Video IO: selects the frame-sampling algorithm.
     # - "opencv": uniform sampling.
     # - "opencv_dynamic": duration-aware dynamic sampling.
     # - "identity": returns raw video bytes for model processor to handle.
@@ -1726,8 +1726,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_KV_CACHE_LAYOUT", None, ["NHD", "HND"]
     ),
     # SSM conv state layout used for Mamba models.
-    # - SD: (state_len, dim) — dim contiguous (default)
-    # - DS: (dim, state_len) — TP-sharded dim on dim1,
+    # - SD: (state_len, dim), dim contiguous (default)
+    # - DS: (dim, state_len), TP-sharded dim on dim1,
     #   consistent with SSM temporal state and HND KV cache layout.
     "VLLM_SSM_CONV_STATE_LAYOUT": env_with_choices(
         "VLLM_SSM_CONV_STATE_LAYOUT", None, ["SD", "DS"]

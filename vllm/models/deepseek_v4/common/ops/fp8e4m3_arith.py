@@ -3,7 +3,7 @@
 """Arithmetic-only FP8 E4M3 encode/decode for sm_8x.
 
 Triton's NVIDIA backend refuses to lower the `tl.float8e4nv` cast on
-sm_8x — even though FP8 hardware MMA isn't strictly required for plain
+sm_8x, even though FP8 hardware MMA isn't strictly required for plain
 cast/bitcast. The kernels here let sm_8x kernels keep their structure by
 swapping the unsupported cast for an arithmetic decode/encode that
 operates on `uint8` and `fp32` only.

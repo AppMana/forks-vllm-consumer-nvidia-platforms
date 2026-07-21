@@ -569,7 +569,7 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 continue
 
             # Stacked rules only apply to decoder-layer weights. Head-stack params
-            # (main_proj/norm/hc_head/markov_head) load directly — otherwise e.g.
+            # (main_proj/norm/hc_head/markov_head) load directly. Otherwise e.g.
             # "markov_w1" would collide with the "w1" shard rule.
             is_layer_param = name.startswith("model.layers.")
             for param_name, weight_name, stacked_shard_id in stacked_params_mapping:

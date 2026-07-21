@@ -768,7 +768,7 @@ class EngineArgs:
         load_general_plugins()
         # when use hf offline,replace model and tokenizer id to local model path
         if huggingface_hub.constants.HF_HUB_OFFLINE:
-            # Skip cloud storage URIs (s3://, gs://, az://) — they are not
+            # Skip cloud storage URIs (s3://, gs://, az://): they are not
             # HF repo IDs and will be resolved later by
             # ModelConfig.maybe_pull_model_tokenizer_for_runai().
             if not is_cloud_storage(self.model):
@@ -2249,7 +2249,7 @@ class EngineArgs:
                 self.attention_backend
             )
 
-        # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
+        # TurboQuant requires FlashAttention 2. FA3 boundary layers assert
         # FlashAttentionImpl which fails with TurboQuantAttentionImpl.
         if resolved_cache_dtype.startswith("turboquant_") and (
             attention_config.flash_attn_version is None
@@ -2602,7 +2602,7 @@ class EngineArgs:
             # get_mm_max_tokens_per_item returns pre-computed per-item token
             # ceilings for models that override it (e.g., Gemma4), or None
             # for models that rely on dummy-input profiling. When None is
-            # returned we bail out — no dummy generation is triggered here.
+            # returned we bail out: no dummy generation is triggered here.
             max_tokens = info.get_mm_max_tokens_per_item(
                 seq_len=model_config.max_model_len,
                 mm_counts=mm_counts,

@@ -14,8 +14,8 @@ ROCm port of ``nvidia/dspark.py``. Follows the same nvidia->amd recipe used for
   * drop the mega-MoE weight path (``make_deepseek_v4_expert_params_mapping`` /
     ``use_mega_moe`` / ``finalize_mega_moe_weights`` do not exist in amd/model.py).
 
-Everything else — the semi-autoregressive drafting hooks, the Markov head, the
-sliding-window context-KV insert, and the checkpoint ``mtp.*`` weight remap — is
+Everything else (the semi-autoregressive drafting hooks, the Markov head, the
+sliding-window context-KV insert, and the checkpoint ``mtp.*`` weight remap) is
 pure torch / Triton and shared with the nvidia implementation unchanged.
 """
 
@@ -447,7 +447,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 continue
 
             # Stacked rules only apply to decoder-layer weights. Head-stack params
-            # (main_proj/norm/hc_head/markov_head) load directly — otherwise e.g.
+            # (main_proj/norm/hc_head/markov_head) load directly. Otherwise e.g.
             # "markov_w1" would collide with the "w1" shard rule.
             is_layer_param = name.startswith("model.layers.")
             for param_name, weight_name, stacked_shard_id in stacked_params_mapping:

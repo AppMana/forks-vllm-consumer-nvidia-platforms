@@ -18,7 +18,7 @@ def _supports_fp8e4nv_in_triton() -> bool:
     """Triton's `tl.float8e4nv` cast / `tl.dot(fp8, fp8)` requires sm_89+.
 
     Ada (sm_89), Hopper (sm_9x), and Blackwell (sm_10x/12x) qualify; Ampere
-    (sm_8x with major.minor != 8.9) does not — Triton refuses with
+    (sm_8x with major.minor != 8.9) does not. Triton refuses with
     `ValueError: type fp8e4nv not supported in this architecture`.
     """
     cap = current_platform.get_device_capability()

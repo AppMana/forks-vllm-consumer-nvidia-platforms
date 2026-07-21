@@ -23,7 +23,7 @@ Principles:
    ``KERNEL_REGISTRY``.
 3. Fail closed: an unknown symbol is a hard startup error; two symbols
    claiming the same role is a hard error. A *selector* role (decode fp8,
-   decode int8, prefill — roles that always need one kernel) with no symbol
+   decode int8, prefill: roles that always need one kernel) with no symbol
    uses its documented default. When a block with a ``kernels`` list is
    present it is authoritative for the *toggle* roles (indexer cache int8,
    indexer query int8, dense experts int8 activation, indexer streaming
@@ -33,7 +33,7 @@ Principles:
 4. Overriding everything is trivial: vLLM applies dict-valued
    ``--hf-overrides`` entries by *replacing* the whole attribute
    (``ModelConfig._apply_dict_overrides`` does ``setattr`` for plain-dict
-   attributes — it does NOT deep-merge), so one
+   attributes; it does NOT deep-merge), so one
    ``--hf-overrides '{"vllm": {...}}'`` blob replaces the entire block.
 
 Legacy compatibility (deprecated, still honored when no block is present):

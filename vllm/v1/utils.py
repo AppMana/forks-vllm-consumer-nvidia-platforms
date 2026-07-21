@@ -722,7 +722,7 @@ def report_usage_stats(
             "all2all_backend": parallel_config.all2all_backend,
             # KV connector used
             "kv_connector": kv_connector,
-            # Batching limits — tuning knobs operators commonly override
+            # Batching limits: tuning knobs operators commonly override
             "max_model_len": model_config.max_model_len,
             "max_num_seqs": scheduler_config.max_num_seqs,
             "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,

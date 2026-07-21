@@ -365,7 +365,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        # Allocated unconditionally — consumer picks paged-direct vs dequant
+        # Allocated unconditionally, consumer picks paged-direct vs dequant
         # at call time.
         self.prefill_swa_indices = torch.zeros(
             max_tokens,
