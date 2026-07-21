@@ -39,7 +39,12 @@ from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.core_client import EngineCoreClient
-from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.v1.engine.exceptions import (
+    EngineDeadError,
+    EngineGenerateError,
+    EngineStalledError,
+)
+from vllm.v1.engine.health import EngineStepMonitor
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -150,6 +155,15 @@ class AsyncLLM(EngineClient):
             client_addresses=client_addresses,
             client_count=client_count,
             client_index=client_index,
+        )
+
+        # Engine-core step heartbeats only flow on every step when stats are
+        # enabled (stats-only messages cover output-less chunked prefill
+        # steps), so stall detection is disabled without them.
+        self.step_monitor = EngineStepMonitor(
+            self.vllm_config.observability_config.engine_stall_timeout_s
+            if self.log_stats
+            else 0.0
         )
 
         # Loggers.
@@ -405,6 +419,11 @@ class AsyncLLM(EngineClient):
         index: int,
         queue: RequestOutputCollector,
     ):
+        # An idle engine sends no heartbeats; restart the stall clock when
+        # transitioning from idle to busy so idle time never counts.
+        if not self.output_processor.has_unfinished_requests():
+            self.step_monitor.note_activity()
+
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
@@ -652,12 +671,15 @@ class AsyncLLM(EngineClient):
         logger_ref = self._logger_ref
         renderer = self.renderer
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+        step_monitor = self.step_monitor
 
         async def output_handler():
             try:
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
+                    # Every engine-core message is a step heartbeat.
+                    step_monitor.note_activity()
                     num_outputs = len(outputs.outputs)
 
                     iteration_stats = (
@@ -901,6 +923,11 @@ class AsyncLLM(EngineClient):
         logger.debug("Called check_health.")
         if self.errored:
             raise self.dead_error
+        if self.step_monitor.stalled(self.output_processor.has_unfinished_requests()):
+            raise EngineStalledError(
+                stalled_for_s=self.step_monitor.seconds_since_activity(),
+                num_requests=self.output_processor.get_num_unfinished_requests(),
+            )
 
     async def start_profile(self, profile_prefix: str | None = None) -> None:
         coros = [self.engine_core.profile_async(True, profile_prefix)]

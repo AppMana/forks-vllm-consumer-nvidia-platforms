@@ -3,11 +3,11 @@
 
 
 from fastapi import APIRouter, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
-from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.exceptions import EngineDeadError, EngineStalledError
 
 logger = init_logger(__name__)
 
@@ -29,5 +29,16 @@ async def health(raw_request: Request) -> Response:
     try:
         await client.check_health()
         return Response(status_code=200)
-    except EngineDeadError:
-        return Response(status_code=503)
+    except EngineStalledError as e:
+        return JSONResponse(
+            {
+                "stage": "stalled",
+                "detail": str(e),
+                "elapsed_s": round(e.stalled_for_s, 1),
+            },
+            status_code=503,
+        )
+    except EngineDeadError as e:
+        return JSONResponse(
+            {"stage": "dead", "detail": str(e)}, status_code=503
+        )

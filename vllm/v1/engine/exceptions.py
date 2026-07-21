@@ -6,6 +6,20 @@ class EngineGenerateError(Exception):
     pass
 
 
+class EngineStalledError(Exception):
+    """Raised by health checks when requests are outstanding but the engine
+    core has stopped producing step heartbeats (e.g. a worker died mid-step
+    and the engine is blocked forever waiting on it)."""
+
+    def __init__(self, stalled_for_s: float, num_requests: int):
+        self.stalled_for_s = stalled_for_s
+        self.num_requests = num_requests
+        super().__init__(
+            f"Engine core has produced no step heartbeat for "
+            f"{stalled_for_s:.1f}s with {num_requests} request(s) outstanding."
+        )
+
+
 class EngineDeadError(Exception):
     """Raised when the EngineCore dies. Unrecoverable."""
 

@@ -70,6 +70,12 @@ class ObservabilityConfig:
     This is for internal use only (e.g., benchmarks) and is not exposed as a CLI
     argument."""
 
+    engine_stall_timeout_s: float = 60.0
+    """Seconds without an engine-core step heartbeat (while requests are
+    outstanding) before health checks report the engine as stalled with HTTP
+    503. Requires log stats to be enabled (i.e. `--disable-log-stats` not
+    set); set to 0 to disable stall detection."""
+
     enable_logging_iteration_details: bool = False
     """Enable detailed logging of iteration details.
     If set, vllm EngineCore will log iteration details
