@@ -17,6 +17,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
+from vllm.transformers_utils.configs.deepseek_v4_appmana import (
+    indexer_prefill_topk_slab_rows_override,
+    indexer_streaming_topk_prefill_enabled,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -88,15 +92,44 @@ MXFP4_BLOCK_SIZE = 32
 # shared memory), so on data with boundary ties its selected set is not even
 # deterministic run-to-run; the key order is a deterministic refinement.
 #
-# TODO(prototype): gate via the checkpoint "appmana" kernel-config block
-# (vllm/transformers_utils/configs/deepseek_v4_appmana.py) as a toggle role,
-# e.g. symbol "indexer_streaming_topk_prefill", instead of this module
-# constant.
-INDEXER_PREFILL_STREAMING_TOPK = False
-# Context-slab width in K rows (compressed tokens). At M=1024, K=2048,
+# Gated by the checkpoint "appmana" kernel-config block
+# (vllm/transformers_utils/configs/deepseek_v4_appmana.py): toggle role
+# "indexer_streaming_topk_prefill", activated by listing the symbol
+# "vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk" in
+# "appmana.kernels". Absent block/symbol = OFF (one-shot path, bit-for-bit).
+#
+# Default context-slab width in K rows (compressed tokens); override via the
+# "appmana.indexer_prefill_topk_slab_rows" config key. At M=1024, K=2048,
 # slab=16384 the transient footprint is ~231 MiB (64 MiB slab logits fp32 +
 # 144 MiB int64 candidate keys + topk temporaries) vs O(M x window) one-shot.
 INDEXER_PREFILL_TOPK_SLAB_ROWS = 16384
+
+
+def _resolved_prefill_topk_slab_rows() -> int:
+    override = indexer_prefill_topk_slab_rows_override()
+    return INDEXER_PREFILL_TOPK_SLAB_ROWS if override is None else override
+
+
+def should_use_prefill_streaming_topk(
+    dcp_world_size: int,
+    use_fp4_cache: bool,
+) -> bool:
+    """Gate for the streaming prefill top-k path.
+
+    The toggle comes from the checkpoint "appmana" kernel-config block
+    (indexer_streaming_topk_prefill role); the remaining guards are the
+    DCP/FP4/platform constraints of the streaming implementation.
+    """
+    return (
+        indexer_streaming_topk_prefill_enabled()
+        and dcp_world_size <= 1
+        and not use_fp4_cache
+        and current_platform.is_cuda()
+        and (
+            current_platform.is_device_capability_family(80)
+            or current_platform.is_device_capability_family(120)
+        )
+    )
 
 # Centered order-preserving key of float32 -inf (bits 0xFF800000): columns
 # masked out by the logits kernel are exactly -inf; every in-range score is a
@@ -233,7 +266,7 @@ def streaming_prefill_topk(
             and indexer_imma_enabled()
         )
     if slab_rows is None:
-        slab_rows = INDEXER_PREFILL_TOPK_SLAB_ROWS
+        slab_rows = _resolved_prefill_topk_slab_rows()
     device = q_cast.device
     ks32 = cu_seqlen_ks.to(torch.int32)
     ke32 = cu_seqlen_ke.to(torch.int32)
@@ -720,15 +753,8 @@ def sparse_attn_indexer(
                         k_quant.view(torch.int8) if _indexer_int8 else k_quant
                     )
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-                use_streaming_topk = (
-                    INDEXER_PREFILL_STREAMING_TOPK
-                    and dcp_world_size <= 1
-                    and not use_fp4_cache
-                    and current_platform.is_cuda()
-                    and (
-                        current_platform.is_device_capability_family(80)
-                        or current_platform.is_device_capability_family(120)
-                    )
+                use_streaming_topk = should_use_prefill_streaming_topk(
+                    dcp_world_size, use_fp4_cache
                 )
                 if use_streaming_topk:
                     # Activation chunking: O(M x slab) streaming top-k instead

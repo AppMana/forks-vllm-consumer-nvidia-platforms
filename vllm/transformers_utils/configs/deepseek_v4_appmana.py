@@ -26,9 +26,10 @@ Principles:
    decode int8, prefill — roles that always need one kernel) with no symbol
    uses its documented default. When a block with a ``kernels`` list is
    present it is authoritative for the *toggle* roles (indexer cache int8,
-   indexer query int8, dense experts int8 activation): unlisted means OFF,
-   overriding the legacy checkpoint flag. Without a block, legacy behavior
-   applies unchanged.
+   indexer query int8, dense experts int8 activation, indexer streaming
+   top-k prefill): unlisted means OFF, overriding the legacy checkpoint
+   flag. Without a block, legacy behavior applies unchanged (the streaming
+   top-k prefill toggle has no legacy source and is simply OFF).
 4. Overriding everything is trivial: vLLM applies dict-valued
    ``--hf-overrides`` entries by *replacing* the whole attribute
    (``ModelConfig._apply_dict_overrides`` does ``setattr`` for plain-dict
@@ -56,7 +57,14 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 APPMANA_CONFIG_KEY = "appmana"
-_ALLOWED_BLOCK_KEYS = frozenset({"kernels", "cache_type", "pp_transport"})
+# Context-slab width (in compressed-token rows) for the streaming prefill
+# top-k path. A tuning key: only effective while the
+# ``indexer_streaming_topk_prefill`` toggle role is active; absent means the
+# indexer module's documented default.
+_INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY = "indexer_prefill_topk_slab_rows"
+_ALLOWED_BLOCK_KEYS = frozenset(
+    {"kernels", "cache_type", "pp_transport", _INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY}
+)
 # Sub-keys of the "pp_transport" block. Each toggles a PP intermediate-tensor
 # transport optimization. Absent (None) means "not specified": the coordinator
 # falls back to the env var, then the built-in default. See parallel_state's
@@ -81,6 +89,7 @@ ROLE_SPARSE_MLA_PREFILL = "sparse_mla_prefill"
 ROLE_INDEXER_CACHE_INT8 = "indexer_cache_int8"
 ROLE_INDEXER_QUERY_INT8 = "indexer_query_int8"
 ROLE_DENSE_EXPERTS_INT8_ACTIVATION = "dense_experts_int8_activation"
+ROLE_INDEXER_STREAMING_TOPK_PREFILL = "indexer_streaming_topk_prefill"
 
 # ---------------------------------------------------------------------------
 # Symbols (importable FQNs; each is the most salient callable activated)
@@ -106,6 +115,9 @@ DENSE_EXPERTS_INT8_ACTIVATION = (
     "vllm.model_executor.layers.quantization.utils.marlin_utils."
     "marlin_act_int8_process_scales"
 )
+INDEXER_STREAMING_TOPK_PREFILL = (
+    "vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk"
+)
 
 KERNEL_REGISTRY: dict[str, str] = {
     SPARSE_MLA_DECODE_FP8_FLASH: ROLE_SPARSE_MLA_DECODE_FP8,
@@ -117,6 +129,7 @@ KERNEL_REGISTRY: dict[str, str] = {
     INDEXER_CACHE_INT8_WRITER: ROLE_INDEXER_CACHE_INT8,
     INDEXER_QUERY_INT8_QUANT: ROLE_INDEXER_QUERY_INT8,
     DENSE_EXPERTS_INT8_ACTIVATION: ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
+    INDEXER_STREAMING_TOPK_PREFILL: ROLE_INDEXER_STREAMING_TOPK_PREFILL,
 }
 
 SELECTOR_ROLE_DEFAULTS: dict[str, str] = {
@@ -130,6 +143,7 @@ TOGGLE_ROLES = frozenset(
         ROLE_INDEXER_CACHE_INT8,
         ROLE_INDEXER_QUERY_INT8,
         ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
+        ROLE_INDEXER_STREAMING_TOPK_PREFILL,
     }
 )
 
@@ -147,6 +161,7 @@ _PROOF_ROLE_ORDER = (
     ROLE_INDEXER_CACHE_INT8,
     ROLE_INDEXER_QUERY_INT8,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
+    ROLE_INDEXER_STREAMING_TOPK_PREFILL,
 )
 
 
@@ -170,6 +185,10 @@ class ResolvedAppmanaKernelConfig:
     # rides VllmConfig to every Ray worker, unlike the env var (which is only
     # forwarded to workers via a fixed allowlist).
     pp_cache_metadata: bool | None = None
+    # Streaming prefill top-k context-slab width in compressed-token rows.
+    # None = "not specified": the indexer module's documented default applies.
+    # Only consulted while ROLE_INDEXER_STREAMING_TOPK_PREFILL is active.
+    indexer_prefill_topk_slab_rows: int | None = None
 
     def symbol(self, role: str) -> str | None:
         return self.roles.get(role)
@@ -213,6 +232,7 @@ def resolve_appmana_kernel_config(
     kernels: list[str] = []
     cache_type: str | None = None
     pp_cache_metadata: bool | None = None
+    indexer_prefill_topk_slab_rows: int | None = None
 
     if block is not None:
         if not isinstance(block, dict):
@@ -273,6 +293,20 @@ def resolve_appmana_kernel_config(
             pp_cache_metadata = raw_pp_transport.get(
                 _PP_TRANSPORT_CACHE_METADATA_KEY
             )
+        raw_slab_rows = block.get(_INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY)
+        if raw_slab_rows is not None:
+            # Strict positive int: reject JSON true/false (bool is an int
+            # subclass), floats, strings and non-positive widths.
+            if (
+                isinstance(raw_slab_rows, bool)
+                or not isinstance(raw_slab_rows, int)
+                or raw_slab_rows < 1
+            ):
+                raise ValueError(
+                    f'"{APPMANA_CONFIG_KEY}.{_INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY}" '
+                    f"must be a positive integer, got {raw_slab_rows!r}"
+                )
+            indexer_prefill_topk_slab_rows = raw_slab_rows
 
     roles: dict[str, str] = {}
     for symbol in kernels:
@@ -343,6 +377,7 @@ def resolve_appmana_kernel_config(
         cache_type=cache_type,
         legacy_dense_flag=bool(legacy_dense_flag),
         pp_cache_metadata=pp_cache_metadata,
+        indexer_prefill_topk_slab_rows=indexer_prefill_topk_slab_rows,
     )
 
 
@@ -458,6 +493,30 @@ def dense_experts_int8_activation_enabled() -> bool:
     return _legacy_dense_runtime_active()
 
 
+def indexer_streaming_topk_prefill_enabled() -> bool:
+    """True when the prefill indexer runs the slab-tiled streaming top-k
+    instead of materializing the full [M, N] logits.
+
+    Explicit block: on iff ``streaming_prefill_topk`` is listed. No block (or
+    no ``kernels`` list): OFF -- the one-shot prefill path is preserved
+    bit-for-bit; there is no legacy source for this toggle.
+    """
+    config = _ACTIVE_CONFIG
+    return config is not None and config.explicit and config.has_role(
+        ROLE_INDEXER_STREAMING_TOPK_PREFILL
+    )
+
+
+def indexer_prefill_topk_slab_rows_override() -> int | None:
+    """Streaming prefill top-k slab width from ``appmana.
+    indexer_prefill_topk_slab_rows``; None = use the indexer module's
+    documented default."""
+    config = _ACTIVE_CONFIG
+    if config is None:
+        return None
+    return config.indexer_prefill_topk_slab_rows
+
+
 # ---------------------------------------------------------------------------
 # Engine-side application (cache_type default + startup fail-closed check)
 # ---------------------------------------------------------------------------
@@ -516,6 +575,8 @@ def resolved_proof_line(
                 active = indexer_cache_int8_enabled()
             elif role == ROLE_INDEXER_QUERY_INT8:
                 active = indexer_query_int8_enabled()
+            elif role == ROLE_INDEXER_STREAMING_TOPK_PREFILL:
+                active = indexer_streaming_topk_prefill_enabled()
             else:
                 active = dense_experts_int8_activation_enabled()
             if active:
@@ -533,4 +594,5 @@ _TOGGLE_ROLE_SYMBOLS: dict[str, str] = {
     ROLE_INDEXER_CACHE_INT8: INDEXER_CACHE_INT8_WRITER,
     ROLE_INDEXER_QUERY_INT8: INDEXER_QUERY_INT8_QUANT,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION: DENSE_EXPERTS_INT8_ACTIVATION,
+    ROLE_INDEXER_STREAMING_TOPK_PREFILL: INDEXER_STREAMING_TOPK_PREFILL,
 }
