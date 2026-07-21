@@ -1355,7 +1355,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
+        first_layer = next(
+            iter(islice(self.layers, self.start_layer, self.end_layer)), None
+        )
+        if first_layer is None:
+            # Zero-layer PP rank (VLLM_PP_LAYER_PARTITION tail "...,0", e.g.
+            # the DSpark draft rank): no local decoder layers means no local
+            # experts, and the PP weight filter strips every layers.N.* tensor
+            # before load_weights sees it. A bare next() here would raise
+            # StopIteration inside AutoWeightsLoader's _load_module generator
+            # (PEP 479 -> RuntimeError: generator raised StopIteration).
+            return []
         if first_layer.ffn.use_mega_moe:
             return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
         # Params for weights, fp8 weight scales, fp8 activation scales
