@@ -157,8 +157,41 @@ through the LWS at `appmana-cluster/.../inference/lws-vllm-deepseek-v4.yaml` (Gi
 `tb-chain-webhook` injects `NCCL_SOCKET_IFNAME` + `VLLM_RAY_WORKER_IP_ORDER`; the leader/
 worker commands materialize each rank's shards by pod ordinal.
 
-**Measured (single-user, server-side Prometheus):** ~**26.7 tok/s** decode, **~175 ms TTFT**
-on the int4mse-int8 checkpoint over the 12-node chain.
+**Measured (single-user, PP=12 TB chain, int4/int8 checkpoint, image `225f0ade8`,
+2026-07-21):**
+
+| | `--no-async-scheduling` | `--async-scheduling` |
+|---|---|---|
+| Decode, nonspec (C=1, 4k ctx) | 29.8–30.9 tok/s | **36.0 tok/s** |
+| Decode, DSpark spec (C=1, 4k ctx) | 54.2–57.8 tok/s | **65.3–67.2 tok/s** |
+
+Async scheduling was disabled fleet-wide from 2026-06-30 (a C=2 PP-hang
+workaround, appmana-cluster `c5c226da`/`349b56c5`) through 2026-07-20; it is
+safe again as of the packed-PP-transport removal (`0ee7e9f50c`) and is now the
+default. Re-enabling it is worth +17–20% decode throughput on its own — verify
+against the current image before assuming either column.
+
+**Long-context prefill** (same config, 650k–1M `max_model_len`, chunked
+prefill, chunk 1024): needle retrieval verbatim at 620k, 950k, and the 1M
+window edge; **~3,000–4,100 tok/s** prefill depending on depth and whether
+`indexer_streaming_topk_prefill` is enabled (required above ~700k for the
+one-shot indexer logits to fit in VRAM; costs ~17% prefill throughput below
+that, so leave it off for shorter windows — see the `appmana` block below).
+**1M window + DSpark speculative decoding together** is supported: the last PP
+rank can carry zero target-model layers (`VLLM_PP_LAYER_PARTITION` tail
+`...,0`) and only the MTP draft stages, freeing enough VRAM for the KV pool at
+that depth (fix for the zero-layer weight-loader crash: `f67f53db71`).
+
+The single largest prefill win this session: the sparse int8 prefill kernel's
+whole-KV-pool bf16 dequant buffer (2.25 GiB per call, independent of how much
+of the pool a call actually touched) was replaced with in-kernel dequant
+(`forks-flash-mla-ampere-dsv4` `5966fcc`/`8465684`) — bit-exact, op peak memory
+2314→64 MiB, +23% at the kernel, +37% end-to-end at a 620k-token prefill. Two
+more allocation reclaims of the same shape landed the same night: the
+indexer's prefill gather workspace budget (was `max_model_len × 40`, now
+scheduler-derived — reclaims ~1.26 GiB/rank at 1M context) and per-decode-step
+scratch (indexer logits and the C128A gather were sized by `max_model_len`
+instead of the batch's actual context; `225f0ade82`).
 
 ### Configuration: the `appmana` checkpoint-config block
 
@@ -169,17 +202,32 @@ checkpoint's `config.json` carries one block, overridable wholesale via
 ```json
 "appmana": {
   "kernels": [
-    "flash_mla.flash_sparse_mla_decode",
-    "flash_mla.triton_sparse_int8_mla_decode",
-    "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels.sparse_attention_triton",
+    "flash_mla.sparse_mla_decode_fp8",
+    "flash_mla.sparse_mla_decode_int8",
+    "flash_mla.sparse_mla_prefill",
     "vllm._custom_ops.indexer_k_quant_and_cache_int8",
     "vllm.models.deepseek_v4.common.ops.fused_indexer_q.fused_indexer_q_rope_quant_int8",
     "vllm.model_executor.layers.quantization.utils.marlin_utils.marlin_act_int8_process_scales"
   ],
-  "cache_type": "fp8_ds_mla",
-  "pp_transport": {"pack": true, "cache_metadata": true}
+  "cache_type": "int8_ds_mla"
 }
 ```
+
+The `pp_transport` sub-block (`pack`, `cache_metadata`) has been **removed** —
+the packed intermediate-tensor wire format caused a deterministic ~507k-token
+chunked-prefill stall on the chain transport and was deleted, not disabled
+(`0ee7e9f50c`). Do not re-add it.
+
+A separate role, `indexer_streaming_topk_prefill`, gates the prefill indexer's
+activation-chunked top-k (bit-identical selection, ~231 MiB slab vs. the
+one-shot path's ~1 GiB+ logits tensor at long context) — add
+`"vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk"` to
+`kernels` to enable it; default off. `--hf-overrides` **replaces** the whole
+`appmana` dict rather than merging, so build the override from the
+checkpoint's own `config.json` block plus the one symbol you're adding, never
+a hand-curated list — a dropped kernel entry degrades silently (same
+`--hf-overrides` payload, no error) and is only caught by comparing the
+temperature-0 sanity completion against a known-good baseline byte-for-byte.
 
 Every value is the exact importable symbol that gets activated; the role is
 inferred from a registry. Unknown symbols, duplicate roles, and invalid
