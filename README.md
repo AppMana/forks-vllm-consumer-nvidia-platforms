@@ -2,20 +2,21 @@
 
 # AppMana vLLM: DeepSeek-V4 on Ampere (`appmana/vllm-ampere`)
 
-This is a fork of [vLLM](https://github.com/vllm-project/vllm) that serves
+This is a fork of [vLLM](https://github.com/vllm-project/vllm) that runs
 **DeepSeek-V4-Flash** — a model whose official kernel support starts at
-Hopper — on twelve consumer **RTX 3090 / A5000 (sm_86, Ampere, 24 GB)**
-GPUs, one per node, connected into a pipeline-parallel ring over
-**Thunderbolt RDMA** (`PP=12, TP=1`), with a **1,000,000-token context
-window** and **DSpark speculative decoding**. Single-stream: ~3,000 tok/s
-prefill at 950k context and 66 tok/s decode.
+Hopper — on GPUs upstream does not support: Ampere ports of the sparse-MLA
+kernel surface (Triton and fused native CUDA), an INT4/INT8 quantization of
+the checkpoint that fits 24 GB cards, an INT8 KV-cache/indexer layout,
+streaming long-context prefill, and pipeline-parallel correctness fixes.
+GPU count, pipeline size, interconnect, and context length are all
+configuration, not assumptions.
 
-Everything here exists to make that sentence true on hardware upstream does
-not support: Ampere ports of the sparse-MLA kernel surface, an INT4/INT8
-quantization of the checkpoint that fits 24 GB cards, a KV-cache layout and
-indexer path that survive a million tokens, and the pipeline-parallel and
-scheduling fixes the 12-node chain needed. The branch is
-`appmana/vllm-ampere`, kept merged with `upstream/main`.
+The configuration it is **tested and benchmarked on**: twelve consumer
+**RTX 3090 / A5000 (sm_86, 24 GB)** GPUs, one per node, joined into a
+pipeline-parallel chain over **Thunderbolt RDMA** (`PP=12, TP=1`) with a
+**1,000,000-token context window** and **DSpark speculative decoding** —
+single-stream ~3,000 tok/s prefill at 950k context and 66 tok/s decode.
+The branch is `appmana/vllm-ampere`, kept merged with `upstream/main`.
 
 **Checkpoint:**
 [`appmana/deepseek-v4-int4-int8`](https://huggingface.co/appmana/deepseek-v4-int4-int8)
