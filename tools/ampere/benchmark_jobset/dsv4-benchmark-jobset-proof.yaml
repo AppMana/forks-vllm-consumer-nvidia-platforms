@@ -1,0 +1,1218 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dsv4-benchmark-jobset-proof-script
+  namespace: inference
+data:
+  run.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    export HF_HOME=/hf-cache
+    export HF_HUB_CACHE=/hf-cache/hub
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export PATH=$PATH:/usr/local/bin
+
+    JOBSET_NAME="${JOBSET_NAME:-dsv4-bench-proof-010}"
+    WORLD_SIZE="${WORLD_SIZE:-10}"
+    # Scoped by APPMANA_JOBSET_UID (stamped by the core JobSet controller,
+    # unique per JobSet object, identical across all ranks of one real run)
+    # rather than just JOBSET_NAME (a fixed human-chosen string reused
+    # across every delete+recreate retry of "the same" benchmark). Without
+    # this, a stale done marker or host-rendezvous file left behind by a
+    # prior failed attempt under the same name gets picked up by the next
+    # attempt's workers as if the new run were already finished, tearing
+    # down their Ray processes while the new leader is still waiting for
+    # them -- confirmed live 2026-07-16.
+    RESULT_DIR="/jit-shared/dsv4-jobset-results/${JOBSET_NAME}/${APPMANA_JOBSET_UID:-nouid}"
+    DONE_FILE="${RESULT_DIR}/done"
+    if [ "${APPMANA_DSV4_SCOPE_COMPILER_CACHES:-1}" = "1" ]; then
+      APPMANA_DSV4_COMPILER_CACHE_BASE="/jit-local/jobset-proof/${JOBSET_NAME}"
+      export TRITON_CACHE_DIR="${APPMANA_DSV4_COMPILER_CACHE_BASE}/triton"
+      export TORCH_EXTENSIONS_DIR="${APPMANA_DSV4_COMPILER_CACHE_BASE}/torch-ext"
+      export CUDA_CACHE_PATH="${APPMANA_DSV4_COMPILER_CACHE_BASE}/cuda"
+      export TORCHINDUCTOR_CACHE_DIR="${APPMANA_DSV4_COMPILER_CACHE_BASE}/inductor"
+      export XDG_CACHE_HOME="${APPMANA_DSV4_COMPILER_CACHE_BASE}/xdg"
+    else
+      export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/jit-local/jobset-proof/triton}"
+      export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/jit-local/jobset-proof/torch-ext}"
+      export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-/jit-local/jobset-proof/cuda}"
+      export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/jit-local/jobset-proof/inductor}"
+      export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/jit-local/jobset-proof/xdg}"
+    fi
+    # The SeaweedFS CSI staging mount is routinely unhealthy for the first ~30s
+    # of a pod's life: its health monitor times out the 5s check, unmounts the
+    # stale publish path, and re-publishes. Any write to /jit-shared inside that
+    # window dies with "Transport endpoint is not connected" and, at
+    # backoffLimit 0, takes the whole 10-rank JobSet with it. Wait the mount out.
+    SHARED_MOUNT_WAIT_SECONDS="${APPMANA_DSV4_SHARED_MOUNT_WAIT_SECONDS:-300}"
+    shared_mount_ready() {
+      local probe="/jit-shared/.mount-probe.${POD_NAME:-$$}"
+      timeout 10 sh -c ": >'$probe' && rm -f '$probe'" 2>/dev/null
+    }
+    mount_waited=0
+    until shared_mount_ready; do
+      if [ "$mount_waited" -ge "$SHARED_MOUNT_WAIT_SECONDS" ]; then
+        echo "[boot] FATAL: /jit-shared not writable after ${SHARED_MOUNT_WAIT_SECONDS}s (seaweedfs CSI mount never recovered)"
+        exit 14
+      fi
+      echo "[boot] /jit-shared not writable yet (${mount_waited}s), waiting for seaweedfs CSI recovery"
+      sleep 5
+      mount_waited=$((mount_waited + 5))
+    done
+    if [ "$mount_waited" -gt 0 ]; then
+      echo "[boot] /jit-shared became writable after ${mount_waited}s"
+    fi
+
+    mkdir -p "$RESULT_DIR" \
+             "$TRITON_CACHE_DIR" \
+             "$TORCH_EXTENSIONS_DIR" \
+             "$CUDA_CACHE_PATH" \
+             "$TORCHINDUCTOR_CACHE_DIR" \
+             "$XDG_CACHE_HOME"
+    BOOT_LOG="${RESULT_DIR}/${POD_NAME}.boot.log"
+    log_line() {
+      printf '%s\n' "$*" | tee -a "$BOOT_LOG"
+    }
+
+    # Ray's own per-process logs (raylet.err/out, gcs_server.err, python-core-*
+    # -- far more detailed than what's forwarded to vllm-server.log) live at
+    # /tmp/ray/session_latest/logs/ and are lost the instant this pod is
+    # deleted. With backoffLimit=0, one rank failing makes the JobSet kill
+    # every sibling pod within seconds, so a crash on one node used to mean
+    # zero forensic data for any of them. Copy Ray's logs to the shared PVC
+    # on every exit path (normal, `set -e` error, or SIGTERM from the
+    # JobSet's fail-fast teardown) so a future crash is diagnosable instead
+    # of "transient".
+    RAY_LOG_ARCHIVE_DIR="${RESULT_DIR}/ray-logs-${POD_NAME}"
+    preserve_ray_logs() {
+      mkdir -p "$RAY_LOG_ARCHIVE_DIR" 2>/dev/null || return 0
+      if [ -d /tmp/ray/session_latest/logs ]; then
+        cp -r /tmp/ray/session_latest/logs/. "$RAY_LOG_ARCHIVE_DIR/" 2>/dev/null || true
+      fi
+      # Best-effort cluster-state-at-exit snapshot; ray CLI may itself be
+      # unreachable if the crash took down the local raylet.
+      timeout 5 ray status >"$RAY_LOG_ARCHIVE_DIR/ray-status-at-exit.txt" 2>&1 || true
+    }
+    trap preserve_ray_logs EXIT
+    trap 'preserve_ray_logs; exit 143' TERM
+    # Verbose raylet/GCS C++ logging around connection/heartbeat/lease
+    # handling -- the default level does not log enough to explain a raw
+    # "connection error code 2, End of file" from a dead actor.
+    export RAY_BACKEND_LOG_LEVEL="${RAY_BACKEND_LOG_LEVEL:-info}"
+
+    if [ "${APPMANA_DSV4_ENABLE_PY_STACK_SIGNAL:-1}" = "1" ]; then
+      PY_DEBUG_DIR="${APPMANA_DSV4_COMPILER_CACHE_BASE:-/jit-local/jobset-proof}/${JOBSET_NAME}/python-debug"
+      mkdir -p "$PY_DEBUG_DIR"
+      cat >"${PY_DEBUG_DIR}/sitecustomize.py" <<'PY'
+    import faulthandler
+    import os
+    import signal
+    import sys
+
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    try:
+        faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True, chain=False)
+        print(
+            f"[python-debug] registered SIGUSR2 stack dump pid={os.getpid()}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[python-debug] failed to register SIGUSR2 stack dump: {exc!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+    PY
+      export PYTHONPATH="${PY_DEBUG_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+      log_line "[python-debug] enabled SIGUSR2 stack dumps via $PY_DEBUG_DIR"
+    fi
+
+    run_vllm_bench_matrix() {
+      if [ "${APPMANA_DSV4_RUN_VLLM_BENCH:-0}" != "1" ]; then
+        return 0
+      fi
+      local bench_dir="${RESULT_DIR}/vllm-bench"
+      local input_len="${APPMANA_DSV4_BENCH_INPUT_LEN:-16000}"
+      local output_len="${APPMANA_DSV4_BENCH_OUTPUT_LEN:-512}"
+      local seed="${APPMANA_DSV4_BENCH_SEED:-42}"
+      local backend="${APPMANA_DSV4_BENCH_BACKEND:-openai-chat}"
+      local endpoint="${APPMANA_DSV4_BENCH_ENDPOINT:-/v1/chat/completions}"
+      local extra_body="${APPMANA_DSV4_BENCH_EXTRA_BODY:-}"
+      local extra_args="${APPMANA_DSV4_BENCH_EXTRA_ARGS:-}"
+      if [ -z "$extra_body" ] && [ "$backend" = "openai-chat" ]; then
+        extra_body='{"chat_template_kwargs":{"enable_thinking":false,"thinking":false}}'
+      elif [ -z "$extra_body" ]; then
+        extra_body='{}'
+      fi
+      local timeout_s="${APPMANA_DSV4_BENCH_TIMEOUT_SECONDS:-1800}"
+      mkdir -p "$bench_dir"
+      local concurrencies="${APPMANA_DSV4_BENCH_CONCURRENCIES:-1 2}"
+      concurrencies="${concurrencies//,/ }"
+      for concurrency in $concurrencies; do
+        local label="dsv4-${APPMANA_DSV4_REPO_ID##*/}-c${concurrency}-in${input_len}-out${output_len}"
+        local result_file="${label}.json"
+        log_line "[benchmark] vllm bench serve label=$label backend=$backend endpoint=$endpoint input_len=$input_len output_len=$output_len concurrency=$concurrency extra_body=$extra_body extra_args=$extra_args timeout_s=$timeout_s"
+        read -r -a bench_extra_args <<< "$extra_args"
+        timeout --preserve-status "$timeout_s" vllm bench serve \
+          --backend "$backend" \
+          --base-url http://127.0.0.1:8080 \
+          --endpoint "$endpoint" \
+          --model "$APPMANA_DSV4_REPO_ID" \
+          --dataset-name random \
+          --random-input-len "$input_len" \
+          --random-output-len "$output_len" \
+          --num-prompts "$concurrency" \
+          --max-concurrency "$concurrency" \
+          --request-rate inf \
+          --ignore-eos \
+          --temperature 0 \
+          --seed "$seed" \
+          --percentile-metrics ttft,tpot,itl,e2el \
+          --metric-percentiles 50,90,99 \
+          --extra-body "$extra_body" \
+          --label "$label" \
+          --metadata "jobset=${JOBSET_NAME}" "pp=${VLLM_PIPELINE_PARALLEL_SIZE:-10}" "tp=${VLLM_TENSOR_PARALLEL_SIZE:-1}" \
+          --save-result \
+          --save-detailed \
+          --result-dir "$bench_dir" \
+          --result-filename "$result_file" \
+          "${bench_extra_args[@]}" \
+          2>&1 | tee "${bench_dir}/${label}.log"
+        python3 - "$bench_dir/$result_file" <<'PY' | while IFS= read -r line; do log_line "$line"; done
+    import json, sys
+    path = sys.argv[1]
+    data = json.load(open(path))
+    tpot = data.get("median_tpot_ms") or data.get("mean_tpot_ms")
+    generated = data.get("total_output_tokens") or data.get("total_generated_tokens")
+    tok_s = 1000.0 / tpot if tpot else None
+    print(
+        "[benchmark-summary] "
+        f"file={path} "
+        f"completed={data.get('completed')} "
+        f"failed={data.get('failed')} "
+        f"total_generated_tokens={generated} "
+        f"output_throughput={data.get('output_throughput')} "
+        f"mean_ttft_ms={data.get('mean_ttft_ms')} "
+        f"median_ttft_ms={data.get('median_ttft_ms')} "
+        f"mean_tpot_ms={data.get('mean_tpot_ms')} "
+        f"median_tpot_ms={data.get('median_tpot_ms')} "
+        f"decode_tok_s_per_stream_from_tpot={tok_s}"
+    )
+    if not data.get("completed"):
+        raise SystemExit(
+            f"benchmark produced no successful requests: "
+            f"failed={data.get('failed')} errors={data.get('errors')}"
+        )
+    PY
+      done
+    }
+
+    { grep -vE '^127\.0\.1\.1\b' /etc/hosts; echo "${HOST_IP} $(hostname)"; } > /tmp/hosts.new
+    cat /tmp/hosts.new > /etc/hosts
+    rm -f /tmp/hosts.new
+
+    PRIMARY_IFACE="$(awk '$2=="00000000" {print $1; exit}' /proc/net/route)"
+    if [ -z "${NCCL_SOCKET_IFNAME:-}" ]; then
+      if [ "${APPMANA_DSV4_REQUIRE_CONTROLLER_NCCL_ENV:-1}" = "1" ]; then
+        log_line "[boot] FATAL: NCCL_SOCKET_IFNAME was not injected by tb-chain-webhook"
+        cp "$BOOT_LOG" "${RESULT_DIR}/${POD_NAME}.error"
+        exit 12
+      fi
+      export NCCL_SOCKET_IFNAME="$PRIMARY_IFACE"
+    fi
+    if [ -z "${GLOO_SOCKET_IFNAME:-}" ]; then
+      if [ "${APPMANA_DSV4_REQUIRE_CONTROLLER_NCCL_ENV:-1}" = "1" ]; then
+        log_line "[boot] FATAL: GLOO_SOCKET_IFNAME was not injected by tb-chain-webhook"
+        cp "$BOOT_LOG" "${RESULT_DIR}/${POD_NAME}.error"
+        exit 13
+      fi
+      export GLOO_SOCKET_IFNAME="$PRIMARY_IFACE"
+    fi
+    HOSTS_DIR="${RESULT_DIR}/hosts"
+    mkdir -p "$HOSTS_DIR"
+    : >"${HOSTS_DIR}/${HOST_IP}"
+
+    # A rank that is still pulling a freshly built image has not run this script
+    # yet, so it has not written its host file. The barrier must outlast a cold
+    # pull of the vLLM image on a node with no layer cache, or every rank aborts
+    # together. 6 minutes was not enough; 30 is.
+    HOST_RENDEZVOUS_SECONDS="${APPMANA_DSV4_HOST_RENDEZVOUS_SECONDS:-1800}"
+    for _ in $(seq 1 $((HOST_RENDEZVOUS_SECONDS / 2))); do
+      if [ "$(find "$HOSTS_DIR" -type f | wc -l)" -ge "$WORLD_SIZE" ]; then
+        break
+      fi
+      sleep 2
+    done
+    if [ "$(find "$HOSTS_DIR" -type f | wc -l)" -lt "$WORLD_SIZE" ]; then
+      log_line "[boot] FATAL: saw $(find "$HOSTS_DIR" -type f | wc -l) JobSet host IPs, expected $WORLD_SIZE after ${HOST_RENDEZVOUS_SECONDS}s (a rank may still be pulling the image)"
+      cp "$BOOT_LOG" "${RESULT_DIR}/${POD_NAME}.error"
+      exit 10
+    fi
+
+    mapfile -t ACTIVE_CHAIN_IPS < <(
+      python3 - "$WORLD_SIZE" "$VLLM_RAY_WORKER_IP_ORDER" "$HOSTS_DIR" <<'PY'
+    import os, sys
+    world = int(sys.argv[1])
+    chain = [x for x in sys.argv[2].split(",") if x]
+    hosts_dir = sys.argv[3]
+    actual = set(os.listdir(hosts_dir))
+    active = [ip for ip in chain if ip in actual]
+    if len(active) != world:
+        raise SystemExit(f"active slice has {len(active)} IPs, expected {world}; active={active}; actual={sorted(actual)}; chain={chain}")
+    print("\n".join(active))
+    PY
+    )
+
+    APPMANA_DSV4_RANK=-1
+    for i in "${!ACTIVE_CHAIN_IPS[@]}"; do
+      if [ "${ACTIVE_CHAIN_IPS[$i]}" = "$HOST_IP" ]; then
+        APPMANA_DSV4_RANK="$i"
+        break
+      fi
+    done
+    if [ "$APPMANA_DSV4_RANK" -lt 0 ]; then
+      log_line "[boot] FATAL: HOST_IP=$HOST_IP not in VLLM_RAY_WORKER_IP_ORDER=$VLLM_RAY_WORKER_IP_ORDER"
+      cp "$BOOT_LOG" "${RESULT_DIR}/${POD_NAME}.error"
+      exit 11
+    fi
+    export APPMANA_DSV4_RANK
+    LEADER_HOST_IP="${ACTIVE_CHAIN_IPS[0]}"
+    export MASTER_ADDR="$LEADER_HOST_IP"
+    export VLLM_HOST_IP="$HOST_IP"
+    VLLM_RAY_WORKER_IP_ORDER="$(printf '%s\n' "${ACTIVE_CHAIN_IPS[@]}" | paste -sd, -)"
+    export VLLM_RAY_WORKER_IP_ORDER
+
+    VLLM_TP_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+    VLLM_PP_SIZE="${VLLM_PIPELINE_PARALLEL_SIZE:-10}"
+    VLLM_TP_RANK=$((APPMANA_DSV4_RANK % VLLM_TP_SIZE))
+    VLLM_PP_RANK=$((APPMANA_DSV4_RANK / VLLM_TP_SIZE))
+    export VLLM_TP_SIZE VLLM_PP_SIZE VLLM_TP_RANK VLLM_PP_RANK
+
+    log_line "[boot] pod=$POD_NAME node=${NODE_NAME:-?} job_index=${JOB_COMPLETION_INDEX:-?} host_ip=$HOST_IP chain_rank=$APPMANA_DSV4_RANK pp_rank=$VLLM_PP_RANK tp_rank=$VLLM_TP_RANK pp_size=$VLLM_PP_SIZE tp_size=$VLLM_TP_SIZE leader=$LEADER_HOST_IP active_order=$VLLM_RAY_WORKER_IP_ORDER iface=$PRIMARY_IFACE gloo_if=$GLOO_SOCKET_IFNAME nccl_if=$NCCL_SOCKET_IFNAME nccl_hca=${NCCL_IB_HCA:-unset} nccl_subnet=${NCCL_IB_SUBNET_AWARE_ROUTING:-unset} nccl_algo=${NCCL_ALGO:-unset} nccl_proto=${NCCL_PROTO:-unset}"
+
+    if [ "$APPMANA_DSV4_RANK" = "0" ]; then
+      /opt/appmana-hf-cache/populate.sh
+    else
+      /opt/appmana-hf-cache/wait.sh
+    fi
+
+    materialize_rank_local_model() {
+      local repo_id="${APPMANA_DSV4_REPO_ID:-deepseek-ai/DeepSeek-V4-Flash}"
+      local repo_cache_name="${repo_id//\//--}"
+      local cache_root="/hf-cache/hub/models--$repo_cache_name"
+      local expected_snapshot
+      expected_snapshot="$(cat "$cache_root/refs/main")"
+      local src="$cache_root/snapshots/$expected_snapshot"
+
+      test -d "$src"
+      test -f "$src/config.json"
+      test -f "$src/model.safetensors.index.json"
+      python3 - "$src/config.json" "$repo_id" <<'PY'
+    import json, sys
+    config = json.load(open(sys.argv[1]))
+    repo_id = sys.argv[2]
+    qc = config.get("quantization_config") or {}
+    if repo_id == "deepseek-ai/DeepSeek-V4-Flash":
+        assert qc.get("quant_method") == "fp8", qc
+    elif repo_id == "appmana/deepseek-v4-int4-int8":
+        assert qc.get("quant_method") == "dsv4_int", qc
+    else:
+        raise AssertionError(f"unsupported APPMANA_DSV4_REPO_ID={repo_id!r}")
+    PY
+
+      python3 - "$src" "$APPMANA_DSV4_RANK" <<'PY' | while IFS= read -r line; do log_line "$line"; done
+    import hashlib
+    import os
+    import sys
+
+    src = sys.argv[1]
+    rank = sys.argv[2]
+    names = [
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    ]
+    for name in names:
+        path = os.path.join(src, name)
+        if not os.path.exists(path):
+            print(f"[model-cache] meta rank={rank} {name} missing")
+            continue
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()[:16]
+        print(f"[model-cache] meta rank={rank} {name} sha256={digest}")
+    PY
+
+      if [ -n "${APPMANA_DSV4_PP_LAYER_PARTITION:-}" ]; then
+        export VLLM_PP_LAYER_PARTITION="$APPMANA_DSV4_PP_LAYER_PARTITION"
+      else
+        export VLLM_PP_LAYER_PARTITION="$(
+          python3 /usr/local/lib/python3.12/dist-packages/vllm/layer_partition.py partition \
+            --config "$src/config.json" \
+            --pp-size "${VLLM_PIPELINE_PARALLEL_SIZE:-10}"
+        )"
+      fi
+
+      # $src is the SeaweedFS-backed shared snapshot (hf-cache-seaweed PVC).
+      # Stage only this rank's ~1/pp_size share of shards onto local disk:
+      # real-copy shards containing a locally-owned tensor, symlink the rest
+      # back to $src. safetensors only reads a symlinked shard's small
+      # header (should_skip_pp_weight already skips every get_tensor() call
+      # for its tensors), so SeaweedFS is only touched for cheap headers on
+      # the ~9/10 of shards this rank doesn't own, never their bulk data.
+      # See forks-vllm-ampere/tools/prep_pp_shards.py (delivered here via
+      # the ConfigMap so no image rebuild is needed to pick up changes).
+      # Importing vllm.config.ModelConfig inside prep_pp_shards.py triggers
+      # vLLM's own INFO logging to stdout before the script's final
+      # print(dest_dir) -- take only the last line, or that logging noise
+      # ends up concatenated into the path and breaks --model downstream.
+      APPMANA_LOCAL_MODEL_PATH="$(
+        python3 /work/prep_pp_shards.py \
+          --source-dir "$src" \
+          --dest-root /shard-cache-local \
+          --pp-rank "$VLLM_PP_RANK" \
+          --pp-size "$VLLM_PP_SIZE" \
+          --trust-remote-code \
+          --gc \
+        | tail -n1
+      )"
+      export APPMANA_LOCAL_MODEL_PATH
+      log_line "[model-cache] rank=$APPMANA_DSV4_RANK path=$APPMANA_LOCAL_MODEL_PATH partition=$VLLM_PP_LAYER_PARTITION"
+    }
+    materialize_rank_local_model
+    if [ "${APPMANA_DSV4_PREWARM_ONLY:-0}" = "1" ]; then
+      log_line "[prewarm] complete rank=$APPMANA_DSV4_RANK path=$APPMANA_LOCAL_MODEL_PATH"
+      exit 0
+    fi
+
+    pkill -9 -f '(^|/)(gcs_server|raylet|plasma_store|dashboard_agent|dashboard.py|monitor.py|log_monitor.py)( |$)' >/dev/null 2>&1 || true
+    timeout 10 ray stop --force >/dev/null 2>&1 || true
+    pkill -9 -f '(^|/)(gcs_server|raylet|plasma_store|dashboard_agent|dashboard.py|monitor.py|log_monitor.py)( |$)' >/dev/null 2>&1 || true
+    rm -rf /tmp/ray/session_* /tmp/ray/session_latest /tmp/ray/ray_current_cluster
+
+    export APPMANA_DSV4_RAY_PORT="${APPMANA_DSV4_RAY_PORT:-26379}"
+    if [ "$APPMANA_DSV4_RANK" = "0" ]; then
+      export RAY_ADDRESS="$LEADER_HOST_IP:$APPMANA_DSV4_RAY_PORT"
+      bash /vllm-workspace/examples/ray_serving/multi-node-serving.sh leader \
+        --ray_cluster_size="$WORLD_SIZE" --node-ip-address="$HOST_IP" \
+        --ray_port="$APPMANA_DSV4_RAY_PORT" --ray_init_timeout=1200
+      for _ in $(seq 1 240); do
+        if ray status 2>/dev/null | grep -q "1 node"; then
+          break
+        fi
+        sleep 5
+      done
+
+      hf_override_args=()
+      if [ -n "${APPMANA_DSV4_HF_OVERRIDES:-}" ]; then
+        hf_override_args=(--hf-overrides "$APPMANA_DSV4_HF_OVERRIDES")
+      fi
+
+      compilation_args=()
+      if [ "${APPMANA_DSV4_COMPILATION_CONFIG:-default}" = "default" ]; then
+        compilation_args=(--compilation-config '{"mode":3,"cudagraph_mode":"FULL_DECODE_ONLY"}')
+      elif [ "${APPMANA_DSV4_COMPILATION_CONFIG:-}" != "none" ]; then
+        compilation_args=(--compilation-config "$APPMANA_DSV4_COMPILATION_CONFIG")
+      fi
+
+      eager_args=()
+      if [ "${APPMANA_DSV4_ENFORCE_EAGER:-0}" = "1" ]; then
+        eager_args=(--enforce-eager)
+      fi
+
+      server_extra_args=()
+      if [ -n "${APPMANA_DSV4_SERVER_EXTRA_ARGS:-}" ]; then
+        read -r -a server_extra_args <<< "$APPMANA_DSV4_SERVER_EXTRA_ARGS"
+      fi
+
+      reasoning_args=()
+      if [ "${APPMANA_DSV4_ENABLE_REASONING_PARSER:-1}" = "1" ]; then
+        reasoning_args=(--reasoning-parser deepseek_v4)
+      fi
+
+      vllm serve "$APPMANA_LOCAL_MODEL_PATH" \
+        --served-model-name "$APPMANA_DSV4_REPO_ID" \
+        --tokenizer-mode deepseek_v4 \
+        "${reasoning_args[@]}" \
+        --enable-request-id-headers \
+        --pipeline-parallel-size "${VLLM_PIPELINE_PARALLEL_SIZE:-10}" \
+        --tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-1}" \
+        --distributed-executor-backend ray \
+        --safetensors-load-strategy "${APPMANA_DSV4_SAFETENSORS_LOAD_STRATEGY:-lazy}" \
+        --max-model-len "${APPMANA_DSV4_MAX_MODEL_LEN:-200000}" \
+        --gpu-memory-utilization "${APPMANA_DSV4_GPU_MEMORY_UTILIZATION:-0.90}" \
+        --kv-cache-memory-bytes "${APPMANA_DSV4_KV_CACHE_MEMORY_BYTES:-1073741824}" \
+        --enable-chunked-prefill \
+        --max-num-batched-tokens "${APPMANA_DSV4_MAX_NUM_BATCHED_TOKENS:-1024}" \
+        --long-prefill-token-threshold "${APPMANA_DSV4_LONG_PREFILL_TOKEN_THRESHOLD:-4096}" \
+        --max-num-seqs "${APPMANA_DSV4_MAX_NUM_SEQS:-6}" \
+        --stream-interval "${APPMANA_DSV4_STREAM_INTERVAL:-4}" \
+        --cudagraph-metrics \
+        --trust-remote-code \
+        "${hf_override_args[@]}" \
+        "${compilation_args[@]}" \
+        "${eager_args[@]}" \
+        "${server_extra_args[@]}" \
+        --host 0.0.0.0 \
+        --port 8080 \
+        --async-scheduling \
+        --no-enable-prefix-caching \
+        >"${RESULT_DIR}/vllm-server.log" 2>&1 &
+      server_pid=$!
+
+      for _ in $(seq 1 720); do
+        if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+          break
+        fi
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+          echo "[leader] vLLM exited early" | tee "${RESULT_DIR}/leader.error"
+          tail -1000 "${RESULT_DIR}/vllm-server.log" || true
+          if [ "${APPMANA_DSV4_DEBUG_HOLD_ON_FAILURE:-0}" = "1" ]; then
+            log_line "[leader] debug hold after vLLM failure"
+            sleep 36000
+          fi
+          touch "$DONE_FILE"
+          exit 20
+        fi
+        sleep 5
+      done
+      if ! curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+        echo "[leader] vLLM health check timed out" | tee "${RESULT_DIR}/leader.error"
+        tail -300 "${RESULT_DIR}/vllm-server.log" || true
+        touch "$DONE_FILE"
+        exit 21
+      fi
+
+      if [ "${APPMANA_DSV4_SKIP_SANITY:-0}" = "1" ]; then
+        log_line "[sanity] skipped"
+      else
+      python3 - "$RESULT_DIR/result.json" "${APPMANA_DSV4_REPO_ID}" <<'PY'
+    import http.client
+    import json
+    import os
+    import time
+    import urllib.error
+    import urllib.request
+
+    out_path = __import__("sys").argv[1]
+    model = __import__("sys").argv[2]
+    sanity_deadline_s = int(os.environ.get("APPMANA_DSV4_SANITY_TIMEOUT_SECONDS", "900"))
+    def run_case(name, chat_template_kwargs, max_tokens=512, temperature=0.6):
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "Answer the user accurately and concisely."},
+                {"role": "user", "content": "What is the capital of France? Reply with the city name."},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": 0.95,
+            "chat_template_kwargs": chat_template_kwargs,
+        }
+        req = urllib.request.Request(
+            "http://127.0.0.1:8080/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        start = time.time()
+        deadline = start + sanity_deadline_s
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    body = json.loads(resp.read())
+                break
+            except (
+                http.client.RemoteDisconnected,
+                TimeoutError,
+                urllib.error.URLError,
+            ) as exc:
+                if time.time() >= deadline:
+                    raise
+                print(
+                    "[sanity-retry]",
+                    json.dumps(
+                        {
+                            "case": name,
+                            "attempt": attempts,
+                            "error": repr(exc),
+                        }
+                    ),
+                    flush=True,
+                )
+                time.sleep(5)
+        elapsed = time.time() - start
+        message = body["choices"][0]["message"]
+        text = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+        combined = f"{reasoning}\n{text}".strip()
+        bad_fragments = (
+            "####",
+            "The The The",
+            "capital capital capital",
+            "France France France France",
+            "ParisParis",
+        )
+        valid = (
+            "paris" in text.lower()
+            and len(combined) < 4000
+            and not any(fragment in combined for fragment in bad_fragments)
+        )
+        return {
+            "name": name,
+            "valid": valid,
+            "elapsed_s": elapsed,
+            "text": text,
+            "reasoning": reasoning,
+            "normalized_text": text.rstrip("#").strip(),
+            "response": body,
+        }
+
+    cases = [
+        run_case(
+            "no_thinking",
+            {"enable_thinking": False, "thinking": False},
+            max_tokens=64,
+            temperature=0.0,
+        ),
+        run_case(
+            "thinking",
+            {"enable_thinking": True, "thinking": True},
+            max_tokens=512,
+            temperature=0.6,
+        ),
+    ]
+    valid = all(case["valid"] for case in cases)
+    result = {
+        "valid": valid,
+        "cases": cases,
+    }
+    with open(out_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(
+        "[sanity]",
+        json.dumps(
+            {
+                "valid": valid,
+                "cases": [
+                    {
+                        "name": case["name"],
+                        "valid": case["valid"],
+                        "elapsed_s": case["elapsed_s"],
+                        "text": case["text"],
+                        "reasoning_prefix": case["reasoning"][:80],
+                    }
+                    for case in cases
+                ],
+            }
+        ),
+        flush=True,
+    )
+    if not valid:
+        raise SystemExit(30)
+    PY
+      fi
+      if [ "${APPMANA_DSV4_HOLD_AFTER_SANITY:-0}" = "1" ]; then
+        log_line "[leader] holding after sanity with vLLM server alive"
+        while kill -0 "$server_pid" 2>/dev/null; do
+          sleep 30
+        done
+        touch "$DONE_FILE"
+        exit 22
+      fi
+      run_vllm_bench_matrix
+      touch "$DONE_FILE"
+      ray stop --force || true
+      wait "$server_pid" || true
+    else
+      bash /vllm-workspace/examples/ray_serving/multi-node-serving.sh worker \
+        --ray_address="$LEADER_HOST_IP" --node-ip-address="$HOST_IP" \
+        --ray_port="$APPMANA_DSV4_RAY_PORT" --ray_init_timeout=1200 &
+      ray_pid=$!
+      while [ ! -f "$DONE_FILE" ]; do
+        if ! kill -0 "$ray_pid" 2>/dev/null; then
+          echo "[worker] ray worker exited before done" | tee "${RESULT_DIR}/${POD_NAME}.error"
+          exit 40
+        fi
+        sleep 5
+      done
+      ray stop --force || true
+      kill "$ray_pid" >/dev/null 2>&1 || true
+      wait "$ray_pid" || true
+    fi
+  prep_pp_shards.py: |
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """Stage a PP-rank-local subset of a safetensors checkpoint as a partial
+    local HF cache.
+
+    Each PP rank only needs its own contiguous slice of hidden layers (see
+    vllm.model_executor.model_loader.pp_weight_filter). Reading the rest of the
+    checkpoint every load is wasted I/O against a shared, network-backed mount
+    (e.g. a SeaweedFS PVC), so the owned shards are brought onto local disk and
+    the rest resolve back to the shared cache -- safetensors only reads a
+    shard's header until get_tensor() is called for a specific name, and
+    should_skip_pp_weight already causes the loader to skip get_tensor() for
+    every tensor in a foreign shard, so its bulk data is never read over the
+    network.
+
+    The local cache is a standard HF hub cache, not a bespoke layout:
+
+        <dest-root>/hub/models--<org>--<name>/
+            blobs/<etag>                  # content-addressed; owned shards only
+            snapshots/<rev>/<filename>    # symlinks: owned -> local blob,
+                                          #           foreign -> source blob
+            refs/main                     # <rev>
+
+    Blob names are the source cache's own content hashes, so "copy only what is
+    missing" across partition/pp_size changes is inherited from the HF layout
+    rather than reinvented: an ownership change repoints snapshot symlinks in
+    place and copies just the blobs the local blobs/ directory lacks. The staged
+    model path is the snapshot directory -- identical on every rank (vLLM's Ray
+    executor resolves one --model path string independently on each worker's
+    node; confirmed live 2026-07-16 that a rank-dependent path breaks remote
+    workers), with per-node divergence living entirely in which blobs are local.
+
+    ``--gc`` prunes snapshots of other revisions, local blobs that do not
+    belong to the current checkpoint, and directories left by the older staging
+    layouts (16-hex config dirs, store/) -- their real files are harvested into
+    blobs/ by hardlink during staging first, so reclaiming them never re-reads
+    the network. Blobs of the current checkpoint are kept even when the current
+    partition does not reference them: partitions are additive against one
+    checkpoint, so a partition change never re-copies a blob any earlier
+    partition already staged.
+
+    Usage:
+        python prep_pp_shards.py --source-dir /hf-cache/.../snapshots/<rev> \
+            --dest-root /shard-cache-local --pp-rank 3 --pp-size 12 [--gc]
+    """
+
+    from __future__ import annotations
+
+    import argparse
+    import contextlib
+    import json
+    import os
+    import re
+    import shutil
+    import sys
+
+    SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+    COMPLETE_MARKER = ".prep-complete"
+    _LEGACY_CONFIG_DIR_RE = re.compile(r"^[0-9a-f]{16}$")
+    _LEGACY_STORE_DIR = "store"
+
+
+    def _parse_source_snapshot(source_dir: str) -> tuple[str, str]:
+        """Return (repo_dir_name, revision) from an HF-cache snapshot path
+        ``.../hub/models--org--name/snapshots/<rev>``."""
+        source_dir = os.path.abspath(source_dir)
+        rev = os.path.basename(source_dir)
+        snapshots = os.path.dirname(source_dir)
+        repo = os.path.dirname(snapshots)
+        repo_name = os.path.basename(repo)
+        if os.path.basename(snapshots) != "snapshots" or not repo_name.startswith(
+            "models--"
+        ):
+            raise ValueError(
+                f"--source-dir must be an HF cache snapshot directory "
+                f"(.../hub/models--*/snapshots/<rev>), got {source_dir}"
+            )
+        return repo_name, rev
+
+
+    def _local_repo_dir(dest_root: str, repo_name: str) -> str:
+        return os.path.join(dest_root, "hub", repo_name)
+
+
+    def _source_blob(source_dir: str, filename: str) -> str:
+        """Resolve a snapshot entry to its blob (or to itself if not a link)."""
+        return os.path.realpath(os.path.join(source_dir, filename))
+
+
+    def _is_complete(
+        snap_dir: str,
+        source_dir: str,
+        blobs_dir: str,
+        needs_copy: dict[str, bool],
+    ) -> bool:
+        if not os.path.exists(os.path.join(snap_dir, COMPLETE_MARKER)):
+            return False
+        blobs_real = os.path.realpath(blobs_dir)
+        for shard_filename, owned in needs_copy.items():
+            path = os.path.join(snap_dir, shard_filename)
+            if not os.path.islink(path) or not os.path.exists(path):
+                return False
+            target = os.path.realpath(path)
+            src_blob = _source_blob(source_dir, shard_filename)
+            if owned:
+                if os.path.dirname(target) != blobs_real:
+                    return False
+                if os.path.getsize(target) != os.path.getsize(src_blob):
+                    return False
+            else:
+                if target != src_blob:
+                    return False
+        return True
+
+
+    def _ensure_local_blob(
+        dest_root: str, blobs_dir: str, source_dir: str, shard_filename: str
+    ) -> str:
+        """Ensure the shard's blob exists locally; return its path.
+
+        Prefer hardlinking a real copy left behind by the older staging layouts
+        (16-hex config dirs, store/<ckpt>/) on the same filesystem over
+        re-copying bulk data from the network-backed source.
+        """
+        src_blob = _source_blob(source_dir, shard_filename)
+        etag = os.path.basename(src_blob)
+        blob_path = os.path.join(blobs_dir, etag)
+        src_size = os.path.getsize(src_blob)
+        if os.path.exists(blob_path):
+            if os.path.getsize(blob_path) == src_size:
+                return blob_path
+            os.remove(blob_path)
+
+        os.makedirs(blobs_dir, exist_ok=True)
+
+        legacy_candidates = []
+        with contextlib.suppress(FileNotFoundError):
+            for entry in sorted(os.listdir(dest_root)):
+                if _LEGACY_CONFIG_DIR_RE.match(entry):
+                    legacy_candidates.append(
+                        os.path.join(dest_root, entry, shard_filename)
+                    )
+            store_root = os.path.join(dest_root, _LEGACY_STORE_DIR)
+            if os.path.isdir(store_root):
+                for ckpt in sorted(os.listdir(store_root)):
+                    legacy_candidates.append(
+                        os.path.join(store_root, ckpt, shard_filename)
+                    )
+        for candidate in legacy_candidates:
+            if (
+                os.path.isfile(candidate)
+                and not os.path.islink(candidate)
+                and os.path.getsize(candidate) == src_size
+            ):
+                try:
+                    os.link(candidate, blob_path)
+                    return blob_path
+                except OSError:
+                    break
+
+        tmp_path = blob_path + ".tmp"
+        shutil.copy2(src_blob, tmp_path)
+        os.replace(tmp_path, blob_path)
+        return blob_path
+
+
+    def stage_shards(
+        source_dir: str,
+        dest_root: str,
+        local_layer_range: tuple[int, int] | None,
+    ) -> str:
+        from vllm.model_executor.model_loader.pp_weight_filter import classify_shards
+
+        source_dir = os.path.abspath(source_dir)
+        index_path = os.path.join(source_dir, SAFE_WEIGHTS_INDEX_NAME)
+        with open(index_path, "rb") as f:
+            index_bytes = f.read()
+        weight_map: dict[str, str] = json.loads(index_bytes)["weight_map"]
+
+        needs_copy = classify_shards(weight_map, local_layer_range)
+
+        repo_name, rev = _parse_source_snapshot(source_dir)
+        repo_dir = _local_repo_dir(dest_root, repo_name)
+        blobs_dir = os.path.join(repo_dir, "blobs")
+        snap_dir = os.path.join(repo_dir, "snapshots", rev)
+
+        if _is_complete(snap_dir, source_dir, blobs_dir, needs_copy):
+            return snap_dir
+
+        os.makedirs(snap_dir, exist_ok=True)
+        os.makedirs(os.path.join(repo_dir, "refs"), exist_ok=True)
+        with open(os.path.join(repo_dir, "refs", "main"), "w") as f:
+            f.write(rev)
+
+        for entry in os.listdir(source_dir):
+            src_path = os.path.join(source_dir, entry)
+            if entry.endswith(".safetensors") or not os.path.isfile(src_path):
+                continue
+            dst_path = os.path.join(snap_dir, entry)
+            if os.path.islink(dst_path):
+                os.remove(dst_path)
+            shutil.copy2(src_path, dst_path)
+
+        # Original, unmodified index -- every shard filename it references must
+        # resolve in snap_dir or vLLM's filter_duplicate_safetensors_files
+        # raises FileNotFoundError.
+        shutil.copy2(index_path, os.path.join(snap_dir, SAFE_WEIGHTS_INDEX_NAME))
+
+        for shard_filename, owned in needs_copy.items():
+            dst_path = os.path.join(snap_dir, shard_filename)
+            if os.path.islink(dst_path) or os.path.exists(dst_path):
+                os.remove(dst_path)
+            if owned:
+                target = _ensure_local_blob(
+                    dest_root, blobs_dir, source_dir, shard_filename
+                )
+            else:
+                target = _source_blob(source_dir, shard_filename)
+            os.symlink(target, dst_path)
+
+        with open(os.path.join(snap_dir, COMPLETE_MARKER), "w") as f:
+            f.write("")
+
+        return snap_dir
+
+
+    def gc_dest_root(
+        dest_root: str, keep_dir: str, source_dir: str | None = None
+    ) -> dict[str, int]:
+        """Prune legacy layout directories, snapshots of other revisions, and
+        blobs from other checkpoints. Blobs belonging to the current checkpoint
+        (present in the source snapshot's etag set) are kept even when the
+        current partition does not reference them -- partitions add onto each
+        other against one checkpoint."""
+        keep_dir = os.path.realpath(keep_dir)
+        removed = {"legacy_dirs": 0, "snapshots": 0, "blobs": 0}
+
+        for entry in sorted(os.listdir(dest_root)):
+            path = os.path.join(dest_root, entry)
+            if not os.path.isdir(path):
+                continue
+            if _LEGACY_CONFIG_DIR_RE.match(entry) or entry == _LEGACY_STORE_DIR:
+                shutil.rmtree(path)
+                removed["legacy_dirs"] += 1
+
+        repo_dir = os.path.dirname(os.path.dirname(keep_dir))
+        snapshots_dir = os.path.join(repo_dir, "snapshots")
+        if os.path.isdir(snapshots_dir):
+            for entry in sorted(os.listdir(snapshots_dir)):
+                path = os.path.join(snapshots_dir, entry)
+                if os.path.realpath(path) != keep_dir:
+                    shutil.rmtree(path)
+                    removed["snapshots"] += 1
+
+        keep_etags: set[str] = set()
+        if source_dir is not None:
+            for name in os.listdir(source_dir):
+                path = os.path.join(source_dir, name)
+                if name.endswith(".safetensors") and os.path.exists(path):
+                    keep_etags.add(os.path.basename(os.path.realpath(path)))
+        else:
+            # No source to define the checkpoint: fall back to keeping what the
+            # surviving snapshot references.
+            for name in os.listdir(keep_dir):
+                path = os.path.join(keep_dir, name)
+                if os.path.islink(path):
+                    keep_etags.add(os.path.basename(os.path.realpath(path)))
+
+        blobs_dir = os.path.join(repo_dir, "blobs")
+        if os.path.isdir(blobs_dir):
+            for name in sorted(os.listdir(blobs_dir)):
+                if name not in keep_etags:
+                    os.remove(os.path.join(blobs_dir, name))
+                    removed["blobs"] += 1
+
+        return removed
+
+
+    def _resolve_local_layer_range(
+        source_dir: str, pp_rank: int, pp_size: int, trust_remote_code: bool = False
+    ) -> tuple[int, int] | None:
+        if pp_size <= 1:
+            return None
+        from vllm.config import ModelConfig
+        from vllm.distributed.utils import get_pp_indices
+
+        # Constructing ModelConfig logs (architecture resolution, tokenizer
+        # mode, max model len, ...) straight to stdout via vLLM's own logger --
+        # this script's contract is "stdout is exactly the staged path, nothing
+        # else" (callers commonly do `path=$(prep_pp_shards.py ...)`), so divert
+        # that incidental logging to stderr rather than letting it silently
+        # corrupt the captured path with embedded newlines.
+        with contextlib.redirect_stdout(sys.stderr):
+            model_config = ModelConfig(model=source_dir, trust_remote_code=trust_remote_code)
+            total_num_hidden_layers = model_config.get_total_num_hidden_layers()
+        return get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+
+
+    def main(argv: list[str] | None = None) -> int:
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--source-dir", required=True)
+        parser.add_argument("--dest-root", required=True)
+        parser.add_argument("--pp-rank", type=int, required=True)
+        parser.add_argument("--pp-size", type=int, required=True)
+        parser.add_argument("--trust-remote-code", action="store_true")
+        parser.add_argument(
+            "--gc",
+            action="store_true",
+            help="after staging, prune legacy layouts, other snapshots, and "
+            "unreferenced local blobs",
+        )
+        args = parser.parse_args(argv)
+
+        local_layer_range = _resolve_local_layer_range(
+            args.source_dir, args.pp_rank, args.pp_size, args.trust_remote_code
+        )
+        snap_dir = stage_shards(args.source_dir, args.dest_root, local_layer_range)
+        if args.gc:
+            removed = gc_dest_root(
+                args.dest_root, keep_dir=snap_dir, source_dir=args.source_dir
+            )
+            print(
+                f"[prep-gc] removed {removed['legacy_dirs']} legacy dirs, "
+                f"{removed['snapshots']} stale snapshots, "
+                f"{removed['blobs']} unreferenced blobs",
+                file=sys.stderr,
+            )
+        print(snap_dir)
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: dsv4-bench-proof-010
+  namespace: inference
+  labels:
+    kueue.x-k8s.io/queue-name: tb-chain
+spec:
+  replicatedJobs:
+    - name: rank
+      replicas: 1
+      template:
+        spec:
+          completions: 10
+          parallelism: 10
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                appmana.com/tb-chain-hostnet: primary
+                appmana.com/tb-chain-nccl-transport: ibverbs
+              annotations:
+                kueue.x-k8s.io/podset-required-topology: appmana.com/tb-chain-name
+                kueue.x-k8s.io/podset-slice-required-topology: appmana.com/tb-chain-index
+                kueue.x-k8s.io/podset-slice-size: "1"
+                kueue.x-k8s.io/tas-ordered-evictable: "true"
+            spec:
+              restartPolicy: Never
+              hostNetwork: true
+              # Without this, run.sh's own `pkill -9 -f 'gcs_server|raylet|...'`
+              # and `ray stop --force` (already present, meant to clear stale
+              # Ray state before starting fresh) can only see processes in
+              # THIS container's own PID namespace -- hostNetwork shares the
+              # port space across pods on a node but not the PID namespace,
+              # so a Ray GCS/raylet left behind by a prior pod on the same
+              # node is invisible to that cleanup. Confirmed live 2026-07-16:
+              # a retry's engine core failed with
+              # "ActorHandle ... created in job 03000000, but the current
+              # job is 04000000" -- Ray's own job counter incrementing
+              # across separate pod attempts is a symptom of exactly this,
+              # port 26379 (shared via hostNetwork) landing on stale GCS
+              # state instead of a clean start. Same pattern already used
+              # by the seaweedfs-node DaemonSet for the same reason.
+              hostPID: true
+              dnsPolicy: ClusterFirstWithHostNet
+              runtimeClassName: nvidia
+              enableServiceLinks: false
+              imagePullSecrets:
+                - name: harbor
+              nodeSelector:
+                kubernetes.io/os: linux
+              containers:
+                - name: vllm-bench
+                  image: harbor.appmana.com/appmana/vllm-ampere:fence-event-415fe6eed700-1784264073
+                  imagePullPolicy: IfNotPresent
+                  workingDir: /vllm-workspace
+                  command:
+                    - /bin/bash
+                    - /work/run.sh
+                  envFrom:
+                    - secretRef:
+                        name: hf-token
+                  env:
+                    - name: HOST_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.hostIP
+                    - name: POD_NAME
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.name
+                    - name: NODE_NAME
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: spec.nodeName
+                    - name: JOB_COMPLETION_INDEX
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+                    # Stamped by the core JobSet controller (not a webhook,
+                    # so no admission-ordering race), unique per JobSet
+                    # object and identical across all ranks of one real run
+                    # -- unlike JOBSET_NAME, which is a fixed human-chosen
+                    # string reused across every delete+recreate retry.
+                    # RESULT_DIR is scoped by this so a stale done marker or
+                    # host-rendezvous file from a prior attempt of the same
+                    # named JobSet can never be mistaken for the current
+                    # one's state.
+                    - name: APPMANA_JOBSET_UID
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-uid']
+                    - name: JOBSET_NAME
+                      value: dsv4-bench-proof-010
+                    - name: WORLD_SIZE
+                      value: "10"
+                    - name: APPMANA_DSV4_REPO_ID
+                      value: appmana/deepseek-v4-int4-int8
+                    - name: APPMANA_DSV4_USE_SHARED_MODEL_PATH
+                      value: "0"
+                    - name: APPMANA_DSV4_REQUIRE_LOCAL_MODEL_PATH
+                      value: "1"
+                    - name: APPMANA_DSV4_KV_CACHE_MEMORY_BYTES
+                      value: "1073741824"
+                    - name: APPMANA_DSV4_MAX_NUM_BATCHED_TOKENS
+                      value: "1024"
+                    - name: APPMANA_DSV4_MAX_NUM_SEQS
+                      value: "6"
+                    - name: APPMANA_DSV4_LONG_PREFILL_TOKEN_THRESHOLD
+                      value: "4096"
+                    - name: APPMANA_DSV4_STREAM_INTERVAL
+                      value: "4"
+                    - name: VLLM_PIPELINE_PARALLEL_SIZE
+                      value: "10"
+                    - name: VLLM_TENSOR_PARALLEL_SIZE
+                      value: "1"
+                    - name: VLLM_USE_V2_MODEL_RUNNER
+                      value: "0"
+                    - name: VLLM_DEEPSEEK_V4_PREFILL_FORWARD_WARMUP
+                      value: "1"
+                    - name: VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE
+                      value: "512"
+                    - name: VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE
+                      value: "1024"
+                    - name: VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL
+                      value: "1"
+                    - name: VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH
+                      value: "0"
+                    - name: VLLM_MHC_POST_TRITON
+                      value: "1"
+                    - name: VLLM_MHC_HEAD_TRITON
+                      value: "1"
+                    - name: VLLM_MHC_PRE_TRITON
+                      value: "1"
+                    - name: VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS
+                      value: "1800"
+                    - name: VLLM_ENGINE_ITERATION_TIMEOUT_S
+                      value: "1800"
+                    - name: NCCL_P2P_DISABLE
+                      value: "0"
+                    - name: NCCL_DEBUG
+                      value: WARN
+                    - name: NCCL_DEBUG_SUBSYS
+                      value: INIT,NET,GRAPH,TUNING
+                    - name: LD_PRELOAD
+                      value: /usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7
+                    - name: TRITON_CACHE_DIR
+                      value: /jit-local/jobset-proof/triton
+                    - name: TORCH_EXTENSIONS_DIR
+                      value: /jit-local/jobset-proof/torch-ext
+                    - name: CUDA_CACHE_PATH
+                      value: /jit-local/jobset-proof/cuda
+                    - name: TORCHINDUCTOR_CACHE_DIR
+                      value: /jit-local/jobset-proof/inductor
+                    - name: XDG_CACHE_HOME
+                      value: /jit-local/jobset-proof/xdg
+                    - name: TORCH_CUDA_ARCH_LIST
+                      value: "8.6"
+                    - name: MAX_JOBS
+                      value: "2"
+                    - name: CUDA_VISIBLE_DEVICES
+                      value: "0"
+                  resources:
+                    requests:
+                      cpu: "4"
+                      memory: 12Gi
+                      nvidia.com/gpu: "1"
+                    limits:
+                      memory: 48Gi
+                      nvidia.com/gpu: "1"
+                  volumeMounts:
+                    - name: script
+                      mountPath: /work
+                    - name: hf-cache
+                      mountPath: /hf-cache
+                    - name: jit-cache-shared
+                      mountPath: /jit-shared
+                    - name: jit-cache-local
+                      mountPath: /jit-local
+                    - name: shard-cache-local
+                      mountPath: /shard-cache-local
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: hf-cache-bootstrap-scripts
+                      mountPath: /opt/appmana-hf-cache
+                      readOnly: true
+              volumes:
+                - name: script
+                  configMap:
+                    name: dsv4-benchmark-jobset-proof-script
+                    defaultMode: 0555
+                - name: hf-cache
+                  persistentVolumeClaim:
+                    claimName: hf-cache-seaweed
+                - name: jit-cache-shared
+                  persistentVolumeClaim:
+                    claimName: jit-cache-shared-seaweed
+                - name: jit-cache-local
+                  emptyDir:
+                    sizeLimit: 50Gi
+                - name: shard-cache-local
+                  # Must survive pod recreation across JobSet re-runs, not
+                  # just process restarts within one pod's life -- emptyDir
+                  # and the generic ephemeral-volume PVC (checked: its own
+                  # docs say "the PVC will be deleted together with the pod")
+                  # both fail that. A real local-path PVC is single-node
+                  # (ReadWriteOnce) and this JobSet's 10 ranks share one
+                  # volume reference across 10 different chain nodes, so a
+                  # single PVC can't be mounted by all of them either.
+                  # hostPath is the one option tied to the *node*, not the
+                  # pod or a PVC -- same pattern already used for
+                  # SeaweedFS's own mount cache (/var/cache/seaweedfs). This
+                  # tb-chain topology is physically fixed cabling, so a
+                  # given PP rank lands on the same node every run: one
+                  # identical hostPath spec across all 10 pod replicas
+                  # already resolves to a distinct, stable, per-rank
+                  # directory per node -- no per-completion-index injection
+                  # needed. prep_pp_shards.py's own cache-key hashing still
+                  # scopes each config's subdirectory, so a checkpoint or
+                  # pp_size change never collides with stale shards left by
+                  # a prior config on the same node.
+                  hostPath:
+                    path: /var/cache/vllm-shard-staging
+                    type: DirectoryOrCreate
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 24Gi
+                - name: hf-cache-bootstrap-scripts
+                  configMap:
+                    name: hf-cache-bootstrap-scripts
+                    defaultMode: 0555
