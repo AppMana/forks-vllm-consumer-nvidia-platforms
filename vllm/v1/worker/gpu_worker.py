@@ -1352,30 +1352,6 @@ class Worker(WorkerBase):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
-def _stash_pp_transport_overrides(vllm_config: VllmConfig) -> None:
-    """Resolve vllm.pp_transport from the checkpoint config and stash the PP
-    transport overrides process-wide (defensive: a no-op for non-DSV4 /
-    blockless runs, and never fatal to distributed init)."""
-    try:
-        from vllm.transformers_utils.configs.dsv4.kernel_config import (
-            VLLM_CONFIG_KEY,
-            resolve_kernel_config_from_hf_config,
-            stash_pp_transport_overrides,
-        )
-
-        model_config = getattr(vllm_config, "model_config", None)
-        hf_config = getattr(model_config, "hf_config", None)
-        if hf_config is None or getattr(hf_config, VLLM_CONFIG_KEY, None) is None:
-            return
-        resolved = resolve_kernel_config_from_hf_config(hf_config)
-        stash_pp_transport_overrides(resolved.pp_cache_metadata)
-    except Exception:
-        logger.exception(
-            "Failed to stash PP transport overrides; falling back to "
-            "VLLM_PP_* env vars for PP transport toggles."
-        )
-
-
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
     rank: int,
@@ -1389,13 +1365,6 @@ def init_worker_distributed_environment(
 
     init_batch_invariance()
 
-    # AppMana DSV4: stash the PP transport overrides from the checkpoint's
-    # "vllm.pp_transport" block. This is the robust plumbing point: every
-    # worker (including remote Ray workers) has vllm_config in hand here, well
-    # before the first PP hop, so the GroupCoordinator's
-    # _pp_metadata_cache_enabled sees the value that rode VllmConfig rather than
-    # relying on env-var forwarding (which is allowlist-limited to the driver).
-    _stash_pp_transport_overrides(vllm_config)
     override_envs_for_eplb(
         parallel_config,
         moe_backend=getattr(vllm_config.kernel_config, "moe_backend", None),

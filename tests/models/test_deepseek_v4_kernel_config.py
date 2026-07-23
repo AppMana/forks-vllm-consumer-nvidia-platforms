@@ -560,94 +560,20 @@ def test_sm86_attention_dispatches_all_registered_prefill_symbols():
 
 
 # ---------------------------------------------------------------------------
-# PP transport toggles (pp_transport block key)
+# pp_transport (REMOVED block key)
 # ---------------------------------------------------------------------------
 
 
-def test_pp_transport_absent_leaves_override_none():
-    """No pp_transport key -> override None (fall back to env/default)."""
-    resolved = resolve_kernel_config({"kernels": []})
-    assert resolved.pp_cache_metadata is None
-    resolved = resolve_kernel_config(None)
-    assert resolved.pp_cache_metadata is None
-
-
-def test_pp_transport_round_trips_booleans():
-    resolved = resolve_kernel_config(
-        {"kernels": [], "pp_transport": {"cache_metadata": True}}
-    )
-    assert resolved.pp_cache_metadata is True
-
-    resolved = resolve_kernel_config(
-        {"kernels": [], "pp_transport": {"cache_metadata": False}}
-    )
-    assert resolved.pp_cache_metadata is False
-
-
-def test_pp_transport_empty_block_leaves_override_none():
-    resolved = resolve_kernel_config(
-        {"kernels": [], "pp_transport": {}}
-    )
-    assert resolved.pp_cache_metadata is None
-
-
-def test_pp_transport_unknown_subkey_is_hard_error():
-    # "pack" was removed with the packed wire format; it must now be
-    # rejected like any other unknown key.
-    with pytest.raises(ValueError, match="pp_transport"):
+def test_pp_transport_key_is_rejected_as_unknown():
+    """The PP metadata-cache transport layer was removed; "pp_transport" is no
+    longer an allowed block key. A checkpoint still carrying it must fail
+    closed at startup like any other unknown key."""
+    with pytest.raises(ValueError, match=r"Unknown .* config key.*pp_transport"):
         resolve_kernel_config(
-            {"kernels": [], "pp_transport": {"pack": True}}
+            {"kernels": [], "pp_transport": {"cache_metadata": False}}
         )
-
-
-def test_pp_transport_non_bool_value_is_hard_error():
-    with pytest.raises(ValueError, match="pp_transport"):
-        resolve_kernel_config(
-            {"kernels": [], "pp_transport": {"cache_metadata": 1}}
-        )
-
-
-def test_pp_transport_non_dict_is_hard_error():
-    with pytest.raises(ValueError, match="pp_transport"):
-        resolve_kernel_config({"kernels": [], "pp_transport": [1, 2]})
-
-
-def test_pp_transport_resolves_from_hf_config():
-    hf_config = SimpleNamespace(
-        vllm={"kernels": [], "pp_transport": {"cache_metadata": False}},
-        quantization_config={"quant_method": "dsv4_int"},
-    )
-    resolved = resolve_kernel_config_from_hf_config(hf_config)
-    assert resolved.pp_cache_metadata is False
-
-
-def test_pp_transport_stash_and_precedence_over_env(monkeypatch):
-    """The stashed override wins over the env var; None falls back."""
-    import vllm.transformers_utils.configs.dsv4.kernel_config as kernel_config_mod
-
-    monkeypatch.setattr(kernel_config_mod, "_PP_CACHE_METADATA_OVERRIDE", None)
-
-    # Nothing stashed -> the override reports None.
-    assert kernel_config_mod.pp_cache_metadata_override() is None
-
-    resolved = resolve_kernel_config(
-        {"kernels": [], "pp_transport": {"cache_metadata": True}}
-    )
-    kernel_config_mod.stash_pp_transport_overrides(resolved.pp_cache_metadata)
-    assert kernel_config_mod.pp_cache_metadata_override() is True
-
-
-def test_activate_stashes_pp_transport_overrides(monkeypatch):
-    """activate_kernel_config propagates pp_transport to the stash
-    (covers the model-build and Ray-unpickle activation paths)."""
-    import vllm.transformers_utils.configs.dsv4.kernel_config as kernel_config_mod
-
-    monkeypatch.setattr(kernel_config_mod, "_PP_CACHE_METADATA_OVERRIDE", None)
-    resolved = resolve_kernel_config(
-        {"kernels": [], "pp_transport": {"cache_metadata": False}}
-    )
-    activate_kernel_config(resolved)
-    assert kernel_config_mod.pp_cache_metadata_override() is False
+    with pytest.raises(ValueError, match=r"Unknown .* config key.*pp_transport"):
+        resolve_kernel_config({"pp_transport": {"cache_metadata": True}})
 
 
 def test_sm86_native_prefill_supports_fp8_and_int8_caches():

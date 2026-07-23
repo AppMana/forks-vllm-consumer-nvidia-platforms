@@ -52,14 +52,8 @@ VLLM_CONFIG_KEY = "vllm"
 # indexer module's documented default.
 _INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY = "indexer_prefill_topk_slab_rows"
 _ALLOWED_BLOCK_KEYS = frozenset(
-    {"kernels", "cache_type", "pp_transport", _INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY}
+    {"kernels", "cache_type", _INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY}
 )
-# Sub-keys of the "pp_transport" block. Each toggles a PP intermediate-tensor
-# transport optimization. Absent (None) means "not specified": the coordinator
-# falls back to the env var, then the built-in default. See parallel_state's
-# _pp_metadata_cache_enabled.
-_PP_TRANSPORT_CACHE_METADATA_KEY = "cache_metadata"
-_ALLOWED_PP_TRANSPORT_KEYS = frozenset({_PP_TRANSPORT_CACHE_METADATA_KEY})
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -155,12 +149,6 @@ class ResolvedKernelConfig:
     # are present iff listed in an explicit block.
     roles: Mapping[str, str] = field(default_factory=dict)
     cache_type: str | None = None
-    # PP intermediate-tensor transport toggles from "vllm.pp_transport".
-    # None = "not specified": the coordinator falls back to the env var, then
-    # the built-in default (both effectively on today). An explicit bool here
-    # rides VllmConfig to every Ray worker, unlike the env var (which is only
-    # forwarded to workers via a fixed allowlist).
-    pp_cache_metadata: bool | None = None
     # Streaming prefill top-k context-slab width in compressed-token rows.
     # None = "not specified": the indexer module's documented default applies.
     # Only consulted while ROLE_INDEXER_STREAMING_TOPK_PREFILL is active.
@@ -197,7 +185,6 @@ def resolve_kernel_config(block: Any) -> ResolvedKernelConfig:
     explicit = False
     kernels: list[str] = []
     cache_type: str | None = None
-    pp_cache_metadata: bool | None = None
     indexer_prefill_topk_slab_rows: int | None = None
 
     if block is not None:
@@ -231,34 +218,6 @@ def resolve_kernel_config(block: Any) -> ResolvedKernelConfig:
                     f'Unsupported "{VLLM_CONFIG_KEY}.cache_type" '
                     f"{cache_type!r}; allowed: {list(allowed)}"
                 )
-        raw_pp_transport = block.get("pp_transport")
-        if raw_pp_transport is not None:
-            if not isinstance(raw_pp_transport, dict):
-                raise ValueError(
-                    f'"{VLLM_CONFIG_KEY}.pp_transport" must be a JSON '
-                    f"object, got {type(raw_pp_transport).__name__}"
-                )
-            unknown_pp = set(raw_pp_transport) - _ALLOWED_PP_TRANSPORT_KEYS
-            if unknown_pp:
-                raise ValueError(
-                    f'Unknown "{VLLM_CONFIG_KEY}.pp_transport" key(s) '
-                    f"{sorted(unknown_pp)}; allowed: "
-                    f"{sorted(_ALLOWED_PP_TRANSPORT_KEYS)}"
-                )
-            for pp_key in _ALLOWED_PP_TRANSPORT_KEYS:
-                if pp_key not in raw_pp_transport:
-                    continue
-                value = raw_pp_transport[pp_key]
-                # Strict bool: JSON true/false only (reject 0/1, matching the
-                # fail-closed spirit of the rest of the parser).
-                if not isinstance(value, bool):
-                    raise ValueError(
-                        f'"{VLLM_CONFIG_KEY}.pp_transport.{pp_key}" must be '
-                        f"a boolean, got {value!r}"
-                    )
-            pp_cache_metadata = raw_pp_transport.get(
-                _PP_TRANSPORT_CACHE_METADATA_KEY
-            )
         raw_slab_rows = block.get(_INDEXER_PREFILL_TOPK_SLAB_ROWS_KEY)
         if raw_slab_rows is not None:
             # Strict positive int: reject JSON true/false (bool is an int
@@ -307,7 +266,6 @@ def resolve_kernel_config(block: Any) -> ResolvedKernelConfig:
         explicit=explicit,
         roles=roles,
         cache_type=cache_type,
-        pp_cache_metadata=pp_cache_metadata,
         indexer_prefill_topk_slab_rows=indexer_prefill_topk_slab_rows,
     )
 
@@ -326,27 +284,6 @@ def resolve_kernel_config_from_hf_config(
 
 _ACTIVE_CONFIG: ResolvedKernelConfig | None = None
 
-# Process-wide PP transport overrides resolved from "vllm.pp_transport".
-# None = "not specified" -> the coordinator falls back to the env var, then the
-# built-in default. Set at worker init (init_worker_distributed_environment,
-# where vllm_config is definitely in hand) AND on every kernel-config
-# activation, so the value is stashed before the first PP hop regardless of
-# path. The GroupCoordinator reads it via pp_cache_metadata_override().
-_PP_CACHE_METADATA_OVERRIDE: bool | None = None
-
-
-def stash_pp_transport_overrides(pp_cache_metadata: bool | None) -> None:
-    """Set the process-wide PP transport override (set-once semantics: only a
-    non-None value replaces an already-stashed value, so a later blockless
-    activation cannot clobber a value resolved from the checkpoint block)."""
-    global _PP_CACHE_METADATA_OVERRIDE
-    if pp_cache_metadata is not None:
-        _PP_CACHE_METADATA_OVERRIDE = pp_cache_metadata
-
-
-def pp_cache_metadata_override() -> bool | None:
-    return _PP_CACHE_METADATA_OVERRIDE
-
 
 def activate_kernel_config(
     resolved: ResolvedKernelConfig,
@@ -359,9 +296,6 @@ def activate_kernel_config(
             resolved,
         )
     _ACTIVE_CONFIG = resolved
-    # Propagate PP transport overrides so the coordinator sees them even when
-    # activation happens via the model build / Ray unpickle path.
-    stash_pp_transport_overrides(resolved.pp_cache_metadata)
 
 
 def active_kernel_config() -> ResolvedKernelConfig | None:

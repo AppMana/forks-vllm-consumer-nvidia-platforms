@@ -138,40 +138,6 @@ def _select_recv_tensor(
     return tensor[slices]
 
 
-# tags for the PP tensor-dict metadata channel: a "full" message carries the
-# complete metadata list, a "cached" message only names the epoch of the last
-# full schema sent to the same peer.
-_PP_METADATA_FULL = "full"
-_PP_METADATA_CACHED = "cached"
-
-
-def _tensor_dict_schema_key(metadata_list: list[tuple[str, Any]]) -> tuple | None:
-    """Hashable schema of a tensor-dict metadata list, or None.
-
-    Returns None when the list carries any non-tensor value: those are data,
-    not schema, and must travel on every send.
-    """
-    key_parts = []
-    for key, value in metadata_list:
-        if isinstance(value, TensorMetadata):
-            key_parts.append((key, value.device, value.dtype, tuple(value.size)))
-        else:
-            return None
-    return tuple(key_parts)
-
-
-def _pp_cache_metadata_override() -> bool | None:
-    """The process-wide vllm.pp_transport.cache_metadata override, or None."""
-    try:
-        from vllm.transformers_utils.configs.dsv4.kernel_config import (
-            pp_cache_metadata_override,
-        )
-
-        return pp_cache_metadata_override()
-    except Exception:
-        return None
-
-
 _group_name_counter: dict[str, int] = {}
 
 
@@ -1025,65 +991,6 @@ class GroupCoordinator:
             use_all_gather = all_gather_tensors.get(key, use_all_gather)
         return use_all_gather
 
-    def _pp_metadata_cache_enabled(self) -> bool:
-        # Resolve once per group; workers stash the override before the
-        # first hop. Precedence: explicit vllm.pp_transport.cache_metadata
-        # value > VLLM_PP_CACHE_TENSOR_DICT_METADATA env (deprecated fallback) >
-        # built-in default (the env default, True).
-        enabled: bool | None = getattr(self, "_pp_cache_tensor_dict_metadata", None)
-        if enabled is None:
-            enabled = _pp_cache_metadata_override()
-            if enabled is None:
-                enabled = envs.VLLM_PP_CACHE_TENSOR_DICT_METADATA
-            self._pp_cache_tensor_dict_metadata = enabled
-        return enabled
-
-    def _send_tensor_dict_metadata(
-        self, metadata_list: list[tuple[str, Any]], dst: int
-    ) -> None:
-        if not self._pp_metadata_cache_enabled():
-            self.send_object(metadata_list, dst=dst)
-            return
-        cache: dict[int, tuple[tuple | None, int]] | None = getattr(
-            self, "_metadata_send_cache", None
-        )
-        if cache is None:
-            cache = {}
-            self._metadata_send_cache = cache
-        schema_key = _tensor_dict_schema_key(metadata_list)
-        cached = cache.get(dst)
-        if schema_key is not None and cached is not None and cached[0] == schema_key:
-            self.send_object((_PP_METADATA_CACHED, cached[1]), dst=dst)
-            return
-        epoch = 1 if cached is None else cached[1] + 1
-        cache[dst] = (schema_key, epoch)
-        self.send_object((_PP_METADATA_FULL, epoch, metadata_list), dst=dst)
-
-    def _recv_tensor_dict_metadata(self, src: int) -> list[tuple[str, Any]]:
-        if not self._pp_metadata_cache_enabled():
-            return self.recv_object(src=src)
-        cache: dict[int, tuple[int, list[tuple[str, Any]]]] | None = getattr(
-            self, "_metadata_recv_cache", None
-        )
-        if cache is None:
-            cache = {}
-            self._metadata_recv_cache = cache
-        message = self.recv_object(src=src)
-        tag = message[0]
-        if tag == _PP_METADATA_CACHED:
-            epoch = message[1]
-            cached = cache.get(src)
-            assert cached is not None and cached[0] == epoch, (
-                f"PP metadata cache desync with rank {src}: sender referenced "
-                f"schema epoch {epoch}, receiver has "
-                f"{'nothing' if cached is None else f'epoch {cached[0]}'}"
-            )
-            return cached[1]
-        assert tag == _PP_METADATA_FULL, f"Unknown PP metadata tag {tag!r}"
-        _, epoch, metadata_list = message
-        cache[src] = (epoch, metadata_list)
-        return metadata_list
-
     def send_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
@@ -1155,7 +1062,7 @@ class GroupCoordinator:
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
 
-        self._send_tensor_dict_metadata(metadata_list, dst)
+        self.send_object(metadata_list, dst=dst)
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
@@ -1253,7 +1160,7 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
 
-        recv_metadata_list = self._recv_tensor_dict_metadata(src)
+        recv_metadata_list = self.recv_object(src=src)
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []
