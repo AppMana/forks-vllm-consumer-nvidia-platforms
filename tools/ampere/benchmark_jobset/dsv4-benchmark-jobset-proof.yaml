@@ -351,10 +351,20 @@ data:
       if [ -n "${APPMANA_DSV4_PP_LAYER_PARTITION:-}" ]; then
         export VLLM_PP_LAYER_PARTITION="$APPMANA_DSV4_PP_LAYER_PARTITION"
       else
+        # Speculative decoding puts the grafted DSpark MTP draft stages on
+        # the last PP rank next to the LM head, so the auto partition must
+        # leave that rank with zero target layers (43/12 -> 3,4,...,4,0).
+        draft_partition_args=()
+        case " ${APPMANA_DSV4_SERVER_EXTRA_ARGS:-} " in
+          *" --speculative-config"*)
+            draft_partition_args=(--draft-zero-last)
+            ;;
+        esac
         export VLLM_PP_LAYER_PARTITION="$(
           python3 /usr/local/lib/python3.12/dist-packages/vllm/layer_partition.py partition \
             --config "$src/config.json" \
-            --pp-size "${VLLM_PIPELINE_PARALLEL_SIZE:-10}"
+            --pp-size "${VLLM_PIPELINE_PARALLEL_SIZE:-10}" \
+            "${draft_partition_args[@]}"
         )"
       fi
 

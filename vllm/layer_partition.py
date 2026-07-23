@@ -22,11 +22,32 @@ def _is_embedding_weight(name: str) -> bool:
     return name.startswith(("embed.", "embed_tokens", "model.embed_tokens."))
 
 
-def compute_layer_counts(num_layers: int, pp_size: int) -> list[int]:
+def compute_layer_counts(
+    num_layers: int,
+    pp_size: int,
+    draft_zero_last: bool = False,
+) -> list[int]:
     if num_layers < 0:
         raise ValueError(f"num_layers must be non-negative, got {num_layers}")
     if pp_size <= 0:
         raise ValueError(f"pp_size must be positive, got {pp_size}")
+
+    if draft_zero_last:
+        # Draft (speculative) mode for checkpoints whose grafted MTP draft
+        # stages live on the last PP rank together with the LM head: the
+        # last rank gets ZERO target layers and the target layers spread
+        # over the remaining pp_size - 1 ranks. Rank 0 gets the smallest
+        # share because it also owns the embeddings (and, on DSV4, a fixed
+        # indexer workspace). Example: 43/12 -> 3,4,4,4,4,4,4,4,4,4,4,0.
+        if pp_size < 2:
+            raise ValueError(
+                f"draft_zero_last requires pp_size >= 2, got {pp_size}")
+        effective = pp_size - 1
+        base, remainder = divmod(num_layers, effective)
+        partitions = [base] * effective + [0]
+        for i in range(1, remainder + 1):
+            partitions[effective - i] += 1
+        return partitions
 
     base, remainder = divmod(num_layers, pp_size)
     partitions = [base] * pp_size
@@ -39,10 +60,15 @@ def compute_layer_counts(num_layers: int, pp_size: int) -> list[int]:
     return partitions
 
 
-def compute_layer_range(num_layers: int, pp_size: int, pp_rank: int) -> tuple[int, int]:
+def compute_layer_range(
+    num_layers: int,
+    pp_size: int,
+    pp_rank: int,
+    draft_zero_last: bool = False,
+) -> tuple[int, int]:
     if not 0 <= pp_rank < pp_size:
         raise ValueError(f"pp_rank must be in [0, {pp_size}), got {pp_rank}")
-    counts = compute_layer_counts(num_layers, pp_size)
+    counts = compute_layer_counts(num_layers, pp_size, draft_zero_last)
     start = sum(counts[:pp_rank])
     return start, start + counts[pp_rank]
 
@@ -68,10 +94,11 @@ def select_shards(
     rank: int,
     tp_size: int,
     pp_size: int,
+    draft_zero_last: bool = False,
 ) -> list[str]:
     pp_rank = rank_to_pp_rank(rank, tp_size, pp_size)
     start, end = compute_layer_range(load_num_layers(config_path), pp_size,
-                                     pp_rank)
+                                     pp_rank, draft_zero_last)
     with index_path.open() as f:
         weights = json.load(f)["weight_map"]
 
@@ -112,6 +139,7 @@ def main() -> None:
     partition.add_argument("--pp-size",
                            type=int,
                            default=_env_int("VLLM_PIPELINE_PARALLEL_SIZE", 1))
+    partition.add_argument("--draft-zero-last", action="store_true")
 
     layers = subparsers.add_parser("layers")
     layers.add_argument("--config", type=Path, required=True)
@@ -124,6 +152,7 @@ def main() -> None:
     layers.add_argument("--pp-size",
                         type=int,
                         default=_env_int("VLLM_PIPELINE_PARALLEL_SIZE", 1))
+    layers.add_argument("--draft-zero-last", action="store_true")
 
     shards = subparsers.add_parser("shards")
     shards.add_argument("--index", type=Path, required=True)
@@ -137,19 +166,23 @@ def main() -> None:
     shards.add_argument("--pp-size",
                         type=int,
                         default=_env_int("VLLM_PIPELINE_PARALLEL_SIZE", 1))
+    shards.add_argument("--draft-zero-last", action="store_true")
 
     args = parser.parse_args()
     if args.command == "partition":
-        counts = compute_layer_counts(load_num_layers(args.config), args.pp_size)
+        counts = compute_layer_counts(load_num_layers(args.config),
+                                      args.pp_size, args.draft_zero_last)
         print(",".join(str(count) for count in counts))
     elif args.command == "layers":
         pp_rank = rank_to_pp_rank(args.rank, args.tp_size, args.pp_size)
         start, end = compute_layer_range(load_num_layers(args.config),
-                                         args.pp_size, pp_rank)
+                                         args.pp_size, pp_rank,
+                                         args.draft_zero_last)
         print(f"{start}:{end}")
     elif args.command == "shards":
         for shard in select_shards(args.index, args.config, args.rank,
-                                   args.tp_size, args.pp_size):
+                                   args.tp_size, args.pp_size,
+                                   args.draft_zero_last):
             print(shard)
 
 
