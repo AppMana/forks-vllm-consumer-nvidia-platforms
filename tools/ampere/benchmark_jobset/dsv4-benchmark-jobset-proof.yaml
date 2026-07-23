@@ -216,22 +216,21 @@ data:
     rm -f /tmp/hosts.new
 
     PRIMARY_IFACE="$(awk '$2=="00000000" {print $1; exit}' /proc/net/route)"
-    if [ -z "${NCCL_SOCKET_IFNAME:-}" ]; then
-      if [ "${APPMANA_DSV4_REQUIRE_CONTROLLER_NCCL_ENV:-1}" = "1" ]; then
-        log_line "[boot] FATAL: NCCL_SOCKET_IFNAME was not injected by tb-chain-webhook"
-        cp "$BOOT_LOG" "${RESULT_DIR}/${POD_NAME}.error"
-        exit 12
-      fi
-      export NCCL_SOCKET_IFNAME="$PRIMARY_IFACE"
+    # Socket interface names are derived here, in-pod, ALWAYS. The fleet
+    # carries five different switched-LAN NIC names (enp110s0/enp111s0/
+    # enp60s0/eno1/enp38s0 as of 2026-07-23) and they change under OS
+    # updates; any name injected by an admission controller or baked into a
+    # template goes stale, and Gloo hard-fails on a name that does not exist
+    # ("Unable to find address for: eno1", observed live). The default-route
+    # interface from this pod's own /proc/net/route is the node's truth.
+    if [ -n "${NCCL_SOCKET_IFNAME:-}" ] && [ "$NCCL_SOCKET_IFNAME" != "$PRIMARY_IFACE" ]; then
+      log_line "[boot] overriding stale NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME with $PRIMARY_IFACE"
     fi
-    if [ -z "${GLOO_SOCKET_IFNAME:-}" ]; then
-      if [ "${APPMANA_DSV4_REQUIRE_CONTROLLER_NCCL_ENV:-1}" = "1" ]; then
-        log_line "[boot] FATAL: GLOO_SOCKET_IFNAME was not injected by tb-chain-webhook"
-        cp "$BOOT_LOG" "${RESULT_DIR}/${POD_NAME}.error"
-        exit 13
-      fi
-      export GLOO_SOCKET_IFNAME="$PRIMARY_IFACE"
+    if [ -n "${GLOO_SOCKET_IFNAME:-}" ] && [ "$GLOO_SOCKET_IFNAME" != "$PRIMARY_IFACE" ]; then
+      log_line "[boot] overriding stale GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME with $PRIMARY_IFACE"
     fi
+    export NCCL_SOCKET_IFNAME="$PRIMARY_IFACE"
+    export GLOO_SOCKET_IFNAME="$PRIMARY_IFACE"
     HOSTS_DIR="${RESULT_DIR}/hosts"
     mkdir -p "$HOSTS_DIR"
     : >"${HOSTS_DIR}/${HOST_IP}"
