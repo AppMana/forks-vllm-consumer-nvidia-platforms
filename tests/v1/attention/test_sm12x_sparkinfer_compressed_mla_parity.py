@@ -273,6 +273,7 @@ def _run_sparkinfer_decode(
     extra_indices: torch.Tensor | None = None,
     extra_lens: torch.Tensor | None = None,
     extra_page_size: int | None = None,
+    mode: str = "decode",
 ) -> torch.Tensor:
     rows, heads, _ = q.shape
     width = swa_indices.shape[1] + (
@@ -300,6 +301,7 @@ def _run_sparkinfer_decode(
         indexed_indices=extra_indices,
         indexed_lengths=extra_lens,
     )
+    binding.scratch.mode = mode
     return compressed_mla.run(
         swa_k_cache=swa_cache,
         binding=binding,
@@ -489,6 +491,111 @@ def test_cross_check_sparkinfer_reference_agrees_with_fork_oracle() -> None:
     _assert_parity(theirs, ours, "reference cross-check")
 
 
+def test_extend_mode_matches_fork_oracle() -> None:
+    """Prefill rows go through scratch mode 'extend' (the MG prefill kernel);
+    same per-row selected-slot semantics as decode, at the layer's real widths
+    (SWA 128 + top-k 512) and many rows. Guards the sm12x _forward_prefill
+    wiring."""
+    torch.manual_seed(16)
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(16)
+    swa_page, extra_page = 288, 72
+    swa_cache = _make_padded_cache(2, swa_page)
+    extra_cache = _make_padded_cache(8, extra_page)
+    swa_expected = _fill_cache(swa_cache, 500, swa_page)
+    extra_expected = _fill_cache(extra_cache, 550, extra_page)
+
+    rows, heads = 48, 32
+    q = (
+        torch.randn(
+            rows, heads, _HEAD_DIM, device="cuda", dtype=torch.float32, generator=gen
+        )
+        / 4
+    ).to(torch.bfloat16)
+    attn_sink = torch.linspace(-0.3, 0.4, heads, dtype=torch.float32, device="cuda")
+    swa_indices, swa_lens = _random_selection(rows, 128, 500, generator=gen)
+    extra_indices, extra_lens = _random_selection(
+        rows, 512, 550, generator=gen, include_empty_row=True
+    )
+    out = _run_sparkinfer_decode(
+        q,
+        swa_cache,
+        swa_indices,
+        swa_lens,
+        swa_page,
+        attn_sink=attn_sink,
+        extra_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+        extra_page_size=extra_page,
+        mode="extend",
+    )
+    expected = _reference_decode(
+        q,
+        swa_indices,
+        swa_lens,
+        swa_expected,
+        attn_sink=attn_sink,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+        extra_expected=extra_expected,
+    )
+    _assert_parity(out, expected, "extend mode")
+
+
+def test_native_vllm_block_sizes_need_no_padding() -> None:
+    """The zero-copy integration constraint: vLLM allocates unpadded
+    (num_blocks, block_size, 584) blocks, and sparkinfer requires page bytes
+    to be a 576 multiple — which holds exactly when block_size % 72 == 0.
+    The deployed sm12x backend uses block_size 288 (SWA pool) with the C4
+    compressed pool at 288/4 = 72; prove the kernel is correct at those page
+    sizes (its own tests only cover 256/64/2)."""
+    torch.manual_seed(15)
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(15)
+    swa_page, extra_page = 288, 72
+    assert compressed_mla_page_nbytes(swa_page) == swa_page * 584
+    assert compressed_mla_page_nbytes(extra_page) == extra_page * 584
+    swa_cache = _make_padded_cache(2, swa_page)
+    extra_cache = _make_padded_cache(8, extra_page)
+    swa_expected = _fill_cache(swa_cache, 500, swa_page)
+    extra_expected = _fill_cache(extra_cache, 550, extra_page)
+
+    for rows, heads in ((2, 32), (16, 32)):
+        q = (
+            torch.randn(
+                rows, heads, _HEAD_DIM, device="cuda", dtype=torch.float32,
+                generator=gen,
+            )
+            / 4
+        ).to(torch.bfloat16)
+        swa_indices, swa_lens = _random_selection(rows, 128, 500, generator=gen)
+        extra_indices, extra_lens = _random_selection(rows, 512, 550, generator=gen)
+        out = _run_sparkinfer_decode(
+            q,
+            swa_cache,
+            swa_indices,
+            swa_lens,
+            swa_page,
+            attn_sink=None,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices,
+            extra_lens=extra_lens,
+            extra_page_size=extra_page,
+        )
+        expected = _reference_decode(
+            q,
+            swa_indices,
+            swa_lens,
+            swa_expected,
+            attn_sink=None,
+            extra_indices=extra_indices,
+            extra_lens=extra_lens,
+            extra_expected=extra_expected,
+        )
+        _assert_parity(out, expected, f"block288/72 rows={rows} heads={heads}")
+
+
 def test_fp8_compute_error_characterization() -> None:
     """The sm121 kernel computes in fp8 (Q requantized to e4m3 in smem), so
     unlike the sm86 flash_mla/Triton kernels (which consume fp8 KV but keep Q
@@ -541,6 +648,8 @@ if __name__ == "__main__":
         test_swa_only_decode_matches_fork_oracle,
         test_swa_plus_compressed_decode_matches_fork_oracle,
         test_attn_sink_decode_matches_fork_oracle,
+        test_extend_mode_matches_fork_oracle,
+        test_native_vllm_block_sizes_need_no_padding,
         test_fp8_compute_error_characterization,
     ):
         print(f"RUN  {fn.__name__} ...", flush=True)
