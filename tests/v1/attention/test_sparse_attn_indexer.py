@@ -13,6 +13,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
     _should_use_sm120_short_row_topk_decode,
 )
 from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
+from vllm.transformers_utils.configs.dsv4 import kernel_config
 
 
 @pytest.mark.parametrize(
@@ -45,7 +46,7 @@ def test_sm120_short_row_topk_decode_selector(
     )
 
 
-def test_dsv4_int_checkpoint_auto_enables_int8_indexer_imma(monkeypatch) -> None:
+def test_dsv4_int_vllm_block_enables_int8_indexer_imma(monkeypatch) -> None:
     quant_config = Dsv4IntConfig.from_config(
         {
             "quant_method": "dsv4_int",
@@ -57,7 +58,13 @@ def test_dsv4_int_checkpoint_auto_enables_int8_indexer_imma(monkeypatch) -> None
                     "weights": {"num_bits": 8, "type": "int"},
                 },
             },
-            "__experimental_enable_imma_from_https://github.com/appMana/forks-vllm-ampere": True,
+            "vllm": {
+                "kernels": [
+                    kernel_config.INDEXER_CACHE_INT8_WRITER,
+                    kernel_config.INDEXER_QUERY_INT8_QUANT,
+                    kernel_config.DENSE_EXPERTS_INT8_ACTIVATION,
+                ],
+            },
         }
     )
 

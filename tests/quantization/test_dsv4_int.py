@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
-import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -104,7 +103,9 @@ def test_dsv4_int_quantization_config_registered():
     assert hybrid_cfg.int8_weight_strategy == "channel"
 
 
-def test_dsv4_int_top_level_imma_config_enables_runtime(monkeypatch):
+def test_dsv4_int_top_level_vllm_block_enables_runtime(monkeypatch):
+    """get_quant_config copies the top-level "vllm" block alongside the
+    quantization_config, so the block enables the dense W4A8 runtime."""
     monkeypatch.setattr(
         dsv4_int_module,
         "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE",
@@ -129,11 +130,9 @@ def test_dsv4_int_top_level_imma_config_enables_runtime(monkeypatch):
             },
         },
     }
-    hf_config = SimpleNamespace(quantization_config=quantization_config)
-    setattr(
-        hf_config,
-        dsv4_int_module._EXPERIMENTAL_IMMA_CONFIG_KEY,
-        True,
+    hf_config = SimpleNamespace(
+        quantization_config=quantization_config,
+        vllm={"kernels": [dsv4_int_module.DENSE_EXPERTS_INT8_ACTIVATION]},
     )
     model_config = SimpleNamespace(
         quantization="dsv4_int",
@@ -145,42 +144,6 @@ def test_dsv4_int_top_level_imma_config_enables_runtime(monkeypatch):
     cfg = get_quant_config(model_config, SimpleNamespace())
 
     assert cfg.experimental_int8_runtime
-    assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
-
-
-def test_dsv4_int_pickle_restores_imma_runtime_gate(monkeypatch):
-    cfg = Dsv4IntConfig.from_config(
-        {
-            "quant_method": "dsv4_int",
-            dsv4_int_module._EXPERIMENTAL_IMMA_CONFIG_KEY: True,
-            "config_groups": {
-                "experts_w4a16": {
-                    "weights": {
-                        "num_bits": 4,
-                        "type": "int",
-                    }
-                },
-                "linears_w8a16": {
-                    "weights": {
-                        "num_bits": 8,
-                        "type": "int",
-                        "symmetric": True,
-                    }
-                },
-            },
-        }
-    )
-    assert cfg.experimental_int8_runtime
-    payload = pickle.dumps(cfg)
-    monkeypatch.setattr(
-        dsv4_int_module,
-        "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE",
-        False,
-    )
-
-    restored = pickle.loads(payload)
-
-    assert restored.experimental_int8_runtime
     assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
 
 

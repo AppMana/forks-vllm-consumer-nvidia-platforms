@@ -3,12 +3,11 @@
 """Unified checkpoint-config-driven kernel configuration for AppMana DSV4.
 
 Covers the ``"vllm"`` config.json block: symbol-list resolution to roles,
-fail-closed validation, defaults, legacy alias/flag compatibility, indexer
-int8 independence from the dense runtime, cache_type defaulting, and Ray
-unpickle gate propagation.
+fail-closed validation, blockless defaults (selector roles get their
+documented defaults, all toggle roles off), indexer int8 independence from
+the dense runtime, cache_type defaulting, and Ray unpickle gate propagation.
 """
 
-import logging
 import pickle
 from types import SimpleNamespace
 
@@ -25,7 +24,6 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     INDEXER_QUERY_INT8_QUANT,
     INDEXER_STREAMING_TOPK_PREFILL,
     KERNEL_REGISTRY,
-    LEGACY_IMMA_CONFIG_KEY,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
     ROLE_INDEXER_CACHE_INT8,
     ROLE_INDEXER_QUERY_INT8,
@@ -41,6 +39,7 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     SPARSE_MLA_PREFILL_TRITON,
     activate_kernel_config,
     apply_checkpoint_config,
+    dense_experts_int8_activation_enabled,
     indexer_cache_int8_enabled,
     indexer_prefill_topk_slab_rows_override,
     indexer_query_int8_enabled,
@@ -183,52 +182,31 @@ def test_defaults_when_absent():
         resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_TRITON
     )
     assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_TRITON
+    # Blockless resolution never activates a toggle role.
     assert ROLE_INDEXER_CACHE_INT8 not in resolved.roles
+    assert ROLE_INDEXER_QUERY_INT8 not in resolved.roles
+    assert ROLE_DENSE_EXPERTS_INT8_ACTIVATION not in resolved.roles
+    assert ROLE_INDEXER_STREAMING_TOPK_PREFILL not in resolved.roles
     assert resolved.cache_type is None
 
 
-# ---------------------------------------------------------------------------
-# Legacy compatibility
-# ---------------------------------------------------------------------------
+def test_blockless_active_config_leaves_all_toggles_off():
+    """Blockless resolution: selector defaults, every toggle gate False."""
+    activate_kernel_config(resolve_kernel_config(None))
+    assert not indexer_cache_int8_enabled()
+    assert not indexer_query_int8_enabled()
+    assert not dense_experts_int8_activation_enabled()
+    assert not indexer_streaming_topk_prefill_enabled()
 
 
-def test_legacy_alias_keys_still_work_and_log_deprecation(caplog_vllm):
-    resolved = resolve_kernel_config(
-        None,
-        legacy_aliases={
-            "deepseek_v4_sm86_sparse_mla_decode_fp8": SPARSE_MLA_DECODE_FP8_TRITON,
-        },
-    )
-    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_TRITON
-    assert any(
-        "deprecated" in record.message.lower()
-        for record in caplog_vllm.records
-        if record.levelno >= logging.WARNING
-    )
+def test_toggle_gates_off_with_no_active_config():
+    assert not indexer_cache_int8_enabled()
+    assert not indexer_query_int8_enabled()
+    assert not dense_experts_int8_activation_enabled()
+    assert not indexer_streaming_topk_prefill_enabled()
 
 
-def test_legacy_alias_invalid_value_is_hard_error():
-    with pytest.raises(ValueError, match="deepseek_v4_sm86_sparse_mla_decode_fp8"):
-        resolve_kernel_config(
-            None,
-            legacy_aliases={
-                # A real symbol, but for the wrong role: fail closed.
-                "deepseek_v4_sm86_sparse_mla_decode_fp8": SPARSE_MLA_PREFILL_TRITON,
-            },
-        )
-
-
-def test_block_wins_over_legacy_alias():
-    resolved = resolve_kernel_config(
-        {"kernels": [SPARSE_MLA_DECODE_FP8_FLASH]},
-        legacy_aliases={
-            "deepseek_v4_sm86_sparse_mla_decode_fp8": SPARSE_MLA_DECODE_FP8_TRITON,
-        },
-    )
-    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_FLASH
-
-
-def test_resolve_from_hf_config_reads_block_aliases_and_flag():
+def test_resolve_from_hf_config_reads_block():
     hf_config = SimpleNamespace(
         vllm={"kernels": [INDEXER_CACHE_INT8_WRITER], "cache_type": "fp8_ds_mla"},
         quantization_config={"quant_method": "dsv4_int"},
@@ -238,14 +216,17 @@ def test_resolve_from_hf_config_reads_block_aliases_and_flag():
     assert resolved.roles[ROLE_INDEXER_CACHE_INT8] == INDEXER_CACHE_INT8_WRITER
     assert resolved.cache_type == "fp8_ds_mla"
 
-    legacy_hf_config = SimpleNamespace(
-        deepseek_v4_sm86_sparse_mla_decode_fp8=SPARSE_MLA_DECODE_FP8_TRITON,
-    )
-    setattr(legacy_hf_config, LEGACY_IMMA_CONFIG_KEY, True)
-    resolved = resolve_kernel_config_from_hf_config(legacy_hf_config)
+
+def test_resolve_from_hf_config_without_block_uses_defaults():
+    resolved = resolve_kernel_config_from_hf_config(SimpleNamespace())
     assert not resolved.explicit
-    assert resolved.legacy_dense_flag
-    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_TRITON
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_FLASH
+    assert (
+        resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_TRITON
+    )
+    assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_TRITON
+    assert ROLE_INDEXER_CACHE_INT8 not in resolved.roles
+    assert ROLE_DENSE_EXPERTS_INT8_ACTIVATION not in resolved.roles
 
 
 # ---------------------------------------------------------------------------
@@ -253,27 +234,43 @@ def test_resolve_from_hf_config_reads_block_aliases_and_flag():
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_url_flag_still_enables_dense_runtime_and_indexer_int8():
+def test_blockless_dsv4_int_config_leaves_dense_and_indexer_off():
+    """Without a "vllm" block, the dense W4A8 runtime and both indexer int8
+    paths stay OFF, even on a checkpoint carrying INT4/INT8 weight groups."""
     from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
 
     cfg = Dsv4IntConfig.from_config(
         {
             "quant_method": "dsv4_int",
-            LEGACY_IMMA_CONFIG_KEY: True,
             "config_groups": _INT_GROUPS,
+        }
+    )
+    assert not cfg.experimental_int8_runtime
+    assert cfg.expert_input_dtype is None
+    assert not dsv4_int_module.dsv4_int4_experts_int8_dense_active()
+    assert not indexer_cache_int8_enabled()
+    assert not indexer_query_int8_enabled()
+    assert not dense_experts_int8_activation_enabled()
+    assert not dsv4_sm86.indexer_cache_is_int8()
+    assert not dsv4_sm86.indexer_imma_enabled()
+
+
+def test_vllm_block_enables_dense_runtime():
+    cfg = Dsv4IntConfig.from_config(
+        {
+            "quant_method": "dsv4_int",
+            "config_groups": _INT_GROUPS,
+            VLLM_CONFIG_KEY: {"kernels": [DENSE_EXPERTS_INT8_ACTIVATION]},
         }
     )
     assert cfg.experimental_int8_runtime
     assert cfg.expert_input_dtype is torch.int8
     assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
-    assert indexer_cache_int8_enabled()
-    assert indexer_query_int8_enabled()
-    assert dsv4_sm86.indexer_cache_is_int8()
-    assert dsv4_sm86.indexer_imma_enabled()
+    assert dense_experts_int8_activation_enabled()
 
 
-def test_vllm_block_enables_indexer_int8_without_legacy_flag():
-    """Indexer int8 is activatable on a checkpoint WITHOUT the legacy flag."""
+def test_vllm_block_enables_indexer_int8_without_dense_runtime():
+    """Indexer int8 is activatable independently of the dense runtime."""
     from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
 
     cfg = Dsv4IntConfig.from_config(
@@ -296,22 +293,21 @@ def test_vllm_block_enables_indexer_int8_without_legacy_flag():
     assert dsv4_sm86.indexer_imma_enabled()
 
 
-def test_vllm_block_disables_indexer_int8_despite_legacy_flag():
-    """Indexer int8 is deactivatable on a checkpoint WITH the legacy flag by
-    overriding the block (e.g. via --hf-overrides)."""
+def test_vllm_block_dense_runtime_does_not_ride_indexer_int8():
+    """Listing only the dense symbol keeps both indexer int8 paths OFF: the
+    indexer never rides the dense runtime."""
     from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
 
     cfg = Dsv4IntConfig.from_config(
         {
             "quant_method": "dsv4_int",
-            LEGACY_IMMA_CONFIG_KEY: True,
             "config_groups": _INT_GROUPS,
             VLLM_CONFIG_KEY: {
                 "kernels": [DENSE_EXPERTS_INT8_ACTIVATION],
             },
         }
     )
-    # Dense runtime stays on (listed), but the indexer no longer rides it.
+    # Dense runtime is on (listed), but the indexer does not ride it.
     assert cfg.experimental_int8_runtime
     assert cfg.expert_input_dtype is torch.int8
     assert not indexer_cache_int8_enabled()
@@ -418,13 +414,13 @@ def test_dsv4_int_pickle_restores_kernel_block_gates(monkeypatch):
     assert indexer_query_int8_enabled()
 
 
-def test_dsv4_int_pickle_restores_legacy_imma_runtime_gate(monkeypatch):
-    """Mirror of the pre-existing legacy-flag pickle test: still works."""
+def test_dsv4_int_pickle_restores_dense_runtime_gate(monkeypatch):
+    """The dense W4A8 runtime gate survives Ray unpickle via the block."""
     cfg = Dsv4IntConfig.from_config(
         {
             "quant_method": "dsv4_int",
-            LEGACY_IMMA_CONFIG_KEY: True,
             "config_groups": _INT_GROUPS,
+            VLLM_CONFIG_KEY: {"kernels": [DENSE_EXPERTS_INT8_ACTIVATION]},
         }
     )
     assert cfg.experimental_int8_runtime
@@ -734,10 +730,10 @@ def test_streaming_topk_prefill_off_when_unlisted():
     assert not indexer_streaming_topk_prefill_enabled()
 
 
-def test_streaming_topk_prefill_off_without_block_even_with_legacy_flag():
+def test_streaming_topk_prefill_off_without_block():
     """Default OFF: an absent block preserves the one-shot prefill path
-    bit-for-bit, and the legacy dense flag never rides this toggle."""
-    resolved = resolve_kernel_config(None, legacy_dense_flag=True)
+    bit-for-bit."""
+    resolved = resolve_kernel_config(None)
     activate_kernel_config(resolved)
     assert not indexer_streaming_topk_prefill_enabled()
 

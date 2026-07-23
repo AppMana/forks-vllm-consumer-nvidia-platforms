@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from vllm.logger import init_logger as _dsv4_init_logger
 from vllm.transformers_utils.configs.dsv4.kernel_config import (
     DENSE_EXPERTS_INT8_ACTIVATION,
-    LEGACY_IMMA_CONFIG_KEY,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
     VLLM_CONFIG_KEY,
     activate_kernel_config,
@@ -33,7 +32,6 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
 _dsv4_logger = _dsv4_init_logger(__name__)
 _DSV4_KERNEL_PATHS: dict = {}
 _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE = False
-_EXPERIMENTAL_IMMA_CONFIG_KEY = LEGACY_IMMA_CONFIG_KEY
 
 def _dsv4_log_path(path: str) -> None:
     _DSV4_KERNEL_PATHS[path] = _DSV4_KERNEL_PATHS.get(path, 0) + 1
@@ -618,21 +616,17 @@ class Dsv4IntConfig(QuantizationConfig):
         self,
         config_groups: dict[str, Any] | None = None,
         ignore_patterns: list[str] | None = None,
-        experimental_indexer_imma: bool = False,
         vllm: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.config_groups = config_groups or {}
         self.ignore_patterns = ignore_patterns or []
-        self.experimental_indexer_imma = experimental_indexer_imma
         # Unified kernel-config block ("vllm" in the checkpoint config;
         # copied alongside quantization_config by get_quant_config). Resolving
         # here fails closed at startup and, together with __setstate__,
         # propagates the kernel gates into Ray workers on unpickle.
         self.vllm = vllm
-        resolved = resolve_kernel_config(
-            vllm, legacy_dense_flag=experimental_indexer_imma
-        )
+        resolved = resolve_kernel_config(vllm)
         if resolved.explicit:
             dense_listed = resolved.has_role(ROLE_DENSE_EXPERTS_INT8_ACTIVATION)
             if dense_listed and not _has_int4_experts_int8_dense(
@@ -646,10 +640,7 @@ class Dsv4IntConfig(QuantizationConfig):
                 )
             self.experimental_int8_runtime = dense_listed
         else:
-            self.experimental_int8_runtime = (
-                experimental_indexer_imma
-                and _has_int4_experts_int8_dense(self.config_groups)
-            )
+            self.experimental_int8_runtime = False
         self.kernels_explicit = resolved.explicit
         _mark_dsv4_int4_experts_int8_dense_active(
             self.experimental_int8_runtime
@@ -681,12 +672,7 @@ class Dsv4IntConfig(QuantizationConfig):
         # Re-activate the unified kernel config in Ray workers (the module
         # global does not travel with the pickle).
         activate_kernel_config(
-            resolve_kernel_config(
-                getattr(self, "vllm", None),
-                legacy_dense_flag=getattr(
-                    self, "experimental_indexer_imma", False
-                ),
-            )
+            resolve_kernel_config(getattr(self, "vllm", None))
         )
 
     @classmethod
@@ -710,9 +696,6 @@ class Dsv4IntConfig(QuantizationConfig):
         return cls(
             config_groups=config.get("config_groups", {}),
             ignore_patterns=config.get("ignore", []),
-            experimental_indexer_imma=config.get(
-                _EXPERIMENTAL_IMMA_CONFIG_KEY, False
-            ),
             vllm=config.get(VLLM_CONFIG_KEY),
         )
 
@@ -734,8 +717,7 @@ class Dsv4IntConfig(QuantizationConfig):
         env > default (None = W4A16). An explicit ``vllm.kernels`` list is
         authoritative: listing ``marlin_act_int8_process_scales`` selects the
         INT8 integer-MMA activation path, omitting it selects W4A16 even when
-        the upstream env is set. Without a block, the legacy flag and then
-        the upstream env apply (historical behavior).
+        the upstream env is set. Without a block, the upstream env applies.
         """
         if getattr(self, "kernels_explicit", False):
             return self.expert_input_dtype

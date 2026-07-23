@@ -67,10 +67,6 @@ from vllm.model_executor.layers.quantization.torchao import torchao_version_at_l
 
 logger = init_logger(__name__)
 
-_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY = (
-    "__experimental_enable_imma_from_https://github.com/appMana/forks-vllm-ampere"
-)
-
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
 # lock files in the temp directory will be automatically deleted when the
@@ -284,20 +280,6 @@ def get_quant_config(
         # quant config: the checkpoint determines `quant_cls`, and the user's
         # QuantizationConfigArgs is consulted by individual quant methods
         # (e.g. for activation overrides via the MXFP4 oracle).
-        if (
-            model_config.quantization == "dsv4_int"
-            and _DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY not in hf_quant_config
-        ):
-            dsv4_imma = getattr(
-                model_config.hf_config,
-                _DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY,
-                None,
-            )
-            if dsv4_imma is not None:
-                hf_quant_config = dict(hf_quant_config)
-                hf_quant_config[_DSV4_EXPERIMENTAL_IMMA_CONFIG_KEY] = (
-                    dsv4_imma
-                )
 
         # Copy the unified AppMana kernel-config block ("vllm" at the top
         # level of the checkpoint config.json) alongside the quantization

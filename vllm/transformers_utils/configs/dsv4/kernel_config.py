@@ -27,24 +27,13 @@ Principles:
    uses its documented default. When a block with a ``kernels`` list is
    present it is authoritative for the *toggle* roles (indexer cache int8,
    indexer query int8, dense experts int8 activation, indexer streaming
-   top-k prefill): unlisted means OFF, overriding the legacy checkpoint
-   flag. Without a block, legacy behavior applies unchanged (the streaming
-   top-k prefill toggle has no legacy source and is simply OFF).
+   top-k prefill): unlisted means OFF. Without a block, selector roles
+   resolve to their documented defaults and every toggle role is OFF.
 4. Overriding everything is trivial: vLLM applies dict-valued
    ``--hf-overrides`` entries by *replacing* the whole attribute
    (``ModelConfig._apply_dict_overrides`` does ``setattr`` for plain-dict
    attributes; it does NOT deep-merge), so one
    ``--hf-overrides '{"vllm": {...}}'`` blob replaces the entire block.
-
-Legacy compatibility (deprecated, still honored when no block is present):
-
-* role-keyed HF override strings ``deepseek_v4_sm86_sparse_mla_decode_fp8`` /
-  ``..._decode_int8`` / ``..._prefill`` (live LWS manifests still use them);
-* the checkpoint flag ``__experimental_enable_imma_from_https://github.com/
-  appMana/forks-vllm-ampere`` which enables the dense W4A8 runtime AND rides
-  the indexer int8 paths on it.
-
-The new block wins whenever both are present.
 """
 
 from __future__ import annotations
@@ -71,10 +60,6 @@ _ALLOWED_BLOCK_KEYS = frozenset(
 # _pp_metadata_cache_enabled.
 _PP_TRANSPORT_CACHE_METADATA_KEY = "cache_metadata"
 _ALLOWED_PP_TRANSPORT_KEYS = frozenset({_PP_TRANSPORT_CACHE_METADATA_KEY})
-
-LEGACY_IMMA_CONFIG_KEY = (
-    "__experimental_enable_imma_from_https://github.com/appMana/forks-vllm-ampere"
-)
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -147,13 +132,6 @@ TOGGLE_ROLES = frozenset(
     }
 )
 
-# Deprecated role-keyed HF config attributes -> the role they select.
-LEGACY_ALIAS_ROLES: dict[str, str] = {
-    "deepseek_v4_sm86_sparse_mla_decode_fp8": ROLE_SPARSE_MLA_DECODE_FP8,
-    "deepseek_v4_sm86_sparse_mla_decode_int8": ROLE_SPARSE_MLA_DECODE_INT8,
-    "deepseek_v4_sm86_sparse_mla_prefill": ROLE_SPARSE_MLA_PREFILL,
-}
-
 _PROOF_ROLE_ORDER = (
     ROLE_SPARSE_MLA_DECODE_FP8,
     ROLE_SPARSE_MLA_DECODE_INT8,
@@ -170,15 +148,13 @@ class ResolvedKernelConfig:
     """Validated role -> symbol assignment for one checkpoint."""
 
     # True when a "vllm" block with a "kernels" list was present. When
-    # False, toggle roles fall back to legacy (URL-flag-derived) behavior at
-    # query time via the gates below.
+    # False (blockless), selector roles carry their documented defaults and
+    # every toggle role is off.
     explicit: bool
     # Active role -> symbol. Selector roles are always present; toggle roles
-    # are present iff active (explicit blocks) or resolved lazily (legacy).
+    # are present iff listed in an explicit block.
     roles: Mapping[str, str] = field(default_factory=dict)
     cache_type: str | None = None
-    # Value of the legacy checkpoint flag, used for legacy toggle defaults.
-    legacy_dense_flag: bool = False
     # PP intermediate-tensor transport toggles from "vllm.pp_transport".
     # None = "not specified": the coordinator falls back to the env var, then
     # the built-in default (both effectively on today). An explicit bool here
@@ -216,18 +192,8 @@ def _allowed_cache_types() -> tuple[str, ...]:
     return tuple(_flatten(CacheDType))
 
 
-def resolve_kernel_config(
-    block: Any,
-    *,
-    legacy_aliases: Mapping[str, str] | None = None,
-    legacy_dense_flag: bool = False,
-) -> ResolvedKernelConfig:
-    """Resolve and validate the ``vllm`` block (fail closed).
-
-    ``legacy_aliases`` maps the deprecated role-keyed HF config attribute
-    names to their values; they are honored only when no block is present and
-    log a deprecation warning when they deviate from the defaults.
-    """
+def resolve_kernel_config(block: Any) -> ResolvedKernelConfig:
+    """Resolve and validate the ``vllm`` block (fail closed)."""
     explicit = False
     kernels: list[str] = []
     cache_type: str | None = None
@@ -323,40 +289,6 @@ def resolve_kernel_config(
             )
         roles[role] = symbol
 
-    if explicit:
-        for alias, value in (legacy_aliases or {}).items():
-            role = LEGACY_ALIAS_ROLES.get(alias)
-            if role is None or value is None:
-                continue
-            if value != SELECTOR_ROLE_DEFAULTS[role]:
-                logger.warning_once(
-                    'Deprecated DSV4 kernel override %s=%r is ignored: the '
-                    '"%s" config block wins when both are present.',
-                    alias,
-                    value,
-                    VLLM_CONFIG_KEY,
-                )
-    else:
-        for alias, value in (legacy_aliases or {}).items():
-            role = LEGACY_ALIAS_ROLES.get(alias)
-            if role is None or value is None:
-                continue
-            if KERNEL_REGISTRY.get(value) != role:
-                raise ValueError(
-                    f"Unsupported value {value!r} for deprecated DSV4 kernel "
-                    f"override {alias}; expected one of "
-                    f"{sorted(s for s, r in KERNEL_REGISTRY.items() if r == role)}"
-                )
-            if value != SELECTOR_ROLE_DEFAULTS[role]:
-                logger.warning_once(
-                    "DSV4 kernel override %s is deprecated; use the "
-                    '"%s": {"kernels": [...]} config block (or '
-                    "--hf-overrides) instead.",
-                    alias,
-                    VLLM_CONFIG_KEY,
-                )
-            roles[role] = value
-
     # Selector roles always resolve; absent = documented default.
     for role, default in SELECTOR_ROLE_DEFAULTS.items():
         roles.setdefault(role, default)
@@ -375,7 +307,6 @@ def resolve_kernel_config(
         explicit=explicit,
         roles=roles,
         cache_type=cache_type,
-        legacy_dense_flag=bool(legacy_dense_flag),
         pp_cache_metadata=pp_cache_metadata,
         indexer_prefill_topk_slab_rows=indexer_prefill_topk_slab_rows,
     )
@@ -384,23 +315,8 @@ def resolve_kernel_config(
 def resolve_kernel_config_from_hf_config(
     hf_config: Any,
 ) -> ResolvedKernelConfig:
-    """Resolve from an HF config object (block, legacy aliases, legacy flag)."""
-    legacy_aliases: dict[str, str] = {}
-    for alias in LEGACY_ALIAS_ROLES:
-        value = getattr(hf_config, alias, None)
-        if value is not None:
-            legacy_aliases[alias] = value
-    legacy_dense_flag = bool(getattr(hf_config, LEGACY_IMMA_CONFIG_KEY, False))
-    quantization_config = getattr(hf_config, "quantization_config", None)
-    if isinstance(quantization_config, dict):
-        legacy_dense_flag = legacy_dense_flag or bool(
-            quantization_config.get(LEGACY_IMMA_CONFIG_KEY, False)
-        )
-    return resolve_kernel_config(
-        getattr(hf_config, VLLM_CONFIG_KEY, None),
-        legacy_aliases=legacy_aliases,
-        legacy_dense_flag=legacy_dense_flag,
-    )
+    """Resolve from an HF config object's ``vllm`` block."""
+    return resolve_kernel_config(getattr(hf_config, VLLM_CONFIG_KEY, None))
 
 
 # ---------------------------------------------------------------------------
@@ -452,59 +368,56 @@ def active_kernel_config() -> ResolvedKernelConfig | None:
     return _ACTIVE_CONFIG
 
 
-def _legacy_dense_runtime_active() -> bool:
-    try:
-        from vllm.model_executor.layers.quantization.dsv4_int import (
-            dsv4_int4_experts_int8_dense_active,
-        )
-    except Exception:
-        return False
-    return dsv4_int4_experts_int8_dense_active()
-
-
 def indexer_cache_int8_enabled() -> bool:
     """True when the indexer K cache stores symmetric INT8 instead of FP8.
 
-    Explicit block: on iff ``indexer_k_quant_and_cache_int8`` is listed.
-    Legacy: rides the dense W4A8 runtime flag (historical behavior).
+    On iff ``indexer_k_quant_and_cache_int8`` is listed in an explicit
+    block; no block (or no active config) means OFF.
     """
     config = _ACTIVE_CONFIG
     if config is not None and config.explicit:
         return config.has_role(ROLE_INDEXER_CACHE_INT8)
-    return _legacy_dense_runtime_active()
+    return False
 
 
 def indexer_query_int8_enabled() -> bool:
     """True when the indexer query is quantized to symmetric INT8 so the
     logits run as s8 x s8 integer MMA.
 
-    Explicit block: on iff ``fused_indexer_q_rope_quant_int8`` is listed
-    (resolution guarantees the INT8 cache is also on). Legacy: rides the
-    dense W4A8 runtime flag.
+    On iff ``fused_indexer_q_rope_quant_int8`` is listed in an explicit
+    block (resolution guarantees the INT8 cache is also on); no block (or
+    no active config) means OFF.
     """
     config = _ACTIVE_CONFIG
     if config is not None and config.explicit:
         return config.has_role(ROLE_INDEXER_QUERY_INT8)
-    return _legacy_dense_runtime_active()
+    return False
 
 
 def dense_experts_int8_activation_enabled() -> bool:
-    """True when the Marlin INT8-activation (W4A8) expert runtime is active."""
-    return _legacy_dense_runtime_active()
+    """True when the Marlin INT8-activation (W4A8) expert runtime is active.
+
+    On iff ``marlin_act_int8_process_scales`` is listed in an explicit
+    block; no block (or no active config) means OFF.
+    """
+    config = _ACTIVE_CONFIG
+    if config is not None and config.explicit:
+        return config.has_role(ROLE_DENSE_EXPERTS_INT8_ACTIVATION)
+    return False
 
 
 def indexer_streaming_topk_prefill_enabled() -> bool:
     """True when the prefill indexer runs the slab-tiled streaming top-k
     instead of materializing the full [M, N] logits.
 
-    Explicit block: on iff ``streaming_prefill_topk`` is listed. No block (or
-    no ``kernels`` list): OFF -- the one-shot prefill path is preserved
-    bit-for-bit; there is no legacy source for this toggle.
+    On iff ``streaming_prefill_topk`` is listed in an explicit block; no
+    block (or no active config) means OFF -- the one-shot prefill path is
+    preserved bit-for-bit.
     """
     config = _ACTIVE_CONFIG
-    return config is not None and config.explicit and config.has_role(
-        ROLE_INDEXER_STREAMING_TOPK_PREFILL
-    )
+    if config is not None and config.explicit:
+        return config.has_role(ROLE_INDEXER_STREAMING_TOPK_PREFILL)
+    return False
 
 
 def indexer_prefill_topk_slab_rows_override() -> int | None:
@@ -569,30 +482,11 @@ def resolved_proof_line(
     parts = []
     for role in _PROOF_ROLE_ORDER:
         if role in TOGGLE_ROLES:
-            if resolved.explicit:
-                active = resolved.has_role(role)
-            elif role == ROLE_INDEXER_CACHE_INT8:
-                active = indexer_cache_int8_enabled()
-            elif role == ROLE_INDEXER_QUERY_INT8:
-                active = indexer_query_int8_enabled()
-            elif role == ROLE_INDEXER_STREAMING_TOPK_PREFILL:
-                active = indexer_streaming_topk_prefill_enabled()
-            else:
-                active = dense_experts_int8_activation_enabled()
-            if active:
-                symbol = resolved.symbol(role) or _TOGGLE_ROLE_SYMBOLS[role]
-            else:
-                symbol = "off"
+            # Toggle roles carry a symbol iff listed in an explicit block;
+            # blockless resolution never activates them.
+            symbol = resolved.symbol(role) or "off"
         else:
             symbol = resolved.roles[role]
         parts.append(f"{role}={symbol}")
     parts.append(f"cache_type={kv_cache_dtype}")
     return "vllm kernels resolved: " + " ".join(parts)
-
-
-_TOGGLE_ROLE_SYMBOLS: dict[str, str] = {
-    ROLE_INDEXER_CACHE_INT8: INDEXER_CACHE_INT8_WRITER,
-    ROLE_INDEXER_QUERY_INT8: INDEXER_QUERY_INT8_QUANT,
-    ROLE_DENSE_EXPERTS_INT8_ACTIVATION: DENSE_EXPERTS_INT8_ACTIVATION,
-    ROLE_INDEXER_STREAMING_TOPK_PREFILL: INDEXER_STREAMING_TOPK_PREFILL,
-}

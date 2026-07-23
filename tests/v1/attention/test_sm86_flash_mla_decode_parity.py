@@ -23,9 +23,9 @@ from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (  # noqa: E402
 from vllm.models.deepseek_v4.nvidia_sm86.attention import (  # noqa: E402
     DeepseekV4SM86Attention,
 )
-from vllm.transformers_utils.configs.deepseek_v4 import (  # noqa: E402
-    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8,
-    DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON,
+from vllm.transformers_utils.configs.dsv4.kernel_config import (  # noqa: E402
+    SPARSE_MLA_DECODE_FP8_FLASH,
+    SPARSE_MLA_DECODE_FP8_TRITON,
 )
 
 _FP8_DIM = 448
@@ -370,10 +370,10 @@ def test_flash_mla_int8_native_matches_triton_on_vllm_528B_views() -> None:
 
 
 def test_sm86_fp8_decode_dispatch_supports_native_and_triton_fqns() -> None:
-    assert DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8 == (
+    assert SPARSE_MLA_DECODE_FP8_FLASH == (
         "flash_mla.sparse_mla_decode_fp8"
     )
-    assert DEEPSEEK_V4_SM86_SPARSE_MLA_DECODE_FP8_TRITON == (
+    assert SPARSE_MLA_DECODE_FP8_TRITON == (
         "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels."
         "decode_sparse_attention_triton"
     )

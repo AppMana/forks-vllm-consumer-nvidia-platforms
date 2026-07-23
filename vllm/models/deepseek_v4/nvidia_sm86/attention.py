@@ -92,8 +92,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Unified kernel selection: the "vllm" checkpoint config block
-        # (with the deprecated role-keyed HF override strings as fallback).
+        # Unified kernel selection: the "vllm" checkpoint config block.
         # Resolution fails closed on unknown symbols / duplicate roles.
         resolved = resolve_kernel_config_from_hf_config(self.config)
         validate_sm86_kernel_selection(resolved, kv_cache_dtype=self.kv_cache_dtype)
