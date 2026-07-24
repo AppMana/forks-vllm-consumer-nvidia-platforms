@@ -31,10 +31,14 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# (device_index, heads, max_q_rows, swa_width, extra_width, mode) ->
-# (plan, scratch tensor). Capacities are stable per layer type, so this holds
-# a handful of entries per process.
-_PLAN_CACHE: dict[tuple, tuple] = {}
+# (device_index, heads, max_q_rows, swa_width, extra_width, mode) -> plan.
+# Capacities are stable per layer type, so this holds a handful of entries
+# per process.
+_PLAN_CACHE: dict[tuple, object] = {}
+# One shared scratch buffer per device, grown to the largest plan spec seen.
+# Growth only happens at plan creation, which vLLM's eager warmup runs drive
+# before any CUDA-graph capture, so captured launches see a stable address.
+_SCRATCH_BY_DEVICE: dict[int, torch.Tensor] = {}
 
 
 def _as_page_bytes(cache: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -73,8 +77,8 @@ def _get_binding(
     extra_width = int(extra_indices.shape[-1]) if extra_indices is not None else 0
     max_q_rows = max(int(max_q_rows), int(q.shape[0]))
     key = (q.device.index, heads, max_q_rows, swa_width, extra_width, mode)
-    cached = _PLAN_CACHE.get(key)
-    if cached is None:
+    plan = _PLAN_CACHE.get(key)
+    if plan is None:
         width = swa_width + extra_width
         plan = compressed_mla.plan(
             compressed_mla.Caps(
@@ -86,23 +90,36 @@ def _get_binding(
                 max_q_rows=max_q_rows,
                 max_batch=max_q_rows,
                 max_kv_rows=max_q_rows * width,
+                # Scratch scales with max_q_rows * max_chunks_per_row; the
+                # default (64) sizes for a worst-case decode split, but a row
+                # only ever covers ceil(width/64) index chunks. Bound it (+1
+                # slack) or the layout balloons to gigabytes per plan.
+                max_chunks_per_row=(width + 63) // 64 + 1,
             )
         )
         (spec,) = plan.scratch_specs()
-        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        scratch = _SCRATCH_BY_DEVICE.get(q.device.index)
+        needed = int(spec.shape[0])
+        if scratch is not None and scratch.dtype != spec.dtype:
+            raise TypeError(
+                f"sparkinfer scratch dtype changed across plans: "
+                f"{scratch.dtype} vs {spec.dtype}"
+            )
+        if scratch is None or scratch.numel() < needed:
+            scratch = torch.empty(needed, dtype=spec.dtype, device=q.device)
+            _SCRATCH_BY_DEVICE[q.device.index] = scratch
         logger.info_once(
             "sparkinfer compressed_mla plan: mode=%s heads=%d max_q_rows=%d "
-            "swa_width=%d extra_width=%d scratch=%s",
+            "swa_width=%d extra_width=%d scratch_elems=%d (shared)",
             mode,
             heads,
             max_q_rows,
             swa_width,
             extra_width,
-            tuple(spec.shape),
+            needed,
         )
-        cached = (plan, scratch)
-        _PLAN_CACHE[key] = cached
-    plan, scratch = cached
+        _PLAN_CACHE[key] = plan
+    scratch = _SCRATCH_BY_DEVICE[q.device.index]
     binding = plan.bind(
         scratch=scratch,
         q=q,

@@ -22,6 +22,7 @@ round-up is a pool convention, not a kernel requirement) — so the standard
 block size 256 (C4 pool 64, C128 pool 2) is used unchanged.
 """
 
+import dataclasses
 from typing import ClassVar
 
 import torch
@@ -164,8 +165,19 @@ class DeepseekV4SparkInferSM12xAttention(DeepseekV4FlashInferSM120Attention):
             self.decode_symbol,
             self.prefill_symbol,
         )
+        # The proof line must state what actually runs: substitute the sm12x
+        # EFFECTIVE decode/prefill symbols (blockless/unlisted roles resolve
+        # to sparkinfer here, not the global sm86-flavored defaults).
+        effective = dataclasses.replace(
+            resolved,
+            roles={
+                **resolved.roles,
+                ROLE_SPARSE_MLA_DECODE_FP8: self.decode_symbol,
+                ROLE_SPARSE_MLA_PREFILL: self.prefill_symbol,
+            },
+        )
         logger.info_once(
-            "%s", resolved_proof_line(resolved, kv_cache_dtype=self.kv_cache_dtype)
+            "%s", resolved_proof_line(effective, kv_cache_dtype=self.kv_cache_dtype)
         )
 
     def _reserve_empty_forward_workspace(self) -> None:

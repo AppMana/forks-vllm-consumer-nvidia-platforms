@@ -544,9 +544,32 @@ def has_fbgemm_gpu() -> bool:
     return _has_module("fbgemm_gpu")
 
 
+@cache
 def has_cutedsl() -> bool:
-    """Whether the optional `cutelass` package is available."""
-    return _has_module("cutlass")
+    """Whether cutlass-dsl is available AND compatible with the in-tree FA4
+    CuTe kernels.
+
+    Every has_cutedsl() consumer routes into kernels built on
+    ``vllm.vllm_flash_attn.cute``, which is written against
+    nvidia-cutlass-dsl 4.5.x; 4.6 moved ``cute.core`` APIs (e.g. ``ThrMma``)
+    and the module explodes at import. Environments that pin 4.6 for
+    sparkinfer (GB10/sm12x) therefore probe the actual import once and fall
+    back to the Triton paths instead of failing mid-forward.
+    """
+    if not _has_module("cutlass"):
+        return False
+    try:
+        import vllm.vllm_flash_attn.cute.utils  # noqa: F401
+    except Exception as exc:
+        logger.warning_once(
+            "cutlass-dsl is installed but the in-tree FA4 CuTe kernels do "
+            "not import against it (%s: %s); CuTe-DSL fast paths are "
+            "disabled and Triton fallbacks will be used.",
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    return True
 
 
 def has_humming() -> bool:
