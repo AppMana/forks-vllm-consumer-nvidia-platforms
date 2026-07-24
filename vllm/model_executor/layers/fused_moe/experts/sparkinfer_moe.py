@@ -97,9 +97,13 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
         # Built lazily in process_weights_after_loading / first apply.
         self._weight_plan = None
         self._experts = None
-        self._plan = None  # runtime scratch plan
-        self._scratch: torch.Tensor | None = None
-        self._planned_max_tokens = 0
+        # Per-token-count (plan, scratch) cache. sparkinfer selects a kernel
+        # REGIME (micro / dynamic / tiny-decode) from the token count and the
+        # scratch layout is regime-specific — one plan cannot serve both a
+        # decode batch (micro) and a prefill batch (dynamic). Keying by exact
+        # token count gives each CUDA-graph-captured decode size its own stable
+        # scratch address (capture-safe) while prefill sizes rebuild eagerly.
+        self._plan_cache: dict[int, tuple] = {}
 
     # -- capability gates (mirror FlashInferB12xExperts) --------------------
 
@@ -212,19 +216,20 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
             params_dtype=self.out_dtype,
         )
 
-    def _ensure_plan(self, num_tokens: int, device: torch.device) -> None:
-        """Grow the runtime scratch plan to cover ``num_tokens``. Growth only
-        happens when a larger batch than any seen appears; vLLM's eager
-        warmup drives the max-token plan before graph capture, so captured
-        launches reuse a stable scratch address."""
+    def _get_plan_scratch(self, num_tokens: int, device: torch.device) -> tuple:
+        """Return the (plan, scratch) for exactly ``num_tokens``, building and
+        caching on first sight. Sizing the plan at the actual token count keeps
+        it in the kernel regime that ``run`` will re-derive for that count, so
+        the bound workspace metadata matches (a single max-token plan is always
+        'dynamic' and mismatches decode-sized 'micro' launches)."""
         from sparkinfer.moe import fused_moe
 
-        cap_tokens = max(int(self.max_num_tokens), int(num_tokens))
-        if self._plan is not None and cap_tokens <= self._planned_max_tokens:
-            return
-        self._plan = fused_moe.plan(
+        cached = self._plan_cache.get(num_tokens)
+        if cached is not None:
+            return cached
+        plan = fused_moe.plan(
             fused_moe.Caps(
-                max_tokens=cap_tokens,
+                max_tokens=num_tokens,
                 num_topk=self.topk,
                 device=device,
                 weight_plan=self._weight_plan,
@@ -234,9 +239,10 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
                 swiglu_beta=self.swiglu_beta,
             )
         )
-        (spec,) = self._plan.scratch_specs()
-        self._scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-        self._planned_max_tokens = cap_tokens
+        (spec,) = plan.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        self._plan_cache[num_tokens] = (plan, scratch)
+        return plan, scratch
 
     def apply(
         self,
@@ -262,11 +268,11 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
         from sparkinfer.moe import fused_moe
 
         num_tokens = int(hidden_states.shape[0])
-        self._ensure_plan(num_tokens, hidden_states.device)
+        plan, scratch = self._get_plan_scratch(num_tokens, hidden_states.device)
 
         binding = fused_moe.bind(
-            self._plan,
-            scratch=self._scratch,
+            plan,
+            scratch=scratch,
             a=hidden_states,
             experts=self._experts,
             topk_weights=topk_weights,
