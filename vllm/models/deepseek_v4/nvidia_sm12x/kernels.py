@@ -40,6 +40,41 @@ _PLAN_CACHE: dict[tuple, object] = {}
 # before any CUDA-graph capture, so captured launches see a stable address.
 _SCRATCH_BY_DEVICE: dict[int, torch.Tensor] = {}
 
+# The MG prefill kernel supports fixed index widths only (DSV4 single-cache:
+# 128 BF16-QK or {512, 1024, 2048} FP8; dual-cache: swa exactly 128). Other
+# widths — e.g. the DSpark draft layers' 256 — are padded up with -1 columns
+# (masked by the kernel, parity-verified) through cached persistent buffers so
+# padded launches stay CUDA-graph-safe (fixed addresses, in-graph copy/fill).
+_SINGLE_CACHE_EXTEND_WIDTHS = (128, 512, 1024, 2048)
+_PAD_TARGETS = (512, 1024, 2048)
+_PAD_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def _pad_extend_indices(
+    indices: torch.Tensor, max_q_rows: int
+) -> torch.Tensor:
+    width = int(indices.shape[-1])
+    if width in _SINGLE_CACHE_EXTEND_WIDTHS:
+        return indices
+    target = next((w for w in _PAD_TARGETS if w >= width), None)
+    if target is None:
+        raise ValueError(
+            f"sparse-MLA extend index width {width} exceeds the largest "
+            f"supported MG prefill width {_PAD_TARGETS[-1]}"
+        )
+    rows_cap = max(int(max_q_rows), int(indices.shape[0]))
+    key = (indices.device.index, rows_cap, target)
+    buf = _PAD_BUFFERS.get(key)
+    if buf is None:
+        buf = torch.full(
+            (rows_cap, target), -1, dtype=indices.dtype, device=indices.device
+        )
+        _PAD_BUFFERS[key] = buf
+    view = buf[: indices.shape[0]]
+    view[:, :width].copy_(indices)
+    view[:, width:].fill_(-1)
+    return view
+
 
 def _as_page_bytes(cache: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Flatten a paged vLLM fp8_ds_mla cache to sparkinfer's [pages,
@@ -158,6 +193,8 @@ def _run(
     extra_page_size = None
     if extra_cache is not None:
         extra_pages, extra_page_size = _as_page_bytes(extra_cache)
+    if mode == "extend" and extra_indices is None:
+        swa_indices = _pad_extend_indices(swa_indices, max_q_rows)
     binding = _get_binding(
         mode=mode,
         q=q,

@@ -9,6 +9,8 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
+import glob
+import os
 from collections.abc import Iterable
 
 import regex as re
@@ -380,6 +382,21 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
+        # The draft loads from the SAME checkpoint dir as the target
+        # (self-drafting), whose default weight iterator walks every shard —
+        # rereading the whole multi-hundred-GB checkpoint to pick out the
+        # mtp.* subtree. On GB10 unified memory (cache under pressure after
+        # the target load + KV allocation) that turned an ~11G draft load
+        # into a 30+ minute crawl that outlived the executor's 30-minute
+        # gloo barrier. The graft tool (dsv4_requant_checkpoint --mtp-src)
+        # always emits the DSpark subtree + materialized shared embed/head
+        # as dedicated model-mtp-*.safetensors shards; when they exist,
+        # restrict the loader to exactly those files.
+        _model_path = self.draft_model_config.model
+        if os.path.isdir(_model_path) and glob.glob(
+            os.path.join(_model_path, "model-mtp-*.safetensors")
+        ):
+            self.allow_patterns_overrides = ["model-mtp-*.safetensors"]
         self.model = DSparkDeepseekV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
