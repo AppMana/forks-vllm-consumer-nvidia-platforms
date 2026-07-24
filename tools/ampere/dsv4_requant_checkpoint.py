@@ -42,13 +42,23 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from dsv4_checkpoint_audit import classify_tensor, matched_scale_name  # noqa: E402
 
-from vllm.model_executor.layers.quantization.dsv4_int import (  # noqa: E402
-    dequantize_fp8_block_to_bf16,
-    requantize_fp8_block_to_int4_w4a16,
-    requantize_fp8_to_allspark_uint8_w8a16,
-    requantize_fp8_to_int8_w8a16,
-    requantize_mxfp4_to_int4_w4a16,
-)
+try:
+    # The requantizing targets (int4/mxfp4) need the dsv4_int kernels; the
+    # nvfp4 passthrough target needs only torch+safetensors so it can run on
+    # a bare spark workspace without a vLLM install.
+    from vllm.model_executor.layers.quantization.dsv4_int import (  # noqa: E402
+        dequantize_fp8_block_to_bf16,
+        requantize_fp8_block_to_int4_w4a16,
+        requantize_fp8_to_allspark_uint8_w8a16,
+        requantize_fp8_to_int8_w8a16,
+        requantize_mxfp4_to_int4_w4a16,
+    )
+except ImportError:  # pragma: no cover - bare-workspace nvfp4 runs
+    dequantize_fp8_block_to_bf16 = None
+    requantize_fp8_block_to_int4_w4a16 = None
+    requantize_fp8_to_allspark_uint8_w8a16 = None
+    requantize_fp8_to_int8_w8a16 = None
+    requantize_mxfp4_to_int4_w4a16 = None
 
 _FP8_WEIGHT_ROLES = {
     "dense_fp8_weight",
@@ -399,6 +409,29 @@ def _write_config(
         cfg["n_routed_experts"] = keep_experts
     if drop_mtp:
         cfg["num_nextn_predict_layers"] = 0
+    if expert_format == "nvfp4":
+        # Native-precision target (appmana/deepseek-v4-nvfp4-fp8): the source
+        # modelopt MIXED_PRECISION quantization_config stays VERBATIM — it is
+        # the proven loadable description of the NVFP4-expert/fp8-backbone
+        # weights being passed through. Add the fork's "vllm" kernel-config
+        # block selecting the GB10/sm12x sparkinfer kernels by FQN and the
+        # fp8_ds_mla KV cache. The FQN strings mirror kernel_config.py's
+        # SPARSE_MLA_DECODE_FP8_SPARKINFER / SPARSE_MLA_PREFILL_SPARKINFER
+        # (inlined so this tool runs without a vLLM install; resolution is
+        # fail-closed at serve time, so drift cannot pass silently; and
+        # --hf-overrides can replace the whole block without touching
+        # weights).
+        cfg["vllm"] = {
+            "kernels": [
+                "vllm.models.deepseek_v4.nvidia_sm12x.kernels"
+                ".sparkinfer_sparse_mla_decode",
+                "vllm.models.deepseek_v4.nvidia_sm12x.kernels"
+                ".sparkinfer_sparse_mla_extend",
+            ],
+            "cache_type": "fp8_ds_mla",
+        }
+        (dst / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+        return
     dense_weights_cfg: dict[str, object] = {
         "num_bits": 8,
         "type": "int",
@@ -516,6 +549,13 @@ def convert_shard(
         sample = ", ".join(sorted(missing_scales)[:8])
         raise ValueError(f"{src_shard.name} missing scales for: {sample}")
 
+    # nvfp4 target (appmana/deepseek-v4-nvfp4-fp8): the checkpoint is served
+    # in its NATIVE precision — NVFP4 experts and fp8 linears byte-for-byte —
+    # so conversion is a classification-validated passthrough (subset/remap/
+    # drop-mtp still apply). Everything else about the pipeline (mtp splice,
+    # index rewrite, config) is shared with the requantizing targets.
+    passthrough = expert_format == "nvfp4"
+
     out: dict[str, torch.Tensor] = {}
     counts = {
         "int4": 0,
@@ -525,17 +565,19 @@ def convert_shard(
         "preserve": 0,
         "int4_from_fp8_block": 0,
     }
-    paired_scales = {
-        matched_scale_name(name)
-        for name, role in roles.items()
-        if role
-        in (
-            "routed_expert_mxfp4_weight",
-            "routed_expert_fp8_block_weight",
-        )
-        or role in _FP8_WEIGHT_ROLES
-    }
-    paired_scales.discard(None)
+    paired_scales: set[str | None] = set()
+    if not passthrough:
+        paired_scales = {
+            matched_scale_name(name)
+            for name, role in roles.items()
+            if role
+            in (
+                "routed_expert_mxfp4_weight",
+                "routed_expert_fp8_block_weight",
+            )
+            or role in _FP8_WEIGHT_ROLES
+        }
+        paired_scales.discard(None)
 
     with safe_open(src_shard, framework="pt", device=device) as handle:
         for name in sorted(handle.keys()):
@@ -548,6 +590,12 @@ def convert_shard(
             role = roles[name]
             out_name = _remap_tensor_name(name, layer_remap)
             if out_name is None:
+                continue
+            if passthrough:
+                out[out_name] = _subset_slice(
+                    name, handle.get_tensor(name), keep_experts
+                ).cpu()
+                counts["preserve"] += 1
                 continue
             if role == "routed_expert_mxfp4_weight":
                 scale_name = matched_scale_name(name)
@@ -645,6 +693,7 @@ def splice_mtp(
     device: str,
     out_scale_dtype: torch.dtype,
     dense_int8_strategy: str,
+    expert_format: str = "int4",
     out_shard_name: str = "model-mtp-dspark.safetensors",
 ) -> dict[str, int]:
     """Requantize ``mtp_src``'s ``mtp.*`` subtree into the SAME INT4/INT8
@@ -709,7 +758,10 @@ def splice_mtp(
                 out_scale_dtype=out_scale_dtype,
                 layer_remap=None,
                 dense_int8_strategy=dense_int8_strategy,
-                expert_format="int4",
+                # nvfp4 target: DSpark's mtp fp8/bf16 tensors are PRESERVED
+                # in their native precision (the draft dtype rides the fp8
+                # backbone convention); requantizing targets keep int4/int8.
+                expert_format="nvfp4" if expert_format == "nvfp4" else "int4",
                 expert_int4_scale_mode="mse",
                 name_filter=lambda n, ns=name_set: n in ns,
             )
@@ -778,9 +830,10 @@ def convert_checkpoint(
             f"dense_int8_strategy must be 'block' or 'channel', got "
             f"{dense_int8_strategy!r}"
         )
-    if expert_format not in ("int4", "mxfp4"):
+    if expert_format not in ("int4", "mxfp4", "nvfp4"):
         raise ValueError(
-            f"expert_format must be 'int4' or 'mxfp4', got {expert_format!r}"
+            f"expert_format must be 'int4', 'mxfp4', or 'nvfp4', got "
+            f"{expert_format!r}"
         )
     if expert_int4_scale_mode not in ("absmax7", "absmax8", "mse"):
         raise ValueError(
@@ -884,10 +937,14 @@ def main() -> int:
     )
     parser.add_argument(
         "--expert-format",
-        choices=("int4", "mxfp4"),
+        choices=("int4", "mxfp4", "nvfp4"),
         default="int4",
-        help="Convert routed expert MXFP4 to signed INT4, or preserve native "
-        "MXFP4 experts and emit quant_method=dsv4_mxfp4_int8.",
+        help="Convert routed expert MXFP4 to signed INT4; preserve native "
+        "MXFP4 experts and emit quant_method=dsv4_mxfp4_int8; or (nvfp4) "
+        "pass the whole checkpoint through in native precision — modelopt "
+        "NVFP4 experts + fp8 backbone byte-for-byte, source "
+        "quantization_config kept verbatim, sm12x sparkinfer FQN 'vllm' "
+        "block added (the appmana/deepseek-v4-nvfp4-fp8 target).",
     )
     parser.add_argument(
         "--expert-int4-scale-mode",
@@ -965,6 +1022,7 @@ def main() -> int:
             device=args.device,
             out_scale_dtype=out_scale_dtype,
             dense_int8_strategy=args.dense_int8_strategy,
+            expert_format=args.expert_format,
         )
         _ensure_mtp_shared_tensors(args.dst.resolve())
         if args.num_output_shards is not None:
