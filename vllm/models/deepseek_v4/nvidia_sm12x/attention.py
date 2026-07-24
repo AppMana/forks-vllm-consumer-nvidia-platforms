@@ -15,10 +15,11 @@ env flags: sparkinfer decode/extend are the sm12x defaults; the portable
 Triton kernel (bf16-Q, same cache bytes) is the registered fallback, so an
 A/B swap is one ``--hf-overrides`` edit with no rebuild.
 
-Cache geometry: vLLM blocks are unpadded ``(num_blocks, block_size, 584)``
-and sparkinfer requires 576-byte-aligned pages; ``block_size % 72 == 0``
-makes those identical, hence this backend advertises block size 288 (the C4
-compressed pool follows at 288/4 = 72).
+Cache geometry: vLLM's unpadded ``(num_blocks, block_size, 584)`` blocks
+flatten zero-copy into sparkinfer pages — the AppMana sparkinfer fork
+accepts the unpadded ``block_size * 584`` page width (SGLang's 576-multiple
+round-up is a pool convention, not a kernel requirement) — so the standard
+block size 256 (C4 pool 64, C128 pool 2) is used unchanged.
 """
 
 from typing import ClassVar
@@ -118,10 +119,10 @@ class DeepseekV4SparkInferMLABackend(DeepseekV4FlashMLABackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
-        # block_size * 584 must be a 576-byte multiple (sparkinfer page
-        # alignment) => block_size % 72 == 0, and the C4 compressed pool
-        # (block_size / 4) must satisfy the same => block_size % 288 == 0.
-        return [288]
+        # The standard DSV4 block size, shared with the other sparse-MLA
+        # backends (kv manager groups require one common size). The AppMana
+        # sparkinfer fork consumes vLLM's unpadded pages at any block size.
+        return [256]
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:

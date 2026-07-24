@@ -543,13 +543,76 @@ def test_extend_mode_matches_fork_oracle() -> None:
     _assert_parity(out, expected, "extend mode")
 
 
+def _make_unpadded_cache(num_pages: int, page_size: int) -> torch.Tensor:
+    """A zeroed UNPADDED page buffer — exactly what vLLM's paged fp8_ds_mla
+    blocks look like when flattened: (num_blocks, block_size * 584)."""
+    return torch.zeros(
+        (num_pages, page_size * 584), dtype=torch.uint8, device="cuda"
+    )
+
+
+def test_native_unpadded_vllm_pages() -> None:
+    """The zero-copy integration contract: vLLM allocates UNPADDED
+    (num_blocks, block_size, 584) blocks while SGLang pads pages up to a
+    576-byte multiple. The AppMana sparkinfer fork accepts the unpadded
+    width directly (the kernel touches payload entries + scale footers only,
+    never the pad), so vLLM keeps its standard block size 256 with the C4
+    pool at 64 and the C128 pool at 2 — prove correctness at exactly those
+    pool geometries with unpadded pages."""
+    torch.manual_seed(15)
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(15)
+    for swa_page, extra_page in ((256, 64), (256, 2)):
+        swa_cache = _make_unpadded_cache(3, swa_page)
+        extra_cache = _make_unpadded_cache(300 // extra_page + 1, extra_page)
+        swa_expected = _fill_cache(swa_cache, 500, swa_page)
+        extra_expected = _fill_cache(extra_cache, 300, extra_page)
+
+        for rows, heads in ((2, 32), (16, 32)):
+            q = (
+                torch.randn(
+                    rows, heads, _HEAD_DIM, device="cuda", dtype=torch.float32,
+                    generator=gen,
+                )
+                / 4
+            ).to(torch.bfloat16)
+            swa_indices, swa_lens = _random_selection(rows, 128, 500, generator=gen)
+            extra_indices, extra_lens = _random_selection(
+                rows, min(512, 300), 300, generator=gen
+            )
+            out = _run_sparkinfer_decode(
+                q,
+                swa_cache,
+                swa_indices,
+                swa_lens,
+                swa_page,
+                attn_sink=None,
+                extra_cache=extra_cache,
+                extra_indices=extra_indices,
+                extra_lens=extra_lens,
+                extra_page_size=extra_page,
+            )
+            expected = _reference_decode(
+                q,
+                swa_indices,
+                swa_lens,
+                swa_expected,
+                attn_sink=None,
+                extra_indices=extra_indices,
+                extra_lens=extra_lens,
+                extra_expected=extra_expected,
+            )
+            _assert_parity(
+                out,
+                expected,
+                f"unpadded {swa_page}/{extra_page} rows={rows} heads={heads}",
+            )
+
+
 def test_native_vllm_block_sizes_need_no_padding() -> None:
-    """The zero-copy integration constraint: vLLM allocates unpadded
-    (num_blocks, block_size, 584) blocks, and sparkinfer requires page bytes
-    to be a 576 multiple — which holds exactly when block_size % 72 == 0.
-    The deployed sm12x backend uses block_size 288 (SWA pool) with the C4
-    compressed pool at 288/4 = 72; prove the kernel is correct at those page
-    sizes (its own tests only cover 256/64/2)."""
+    """Block sizes where the unpadded width happens to equal the padded one
+    (block_size % 72 == 0): kept as coverage for intrinsically aligned pages.
+    """
     torch.manual_seed(15)
     gen = torch.Generator(device="cuda")
     gen.manual_seed(15)
@@ -649,6 +712,7 @@ if __name__ == "__main__":
         test_swa_plus_compressed_decode_matches_fork_oracle,
         test_attn_sink_decode_matches_fork_oracle,
         test_extend_mode_matches_fork_oracle,
+        test_native_unpadded_vllm_pages,
         test_native_vllm_block_sizes_need_no_padding,
         test_fp8_compute_error_characterization,
     ):

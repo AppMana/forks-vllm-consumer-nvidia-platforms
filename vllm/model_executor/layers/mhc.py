@@ -734,10 +734,13 @@ class HCHeadOp(CustomOp):
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
         num_tokens = hs_flat.shape[0]
 
-        out = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
-        )
         if _MHC_TORCH_FALLBACK:
+            out = torch.empty(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
             _hc_head_fused_kernel(
                 hs_flat=hs_flat,
                 fn=hc_fn,
@@ -750,16 +753,13 @@ class HCHeadOp(CustomOp):
                 hc_mult=hc_mult,
             )
             return out.view(*outer_shape, hidden_size)
-        torch.ops.vllm.hc_head_fused_kernel_tilelang(
+        out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
             hs_flat,
             hc_fn,
             hc_scale,
             hc_base,
-            out,
-            hidden_size,
             rms_norm_eps,
             hc_eps,
-            hc_mult,
         )
         return out.view(*outer_shape, hidden_size)
 

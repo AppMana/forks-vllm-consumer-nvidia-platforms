@@ -49,8 +49,15 @@ def _choose_gpu() -> str | None:
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
         return None
+    def _used(value: str) -> int:
+        # GB10/Grace unified memory reports "[N/A]" for memory.used.
+        try:
+            return int(value.strip())
+        except ValueError:
+            return 0
+
     rows = [line.split(",") for line in proc.stdout.splitlines() if line.strip()]
-    rows = [(idx.strip(), int(used.strip())) for idx, used in rows]
+    rows = [(idx.strip(), _used(used)) for idx, used in rows]
     if not rows:
         return None
     rows.sort(key=lambda r: r[1])

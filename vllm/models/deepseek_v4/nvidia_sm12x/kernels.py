@@ -41,20 +41,15 @@ def _as_page_bytes(cache: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Flatten a paged vLLM fp8_ds_mla cache to sparkinfer's [pages,
     page_bytes] uint8 view and return it with the page size (tokens/page).
 
-    ``block_size % 72 == 0`` makes ``block_size * 584`` a 576-byte multiple,
-    so the unpadded vLLM block IS a valid sparkinfer page (no copy).
+    The AppMana sparkinfer fork accepts vLLM's unpadded page width
+    (block_size * 584 bytes) directly — the kernel touches payload entries
+    and scale footers only, never SGLang's 576-multiple round-up pad — so
+    this is zero-copy at any block size.
     """
     if cache.dim() == 4 and cache.shape[-2] == 1:
         cache = cache.squeeze(-2)
     assert cache.dim() == 3, f"expected (blocks, block_size, 584), got {cache.shape}"
     page_size = int(cache.shape[1])
-    if page_size % 72 != 0:
-        raise ValueError(
-            "sparkinfer sparse-MLA needs block_size % 72 == 0 so vLLM's "
-            f"unpadded blocks satisfy the 576-byte page alignment; got "
-            f"block_size={page_size}. The SPARKINFER_MLA_SPARSE_DSV4 backend "
-            "advertises 288."
-        )
     if cache.dtype not in (torch.uint8, torch.float8_e4m3fn):
         raise TypeError(f"expected byte/fp8 cache storage, got {cache.dtype}")
     view = cache if cache.dtype == torch.uint8 else cache.view(torch.uint8)
