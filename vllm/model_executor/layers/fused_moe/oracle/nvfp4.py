@@ -464,6 +464,12 @@ def convert_to_nvfp4_moe_kernel_format(
         # for other experts - other selection strategies may be used.
         a13_scale = 1.0 / a13_scale.max().to(torch.float32)
         a2_scale = 1.0 / a2_scale.max().to(torch.float32)
+    elif nvfp4_backend == NvFp4MoeBackend.SPARKINFER:
+        # No layer-side weight transform: SparkInferExperts consumes the raw
+        # modelopt NVFP4 tensors (U8 E2M1 weight, E4M3 blockscale, F32 global
+        # scale) directly in its own process_weights_after_loading via
+        # sparkinfer's plan_weights/prepare_weights. Leave everything as-is.
+        pass
     else:
         raise ValueError(f"Unknown NvFp4 backend for MoE: {nvfp4_backend}")
 
