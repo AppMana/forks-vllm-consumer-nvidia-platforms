@@ -596,7 +596,11 @@ def download_safetensors_index_file_from_hf(
 # So, we use the index_file to
 # look up which safetensors files should be used.
 def filter_duplicate_safetensors_files(
-    hf_weights_files: list[str], hf_folder: str, index_file: str
+    hf_weights_files: list[str],
+    hf_folder: str,
+    index_file: str,
+    *,
+    allow_partial: bool = False,
 ) -> list[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
@@ -612,13 +616,16 @@ def filter_duplicate_safetensors_files(
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
     # Check if files referenced in model.safetensors.index.json actually exist.
-    # Raise error if any file is missing.
-    hf_weights_files_set = set(hf_weights_files)
-    missing_files = weight_files_in_index - hf_weights_files_set
-    if missing_files:
-        raise FileNotFoundError(
-            f"Weight files referenced in index but missing: {missing_files}"
-        )
+    # Raise error if any file is missing — unless the caller deliberately
+    # restricted the file set (a model's allow_patterns_overrides selecting a
+    # weight subset, e.g. the DSpark draft loading only model-mtp-* shards).
+    if not allow_partial:
+        hf_weights_files_set = set(hf_weights_files)
+        missing_files = weight_files_in_index - hf_weights_files_set
+        if missing_files:
+            raise FileNotFoundError(
+                f"Weight files referenced in index but missing: {missing_files}"
+            )
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
