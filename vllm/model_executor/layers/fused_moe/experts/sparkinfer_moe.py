@@ -182,21 +182,22 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
             hidden_size=self.hidden_dim,
             intermediate_size=self.intermediate_size_per_partition,
         )
-        # a1/a2 global activation scales: the modelopt input_scale companions,
-        # or a synthesized 1.0 per expert for W4A16 checkpoints (sparkinfer
-        # then uses its own in-kernel dynamic per-block activation scale, the
-        # same treatment FlashInferB12xExperts applies).
+        # Activation global scales: sparkinfer does DYNAMIC per-block FC1/FC2
+        # activation quant (bind input_scales_static=False), so the activation
+        # global scale is identity — one 1.0 per expert. We deliberately do
+        # NOT forward vLLM's calibrated a13_scale: for the fused gate+up (w13)
+        # layer it is per-(expert x {gate, up}) = 2*num_experts = 512, whereas
+        # sparkinfer's per-expert runtime-alpha vector is num_experts = 256.
+        # The weight global scale (w*_weight_scale_2) carries the FP4 dequant;
+        # with a_gscale = 1.0 the runtime alpha reduces to it exactly, matching
+        # FlashInferB12xExperts' W4A16 treatment.
         device = layer.w13_weight.device
-        a1_gscale = self.a1_gscale
-        a2_gscale = self.a2_gscale
-        if a1_gscale is None:
-            a1_gscale = torch.ones(
-                self.num_local_experts, device=device, dtype=torch.float32
-            )
-        if a2_gscale is None:
-            a2_gscale = torch.ones(
-                self.num_local_experts, device=device, dtype=torch.float32
-            )
+        a1_gscale = torch.ones(
+            self.num_local_experts, device=device, dtype=torch.float32
+        )
+        a2_gscale = torch.ones(
+            self.num_local_experts, device=device, dtype=torch.float32
+        )
 
         self._experts = fused_moe.prepare_weights(
             plan=self._weight_plan,
