@@ -141,7 +141,7 @@ class DeepseekV4SparkInferSM12xAttention(DeepseekV4FlashInferSM120Attention):
         except ImportError as exc:  # pragma: no cover - environment specific
             raise RuntimeError(
                 "DeepSeek V4 sm12x attention requires sparkinfer "
-                "(install from the AppMana/sparkinfer fork)."
+                "(install from the AppMana/forks-sparkinfer fork)."
             ) from exc
         if not compressed_mla.is_supported():
             raise RuntimeError(
