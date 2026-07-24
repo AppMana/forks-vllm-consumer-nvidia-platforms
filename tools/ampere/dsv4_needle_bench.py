@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
 import random
 import statistics
@@ -145,7 +146,12 @@ async def run_request(
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "needle_verbatim": needle in text,
-        "text_head": text[:120],
+        # autojunk=False: with a small word vocabulary every word is
+        # "popular" and the default heuristic degenerates ratio() to 0.
+        "match_ratio": difflib.SequenceMatcher(
+            None, needle.split(), text.split(), autojunk=False
+        ).ratio(),
+        "text": text,
     }
 
 
@@ -188,6 +194,7 @@ async def main() -> int:
     wall_s = time.perf_counter() - bench_t0
 
     passed = sum(r["needle_verbatim"] for r in results)
+    ratios = [r["match_ratio"] for r in results]
     ttfts = [r["ttft_s"] for r in results if r["ttft_s"] is not None]
     out_tokens = sum(r["completion_tokens"] or 0 for r in results)
     in_tokens = sum(r["prompt_tokens"] or 0 for r in results)
@@ -203,6 +210,11 @@ async def main() -> int:
         "target_needle_tokens": args.needle_tokens,
         "wall_s": round(wall_s, 2),
         "needle_verbatim_passed": passed,
+        "match_ratio": {
+            "mean": round(statistics.mean(ratios), 4),
+            "p50": round(statistics.median(ratios), 4),
+            "min": round(min(ratios), 4),
+        },
         "prompt_tokens_total": in_tokens,
         "completion_tokens_total": out_tokens,
         "aggregate_output_tok_s": round(out_tokens / wall_s, 2),
