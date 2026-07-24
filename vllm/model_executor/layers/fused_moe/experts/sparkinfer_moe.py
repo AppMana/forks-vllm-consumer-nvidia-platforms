@@ -79,6 +79,12 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
             moe_config.intermediate_size_per_partition
         )
         self.max_num_tokens = moe_config.max_num_tokens
+        # SwiGLU clamp params (DSV4-Flash sets swiglu_limit). sparkinfer applies
+        # the clamp natively via its Caps, so — unlike the Marlin fallback path
+        # — we do NOT need to drop out of the clamp-capable backend set.
+        self.swiglu_limit = moe_config.swiglu_limit
+        self.swiglu_alpha = moe_config.swiglu_alpha
+        self.swiglu_beta = moe_config.swiglu_beta
 
         activation = moe_config.activation
         if activation not in self._ACTIVATION_MAP:
@@ -222,6 +228,9 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
                 device=device,
                 weight_plan=self._weight_plan,
                 quant_mode="nvfp4",
+                swiglu_limit=self.swiglu_limit,
+                swiglu_alpha=self.swiglu_alpha,
+                swiglu_beta=self.swiglu_beta,
             )
         )
         (spec,) = self._plan.scratch_specs()

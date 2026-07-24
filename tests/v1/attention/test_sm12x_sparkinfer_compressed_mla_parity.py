@@ -659,6 +659,69 @@ def test_native_vllm_block_sizes_need_no_padding() -> None:
         _assert_parity(out, expected, f"block288/72 rows={rows} heads={heads}")
 
 
+def test_production_scale_extend_smoke() -> None:
+    """Production-scale prefill footprint: 2048 query rows, ~4200-token
+    context slot ids across many pages, real widths (SWA 128 + topk 512 at
+    pool pages 256/64). No oracle comparison (too slow at this size) — this
+    guards ADDRESSING: the kernel must complete with finite output. Written
+    for the long-prefill IMA investigation."""
+    torch.manual_seed(17)
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(17)
+    swa_page, extra_page = 256, 64
+    swa_tokens, extra_tokens = 4352, 1088  # 17 pages / 17 pages
+    swa_cache = _make_unpadded_cache(17, swa_page)
+    extra_cache = _make_unpadded_cache(17, extra_page)
+    # Random bytes are fine for addressing coverage; scales must be valid
+    # UE8M0 (any byte decodes) and payloads any fp8 pattern.
+    for cache in (swa_cache, extra_cache):
+        cache.random_(0, 255, generator=gen)
+
+    rows, heads = 2048, 32
+    q = (
+        torch.randn(
+            rows, heads, _HEAD_DIM, device="cuda", dtype=torch.float32, generator=gen
+        )
+        / 4
+    ).to(torch.bfloat16)
+    swa_indices, swa_lens = _random_selection(rows, 128, swa_tokens, generator=gen)
+    extra_indices, extra_lens = _random_selection(
+        rows, 512, extra_tokens, generator=gen
+    )
+    sink = torch.linspace(-0.3, 0.3, heads, dtype=torch.float32, device="cuda")
+    out = _run_sparkinfer_decode(
+        q,
+        swa_cache,
+        swa_indices,
+        swa_lens,
+        swa_page,
+        attn_sink=sink,
+        extra_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+        extra_page_size=extra_page,
+        mode="extend",
+    )
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(out.float()).all().item())
+    # Decode mode at the same footprint (spec-verify batches).
+    out2 = _run_sparkinfer_decode(
+        q[:512],
+        swa_cache,
+        swa_indices[:512],
+        swa_lens[:512],
+        swa_page,
+        attn_sink=sink,
+        extra_cache=extra_cache,
+        extra_indices=extra_indices[:512],
+        extra_lens=extra_lens[:512],
+        extra_page_size=extra_page,
+        mode="decode",
+    )
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(out2.float()).all().item())
+
+
 def test_fp8_compute_error_characterization() -> None:
     """The sm121 kernel computes in fp8 (Q requantized to e4m3 in smem), so
     unlike the sm86 flash_mla/Triton kernels (which consume fp8 KV but keep Q
@@ -714,6 +777,7 @@ if __name__ == "__main__":
         test_extend_mode_matches_fork_oracle,
         test_native_unpadded_vllm_pages,
         test_native_vllm_block_sizes_need_no_padding,
+        test_production_scale_extend_smoke,
         test_fp8_compute_error_characterization,
     ):
         print(f"RUN  {fn.__name__} ...", flush=True)

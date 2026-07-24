@@ -207,6 +207,10 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.MARLIN,
+        # sparkinfer applies the SwiGLU clamp natively (Caps.swiglu_limit),
+        # so it stays eligible for clamp models like DSV4-Flash — without
+        # this it was filtered out and sm12x fell to the Marlin bf16 path.
+        NvFp4MoeBackend.SPARKINFER,
     }
 
     if config.swiglu_limit is not None:
