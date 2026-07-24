@@ -574,8 +574,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             tma_aligned_scales=self._tma_aligned_scales,
         )
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def _check_kernel_available(self) -> None:
+        """Fail fast when the arch kernel dependency is missing. Subclasses
+        with a different kernel provider (nvidia_sm12x/sparkinfer) override."""
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
         if not has_flashinfer_sparse_mla_sm120():
@@ -583,6 +584,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires FlashInfer's "
                 "sparse MLA decode API."
             )
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._check_kernel_available()
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
@@ -760,25 +765,55 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         assert swa_indices is not None
         assert swa_lens is not None
         q = self._prepare_query(q, output)
-        swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
-        extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
-        if extra_cache is not None and extra_sparse_indices is None:
+        if kv_cache is not None and extra_sparse_indices is None:
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
+        self._launch_sparse(
+            q=q,
+            swa_cache=self.swa_cache_layer.kv_cache,
+            swa_indices=swa_indices,
+            swa_lens=swa_lens,
+            extra_cache=kv_cache,
+            extra_indices=extra_sparse_indices,
+            extra_lens=extra_sparse_lengths,
+            output=output,
+            mode="decode",
+        )
+
+    def _launch_sparse(
+        self,
+        *,
+        q: torch.Tensor,
+        swa_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        extra_cache: torch.Tensor | None,
+        extra_indices: torch.Tensor | None,
+        extra_lens: torch.Tensor | None,
+        output: torch.Tensor,
+        mode: str,
+    ) -> None:
+        """One sparse-MLA launch over selected global slots. ``mode`` is
+        "decode" or "extend" (prefill rows); the FlashInfer TRTLLM launcher
+        uses the same entry point for both. The sparkinfer subclass routes by
+        the FQN-resolved kernel selection instead."""
+        del mode
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
-            swa_kv_cache=swa_cache,
+            swa_kv_cache=self._as_sparse_cache(swa_cache),
             workspace_buffer=self._get_workspace(q.device),
             sparse_indices=swa_indices,
-            compressed_kv_cache=extra_cache,
+            compressed_kv_cache=(
+                self._as_sparse_cache(extra_cache) if extra_cache is not None else None
+            ),
             out=output,
             bmm1_scale=self.scale,
             sinks=self.attn_sink,
             kv_layout="NHD",
             swa_topk_lens=swa_lens,
-            extra_sparse_indices=extra_sparse_indices,
-            extra_sparse_topk_lens=extra_sparse_lengths,
+            extra_sparse_indices=extra_indices,
+            extra_sparse_topk_lens=extra_lens,
         )
 
     def _forward_prefill(
@@ -844,15 +879,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         assert swa_metadata.prefill_swa_lens is not None
 
         q = self._prepare_query(q, output)
-        swa_kv_paged = self._as_sparse_cache(swa_k_cache)
-        if swa_only:
-            extra_kv_paged = None
-        else:
-            if compressed_k_cache is None:
-                raise RuntimeError(
-                    "Compressed sparse MLA layers require their compressed KV cache."
-                )
-            extra_kv_paged = self._as_sparse_cache(compressed_k_cache)
+        if not swa_only and compressed_k_cache is None:
+            raise RuntimeError(
+                "Compressed sparse MLA layers require their compressed KV cache."
+            )
+        extra_kv_cache = None if swa_only else compressed_k_cache
 
         num_chunks = (
             num_prefills + self.PREFILL_CHUNK_SIZE - 1
@@ -881,21 +912,18 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             q_chunk = q[query_start:query_end]
             swa_indices_chunk = swa_metadata.prefill_swa_indices[query_start:query_end]
             swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
-            if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
+            if extra_kv_cache is not None and extra_sparse_indices_chunk is None:
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                query=q_chunk,
-                swa_kv_cache=swa_kv_paged,
-                workspace_buffer=self._get_workspace(q.device),
-                sparse_indices=swa_indices_chunk,
-                compressed_kv_cache=extra_kv_paged,
-                out=output[query_start:query_end],
-                bmm1_scale=self.scale,
-                sinks=self.attn_sink,
-                kv_layout="NHD",
-                swa_topk_lens=swa_lens_chunk,
-                extra_sparse_indices=extra_sparse_indices_chunk,
-                extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+            self._launch_sparse(
+                q=q_chunk,
+                swa_cache=swa_k_cache,
+                swa_indices=swa_indices_chunk,
+                swa_lens=swa_lens_chunk,
+                extra_cache=extra_kv_cache,
+                extra_indices=extra_sparse_indices_chunk,
+                extra_lens=extra_sparse_lengths_chunk,
+                output=output[query_start:query_end],
+                mode="extend",
             )
