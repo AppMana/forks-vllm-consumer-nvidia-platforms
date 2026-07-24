@@ -1,0 +1,95 @@
+# DGX Spark (GB10, sm_121, aarch64) serving image for the appmana/gb12x fork.
+#
+# Deliberately a LEAN, SEPARATE Dockerfile from the main x86 one (per the
+# gb12x plan: the Ampere/x86 hardcodes — flash_mla wheel, NCCL-fork gencodes,
+# usb4/thunderbolt debs — are dropped, not ported). Base is Ubuntu 24.04
+# CUDA-13 devel to match DGX OS glibc 2.39 AND keep nvcc + headers in the
+# runtime layer: sparkinfer JIT-compiles CuTe-DSL kernels at runtime and
+# comm.pcie builds via torch cpp_extension.
+#
+# The dependency matrix below is the exact set validated live on the sparks
+# (see docs/cluster-logbook.md 2026-07-24): torch 2.13.0+cu130,
+# nvidia-cutlass-dsl 4.6.0 (sparkinfer's pin; the in-tree FA4-cute kernels
+# degrade to Triton via the has_cutedsl() probe), tilelang 0.1.12 +
+# apache-tvm-ffi 0.1.11, quack-kernels installed --no-deps, torchvision
+# 0.28, sparkinfer from AppMana/forks-sparkinfer.
+#
+# Build natively on a spark via the cluster buildkitd (containerd worker →
+# image lands in the node store, Spegel-distributed, no registry needed):
+#   buildctl --addr tcp://<buildkitd>:1234 build \
+#     --frontend dockerfile.v0 \
+#     --local context=~/workspace/vllm-gb12x \
+#     --local dockerfile=~/workspace/vllm-gb12x/docker \
+#     --opt filename=Dockerfile.gb10 \
+#     --output type=image,name=appmana/vllm-gb10:<tag>
+
+ARG CUDA_VERSION=13.0.2
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv python3-pip \
+        git curl ca-certificates cmake ninja-build gcc g++ \
+        rsync \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv for fast, reproducible installs.
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+RUN uv venv /opt/venv --python 3.12
+ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:$PATH \
+    VIRTUAL_ENV=/opt/venv \
+    UV_HTTP_TIMEOUT=600
+
+# Torch first (cu130 aarch64), pinned to the validated version.
+RUN uv pip install --index-url https://download.pytorch.org/whl/cu130 \
+        torch==2.13.0 torchvision==0.28.0
+
+# Build prerequisites (the fork's build/cuda.txt pins torch 2.11 — skip the
+# file, install the tools individually; SETUPTOOLS_SCM needs no git here
+# because the version is pinned via env at build time).
+RUN uv pip install cmake ninja packaging "setuptools>=77,<81" \
+        "setuptools-scm>=8" "setuptools-rust>=1.9" wheel "jinja2>=3.1.6" \
+        regex build "protobuf>=5.29.6"
+
+# Fork source (build context = repo root).
+WORKDIR /workspace/vllm
+COPY . .
+
+ARG VLLM_PRETEND_VERSION=15.dev401
+RUN --mount=type=cache,target=/root/.cache/uv \
+    env TORCH_CUDA_ARCH_LIST="12.1a" MAX_JOBS=16 CCACHE_DISABLE=1 \
+        VLLM_TARGET_DEVICE=cuda \
+        SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_PRETEND_VERSION}" \
+        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="${VLLM_PRETEND_VERSION}" \
+    uv pip install -e . --no-build-isolation --no-deps -v
+
+# Runtime dependency matrix (order matters: tilelang resolves tvm-ffi 0.1.x;
+# quack must not drag cutlass-dsl 4.5; sparkinfer pins cutlass-dsl 4.6).
+ARG SPARKINFER_REPO=https://github.com/AppMana/forks-sparkinfer
+ARG SPARKINFER_REF=appmana/main
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install -r requirements/common.txt "numba==0.65.0" && \
+    uv pip install "tilelang==0.1.12" && \
+    uv pip install --no-deps "quack-kernels>=0.3.3" && \
+    uv pip install "git+${SPARKINFER_REPO}@${SPARKINFER_REF}"
+
+# Sanity: the stack imports and the kernel registry FQNs resolve.
+RUN python -c "import vllm, sparkinfer, tilelang; \
+import importlib.metadata as md; \
+print('vllm', vllm.__version__, \
+      '| sparkinfer', md.version('sparkinfer'), \
+      '| cutlass-dsl', md.version('nvidia-cutlass-dsl'), \
+      '| tilelang', md.version('tilelang'))" && \
+    python -c "from vllm.transformers_utils.configs.dsv4.kernel_config import \
+KERNEL_REGISTRY; import importlib; \
+[getattr(importlib.import_module(s.rpartition('.')[0]), s.rpartition('.')[2]) \
+ for s in KERNEL_REGISTRY if s.startswith('vllm.models.deepseek_v4.nvidia_sm12x')]; \
+print('sm12x kernel FQNs importable')"
+
+# GB10 serving defaults (see dgx_spark_serve_dsv4_tp2.sh and the logbook's
+# serving recipe): callers still pass model/parallel args.
+ENV NCCL_IB_GID_INDEX=3 \
+    VLLM_LOGGING_LEVEL=INFO
+
+ENTRYPOINT ["vllm", "serve"]
