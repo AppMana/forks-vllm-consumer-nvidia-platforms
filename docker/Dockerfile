@@ -24,7 +24,7 @@
 
 ARG CUDA_VERSION=13.0.3
 ARG PYTHON_VERSION=3.12
-ARG UBUNTU_VERSION=22.04
+ARG UBUNTU_VERSION=24.04
 
 # By parameterizing the base images, we allow third-party to use their own
 # base images. One use case is hermetic builds with base images stored in
@@ -33,13 +33,21 @@ ARG UBUNTU_VERSION=22.04
 # Example:
 # docker build --build-arg BUILD_BASE_IMAGE=registry.acme.org/mirror/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04
 
-# Important: We build with an old version of Ubuntu to maintain broad
-# compatibility with other Linux OSes. The main reason for this is that the
-# glibc version is baked into the distro, and binaries built with one glibc
-# version are not backwards compatible with OSes that use an earlier version.
-ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+# Ubuntu 24.04 (glibc 2.39) matches DGX OS on the Sparks and the rest of the
+# fleet. Upstream builds on 22.04 for broad glibc compatibility, but we ship to
+# machines we own, and the GB10 dependency matrix was validated against 2.39.
+ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
 # Using cuda base image with minimal dependencies necessary for JIT compilation (FlashInfer, DeepGEMM, EP kernels)
-ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
+# devel, not base: sparkinfer JIT-compiles CuTe-DSL kernels at runtime, so nvcc
+# and the CUDA headers have to survive into the serving image. This is the one
+# place the GB10 recipe costs image size, and it is not optional -- a `-base-`
+# final image fails at the first sm12x kernel launch.
+ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+# SASS the NCCL fork is built for. sm_121 is why this is an arg: the previous
+# hardcoded Ampere-only list could not produce a GB10-capable NCCL, so
+# Dockerfile.gb10 dropped the stage entirely and fell back to torch's bundled
+# 2.29.7 -- two minor versions behind what Ampere was running.
+ARG APPMANA_NCCL_GENCODE="-gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_121,code=compute_121"
 ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 ARG APPMANA_NCCL_GIT_REF=22355b63ea9ffd869e208e4f6d381e6f31b471d9
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
@@ -291,7 +299,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Do not add +PTX here: vLLM filters torch's top-level PTX flag when it
 # converts global gencode flags into per-kernel arch lists. If a specific
 # kernel needs PTX, add +PTX to that kernel's CMake arch list instead.
-ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
+# Consumer NVIDIA platforms this image serves: Ampere (sm_86) and consumer
+# Blackwell / GB10 (sm_121). Deliberately narrow -- every extra gencode costs
+# build time, and these are the two we deploy. Override to widen.
+ARG torch_cuda_arch_list='8.6 12.1a'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 #################### BUILD BASE IMAGE ####################
 
@@ -644,6 +655,7 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
 FROM ${BUILD_BASE_IMAGE} AS appmana-nccl-build
 ARG APPMANA_NCCL_GIT_REPO
 ARG APPMANA_NCCL_GIT_REF
+ARG APPMANA_NCCL_GENCODE
 
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
@@ -659,7 +671,7 @@ RUN git clone "${APPMANA_NCCL_GIT_REPO}" /nccl-src && \
     cd /nccl-src && \
     git checkout "${APPMANA_NCCL_GIT_REF}" && \
     make -j"$(nproc)" src.build CUDA_HOME=/usr/local/cuda \
-        NVCC_GENCODE="-gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_86,code=compute_86" && \
+        NVCC_GENCODE="${APPMANA_NCCL_GENCODE}" && \
     test -f build/lib/libnccl.so.2.30.7
 
 #################### DEV IMAGE ####################
@@ -800,14 +812,19 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
     apt-get install -y --no-install-recommends --allow-change-held-packages libnccl-dev=${NCCL_VER} libnccl2=${NCCL_VER} && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=appmana-nccl-build /nccl-src/build/lib/libnccl.so.2.30.7 /usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7
+COPY --from=appmana-nccl-build /nccl-src/build/lib/libnccl.so.2.30.7 /tmp/libnccl.so.2.30.7
+# Install into the arch-correct multiarch dir rather than a hardcoded
+# x86_64-linux-gnu, so this works unchanged on aarch64 (the Sparks).
 RUN set -eux; \
-    cd /usr/lib/x86_64-linux-gnu; \
+    TRIPLET="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
+    install -m 0644 /tmp/libnccl.so.2.30.7 "/usr/lib/${TRIPLET}/libnccl.so.2.30.7"; \
+    rm -f /tmp/libnccl.so.2.30.7; \
+    cd "/usr/lib/${TRIPLET}"; \
     rm -f libnccl.so.2 libnccl.so; \
     ln -sf libnccl.so.2.30.7 libnccl.so.2; \
     ln -sf libnccl.so.2 libnccl.so; \
     ldconfig; \
-    test "$(readlink -f libnccl.so.2)" = "/usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7"
+    test "$(readlink -f libnccl.so.2)" = "/usr/lib/${TRIPLET}/libnccl.so.2.30.7"
 
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt \
@@ -827,7 +844,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
         apt-get install -y --no-install-recommends --allow-change-held-packages \
             /tmp/usb4-rdma-provider.deb; \
         dpkg-query -W -f='${Package} ${Version}\n' usb4-rdma-provider; \
-        test -e /usr/lib/x86_64-linux-gnu/libibverbs/libusb4_rdma-rdmav34.so; \
+        test -e "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libibverbs/libusb4_rdma-rdmav34.so"; \
         rm -f /tmp/usb4-rdma-provider.deb; \
         rm -rf /var/lib/apt/lists/*; \
     fi
@@ -988,7 +1005,7 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
 
 RUN if [ "${REPLACE_TORCH_BUNDLED_NCCL}" = "true" ]; then \
       set -eux; \
-      SYSTEM_NCCL="$(readlink -f /usr/lib/x86_64-linux-gnu/libnccl.so.2)"; \
+      SYSTEM_NCCL="$(readlink -f "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libnccl.so.2")"; \
       TORCH_NCCL_DIR="$(python3 -c "import importlib.util, pathlib; spec = importlib.util.find_spec('nvidia.nccl'); assert spec and spec.submodule_search_locations; print(pathlib.Path(next(iter(spec.submodule_search_locations))) / 'lib')")"; \
       test -f "${SYSTEM_NCCL}"; \
       test -d "${TORCH_NCCL_DIR}"; \
@@ -1110,7 +1127,11 @@ ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG CUDA_VERSION
 ARG LMCACHE_GIT_REF=cd51f3a15766e326f92998c072264a5a6caa4efe
-ARG FLASHMLA_WHEEL_URL=https://github.com/AppMana/forks-flash-mla-ampere-dsv4/releases/download/nightly-84656849d05681ae3457bfceb3b0f4354bf60eca/flash_mla-2.0.0%2B8465684-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
+# FlashMLA (int8 + sparse MLA) comes from the fork's PEP 503 simple index, not
+# a pinned wheel URL: the URL baked in an x86_64 filename, so an aarch64 build
+# could not install it at all. The index lets pip resolve per platform.
+ARG FLASHMLA_INDEX_URL=https://appmana.github.io/forks-flash-mla-ampere-dsv4/
+ARG FLASHMLA_SPEC=flash-mla
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
@@ -1131,7 +1152,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 
 # install kv_connectors if requested
 # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
-ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
+# Consumer NVIDIA platforms this image serves: Ampere (sm_86) and consumer
+# Blackwell / GB10 (sm_121). Deliberately narrow -- every extra gencode costs
+# build time, and these are the two we deploy. Override to widen.
+ARG torch_cuda_arch_list='8.6 12.1a'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
@@ -1186,9 +1210,31 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ -n "${FLASHMLA_WHEEL_URL}" ]; then \
-        uv pip install --system --no-deps "${FLASHMLA_WHEEL_URL}"; \
+    if [ -n "${FLASHMLA_SPEC}" ]; then \
+        uv pip install --system --no-deps \
+            --extra-index-url "${FLASHMLA_INDEX_URL}" "${FLASHMLA_SPEC}"; \
     fi
+
+# sparkinfer supplies the sm12x (GB10) kernels the DSV4 registry resolves to.
+# Install order matters -- it pins nvidia-cutlass-dsl, which quack must not
+# drag backwards; requirements/cuda.txt already pins 4.6.0 for both.
+ARG SPARKINFER_REPO=https://github.com/AppMana/forks-sparkinfer
+ARG SPARKINFER_REF=appmana/main
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ -n "${SPARKINFER_REF}" ]; then \
+        uv pip install --system "git+${SPARKINFER_REPO}@${SPARKINFER_REF}"; \
+    fi
+
+# Fail the build, not the first request, if the sm12x kernel FQNs stop
+# resolving -- the registry is the only thing making one image serve both
+# architectures, so a silent break there is a deploy-time surprise.
+RUN python3 -c "\
+from vllm.transformers_utils.configs.dsv4.kernel_config import KERNEL_REGISTRY; \
+import importlib; \
+fqns = [s for s in KERNEL_REGISTRY if s.startswith('vllm.models.deepseek_v4.nvidia_sm12x')]; \
+assert fqns, 'no sm12x kernels in KERNEL_REGISTRY'; \
+[getattr(importlib.import_module(s.rpartition('.')[0]), s.rpartition('.')[2]) for s in fqns]; \
+print(f'sm12x kernel FQNs importable: {len(fqns)}')"
 
 # Optional override: install mooncake-transfer-engine from a URL instead of the
 # PyPI release pulled in above. Use this for wheels built with non-default CMake
@@ -1243,7 +1289,10 @@ for kernel in (
 # hops keep a usb4 rail and the collective hangs -- world-12 bring-up,
 # 2026-07-19). The implementation's log format strings live in .rodata, so
 # their absence proves the stale build.
-nccl = pathlib.Path("/usr/lib/x86_64-linux-gnu/libnccl.so.2.30.7")
+nccl_candidates = list(pathlib.Path("/usr/lib").glob("*-linux-gnu/libnccl.so.2.30.7"))
+if not nccl_candidates:
+    raise AssertionError("libnccl.so.2.30.7 not found under /usr/lib/*-linux-gnu")
+nccl = nccl_candidates[0]
 if b"rail routing:" not in nccl.read_bytes():
     raise AssertionError(
         "libnccl lacks the prefer_hca rail/fallback selection "
@@ -1287,7 +1336,7 @@ LABEL org.opencontainers.image.source="${VLLM_SOURCE_REPO}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
       ai.vllm.source.repo="${VLLM_SOURCE_REPO}" \
       ai.appmana.lmcache.ref="${LMCACHE_GIT_REF}" \
-      ai.appmana.flashmla.wheel="${FLASHMLA_WHEEL_URL}" \
+      ai.appmana.flashmla.spec="${FLASHMLA_SPEC} from ${FLASHMLA_INDEX_URL}" \
       ai.appmana.nccl.repo="${APPMANA_NCCL_GIT_REPO}" \
       ai.appmana.nccl.ref="${APPMANA_NCCL_GIT_REF}"
 
