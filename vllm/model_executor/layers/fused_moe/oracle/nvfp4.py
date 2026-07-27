@@ -41,6 +41,7 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
     FLASHINFER_B12X = "FLASHINFER_B12X"
+    SPARKINFER = "SPARKINFER"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
     HUMMING = "HUMMING"
@@ -107,6 +108,13 @@ def backend_to_kernel_cls(
 
         return [FlashInferB12xExperts]
 
+    elif backend == NvFp4MoeBackend.SPARKINFER:
+        from vllm.model_executor.layers.fused_moe.experts.sparkinfer_moe import (
+            SparkInferExperts,
+        )
+
+        return [SparkInferExperts]
+
     elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
             CutlassExpertsFp4,
@@ -150,6 +158,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
+        "sparkinfer": NvFp4MoeBackend.SPARKINFER,
         "marlin": NvFp4MoeBackend.MARLIN,
         "humming": NvFp4MoeBackend.HUMMING,
         "emulation": NvFp4MoeBackend.EMULATION,
@@ -181,6 +190,13 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
+        # GB10/sm12x native NVFP4 fused MoE. Gated to sm12x + sparkinfer by
+        # SparkInferExperts._supports_current_device, so it is a no-op on
+        # other arches and falls through to the FlashInfer/CUTLASS/Marlin
+        # chain there. On the sparks it is the first real FP4-tensor-core MoE
+        # (before this, sm12x fell all the way through to Marlin, which
+        # dequantizes FP4 to bf16 and forfeits the FP4 tensor cores).
+        NvFp4MoeBackend.SPARKINFER,
         NvFp4MoeBackend.VLLM_CUTLASS,
         NvFp4MoeBackend.MARLIN,
         NvFp4MoeBackend.HUMMING,
@@ -191,6 +207,10 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.MARLIN,
+        # sparkinfer applies the SwiGLU clamp natively (Caps.swiglu_limit),
+        # so it stays eligible for clamp models like DSV4-Flash — without
+        # this it was filtered out and sm12x fell to the Marlin bf16 path.
+        NvFp4MoeBackend.SPARKINFER,
     }
 
     if config.swiglu_limit is not None:
@@ -444,6 +464,12 @@ def convert_to_nvfp4_moe_kernel_format(
         # for other experts - other selection strategies may be used.
         a13_scale = 1.0 / a13_scale.max().to(torch.float32)
         a2_scale = 1.0 / a2_scale.max().to(torch.float32)
+    elif nvfp4_backend == NvFp4MoeBackend.SPARKINFER:
+        # No layer-side weight transform: SparkInferExperts consumes the raw
+        # modelopt NVFP4 tensors (U8 E2M1 weight, E4M3 blockscale, F32 global
+        # scale) directly in its own process_weights_after_loading via
+        # sparkinfer's plan_weights/prepare_weights. Leave everything as-is.
+        pass
     else:
         raise ValueError(f"Unknown NvFp4 backend for MoE: {nvfp4_backend}")
 

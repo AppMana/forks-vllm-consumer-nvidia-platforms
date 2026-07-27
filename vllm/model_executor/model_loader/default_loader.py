@@ -230,7 +230,13 @@ class DefaultModelLoader(BaseModelLoader):
                     revision=revision,
                 )
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                # An explicit allow_patterns override selects a deliberate
+                # subset of the checkpoint; the index completeness check
+                # must not demand the excluded shards.
+                allow_partial=allow_patterns_overrides is not None,
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)

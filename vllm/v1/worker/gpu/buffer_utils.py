@@ -68,13 +68,28 @@ class UvaBufferPool:
         # Current buffer index
         self._curr = 0
 
+    def _first_dim(self, size: int | Sequence[int]) -> int:
+        return size if isinstance(size, int) else size[0]
+
     def copy_to_uva(self, x: torch.Tensor | np.ndarray | list) -> torch.Tensor:
         # Round robin to the next buffer.
         self._curr = (self._curr + 1) % self.max_concurrency
         buf = self._uva_bufs[self._curr]
+        n = len(x)
+        # Grow the backing buffer when the payload exceeds the preallocated
+        # size. The pools are sized from a worst-case estimate (e.g. the fused
+        # block-table writer's num_kv_cache_groups * max_num_reqs), but a
+        # large chunked prefill on the DSV4 two-group sparse cache can stage
+        # more writes than that. Without this, ``buf.uva[:n]`` silently clamps
+        # to the buffer length while the consuming kernel launches n programs
+        # — the tail programs read past the buffer and fault with an illegal
+        # memory access. Reallocate to the new high-water mark (kept for reuse
+        # so growth is amortized, not per-call).
+        if n > self._first_dim(self.size):
+            self.size = n
+            self._uva_bufs[self._curr] = buf = UvaBuffer(n, self.dtype)
         # CPU-to-CPU copy
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
-        n = len(x)
         dst[:n] = x
         return buf.uva[:n]
 
@@ -176,6 +191,25 @@ class StagedWriteTensor:
         if n == 0:
             return
 
+        # Bounds guard: the kernel writes gpu[index, start : start + len]. A row
+        # width (max_num_blocks) too small for a large prefill would otherwise
+        # write past the row and fault with an opaque illegal memory access.
+        row_width = int(self.gpu.shape[1]) if self.gpu.dim() > 1 else int(len(self.gpu))
+        prev = 0
+        for i in range(n):
+            content_len = self._staged_write_cu_lens[i] - prev
+            prev = self._staged_write_cu_lens[i]
+            end = self._staged_write_starts[i] + content_len
+            if end > row_width:
+                raise ValueError(
+                    f"staged block-table write overflows row: index="
+                    f"{self._staged_write_indices[i]} start="
+                    f"{self._staged_write_starts[i]} len={content_len} "
+                    f"end={end} > max_num_blocks={row_width}. The block table "
+                    "is too narrow for this sequence length (check "
+                    "max_num_blocks_per_group vs max_model_len / block_size)."
+                )
+
         indices_uva = self.write_indices.copy_to_uva(self._staged_write_indices)
         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
@@ -239,6 +273,23 @@ class FusedStagedWriter:
             n = len(t._staged_write_indices)
             if n == 0:
                 continue
+
+            # Bounds guard: the fused kernel writes each group's block table at
+            # [index, start : start + len]; a row too narrow for the sequence
+            # would fault with an opaque IMA. Convert to a clear error.
+            row_width = int(t.gpu.shape[1]) if t.gpu.dim() > 1 else int(len(t.gpu))
+            prev = 0
+            for i in range(n):
+                content_len = t._staged_write_cu_lens[i] - prev
+                prev = t._staged_write_cu_lens[i]
+                end = t._staged_write_starts[i] + content_len
+                if end > row_width:
+                    raise ValueError(
+                        f"staged block-table write overflows row (group "
+                        f"{group_id}): index={t._staged_write_indices[i]} "
+                        f"start={t._staged_write_starts[i]} len={content_len} "
+                        f"end={end} > max_num_blocks={row_width}."
+                    )
 
             group_ids.extend([group_id] * n)
             indices.extend(t._staged_write_indices)

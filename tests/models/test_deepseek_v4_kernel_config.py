@@ -32,10 +32,12 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     ROLE_SPARSE_MLA_DECODE_INT8,
     ROLE_SPARSE_MLA_PREFILL,
     SPARSE_MLA_DECODE_FP8_FLASH,
+    SPARSE_MLA_DECODE_FP8_SPARKINFER,
     SPARSE_MLA_DECODE_FP8_TRITON,
     SPARSE_MLA_DECODE_INT8_FLASH,
     SPARSE_MLA_DECODE_INT8_TRITON,
     SPARSE_MLA_PREFILL_FLASH,
+    SPARSE_MLA_PREFILL_SPARKINFER,
     SPARSE_MLA_PREFILL_TRITON,
     activate_kernel_config,
     apply_checkpoint_config,
@@ -98,6 +100,11 @@ def test_registry_covers_all_roles_with_expected_symbols():
     assert SPARSE_MLA_DECODE_INT8_FLASH == "flash_mla.sparse_mla_decode_int8"
     assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_TRITON] == ROLE_SPARSE_MLA_PREFILL
     assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_FLASH] == ROLE_SPARSE_MLA_PREFILL
+    assert (
+        KERNEL_REGISTRY[SPARSE_MLA_DECODE_FP8_SPARKINFER]
+        == ROLE_SPARSE_MLA_DECODE_FP8
+    )
+    assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_SPARKINFER] == ROLE_SPARSE_MLA_PREFILL
     assert KERNEL_REGISTRY[INDEXER_CACHE_INT8_WRITER] == ROLE_INDEXER_CACHE_INT8
     assert KERNEL_REGISTRY[INDEXER_QUERY_INT8_QUANT] == ROLE_INDEXER_QUERY_INT8
     assert (
@@ -138,6 +145,38 @@ def test_symbol_list_resolves_roles():
         == DENSE_EXPERTS_INT8_ACTIVATION
     )
     assert resolved.cache_type == "fp8_ds_mla"
+
+
+def test_sm12x_sparkinfer_symbols_resolve_roles():
+    """The GB10 checkpoint block shape: sparkinfer decode+extend selected by
+    FQN, fp8_ds_mla cache."""
+    resolved = resolve_kernel_config(
+        {
+            "kernels": [
+                SPARSE_MLA_DECODE_FP8_SPARKINFER,
+                SPARSE_MLA_PREFILL_SPARKINFER,
+            ],
+            "cache_type": "fp8_ds_mla",
+        }
+    )
+    assert resolved.explicit
+    assert (
+        resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_SPARKINFER
+    )
+    assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_SPARKINFER
+    assert resolved.cache_type == "fp8_ds_mla"
+
+
+def test_sparkinfer_and_flash_decode_conflict_is_hard_error():
+    with pytest.raises(ValueError, match="same role"):
+        resolve_kernel_config(
+            {
+                "kernels": [
+                    SPARSE_MLA_DECODE_FP8_SPARKINFER,
+                    SPARSE_MLA_DECODE_FP8_FLASH,
+                ]
+            }
+        )
 
 
 def test_unknown_symbol_is_hard_error():

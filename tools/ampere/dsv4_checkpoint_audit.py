@@ -28,6 +28,15 @@ from safetensors import safe_open
 _ROUTED_EXPERT_RE = re.compile(r"\.ffn\.experts\.\d+\.w[123]\.(weight|scale)$")
 _ROUTED_EXPERT_WEIGHT_RE = re.compile(r"\.ffn\.experts\.\d+\.w[123]\.weight$")
 _ROUTED_EXPERT_SCALE_RE = re.compile(r"\.ffn\.experts\.\d+\.w[123]\.scale$")
+# nvidia/DeepSeek-V4-Flash-NVFP4 (modelopt) routed experts: U8-packed E2M1
+# weight (2 values/byte) + three companions — per-16-group F8_E4M3
+# ``weight_scale``, tensor-scalar F32 ``weight_scale_2``, and F32
+# ``input_scale``. The fp8 backbone around them keeps Flash's familiar
+# ``.weight``/``.scale`` (F8_E4M3 / F8_E8M0) convention.
+_ROUTED_EXPERT_NVFP4_COMPANION_RE = re.compile(
+    r"\.ffn\.experts\.\d+\.w[123]\.(weight_scale|weight_scale_2|input_scale)$"
+)
+_NVFP4_PACKED_WEIGHT_DTYPE_NAMES = {"torch.uint8", "U8"}
 
 _FP8_WEIGHT_PARENTS = (
     ".attn.wq_a.",
@@ -108,9 +117,17 @@ def _is_mtp_fp8_parent(name: str) -> bool:
 
 
 def classify_tensor(name: str, dtype: str) -> tuple[str, str]:
+    if _ROUTED_EXPERT_NVFP4_COMPANION_RE.search(name):
+        # modelopt NVFP4 scale companions ride with their U8 packed weight
+        # and are only ever preserved byte-for-byte (--expert-format nvfp4).
+        return "routed_expert_nvfp4_companion", "preserve"
     if _ROUTED_EXPERT_WEIGHT_RE.search(name):
         # Flash: packed 2-values/byte MXFP4 container (I8). Flash-Base: full
         # width F8_E4M3 with a classic FP32 128x128-tile scale companion.
+        # NVFP4 (modelopt): packed 2-values/byte E2M1 container (U8) with
+        # weight_scale/weight_scale_2/input_scale companions.
+        if dtype in _NVFP4_PACKED_WEIGHT_DTYPE_NAMES:
+            return "routed_expert_nvfp4_weight", "preserve"
         if dtype in _FP8_WEIGHT_DTYPE_NAMES:
             return "routed_expert_fp8_block_weight", "quantize_int4_w4a16_candidate"
         return "routed_expert_mxfp4_weight", "quantize_asym_int4_awq_candidate"

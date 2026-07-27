@@ -97,6 +97,18 @@ DENSE_EXPERTS_INT8_ACTIVATION = (
 INDEXER_STREAMING_TOPK_PREFILL = (
     "vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk"
 )
+# sm_12x (GB10): sparkinfer's fp8-compute CuTe compressed-MLA kernel, wrapped
+# by the nvidia_sm12x launchers. Decode and prefill are distinct symbols
+# (scratch modes) of the same underlying op. On sm12x the portable Triton
+# symbols above (SPARSE_MLA_DECODE_FP8_TRITON / SPARSE_MLA_PREFILL_TRITON
+# fused-decode variant) are the registered fallback — kernel A/B swaps are an
+# --hf-overrides edit, no rebuild.
+SPARSE_MLA_DECODE_FP8_SPARKINFER = (
+    "vllm.models.deepseek_v4.nvidia_sm12x.kernels.sparkinfer_sparse_mla_decode"
+)
+SPARSE_MLA_PREFILL_SPARKINFER = (
+    "vllm.models.deepseek_v4.nvidia_sm12x.kernels.sparkinfer_sparse_mla_extend"
+)
 
 KERNEL_REGISTRY: dict[str, str] = {
     SPARSE_MLA_DECODE_FP8_FLASH: ROLE_SPARSE_MLA_DECODE_FP8,
@@ -105,6 +117,8 @@ KERNEL_REGISTRY: dict[str, str] = {
     SPARSE_MLA_DECODE_INT8_FLASH: ROLE_SPARSE_MLA_DECODE_INT8,
     SPARSE_MLA_PREFILL_TRITON: ROLE_SPARSE_MLA_PREFILL,
     SPARSE_MLA_PREFILL_FLASH: ROLE_SPARSE_MLA_PREFILL,
+    SPARSE_MLA_DECODE_FP8_SPARKINFER: ROLE_SPARSE_MLA_DECODE_FP8,
+    SPARSE_MLA_PREFILL_SPARKINFER: ROLE_SPARSE_MLA_PREFILL,
     INDEXER_CACHE_INT8_WRITER: ROLE_INDEXER_CACHE_INT8,
     INDEXER_QUERY_INT8_QUANT: ROLE_INDEXER_QUERY_INT8,
     DENSE_EXPERTS_INT8_ACTIVATION: ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
@@ -148,6 +162,12 @@ class ResolvedKernelConfig:
     # Active role -> symbol. Selector roles are always present; toggle roles
     # are present iff listed in an explicit block.
     roles: Mapping[str, str] = field(default_factory=dict)
+    # Roles whose symbol was EXPLICITLY listed in the block's kernels list
+    # (as opposed to filled in by SELECTOR_ROLE_DEFAULTS). Lets arch-specific
+    # validators distinguish "the user chose this kernel" from "the global
+    # default happened to land here" — e.g. sm12x maps unlisted selector
+    # roles to sparkinfer while honoring an explicitly listed Triton symbol.
+    listed_roles: frozenset[str] = frozenset()
     cache_type: str | None = None
     # Streaming prefill top-k context-slab width in compressed-token rows.
     # None = "not specified": the indexer module's documented default applies.
@@ -248,6 +268,8 @@ def resolve_kernel_config(block: Any) -> ResolvedKernelConfig:
             )
         roles[role] = symbol
 
+    listed_roles = frozenset(roles)
+
     # Selector roles always resolve; absent = documented default.
     for role, default in SELECTOR_ROLE_DEFAULTS.items():
         roles.setdefault(role, default)
@@ -265,6 +287,7 @@ def resolve_kernel_config(block: Any) -> ResolvedKernelConfig:
     return ResolvedKernelConfig(
         explicit=explicit,
         roles=roles,
+        listed_roles=listed_roles,
         cache_type=cache_type,
         indexer_prefill_topk_slab_rows=indexer_prefill_topk_slab_rows,
     )
