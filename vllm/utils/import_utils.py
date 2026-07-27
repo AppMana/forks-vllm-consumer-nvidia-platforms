@@ -546,27 +546,32 @@ def has_fbgemm_gpu() -> bool:
 
 @cache
 def has_cutedsl() -> bool:
-    """Whether cutlass-dsl is available AND compatible with the in-tree FA4
-    CuTe kernels.
+    """Whether the CuTe-DSL fast paths can run on THIS device.
 
-    Every has_cutedsl() consumer routes into kernels built on
-    ``vllm.vllm_flash_attn.cute``, which is written against
-    nvidia-cutlass-dsl 4.5.x; 4.6 moved ``cute.core`` APIs (e.g. ``ThrMma``)
-    and the module explodes at import. Environments that pin 4.6 for
-    sparkinfer (GB10/sm12x) therefore probe the actual import once and fall
-    back to the Triton paths instead of failing mid-forward.
+    Two conditions, and the second is the one that is easy to forget.
+
+    The package must be importable. The 4.5-vs-4.6 API incompatibility that
+    once made this a runtime probe is gone: requirements/cuda.txt pins
+    nvidia-cutlass-dsl 4.6.0, matching what sparkinfer pins, so the in-tree
+    FA4 CuTe kernels and sparkinfer now agree on one version.
+
+    The device must also be sm_90 or newer. CuTe-DSL cannot target sm_89 or
+    earlier, and this fork ships ONE image covering Ampere (sm_86) and consumer
+    Blackwell (sm_121). Without this check an Ampere GPU would enter the CuTe
+    paths and JIT for an architecture that cannot compile them, failing
+    mid-forward. Previously the 4.5/4.6 import failure masked this by
+    disabling CuTe everywhere; fixing the pin removes that accidental cover.
     """
     if not _has_module("cutlass"):
         return False
-    try:
-        import vllm.vllm_flash_attn.cute.utils  # noqa: F401
-    except Exception as exc:
+
+    from vllm.platforms import current_platform
+
+    if current_platform.is_cuda() and not current_platform.has_device_capability(90):
         logger.warning_once(
-            "cutlass-dsl is installed but the in-tree FA4 CuTe kernels do "
-            "not import against it (%s: %s); CuTe-DSL fast paths are "
-            "disabled and Triton fallbacks will be used.",
-            type(exc).__name__,
-            exc,
+            "CuTe-DSL requires compute capability 9.0 or newer; this device is "
+            "older, so CuTe-DSL fast paths are disabled and Triton fallbacks "
+            "will be used."
         )
         return False
     return True
