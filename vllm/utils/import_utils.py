@@ -546,21 +546,11 @@ def has_fbgemm_gpu() -> bool:
 
 @cache
 def has_cutedsl() -> bool:
-    """Whether the CuTe-DSL fast paths can run on THIS device.
+    """Whether cutlass-dsl is installed and the device can run CuTe-DSL.
 
-    Two conditions, and the second is the one that is easy to forget.
-
-    The package must be importable. The 4.5-vs-4.6 API incompatibility that
-    once made this a runtime probe is gone: requirements/cuda.txt pins
-    nvidia-cutlass-dsl 4.6.0, matching what sparkinfer pins, so the in-tree
-    FA4 CuTe kernels and sparkinfer now agree on one version.
-
-    The device must also be sm_90 or newer. CuTe-DSL cannot target sm_89 or
-    earlier, and this fork ships ONE image covering Ampere (sm_86) and consumer
-    Blackwell (sm_121). Without this check an Ampere GPU would enter the CuTe
-    paths and JIT for an architecture that cannot compile them, failing
-    mid-forward. Previously the 4.5/4.6 import failure masked this by
-    disabling CuTe everywhere; fixing the pin removes that accidental cover.
+    CuTe-DSL requires compute capability 9.0 or newer. This image carries
+    kernels for Ampere (sm_86) and consumer Blackwell (sm_121); sm_86 takes
+    the Triton fallbacks.
     """
     if not _has_module("cutlass"):
         return False
