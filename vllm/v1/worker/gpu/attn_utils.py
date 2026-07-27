@@ -262,7 +262,7 @@ def _reshape_kv_cache(
     kv_cache_config: "KVCacheConfig | None" = None,
 ) -> dict[str, Any]:
     kv_caches: dict[str, Any] = {}
-    has_attn, has_mamba = False, False
+    has_attn = False
 
     layer_packing: dict[str, tuple[int, int]] = {}
     if kv_cache_config is not None:
@@ -361,38 +361,21 @@ def _reshape_kv_cache(
                 )
 
             elif isinstance(kv_cache_spec, MambaSpec):
-                has_mamba = True
-                state_tensors = []
-                storage_offset_bytes = 0
-                for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                    dtype_size = get_dtype_size(dtype)
-                    num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
-                    target_shape = (num_blocks, *shape)
-                    stride = torch.empty(target_shape).stride()
-                    target_stride = (num_element_per_page, *stride[1:])
-                    assert storage_offset_bytes % dtype_size == 0
-                    tensor = torch.as_strided(
-                        kv_raw_tensor.view(dtype),
-                        size=target_shape,
-                        stride=target_stride,
-                        storage_offset=storage_offset_bytes // dtype_size,
-                    )
-                    state_tensors.append(tensor)
-                    storage_offset_bytes += stride[0] * dtype_size
-                kv_caches[layer_name] = state_tensors
+                page_size_bytes = kv_cache_spec.page_size_bytes
+                # Hold a single contiguous [num_blocks, 1, 1, page_size_bytes]
+                # int8 page view per layer; the layer's bind_kv_cache unpacks
+                # each block's bytes into its conv/ssm state views. Keeping
+                # one tensor per layer lets the KV connector register it
+                # without special-casing Mamba.
+                kv_caches[layer_name] = kv_raw_tensor[
+                    : num_blocks * page_size_bytes
+                ].view(num_blocks, 1, 1, page_size_bytes)
             else:
                 raise NotImplementedError(
                     f"Unsupported KV cache spec type: {type(kv_cache_spec)}"
                 )
 
-    if has_attn and has_mamba:
-        _update_hybrid_attention_layout(
-            attn_groups=attn_groups,
-            kv_caches=kv_caches,
-            kernel_block_sizes=kernel_block_sizes,
-            cache_dtype=cache_dtype,
-        )
-    elif has_attn and kv_cache_config is not None:
+    if has_attn and kv_cache_config is not None:
         _align_mixed_attention_kv_cache_views(
             attn_groups=attn_groups,
             kv_caches=kv_caches,
@@ -601,6 +584,7 @@ def build_attn_metadata(
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
+    is_prefilling: torch.Tensor | None = None,
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
@@ -628,6 +612,11 @@ def build_attn_metadata(
             if model_specific_attn_metadata is not None
             else {}
         )
+        # Model-specific metadata (e.g. Mamba hybrid) may supply its own
+        # padding-aware is_prefilling, which takes precedence over the default.
+        group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
+            "is_prefilling", is_prefilling
+        )
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
@@ -642,6 +631,7 @@ def build_attn_metadata(
             causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
+            is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
             **common_attn_metadata_extra_kwargs,

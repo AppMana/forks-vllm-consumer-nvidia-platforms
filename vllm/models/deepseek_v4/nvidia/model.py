@@ -844,6 +844,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
+        self.hc_attn_fn_broadcast: torch.Tensor | None = None
         self.hc_ffn_fn = nn.Parameter(
             torch.empty(
                 (mix_hc, hc_dim),
@@ -1122,7 +1123,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1265,7 +1265,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         for name, loaded_weight in weights:
             if pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
+                loaded_weight = self._pad_shared_expert_weight(
+                    self.quant_config, name, loaded_weight
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
@@ -1340,15 +1342,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         return loaded_params
 
+    @staticmethod
     def _pad_shared_expert_weight(
-        self, name: str, loaded_weight: torch.Tensor
+        quant_config: QuantizationConfig | None,
+        name: str,
+        loaded_weight: torch.Tensor,
     ) -> torch.Tensor:
         """Zero-pad a block-FP8 shared-expert weight/scale on its intermediate
         axis so the standard TP loaders split it into even, block-aligned shards
         (trailing ranks get the zero pad). gate (w1)/up (w3) [I, H] pad dim 0;
         down (w2 -> down_proj) [H, I] pads dim 1.
         """
-        block_size = getattr(self.quant_config, "weight_block_size", None)
+        block_size = getattr(quant_config, "weight_block_size", None)
         assert block_size is not None
         # Round the intermediate axis up to a whole number of TP shards. The axis
         # is in elements for weights (step = block) and in blocks for scales.
@@ -1389,6 +1394,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
+            return
+        layer = self.layers[self.start_layer]
+        if isinstance(layer, DeepseekV4DecoderLayer):
+            layer.hc_attn_fn_broadcast = (
+                layer.hc_attn_fn.detach()
+                .view(-1, layer.hc_mult, layer.hidden_size)
+                .sum(dim=1)
+            )
 
 
 def _get_deepseek_v4_scale_fmt(config) -> str:
@@ -1566,6 +1582,7 @@ class DeepseekV4ForCausalLM(
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
+        self.model.finalize_mhc_broadcast_weights()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

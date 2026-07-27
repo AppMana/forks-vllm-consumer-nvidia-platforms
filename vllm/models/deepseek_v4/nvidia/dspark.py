@@ -48,6 +48,7 @@ from vllm.sequence import IntermediateTensors
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
+    DeepseekV4Model,
     make_deepseek_v4_expert_params_mapping,
 )
 
@@ -397,6 +398,11 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
             os.path.join(_model_path, "model-mtp-*.safetensors")
         ):
             self.allow_patterns_overrides = ["model-mtp-*.safetensors"]
+        self.quant_config = vllm_config.quant_config
+        self.pad_shared_expert = (
+            getattr(self.quant_config, "weight_block_size", None) is not None
+            and not vllm_config.parallel_config.use_sequence_parallel_moe
+        )
         self.model = DSparkDeepseekV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -559,6 +565,12 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                     else ".weight_scale_inv"
                 )
                 name = name.removesuffix(".scale") + suffix
+            if ".shared_experts.w2" in name:
+                name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
+            if self.pad_shared_expert and ".shared_experts." in name:
+                loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
+                    self.quant_config, name, loaded_weight
+                )
 
             # E8M0 expert scales: keep raw exponent bytes.
             if ".experts." in name:
@@ -603,10 +615,6 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                     params_dict[name][: narrow.shape[0]].copy_(narrow)
                     loaded_params.add(name)
                     continue
-                if ".shared_experts.w2" in name:
-                    name = name.replace(
-                        ".shared_experts.w2", ".shared_experts.down_proj"
-                    )
                 if name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"

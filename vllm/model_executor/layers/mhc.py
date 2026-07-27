@@ -780,16 +780,8 @@ class HCHeadOp(CustomOp):
         out = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
-        torch.ops.vllm.hc_head_triton(
-            hs_flat,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            out,
-            hidden_size,
-            rms_norm_eps,
-            hc_eps,
-            hc_mult,
+        torch.ops._xpu_C.hc_head_fused(
+            hs_flat, hc_fn, hc_scale, hc_base, out, rms_norm_eps, hc_eps
         )
         return out.view(*outer_shape, hidden_size)
 
