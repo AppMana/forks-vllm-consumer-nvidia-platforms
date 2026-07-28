@@ -154,9 +154,19 @@ PREFILL_BACKENDS_TO_TEST = [
 ]
 
 
+# These two loops run at import, so an unavailable backend must not raise here.
+# try_get_attention_backend() is written for use inside a test -- it calls
+# pytest.skip, and at module scope that skips this module AND every module that
+# imports it, which is how a missing flashinfer turned into a collection error
+# for test_dspark_noncausal_sparse_mla.py on a machine that has no flashinfer.
+# A backend that will not import is simply absent from these capability tables;
+# the tests that need one still skip individually through the helper.
 SPEC_DECODE_BACKENDS = []
 for backend in BACKENDS_TO_TEST:
-    builder_cls, _ = try_get_attention_backend(backend)
+    try:
+        builder_cls = backend.get_class().get_builder_cls()
+    except ImportError:
+        continue
     query_len_support = getattr(
         builder_cls, "query_len_support", QueryLenSupport.SINGLE_ONLY
     )
@@ -165,7 +175,10 @@ for backend in BACKENDS_TO_TEST:
 
 BACKEND_BLOCK_SIZES = {}
 for backend in BACKENDS_TO_TEST:
-    supported_sizes = backend.get_class().get_supported_kernel_block_sizes()
+    try:
+        supported_sizes = backend.get_class().get_supported_kernel_block_sizes()
+    except ImportError:
+        continue
     if supported_sizes:
         default_size = supported_sizes[0]
         block_size = (

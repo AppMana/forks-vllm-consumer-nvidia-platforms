@@ -9,6 +9,11 @@ from vllm.platforms import current_platform
 if not current_platform.is_cuda():
     pytest.skip("FlashInfer backend requires a CUDA platform.", allow_module_level=True)
 
+# CUDA is necessary but not sufficient: flashinfer is an optional dependency and
+# is absent from the GB10 venv, where the import below would otherwise turn a
+# whole-directory run into a collection error rather than a skip.
+pytest.importorskip("flashinfer", reason="flashinfer is not installed")
+
 import torch
 
 from tests.v1.attention.utils import create_vllm_config
