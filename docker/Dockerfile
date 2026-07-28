@@ -1266,16 +1266,19 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         fi; \
     fi
 
-RUN python3 - <<'PY'
+RUN INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS}" python3 - <<'PY'
 import importlib
 import importlib.metadata
+import os
 import pathlib
 import sysconfig
 
-for name in (
-    "ray",
-    "lmcache",
-):
+names = ["ray"]
+# lmcache ships only when INSTALL_KV_CONNECTORS asks for it; assert on the same
+# condition that installs it.
+if os.environ.get("INSTALL_KV_CONNECTORS") == "true":
+    names.append("lmcache")
+for name in names:
     importlib.import_module(name)
 
 for dist in ("vllm",):
