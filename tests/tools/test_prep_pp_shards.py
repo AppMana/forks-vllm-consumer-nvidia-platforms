@@ -48,17 +48,11 @@ class TestComputeCacheKey:
         assert k1 == k2
 
     def test_deliberately_rank_independent(self, tmp_path):
-        # vllm serve invokes --model once with the LEADER's own staged path,
-        # and distributed_executor_backend=ray resolves that SAME path
-        # string independently on every remote worker's own node. If the
-        # cache key included pp_rank, every rank would stage under a
-        # DIFFERENT directory name, and a remote worker looking for the
-        # leader's hash on its own disk would find nothing and fail model
-        # resolution ("Repo id must be in the form repo_name or
-        # namespace/repo_name"). compute_cache_key must not take a
-        # pp_rank parameter at all -- this test exists so a future
-        # regression re-adding rank-sensitivity fails at the call site, not
-        # silently in production.
+        # Ray resolves the leader's one --model path string on every remote
+        # worker's node, so a rank-dependent cache key would stage each rank
+        # under a different name and break remote workers. Guard the
+        # signature so re-adding rank-sensitivity fails here, not in
+        # production.
         import inspect
 
         params = inspect.signature(prep_pp_shards.compute_cache_key).parameters

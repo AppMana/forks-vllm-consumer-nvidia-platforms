@@ -154,13 +154,10 @@ PREFILL_BACKENDS_TO_TEST = [
 ]
 
 
-# These two loops run at import, so an unavailable backend must not raise here.
-# try_get_attention_backend() is written for use inside a test -- it calls
-# pytest.skip, and at module scope that would skip this module AND every module
-# that imports it, turning one missing optional dependency into a collection
-# error for unrelated test files.
-# A backend that will not import is simply absent from these capability tables;
-# the tests that need one still skip individually through the helper.
+# These loops run at import, so an unavailable backend must not raise here:
+# try_get_attention_backend() calls pytest.skip, which at module scope kills
+# collection for every importer. Absent backends simply drop out of the
+# tables; tests that need one still skip individually through the helper.
 SPEC_DECODE_BACKENDS = []
 for backend in BACKENDS_TO_TEST:
     try:

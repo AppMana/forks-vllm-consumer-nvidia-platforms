@@ -307,27 +307,13 @@ def _reshape_kv_cache(
                 )
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
                 # Skipped layers (--kv-cache-dtype-skip-layers) keep the
-                # unquantized shape; only the quantized primary uses the
-                # quantized cache dtype's (possibly packed) layout.
-                # NOTE: deliberately NOT upstream's
-                # `_cache_dtype_for_spec`/`spec.cache_dtype_str` getattr here:
-                # cache_dtype_str is set to the *global* cache_config.cache_dtype
-                # at spec-construction time for MLA layers (see
-                # mla_attention.py:get_kv_cache_spec), not the per-layer
-                # skip-aware value, so it silently ignores
-                # --kv-cache-dtype-skip-layers for DeepSeek V4's MLA attention.
-                # kv_quant_mode IS populated per-layer (from self.kv_cache_dtype,
-                # which the skip-layers check already resolves to "auto"), so it
-                # is the correct source of truth here.
-                #
-                # EXCEPT int8_ds_mla: appmana-only packed layout that
-                # upstream's get_kv_quant_mode maps to NONE. Passing "auto"
-                # makes get_kv_cache_shape fall through to
-                # (nb, bs, head_size=512) instead of the packed 528-byte
-                # rows, and get_int8_ds_mla_cache_views then slices a
-                # ZERO-width fp32 scale view whose dangling pointer the
-                # kernels dereference. Same rule as the v1 runner's
-                # initialize_kv_cache.
+                # unquantized shape. Per-layer kv_quant_mode, NOT upstream's
+                # `spec.cache_dtype_str`: for MLA layers that field holds the
+                # GLOBAL cache dtype and ignores skip-layers. EXCEPT
+                # int8_ds_mla (fork-only, quant mode NONE but packed 528-byte
+                # rows): "auto" would view it 512B-wide, giving zero-width
+                # scale views with dangling pointers. Same rule as the v1
+                # runner's initialize_kv_cache.
                 layer_cache_dtype = (
                     "auto"
                     if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE

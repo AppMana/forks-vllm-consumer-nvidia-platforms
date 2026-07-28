@@ -671,13 +671,9 @@ def test_production_scale_extend_smoke() -> None:
     swa_tokens, extra_tokens = 4352, 1088  # 17 pages / 17 pages
     swa_cache = _make_unpadded_cache(17, swa_page)
     extra_cache = _make_unpadded_cache(17, extra_page)
-    # Packed cache contents, not random bytes: not every byte decodes.
-    # 0x7F/0xFF are NaN in fp8 e4m3fn, and a UE8M0 scale byte decodes to
-    # 2^(b-127), so a random footer byte can reach 2^127 and overflow to inf
-    # on the first multiply. Each output element sums 640 slots x 512 dims,
-    # so a random-filled cache turns the whole tensor NaN and masquerades as
-    # a kernel fault. The payload bytes are not what this test covers anyway:
-    # the ADDRESSING coverage comes from the random slot selection below.
+    # Packed cache contents, not random bytes: 0x7F/0xFF are NaN in fp8
+    # e4m3fn and a random UE8M0 scale byte can decode to 2^127, turning the
+    # whole output NaN. Addressing coverage comes from the slot selection.
     _fill_cache(swa_cache, swa_tokens, swa_page)
     _fill_cache(extra_cache, extra_tokens, extra_page)
 

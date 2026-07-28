@@ -3343,10 +3343,8 @@ class GPUModelRunner(
         sync_self: bool,
     ) -> IntermediateTensors:
         if self.intermediate_tensors is None:
-            # Allocated lazily on first use rather than only in the
-            # cudagraph-capture warmup's _dummy_run: a deployment that skips
-            # that warmup (enforce_eager / compilation NONE) still needs the
-            # tensors for the first real batch of every non-first PP rank.
+            # Lazy: deployments that skip the cudagraph warmup (enforce_eager
+            # / compilation NONE) still need these on non-first PP ranks.
             self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
                 batch_size=self.max_num_tokens,
                 dtype=self.model_config.dtype,
@@ -3812,23 +3810,13 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
-        # Ensure the previous step has finished with the reused pinned CPU
-        # input tensors before this step mutates them. Required in EVERY
-        # configuration, not only async scheduling: on a non-last PP rank
-        # execute_model returns right after enqueueing the forward (async
-        # isend, no device sync), so a later step's _update_states /
-        # _prepare_inputs can mutate the shared pinned buffers while an
-        # earlier step's non_blocking H2D copies are still queued behind
-        # its forward kernels.
-        #
-        # A single reusable event is the correct fence. Worker steps are
-        # CPU-serialized, so record-at-exit / synchronize-at-entry always
-        # waits on exactly the immediately previous step's copies --
-        # sufficient, since stream order chains everything older behind
-        # them. A pooled per-step event would be WRONG (it waits on step
-        # N-P instead of N-1), and a full device synchronize is needless.
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver
-        # lock.
+        # Fence the reused pinned CPU input buffers: a non-last PP rank
+        # returns right after enqueueing the forward, so a later step could
+        # mutate them while this step's non_blocking H2D copies are still
+        # queued. Steps are CPU-serialized, so ONE event (record-at-exit,
+        # synchronize-at-entry) fences exactly the previous step; a pooled
+        # per-step event would wait on step N-P instead of N-1. Blocking
+        # (sleep) event to avoid busy-polling the CUDA driver lock.
         torch.cuda.nvtx.range_push("prepare_inputs_wait")
         self.prepare_inputs_event.synchronize()
         torch.cuda.nvtx.range_pop()
@@ -7360,31 +7348,15 @@ class GPUModelRunner(
                     else:
                         shape_block_size = kernel_block_size
 
-                    # Skipped layers (--kv-cache-dtype-skip-layers) need
-                    # the unquantized shape. NOTE: deliberately not upstream's
-                    # `spec.cache_dtype_str` getattr: for MLA layers that
-                    # field is set to the *global* cache_config.cache_dtype at
-                    # spec-construction time (mla_attention.py:get_kv_cache_spec),
-                    # not the per-layer skip-aware value, so it silently
-                    # ignores --kv-cache-dtype-skip-layers for DeepSeek V4's
-                    # MLA attention. kv_quant_mode IS populated per-layer.
-                    #
-                    # EXCEPT int8_ds_mla: it is an appmana-only packed layout
-                    # that upstream's get_kv_quant_mode does not know, so its
-                    # kv_quant_mode is NONE -- but its allocation IS packed
-                    # 528-byte rows (spec real_page_size_bytes, insert kernel
-                    # token_stride, get_int8_ds_mla_cache_views all agree).
-                    # Passing "auto" here makes get_kv_cache_shape fall
-                    # through to (nb, bs, head_size=512), viewing every int8
-                    # cache 512B-wide: get_int8_ds_mla_cache_views then
-                    # slices a ZERO-width fp32 scale view out of it, whose
-                    # dangling pointer+strides the native prefill/decode
-                    # kernels dereference (deterministic illegal memory
-                    # access on the first prefill) and whose garbage scales
-                    # the Triton kernels consume (silent decode corruption).
-                    # Upstream #47716 handles this reshape for fp8_ds_mla
-                    # (whose quant mode is non-NONE via the "fp8*" prefix
-                    # rule) but cannot know about int8_ds_mla.
+                    # Skipped layers (--kv-cache-dtype-skip-layers) need the
+                    # unquantized shape. Per-layer kv_quant_mode, NOT
+                    # upstream's `spec.cache_dtype_str`: for MLA layers that
+                    # field holds the GLOBAL cache dtype and ignores
+                    # skip-layers. EXCEPT int8_ds_mla (fork-only, quant mode
+                    # NONE but packed 528-byte rows): "auto" would view it
+                    # 512B-wide, giving zero-width scale views whose dangling
+                    # pointers the kernels dereference (IMA / silent decode
+                    # corruption). Upstream #47716 covers only fp8_ds_mla.
                     spec_cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
                     layer_cache_dtype_str = (
                         "auto"

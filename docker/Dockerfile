@@ -1283,11 +1283,9 @@ for kernel in (
     if not hasattr(flash_mla, kernel):
         raise AttributeError(f"flash_mla.{kernel}")
 
-# The tb-chain webhook injects NCCL_IB_SUBNET_AWARE_ROUTING=prefer_hca[...];
-# a libnccl built from a fork ref that predates the self-inferring
-# rail/fallback selection silently degrades that contract (non-adjacent ring
-# hops keep a usb4 rail and the collective hangs). The implementation's log
-# format strings live in .rodata, so their absence proves a stale build.
+# A libnccl predating the fork's rail/fallback selection silently breaks the
+# prefer_hca contract (collectives hang); its .rodata log strings prove the
+# build is current.
 nccl_candidates = list(pathlib.Path("/usr/lib").glob("*-linux-gnu/libnccl.so.2.30.7"))
 if not nccl_candidates:
     raise AssertionError("libnccl.so.2.30.7 not found under /usr/lib/*-linux-gnu")

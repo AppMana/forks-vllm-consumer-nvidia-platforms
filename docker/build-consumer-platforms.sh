@@ -2,13 +2,10 @@
 # Build the consumer-NVIDIA-platform image (sm_86 + sm_121) on the appmana
 # cluster's buildkitd and push it to GHCR.
 #
-# Why this builder: the arm64 half is emulated through the binfmt DaemonSet on
-# appmana (src/clusters/appmana-cluster-03/buildkit/binfmt.yaml), so amd64
-# workers can emit arm64 layers. Native alternatives do not work -- GitHub's
-# hosted arm64 runners are 4 cores / 16 GB and are OOM-killed by nvcc, and the
-# hilton buildkitd's containerd worker has no CNI, so RUN steps have no network
-# egress. Never build on a Spark by hand: a ~30 GB build + image import on a
-# serving node exhausts the unified-memory pool and wedges it.
+# Why this builder: arm64 is emulated via appmana's binfmt DaemonSet. The
+# alternatives fail: GitHub's hosted arm64 runners OOM under nvcc, hilton's
+# buildkitd has no CNI (no RUN egress), and a hand build on a serving Spark
+# exhausts the unified-memory pool and wedges the node.
 #
 # Usage:
 #   docker/build-consumer-platforms.sh [--platform linux/arm64] [--tag NAME]
