@@ -737,6 +737,7 @@ ARG APPMANA_THUNDERBOLT_RELEASE_REPO
 ARG INSTALL_USB4_RDMA_PROVIDER
 ARG USB4_RDMA_PROVIDER_VERSION
 ARG APPMANA_THUNDERBOLT_RELEASE_TAG
+ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /vllm-workspace
@@ -826,9 +827,10 @@ RUN set -eux; \
     ldconfig; \
     test "$(readlink -f libnccl.so.2)" = "/usr/lib/${TRIPLET}/libnccl.so.2.30.7"
 
+# The provider deb only exists for amd64 Thunderbolt hosts.
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt \
-    if [ "${INSTALL_USB4_RDMA_PROVIDER}" = "true" ]; then \
+    if [ "${INSTALL_USB4_RDMA_PROVIDER}" = "true" ] && [ "${TARGETARCH}" = "amd64" ]; then \
         set -eux; \
         . /etc/os-release; \
         rm -f /etc/apt/apt.conf.d/docker-clean; \
