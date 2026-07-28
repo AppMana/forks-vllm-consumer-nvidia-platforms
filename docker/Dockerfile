@@ -1222,8 +1222,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # drag backwards; requirements/cuda.txt already pins 4.6.0 for both.
 ARG SPARKINFER_REPO=https://github.com/AppMana/forks-sparkinfer
 ARG SPARKINFER_REF=appmana/main
-RUN --mount=type=cache,target=/opt/uv/cache \
+# uv shells out to git for a `git+` requirement, and this stage has no git.
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    --mount=type=cache,target=/opt/uv/cache \
     if [ -n "${SPARKINFER_REF}" ]; then \
+        rm -f /etc/apt/apt.conf.d/docker-clean; \
+        apt-get update -y && \
+        apt-get install -y --no-install-recommends git ca-certificates && \
         uv pip install --system "git+${SPARKINFER_REPO}@${SPARKINFER_REF}"; \
     fi
 
