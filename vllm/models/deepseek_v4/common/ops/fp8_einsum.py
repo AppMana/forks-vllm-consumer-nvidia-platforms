@@ -4,8 +4,13 @@
 
 import torch
 
-from vllm.platforms import current_platform
+from vllm.logger import init_logger
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
+    cuda_supports_fp8e4nv_in_triton,
+)
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
 
 
 def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
@@ -15,16 +20,7 @@ def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
 
 
 def _supports_fp8e4nv_in_triton() -> bool:
-    """Triton's `tl.float8e4nv` cast / `tl.dot(fp8, fp8)` requires sm_89+.
-
-    Ada (sm_89), Hopper (sm_9x), and Blackwell (sm_10x/12x) qualify; Ampere
-    (sm_8x with major.minor != 8.9) does not. Triton refuses with
-    `ValueError: type fp8e4nv not supported in this architecture`.
-    """
-    cap = current_platform.get_device_capability()
-    if cap is None:
-        return False
-    return (cap.major, cap.minor) >= (8, 9)
+    return cuda_supports_fp8e4nv_in_triton(unknown=False)
 
 
 def _deepseek_v4_fp8_einsum_torch(
@@ -199,6 +195,10 @@ def deepseek_v4_sm12x_fp8_einsum(
         return
 
     if not _supports_fp8e4nv_in_triton():
+        logger.warning_once(
+            "FP8 einsum Triton kernel unavailable (tl.dot(fp8, fp8) needs "
+            "sm_89+); using the slower torch implementation for o_proj."
+        )
         _deepseek_v4_fp8_einsum_torch(a, a_scale, b, b_scale, out)
         return
 

@@ -7,7 +7,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
-from .fp8e4m3_arith import fp8e4m3_encode_from_fp32
+from .fp8e4m3_arith import cuda_supports_fp8e4nv_in_triton, fp8e4m3_encode_from_fp32
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
@@ -314,16 +314,13 @@ def _fused_indexer_q_rope_mxfp4_kernel(
 
 
 def _supports_fp8e4nv_in_triton() -> bool:
-    """Same gate as fused_inv_rope_fp8_quant. Triton's tl.float8e4nv requires
-    sm_89+. Fall back to torch on sm_8x (Ampere)."""
+    """Same gate as fused_inv_rope_fp8_quant: CUDA floor sm_89, other
+    platforms keep their native casts."""
     from vllm.platforms import current_platform
 
     if not current_platform.is_cuda():
         return True
-    cap = current_platform.get_device_capability()
-    if cap is None:
-        return True
-    return cap.major != 8
+    return cuda_supports_fp8e4nv_in_triton(unknown=True)
 
 
 def _fused_indexer_q_rope_fp8_torch(

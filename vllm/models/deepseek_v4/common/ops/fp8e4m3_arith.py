@@ -19,6 +19,26 @@ from __future__ import annotations
 from vllm.triton_utils import tl, triton
 
 
+def cuda_supports_fp8e4nv_in_triton(*, unknown: bool) -> bool:
+    """Whether Triton can lower `tl.float8e4nv` casts / `tl.dot(fp8, fp8)`.
+
+    The single source of truth for this question. sm_89 (Ada) is the floor:
+    Ada, Hopper (sm_9x) and Blackwell (sm_10x/sm_12x) qualify; earlier Ampere
+    (sm_80/sm_86) does not and must use the arithmetic codec in this module or
+    a torch fallback.
+
+    CUDA only -- non-CUDA platforms have their own native casts and must not
+    reach here. ``unknown`` is the answer when no capability is readable; each
+    call site picks the side that is safe for its own fallback.
+    """
+    from vllm.platforms import current_platform
+
+    cap = current_platform.get_device_capability()
+    if cap is None:
+        return unknown
+    return (cap.major, cap.minor) >= (8, 9)
+
+
 @triton.jit
 def fp8e4m3_decode_to_fp32(x_uint8):
     """Decode an E4M3FN byte to fp32 using arithmetic only.

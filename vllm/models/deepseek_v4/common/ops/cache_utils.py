@@ -31,6 +31,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
+    cuda_supports_fp8e4nv_in_triton,
     fp8e4m3_decode_to_fp32,
 )
 
@@ -508,11 +509,7 @@ def dequantize_and_gather_int8_ds_mla_cache(
 
 
 def _supports_fp8e4nv_in_triton() -> bool:
-    """Triton's `tl.float8e4nv` cast / bitcast requires sm_89+."""
-    cap = current_platform.get_device_capability()
-    if cap is None:
-        return False
-    return (cap.major, cap.minor) >= (8, 9)
+    return cuda_supports_fp8e4nv_in_triton(unknown=False)
 
 
 def _quantize_and_insert_k_cache_torch(

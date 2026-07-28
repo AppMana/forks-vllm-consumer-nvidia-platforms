@@ -544,15 +544,30 @@ def has_fbgemm_gpu() -> bool:
     return _has_module("fbgemm_gpu")
 
 
-@cache
 def has_cutedsl() -> bool:
-    """Whether cutlass-dsl is installed and the device can run CuTe-DSL.
+    """Whether a CuTe-DSL kernel in this tree can actually be imported and run.
 
-    CuTe-DSL requires compute capability 9.0 or newer. This image carries
-    kernels for Ampere (sm_86) and consumer Blackwell (sm_121); sm_86 takes
-    the Triton fallbacks.
+    Three conditions, all necessary:
+
+    - ``cutlass`` (cutlass-dsl) provides the DSL itself.
+    - ``quack`` provides ``compile_utils.make_fake_tensor``, which every
+      CuTe-DSL leaf module in this tree imports at module scope. Without it
+      the import raises at first use, long after the dispatch decision.
+    - Compute capability >= 9.0, the CuTe-DSL floor.
+
+    Deliberately not ``@cache``d: the capability is unreadable before device
+    init, and a False memoised there would disable every CuTe-DSL path for the
+    life of the process. The module probes underneath are cached.
     """
     if not _has_module("cutlass"):
+        return False
+
+    if not _has_module("quack"):
+        logger.warning_once(
+            "CuTe-DSL is installed but `quack` is not; every CuTe-DSL kernel "
+            "in this tree needs quack.compile_utils, so CuTe-DSL fast paths "
+            "are disabled and Triton fallbacks will be used."
+        )
         return False
 
     from vllm.platforms import current_platform

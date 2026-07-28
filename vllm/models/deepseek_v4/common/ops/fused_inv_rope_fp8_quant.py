@@ -9,9 +9,15 @@ INT32-packed UE8M0 on SM100) so fp8_einsum skips transform_sf_into_required_layo
 
 import torch
 
+from vllm.logger import init_logger
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
+    cuda_supports_fp8e4nv_in_triton,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
 
 
 @triton.jit(do_not_specialize=["num_tokens"])
@@ -225,22 +231,15 @@ def fused_inv_rope_fp8_quant(
 
 
 def _supports_fp8e4nv_in_triton() -> bool:
-    """Triton's `tl.float8e4nv` cast requires sm_89+ (Ada/Hopper/Blackwell).
-    On sm_8x (Ampere) the Triton compiler refuses with::
+    """Whether the fused Triton quant kernel can run here.
 
-        ValueError: type fp8e4nv not supported in this architecture.
-        Supported fp8 dtypes: ('fp8e4b15', 'fp8e5')
-
-    Fall back to a torch-only implementation that uses
-    ``torch.float8_e4m3fn`` (PyTorch ships a software-emulated cast on
-    Ampere: bit-correct, slower than the native instruction).
+    ROCm / XPU keep their native casts. On CUDA the floor is sm_89; below it
+    the caller uses a torch-only implementation (bit-correct via PyTorch's
+    software-emulated ``torch.float8_e4m3fn`` cast, but slower).
     """
     if not current_platform.is_cuda():
-        return True  # ROCm / XPU keep the existing path; only sm_8x falls back
-    cap = current_platform.get_device_capability()
-    if cap is None:
         return True
-    return cap.major != 8
+    return cuda_supports_fp8e4nv_in_triton(unknown=True)
 
 
 def _fused_inv_rope_fp8_quant_torch(
@@ -386,6 +385,11 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
     scale_inner: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not _supports_fp8e4nv_in_triton():
+        logger.warning_once(
+            "Fused inverse-RoPE + FP8 quant Triton kernel unavailable "
+            "(tl.float8e4nv needs sm_89+); using the slower torch "
+            "implementation."
+        )
         return _fused_inv_rope_fp8_quant_torch(
             o,
             positions,

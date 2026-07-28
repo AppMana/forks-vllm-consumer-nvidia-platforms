@@ -428,10 +428,10 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        # cutedsl needs `quack`, which is unavailable on Ampere (sm_8x) and
-        # consumer Blackwell (sm_12x); those route through the Triton sparse
-        # kernel, which also handles head_dim == 512. (has_cutedsl() is True
-        # even when quack is missing, so gate on capability instead.)
+        # Ampere (sm_8x) and consumer Blackwell (sm_12x) route through the
+        # Triton sparse kernel, which also handles head_dim == 512. The
+        # capability exclusion is independent of has_cutedsl()'s own quack /
+        # sm_90 floor and stays until the cutedsl compressor is validated there.
         _cutedsl_ok = (
             has_cutedsl()
             and not current_platform.is_device_capability_family(80)
