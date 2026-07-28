@@ -376,32 +376,43 @@ class RejectionSampler:
             expanded_idx_mapping = input_batch.expanded_idx_mapping
             expanded_local_pos = input_batch.expanded_local_pos
             has_virtual = None
-        processed_logits = self.sampler.apply_sampling_params(
-            logits_in,
-            expanded_idx_mapping,
-            input_batch.idx_mapping_np,
-            pos,
-            draft_sampled,
-            expanded_local_pos,
+        max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+            input_batch.idx_mapping_np
         )
-        max_chunk_logits = max(1, MAX_CHUNK_BYTES // (logits.shape[1] * _FP32_BYTES))
-        sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
-            logits,
-            input_batch,
-            draft_logits,
-            draft_sampled,
-            cu_num_logits,
-            pos,
-            input_batch.idx_mapping,
-            expanded_idx_mapping,
-            expanded_local_pos,
-            self.sampler.sampling_states.temperature.gpu,
-            self.sampler.sampling_states.seeds.gpu,
-            self.num_speculative_steps,
-            self.synthetic_conditional_rates,
-            use_fp64=self.sampler.use_fp64_gumbel,
-            use_block_verification=self.use_block_verification,
-        )
+        if deferred:
+            # The expanded layout does not line up with input_batch.cu_num_logits,
+            # and the chunking wrapper slices by exactly that, so verify the
+            # expanded batch in one pass instead.
+            if max_num_logprobs != NO_LOGPROBS:
+                raise NotImplementedError(
+                    "logprobs are not supported with PP-deferred speculative "
+                    "verification"
+                )
+            _, sampled, num_sampled = self._verify(
+                logits_in,
+                draft_logits,
+                draft_sampled,
+                pos,
+                cu_num_logits,
+                input_batch.idx_mapping,
+                input_batch.idx_mapping_np,
+                expanded_idx_mapping,
+                expanded_local_pos,
+            )
+            logprobs_tensors = None
+        else:
+            max_chunk_logits = max(
+                1, MAX_CHUNK_BYTES // (logits.shape[1] * _FP32_BYTES)
+            )
+            sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+                logits,
+                input_batch,
+                draft_logits,
+                draft_sampled,
+                pos,
+                max_chunk_logits,
+                max_num_logprobs,
+            )
         if deferred:
             assert has_virtual is not None
             # Drop each virtual slot: its token (the anchor position's sample)
@@ -413,29 +424,6 @@ class RejectionSampler:
             ).clamp_max_(steps1 - 1)
             sampled = torch.gather(sampled, 1, gather_idx)
             num_sampled = num_sampled - has_virtual.to(num_sampled.dtype)
-        if deferred:
-            # The expanded logits layout does not match input_batch.cu_num_logits.
-            if (
-                self.sampler.sampling_states.max_num_logprobs(
-                    input_batch.idx_mapping_np
-                )
-                != NO_LOGPROBS
-            ):
-                raise NotImplementedError(
-                    "logprobs are not supported with PP-deferred speculative "
-                    "verification"
-                )
-            logprobs_tensors = None
-        else:
-            logprobs_tensors = self._get_logprobs_tensors(
-                input_batch,
-                sampled,
-                num_sampled,
-                processed_logits
-                if self.sampler.logprobs_mode == "processed_logprobs"
-                else logits,
-            )
-
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
             input_batch.seq_lens,
