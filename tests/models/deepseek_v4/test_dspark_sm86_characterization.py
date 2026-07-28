@@ -2,27 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Characterization test: resolved kernel/dispatch config for DSpark-on-sm86.
 
-Snapshots the concrete dispatch DECISIONS (not behavior) that the rebase
-(`git rebase --onto 8d8ec38361 e7df232288`, landing DSpark on top of upstream
-vLLM) and the MHC dispatcher fix (commit fcf42a8acf) depend on:
+Pins the dispatch decisions (not behavior) that DSpark-on-Ampere relies on:
 
   * On sm_8x, DeepseekV4DecoderLayer's attention factory (_select_dsv4_attn_cls)
-    resolves to DeepseekV4SM86Attention -- this is what DSpark's mtp.{0,1,2}
-    layers reuse via DeepseekV4DecoderLayer, with NO override in dspark.py.
+    resolves to DeepseekV4TritonSM86Attention. DSpark's mtp.{0,1,2} layers reuse
+    it via DeepseekV4DecoderLayer, with no override in dspark.py.
   * On sm_8x, the MHC module-level flags (_MHC_TORCH_FALLBACK/_MHC_PRE_TRITON/
     _MHC_POST_TRITON/_MHC_HEAD_TRITON) all resolve True, so MHCPreOp/MHCPostOp/
-    HCHeadOp.forward_cuda route to the Triton kernels, NOT bare TileLang ops.
-    This is the dispatch path commit fcf42a8acf's fix (self.mhc_post/self.hc_head
-    instead of mhc_post_tilelang/hc_head_fused_kernel_tilelang) now depends on
-    being live -- if these flags were ever False on this hardware, the fix
-    would be a no-op (both paths would go through TileLang either way) and
-    this test would need to be revisited.
+    HCHeadOp.forward_cuda route to the Triton kernels rather than the bare
+    TileLang ops. DSpark calling self.mhc_post/self.hc_head only differs from
+    calling the TileLang wrappers directly while these flags stay True.
 
-These values are the dispatch logic in vllm/models/deepseek_v4/nvidia/model.py
-and vllm/model_executor/layers/mhc.py, pinned here so a change to either is
-deliberate rather than incidental. This test is the executable form of that
-claim -- it will fail loudly if a future
-change (this session or later) alters which kernel path sm86 resolves to.
+The decisions live in vllm/models/deepseek_v4/nvidia/model.py and
+vllm/model_executor/layers/mhc.py; pinning them here makes a change to either
+deliberate rather than incidental.
 """
 
 import pytest
@@ -53,9 +46,6 @@ def test_sm86_attention_class_resolution_proof_string() -> None:
 
     if not _is_ampere():
         pytest.skip("proof string is sm_8x-specific; other capabilities differ")
-
-    from vllm.config import VllmConfig
-    from vllm.config.attention import AttentionConfig
 
     class _StubAttentionConfig:
         backend = None

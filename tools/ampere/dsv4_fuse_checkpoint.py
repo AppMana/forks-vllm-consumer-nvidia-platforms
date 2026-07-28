@@ -31,7 +31,6 @@ import argparse
 import json
 import re
 import shutil
-from collections import defaultdict
 from pathlib import Path
 
 import torch

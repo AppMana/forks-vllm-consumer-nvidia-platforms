@@ -24,12 +24,9 @@ the assertions verify:
 """
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
-from vllm.platforms import current_platform
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     _fused_inv_rope_fp8_quant_torch,
 )

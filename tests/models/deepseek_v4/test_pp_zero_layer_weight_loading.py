@@ -28,7 +28,6 @@ test_pp_zero_layer_last_rank.py).
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn as nn
 from safetensors.torch import save_file

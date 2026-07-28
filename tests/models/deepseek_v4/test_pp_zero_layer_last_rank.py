@@ -18,7 +18,6 @@ test_dspark_remap.py) with deterministic stand-ins for the MHC ops.
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn as nn
 

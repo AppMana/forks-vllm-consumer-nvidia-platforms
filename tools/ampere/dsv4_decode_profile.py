@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections import defaultdict
 
 
 def main() -> int:
