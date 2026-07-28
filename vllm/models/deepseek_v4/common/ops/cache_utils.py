@@ -1481,24 +1481,8 @@ def combine_topk_swa_indices(
     return combined_indices, combined_lens
 
 
-# M (query rows) and N (combined index width) vary per prefill chunk; pin them off
-# int specialization so this runs one compiled variant. Ported from pre-rebase.
-@triton.jit(do_not_specialize=["M", "N"])
-def _combine_topk_swa_indices_kernel(
-    combined_indices_ptr,
-    combined_indices_stride,
-    combined_lens_ptr,
-    topk_indices_ptr,
-    topk_indices_stride,
-    query_start_loc_ptr,
-    seq_lens_ptr,
-    gather_lens_ptr,
-    M,
-    N,
-    TOP_K: tl.constexpr,
-    COMPRESS_RATIO: tl.constexpr,
-    WINDOW_SIZE: tl.constexpr,
-    PADDED_TOP_K: tl.constexpr,
+class CombineTopkSwaIndicesKernel(
+    VllmJitKernel["CombineTopkSwaIndicesKernel.CompileKey"]
 ):
     @dataclass(frozen=True)
     class CompileKey:

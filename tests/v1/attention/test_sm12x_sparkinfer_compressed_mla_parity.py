@@ -673,9 +673,19 @@ def test_production_scale_extend_smoke() -> None:
     swa_cache = _make_unpadded_cache(17, swa_page)
     extra_cache = _make_unpadded_cache(17, extra_page)
     # Random bytes are fine for addressing coverage; scales must be valid
-    # UE8M0 (any byte decodes) and payloads any fp8 pattern.
-    for cache in (swa_cache, extra_cache):
-        cache.random_(0, 255, generator=gen)
+    # Packed, not random bytes. An earlier revision filled these with uniform
+    # bytes on the claim that any byte decodes -- it does not. 0x7F/0xFF are
+    # NaN in fp8 e4m3fn, and a UE8M0 scale byte decodes to 2^(b-127), so random
+    # footers reach 2^127 and overflow to inf on the first multiply. Each
+    # output element sums 640 slots x 512 dims, so the whole tensor came out
+    # NaN and read as a kernel fault at production scale. It is not: this same
+    # shape with a packed cache is entirely finite.
+    #
+    # Nothing is lost, because the payload bytes were never what this test
+    # covers. The addressing coverage comes from the random slot selection
+    # below, which is unchanged.
+    _fill_cache(swa_cache, swa_tokens, swa_page)
+    _fill_cache(extra_cache, extra_tokens, extra_page)
 
     rows, heads = 2048, 32
     q = (
