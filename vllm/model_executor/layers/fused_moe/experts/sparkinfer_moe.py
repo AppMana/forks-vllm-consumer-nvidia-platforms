@@ -42,15 +42,22 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 
-def _has_sparkinfer_moe() -> bool:
+logger = init_logger(__name__)
+
+
+def _sparkinfer_moe_unavailable_reason() -> str | None:
+    """None when the sparkinfer NVFP4 MoE can run; else why it cannot."""
     try:
         from sparkinfer.moe import fused_moe
-    except ImportError:
-        return False
-    return bool(fused_moe.is_supported())
+    except ImportError as exc:
+        return f"sparkinfer.moe is not importable ({exc})"
+    if not fused_moe.is_supported():
+        return "sparkinfer.moe.fused_moe reports unsupported on this device"
+    return None
 
 
 class SparkInferExperts(mk.FusedMoEExpertsModular):
@@ -114,11 +121,20 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
-        return (
-            p.is_cuda()
-            and p.is_device_capability_family(120)
-            and _has_sparkinfer_moe()
-        )
+        if not (p.is_cuda() and p.is_device_capability_family(120)):
+            return False
+        reason = _sparkinfer_moe_unavailable_reason()
+        if reason is not None:
+            # sm_12x is exactly where this expert is the intended path, so
+            # losing it here is a silent drop to the Marlin bf16 fallback.
+            logger.warning_once(
+                "sparkinfer NVFP4 fused MoE unavailable on this sm_12x "
+                "device (%s); the MoE oracle will fall back to a "
+                "dequantize-to-bf16 path and forfeit the FP4 tensor cores.",
+                reason,
+            )
+            return False
+        return True
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
