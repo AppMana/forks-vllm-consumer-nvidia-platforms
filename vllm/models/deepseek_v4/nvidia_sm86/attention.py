@@ -19,7 +19,7 @@ kernel is sized for sm_80 (A100, 164 KB smem) and overflows sm_86's 100 KB
 per-SM shared-memory cap (see pzhao-eng/FlashMLA#9). The Triton path is the
 smem-frugal route that fits sm_86. ``_o_proj`` is inherited from the FlashMLA
 layer; on sm_86 its fp8 einsum / inv-rope ops fall back to the torch software
-casts (WS6), so no override is needed. INT8 FP8 tensor cores are absent on
+casts, so no override is needed. INT8 FP8 tensor cores are absent on
 Ampere; the Triton kernels upcast FP8 inputs to bf16 internally.
 """
 

@@ -18,12 +18,10 @@ vLLM) and the MHC dispatcher fix (commit fcf42a8acf) depend on:
     would be a no-op (both paths would go through TileLang either way) and
     this test would need to be revisited.
 
-These values were verified against the resolved pre-rebase logic in each
-conflicted file during rebase conflict resolution (see the merge commits
-touching vllm/models/deepseek_v4/nvidia/model.py and
-vllm/model_executor/layers/mhc.py): none of the conflict resolutions changed
-this specific dispatch logic, only merged additive changes around it. This
-test is the executable form of that claim -- it will fail loudly if a future
+These values are the dispatch logic in vllm/models/deepseek_v4/nvidia/model.py
+and vllm/model_executor/layers/mhc.py, pinned here so a change to either is
+deliberate rather than incidental. This test is the executable form of that
+claim -- it will fail loudly if a future
 change (this session or later) alters which kernel path sm86 resolves to.
 """
 

@@ -1511,9 +1511,8 @@ void indexer_k_quant_and_cache(
   int64_t cache_block_stride = kv_cache.stride(0);
   bool use_ue8m0 = scale_fmt == "ue8m0";
   // scale_fmt "int8": symmetric per-token INT8 values (signed bit pattern in
-  // the uint8 cache) with plain fp32 absmax/127 scales. Gate-1 recall study
-  // (tools/ampere/dsv4_indexer_int8_recall.py): 99.48% mean top-512 recall
-  // vs the fp8 path on real tensors.
+  // the uint8 cache) with plain fp32 absmax/127 scales. Measured 99.48% mean
+  // top-512 recall vs the fp8 path on real tensors.
   bool use_int8 = scale_fmt == "int8";
 
   STD_TORCH_CHECK(k.device() == kv_cache.device(),

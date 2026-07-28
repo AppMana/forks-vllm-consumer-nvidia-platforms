@@ -693,8 +693,8 @@ def sparse_attn_indexer(
     if k is not None:
         k = k[:num_tokens]
 
-    # INT8 indexer cache mode (gate-1 recall 99.48% vs fp8 on real tensors;
-    # tools/ampere/dsv4_indexer_int8_recall.py). The writer stores symmetric
+    # INT8 indexer cache mode (99.48% mean top-512 recall vs fp8 on real
+    # tensors). The writer stores symmetric
     # INT8 bit patterns with plain fp32 absmax/127 scales; decode kernels branch
     # on K_IS_INT8 and prefill consumers receive an int8-viewed gather, so their
     # generic float conversions stay correct.

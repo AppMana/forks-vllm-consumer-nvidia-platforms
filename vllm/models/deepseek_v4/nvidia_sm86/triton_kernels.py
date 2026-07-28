@@ -35,7 +35,7 @@ def indexer_cache_is_int8() -> bool:
     ``indexer_k_quant_and_cache_int8``) instead of FP8 e4m3. Selected by the
     ``"vllm"`` checkpoint config block (role ``indexer_cache_int8``);
     legacy checkpoints without a block ride the experimental dense-runtime
-    flag. Gate-1 recall study: tools/ampere/dsv4_indexer_int8_recall.py."""
+    flag."""
     from vllm.transformers_utils.configs.dsv4.kernel_config import (
         indexer_cache_int8_enabled,
     )

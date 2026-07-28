@@ -939,7 +939,7 @@ def quantize_and_insert_k_cache(
 # (16-byte-aligned vs not). During prefill the gather output buffer and the cache /
 # index pointers take varying alignments, so without this pin Triton recompiles a new
 # variant per request, pinning one PP rank in compilation while the chain blocks on the
-# collective (the "rank stuck at 100%, others 0%" wedge). Ported from pre-rebase 0565d010e.
+# collective (the "rank stuck at 100%, others 0%" wedge).
 @triton.jit(
     do_not_specialize_on_alignment=[
         "out_ptr",

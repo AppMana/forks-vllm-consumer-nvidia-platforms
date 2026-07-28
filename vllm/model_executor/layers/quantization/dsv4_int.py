@@ -215,7 +215,7 @@ def requantize_mxfp4_to_int4_w4a16(
     elif scale_mode == "mse":
         # Per-group scale search minimizing round-trip MSE vs the dequantized
         # MXFP4 values: +5.5 to +6.1 dB SNR over absmax7 on real V4-Flash
-        # shards (tools/ampere/dsv4_rotation_snr.py); same layout and kernels.
+        # shards; same layout and kernels.
         best_scale = abs_max / 7.0
         best_err = None
         for div in torch.linspace(5.0, 9.5, 19, device=grouped.device):
@@ -267,10 +267,7 @@ def requantize_fp8_block_to_int4_w4a16(
     3-bit e4m3 mantissa (finer than MXFP4's 4-value E2M1 codebook) but a
     16x coarser scale grid (128x128 tiles vs MXFP4's 32-wide groups), so the
     per-group MSE scale search below re-derives its own scale table each
-    call rather than assuming the MXFP4 hyperparameters
-    (``tools/ampere/dsv4_requant_checkpoint_test.py`` covers both sources
-    against a synthetic ground truth to confirm MSE still beats absmax7 on
-    this source).
+    call rather than assuming the MXFP4 hyperparameters.
     """
     if weight_fp8.dtype != torch.float8_e4m3fn:
         raise TypeError(f"weight must be float8_e4m3fn, got {weight_fp8.dtype}")
