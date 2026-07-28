@@ -685,6 +685,82 @@ def get_paged_mqa_logits_metadata(
     return _get_paged_mqa_logits_metadata_impl(context_lens, block_size, num_sms)
 
 
+def _fp8_paged_mqa_logits_torch(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    """Reference paged MQA logits over the packed fp8 KV cache.
+
+    Correctness contract for the Triton paged-logits kernels: same dequant,
+    same ReLU-then-weight order, same -inf fill outside each context. Chunked
+    over tokens so the materialized score block stays within
+    ``_SM120_MQA_LOGITS_MAX_SCORE_BYTES``.
+    """
+    q_values, q_scale = q
+    if q_scale is not None:
+        raise NotImplementedError("Paged MQA logits torch path only supports FP8 Q")
+
+    batch_size, next_n, num_heads, head_dim = q_values.shape
+    head_dim_with_scale = kv_cache.shape[-1]
+    assert head_dim_with_scale > head_dim
+    assert weights.shape == (batch_size * next_n, num_heads)
+    assert context_lens.shape == (batch_size, next_n)
+
+    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        _view_packed_fp8_paged_mqa_kv_cache,
+    )
+
+    kv_values, kv_scales = _view_packed_fp8_paged_mqa_kv_cache(kv_cache, head_dim)
+    _, block_kv, _, _ = kv_values.shape
+    logits = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+
+    q_f32 = q_values.float()
+    score_bytes = _SM120_MQA_LOGITS_MAX_SCORE_BYTES
+    max_tokens_per_chunk = max(1, score_bytes // max(1, num_heads * 4))
+    token_offsets_cache: dict[int, torch.Tensor] = {}
+
+    for batch_idx in range(batch_size):
+        for next_idx in range(next_n):
+            row = batch_idx * next_n + next_idx
+            context_len = int(context_lens[batch_idx, next_idx].item())
+            if context_len <= 0:
+                continue
+
+            q_row = q_f32[batch_idx, next_idx]
+            row_weights = weights[row]
+            for token_start in range(0, context_len, max_tokens_per_chunk):
+                token_end = min(context_len, token_start + max_tokens_per_chunk)
+                chunk_len = token_end - token_start
+                token_offsets = token_offsets_cache.get(chunk_len)
+                if token_offsets is None or token_offsets.device != q_values.device:
+                    token_offsets = torch.arange(
+                        chunk_len, device=q_values.device, dtype=torch.long
+                    )
+                    token_offsets_cache[chunk_len] = token_offsets
+                token_ids = token_start + token_offsets
+                logical_blocks = token_ids // block_kv
+                token_in_block = token_ids - logical_blocks * block_kv
+                physical_blocks = block_tables[batch_idx, logical_blocks]
+                kv_chunk = kv_values[physical_blocks, token_in_block, 0].float()
+                scale_chunk = kv_scales[physical_blocks, token_in_block, 0].squeeze(-1)
+                kv_chunk.mul_(scale_chunk[:, None])
+                scores = torch.matmul(q_row, kv_chunk.T)
+                scores.relu_()
+                scores.mul_(row_weights[:, None])
+                logits[row, token_start:token_end] = scores.sum(dim=0)
+
+    return logits
+
+
 def fp8_fp4_paged_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv_cache: torch.Tensor,
