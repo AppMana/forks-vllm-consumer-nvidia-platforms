@@ -106,16 +106,6 @@ def main() -> int:
         action="store_true",
         help="Use vLLM compile/cudagraph defaults instead of enforce_eager=True.",
     )
-    parser.add_argument(
-        "--allow-sparse-mla-warmup",
-        action="store_true",
-        help="Keep DeepSeek V4 sparse MLA warmup enabled.",
-    )
-    parser.add_argument(
-        "--allow-mhc-warmup",
-        action="store_true",
-        help="Keep DeepSeek V4 MHC warmup enabled.",
-    )
     args = parser.parse_args()
 
     cuda_visible_devices = args.cuda_visible_devices
@@ -139,10 +129,6 @@ def main() -> int:
             )
     if cuda_visible_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
-    if not args.allow_sparse_mla_warmup:
-        os.environ["VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP"] = "0"
-    if not args.allow_mhc_warmup:
-        os.environ["VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP"] = "0"
 
     from vllm import LLM, SamplingParams
 

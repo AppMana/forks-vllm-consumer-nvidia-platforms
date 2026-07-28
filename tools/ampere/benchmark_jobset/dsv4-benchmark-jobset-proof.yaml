@@ -1111,16 +1111,6 @@ spec:
                       value: "1"
                     - name: VLLM_USE_V2_MODEL_RUNNER
                       value: "0"
-                    - name: VLLM_DEEPSEEK_V4_PREFILL_FORWARD_WARMUP
-                      value: "1"
-                    - name: VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE
-                      value: "512"
-                    - name: VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE
-                      value: "1024"
-                    - name: VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL
-                      value: "1"
-                    - name: VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH
-                      value: "0"
                     - name: VLLM_MHC_POST_TRITON
                       value: "1"
                     - name: VLLM_MHC_HEAD_TRITON

@@ -177,11 +177,6 @@ def main() -> None:
             "serving chain slice in this file."
         ),
     )
-    parser.add_argument(
-        "--kv-cache-dtype",
-        default=None,
-        help="Override APPMANA_DSV4_KV_CACHE_DTYPE for every rank.",
-    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--no-kueue", action="store_true")
     parser.add_argument(
@@ -321,8 +316,6 @@ def main() -> None:
             "APPMANA_DSV4_USE_SHARED_MODEL_PATH",
             "1" if args.use_shared_model_path else "0",
         )
-        if args.kv_cache_dtype is not None:
-            _set_env(env, "APPMANA_DSV4_KV_CACHE_DTYPE", args.kv_cache_dtype)
         _set_env(env, "APPMANA_DSV4_REQUIRE_LOCAL_MODEL_PATH", "0")
         _set_env(env, "APPMANA_DSV4_PREWARM_ONLY", "1" if args.prewarm_only else "0")
         _set_env(env, "NCCL_DEBUG", "WARN")
@@ -394,8 +387,6 @@ def main() -> None:
             "APPMANA_DSV4_USE_SHARED_MODEL_PATH",
             "1" if args.use_shared_model_path else "0",
         )
-        if args.kv_cache_dtype is not None:
-            _set_env(env, "APPMANA_DSV4_KV_CACHE_DTYPE", args.kv_cache_dtype)
         _set_env(
             env,
             "APPMANA_DSV4_REQUIRE_LOCAL_MODEL_PATH",

@@ -38,8 +38,6 @@ def main() -> int:
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    os.environ.setdefault("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "0")
-    os.environ.setdefault("VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP", "0")
 
     import torch
     from torch.profiler import ProfilerActivity, profile, record_function, schedule
