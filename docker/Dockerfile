@@ -1286,9 +1286,8 @@ for kernel in (
 # The tb-chain webhook injects NCCL_IB_SUBNET_AWARE_ROUTING=prefer_hca[...];
 # a libnccl built from a fork ref that predates the self-inferring
 # rail/fallback selection silently degrades that contract (non-adjacent ring
-# hops keep a usb4 rail and the collective hangs -- world-12 bring-up,
-# 2026-07-19). The implementation's log format strings live in .rodata, so
-# their absence proves the stale build.
+# hops keep a usb4 rail and the collective hangs). The implementation's log
+# format strings live in .rodata, so their absence proves a stale build.
 nccl_candidates = list(pathlib.Path("/usr/lib").glob("*-linux-gnu/libnccl.so.2.30.7"))
 if not nccl_candidates:
     raise AssertionError("libnccl.so.2.30.7 not found under /usr/lib/*-linux-gnu")

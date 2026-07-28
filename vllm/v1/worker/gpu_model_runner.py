@@ -3343,12 +3343,10 @@ class GPUModelRunner(
         sync_self: bool,
     ) -> IntermediateTensors:
         if self.intermediate_tensors is None:
-            # Allocated lazily on first use. The cudagraph-capture warmup's
-            # _dummy_run used to be the only allocation site, so any
-            # deployment that skips that warmup (enforce_eager /
-            # compilation NONE) hit `assert intermediate_tensors is not
-            # None` on the first real batch of every non-first PP rank --
-            # confirmed live 2026-07-17 on the PP=10 chain.
+            # Allocated lazily on first use rather than only in the
+            # cudagraph-capture warmup's _dummy_run: a deployment that skips
+            # that warmup (enforce_eager / compilation NONE) still needs the
+            # tensors for the first real batch of every non-first PP rank.
             self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
                 batch_size=self.max_num_tokens,
                 dtype=self.model_config.dtype,
@@ -3823,18 +3821,14 @@ class GPUModelRunner(
         # earlier step's non_blocking H2D copies are still queued behind
         # its forward kernels.
         #
-        # Fence history on the PP=10 chain: the single reusable event was
-        # blamed for the 2026-07-15 decode corruption and replaced first by
-        # a pooled variant (55751a8030 -- genuinely wrong, waited on step
-        # N-P instead of N-1) and then by a full device synchronize. The
-        # corruption's actual root cause was the int8_ds_mla KV-cache
-        # reshape bug (see the int8_ds_mla comment in initialize_kv_cache),
-        # NOT this fence: with that fixed, sanity is clean and the
-        # single-event fence is restored. Worker steps are CPU-serialized,
-        # so record-at-exit / synchronize-at-entry always waits on exactly
-        # the immediately previous step's copies -- sufficient, since
-        # stream order chains everything older behind them. Blocking
-        # (sleep) event to avoid busy-polling the CUDA driver lock.
+        # A single reusable event is the correct fence. Worker steps are
+        # CPU-serialized, so record-at-exit / synchronize-at-entry always
+        # waits on exactly the immediately previous step's copies --
+        # sufficient, since stream order chains everything older behind
+        # them. A pooled per-step event would be WRONG (it waits on step
+        # N-P instead of N-1), and a full device synchronize is needless.
+        # Blocking (sleep) event to avoid busy-polling the CUDA driver
+        # lock.
         torch.cuda.nvtx.range_push("prepare_inputs_wait")
         self.prepare_inputs_event.synchronize()
         torch.cuda.nvtx.range_pop()
@@ -7380,19 +7374,17 @@ class GPUModelRunner(
                     # kv_quant_mode is NONE -- but its allocation IS packed
                     # 528-byte rows (spec real_page_size_bytes, insert kernel
                     # token_stride, get_int8_ds_mla_cache_views all agree).
-                    # Passing "auto" here made get_kv_cache_shape fall through
-                    # to (nb, bs, head_size=512), viewing every int8 cache
-                    # 512B-wide: get_int8_ds_mla_cache_views then sliced a
-                    # ZERO-width fp32 scale view out of it, whose dangling
-                    # pointer+strides the native prefill/decode kernels
-                    # dereferenced (deterministic illegal memory access on the
-                    # first prefill, 2026-07-17, captured via the prefill
-                    # argument dump) and whose garbage scales the Triton
-                    # kernels consumed (the 2026-07-15 "decode corruption").
-                    # Regression came in with the 2026-07-14 upstream merge:
-                    # upstream #47716 fixed this reshape for fp8_ds_mla (whose
-                    # quant mode is non-NONE via the "fp8*" prefix rule) but
-                    # could not know about int8_ds_mla.
+                    # Passing "auto" here makes get_kv_cache_shape fall
+                    # through to (nb, bs, head_size=512), viewing every int8
+                    # cache 512B-wide: get_int8_ds_mla_cache_views then
+                    # slices a ZERO-width fp32 scale view out of it, whose
+                    # dangling pointer+strides the native prefill/decode
+                    # kernels dereference (deterministic illegal memory
+                    # access on the first prefill) and whose garbage scales
+                    # the Triton kernels consume (silent decode corruption).
+                    # Upstream #47716 handles this reshape for fp8_ds_mla
+                    # (whose quant mode is non-NONE via the "fp8*" prefix
+                    # rule) but cannot know about int8_ds_mla.
                     spec_cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
                     layer_cache_dtype_str = (
                         "auto"

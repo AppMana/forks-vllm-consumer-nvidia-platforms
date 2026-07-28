@@ -260,9 +260,9 @@ def test_mxfp4_to_int4_mse_scale_mode_beats_absmax7():
         )
         snrs[mode] = _snr_db(fp4_truth, dequant)
 
-    # Measured +5.5 to +6.1 dB on real V4-Flash shards. Uniform-random
-    # synthetic nibbles exercise the search less (+1.7 dB measured), so the
-    # regression floor here is +1.0 dB.
+    # Real V4-Flash shards gain +5.5 to +6.1 dB; uniform-random synthetic
+    # nibbles exercise the search less (~+1.7 dB), so the regression floor
+    # here is +1.0 dB.
     assert snrs["mse"] > snrs["absmax7"] + 1.0, snrs
 
 

@@ -215,8 +215,8 @@ def requantize_mxfp4_to_int4_w4a16(
     elif scale_mode == "mse":
         # Per-group scale search minimizing round-trip MSE against the
         # dequantized MXFP4 values. On real V4-Flash expert tensors this
-        # measured +5.5 to +6.1 dB SNR over absmax7 (20.1 -> 25.6-26.2 dB,
-        # tools/ampere/dsv4_rotation_snr.py, 2026-06-10) with no format
+        # gains +5.5 to +6.1 dB SNR over absmax7 (20.1 -> 25.6-26.2 dB;
+        # reproducible with tools/ampere/dsv4_rotation_snr.py) with no format
         # change: same signed INT4 group-32 layout and Marlin kernels.
         best_scale = abs_max / 7.0
         best_err = None
@@ -913,11 +913,11 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
             _dsv4_log_path(path)
             return
         if self.strategy == "channel":
-            # AllSpark is the only Ampere channel-W8A16 kernel: the 2026-06-10
-            # A5000 GEMM matrix measured it 2-5x faster than the (now removed)
-            # Triton channel kernel at every M, and its alignment gate (% 16 on
-            # both dims) is identical to Triton's, so any layer Triton could
-            # take AllSpark already takes. Layers AllSpark cannot take (op
+            # AllSpark is the only Ampere channel-W8A16 kernel: it is 2-5x
+            # faster than a Triton channel kernel at every M on Ampere, and
+            # its alignment gate (% 16 on both dims) is identical to the
+            # Triton kernel's, so any layer a Triton kernel could take
+            # AllSpark already takes. Layers AllSpark cannot take (op
             # unavailable, unaligned dims) fall through to the bf16 dequant.
             if self._try_process_allspark(layer):
                 _dsv4_log_path("allspark")

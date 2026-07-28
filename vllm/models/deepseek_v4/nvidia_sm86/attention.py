@@ -519,13 +519,13 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 )
             dump_dir = os.environ.get("APPMANA_DSV4_PREFILL_DUMP_DIR")
             if dump_dir:
-                # Diagnostic capture for the deterministic first-prefill IMA on
-                # the PP=10 chain (2026-07-17): synthetic replays of this call
-                # pass, so save the REAL argument tensors and cache-view
-                # geometry before the kernel launch. The last dump written
-                # before the fault identifies the faulting call exactly; the
-                # saved payload replays locally against zero caches of
-                # identical geometry (IMA is addressing, not values).
+                # Diagnostic capture for prefill IMA debugging: a synthetic
+                # replay of this call can pass while the real one faults, so
+                # save the REAL argument tensors and cache-view geometry
+                # before the kernel launch. The last dump written before a
+                # fault identifies the faulting call exactly; the saved
+                # payload replays locally against zero caches of identical
+                # geometry (IMA is addressing, not values).
                 idx = getattr(self, "_prefill_dump_idx", 0)
                 self._prefill_dump_idx = idx + 1
                 torch.cuda.synchronize()

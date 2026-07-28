@@ -326,8 +326,8 @@ def _reshape_kv_cache(
                 # (nb, bs, head_size=512) instead of the packed 528-byte
                 # rows, and get_int8_ds_mla_cache_views then slices a
                 # ZERO-width fp32 scale view whose dangling pointer the
-                # kernels dereference. Same bug and fix as the v1 runner's
-                # initialize_kv_cache (2026-07-17, f3c6e73eb5).
+                # kernels dereference. Same rule as the v1 runner's
+                # initialize_kv_cache.
                 layer_cache_dtype = (
                     "auto"
                     if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE

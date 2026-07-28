@@ -7,7 +7,8 @@
 # workers can emit arm64 layers. Native alternatives do not work -- GitHub's
 # hosted arm64 runners are 4 cores / 16 GB and are OOM-killed by nvcc, and the
 # hilton buildkitd's containerd worker has no CNI, so RUN steps have no network
-# egress. Building on a Spark by hand is what wedged spark-2ab3 on 2026-07-24.
+# egress. Never build on a Spark by hand: a ~30 GB build + image import on a
+# serving node exhausts the unified-memory pool and wedges it.
 #
 # Usage:
 #   docker/build-consumer-platforms.sh [--platform linux/arm64] [--tag NAME]

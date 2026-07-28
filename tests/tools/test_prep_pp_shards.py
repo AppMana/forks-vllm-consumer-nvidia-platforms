@@ -53,10 +53,9 @@ class TestComputeCacheKey:
         # string independently on every remote worker's own node. If the
         # cache key included pp_rank, every rank would stage under a
         # DIFFERENT directory name, and a remote worker looking for the
-        # leader's hash on its own disk would find nothing -- confirmed
-        # live 2026-07-16: every remote worker failed with "Repo id must be
-        # in the form repo_name or namespace/repo_name" immediately
-        # downstream of exactly this. compute_cache_key must not take a
+        # leader's hash on its own disk would find nothing and fail model
+        # resolution ("Repo id must be in the form repo_name or
+        # namespace/repo_name"). compute_cache_key must not take a
         # pp_rank parameter at all -- this test exists so a future
         # regression re-adding rank-sensitivity fails at the call site, not
         # silently in production.

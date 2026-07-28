@@ -663,8 +663,7 @@ def test_production_scale_extend_smoke() -> None:
     """Production-scale prefill footprint: 2048 query rows, ~4200-token
     context slot ids across many pages, real widths (SWA 128 + topk 512 at
     pool pages 256/64). No oracle comparison (too slow at this size) — this
-    guards ADDRESSING: the kernel must complete with finite output. Written
-    for the long-prefill IMA investigation."""
+    guards ADDRESSING: the kernel must complete with finite output."""
     torch.manual_seed(17)
     gen = torch.Generator(device="cuda")
     gen.manual_seed(17)
@@ -672,18 +671,13 @@ def test_production_scale_extend_smoke() -> None:
     swa_tokens, extra_tokens = 4352, 1088  # 17 pages / 17 pages
     swa_cache = _make_unpadded_cache(17, swa_page)
     extra_cache = _make_unpadded_cache(17, extra_page)
-    # Random bytes are fine for addressing coverage; scales must be valid
-    # Packed, not random bytes. An earlier revision filled these with uniform
-    # bytes on the claim that any byte decodes -- it does not. 0x7F/0xFF are
-    # NaN in fp8 e4m3fn, and a UE8M0 scale byte decodes to 2^(b-127), so random
-    # footers reach 2^127 and overflow to inf on the first multiply. Each
-    # output element sums 640 slots x 512 dims, so the whole tensor came out
-    # NaN and read as a kernel fault at production scale. It is not: this same
-    # shape with a packed cache is entirely finite.
-    #
-    # Nothing is lost, because the payload bytes were never what this test
-    # covers. The addressing coverage comes from the random slot selection
-    # below, which is unchanged.
+    # Packed cache contents, not random bytes: not every byte decodes.
+    # 0x7F/0xFF are NaN in fp8 e4m3fn, and a UE8M0 scale byte decodes to
+    # 2^(b-127), so a random footer byte can reach 2^127 and overflow to inf
+    # on the first multiply. Each output element sums 640 slots x 512 dims,
+    # so a random-filled cache turns the whole tensor NaN and masquerades as
+    # a kernel fault. The payload bytes are not what this test covers anyway:
+    # the ADDRESSING coverage comes from the random slot selection below.
     _fill_cache(swa_cache, swa_tokens, swa_page)
     _fill_cache(extra_cache, extra_tokens, extra_page)
 

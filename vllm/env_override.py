@@ -599,7 +599,7 @@ if is_torch_equal_or_newer("2.10.0") and not is_torch_equal_or_newer("2.12.0.dev
 # PyTorch 2.10's FxGraphCachePickler.dumps() doesn't catch ValueError,
 # causing torch.compile cache failures when tensors with non-standard
 # layouts (e.g. blocked-layout prepacked weights) are serialized.
-# PyTorch mainline fixed this in pytorch/pytorch#176557 (merged 2026-03-04).
+# PyTorch mainline fixed this in pytorch/pytorch#176557.
 # This is a thin backport for 2.10 users; remove once 2.10 is dropped.
 
 

@@ -27,8 +27,8 @@ rather than reinvented: an ownership change repoints snapshot symlinks in
 place and copies just the blobs the local blobs/ directory lacks. The staged
 model path is the snapshot directory -- identical on every rank (vLLM's Ray
 executor resolves one --model path string independently on each worker's
-node; confirmed live 2026-07-16 that a rank-dependent path breaks remote
-workers), with per-node divergence living entirely in which blobs are local.
+node, so a rank-dependent path breaks remote workers), with per-node
+divergence living entirely in which blobs are local.
 
 ``--gc`` prunes snapshots of other revisions, local blobs that do not
 belong to the current checkpoint, and directories left by the older staging
