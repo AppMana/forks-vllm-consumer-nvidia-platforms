@@ -18,6 +18,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mhc import (
     HCHeadOp,
     MHCFusedPostPreOp,
@@ -76,6 +77,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -779,10 +782,28 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         if device_capability is not None and device_capability.major == 12:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
+    if backend == AttentionBackendEnum.SPARKINFER_MLA_SPARSE_DSV4:
+        from vllm.models.deepseek_v4.nvidia_sm12x.attention import (
+            DeepseekV4SparkInferSM12xAttention,
+        )
+
+        return DeepseekV4SparkInferSM12xAttention
     if backend in (
         AttentionBackendEnum.FLASHMLA_SPARSE,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
     ):
+        # An explicit flag outranks capability-based selection, so on sm_8x /
+        # sm_12x this leaves the arch-tuned class behind. Say so: the generic
+        # FlashMLA kernels are sized for sm_80/sm_90 shared memory.
+        if device_capability is not None and device_capability.major in (8, 12):
+            logger.warning(
+                "--attention-backend %s overrides the sm_%d%d DeepSeek-V4 "
+                "attention class; the generic FlashMLA kernels are not tuned "
+                "for this device.",
+                backend.name,
+                device_capability.major,
+                device_capability.minor,
+            )
         return DeepseekV4FlashMLAAttention
 
     if device_capability is not None and device_capability.major == 12:

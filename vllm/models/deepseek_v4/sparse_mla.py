@@ -113,7 +113,11 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major in [9, 10]
+        # sm_8x is served by DeepseekV4TritonSM86Attention, which reuses this
+        # backend's metadata builder and paged layout unchanged and only swaps
+        # the kernel launches. The backend must not reject the arch its own
+        # subclass runs on.
+        return capability.major in (8, 9, 10)
 
     @staticmethod
     def get_kv_cache_shape(

@@ -13,10 +13,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Every DSV4 sparse-MLA backend, whatever its kernel provider: all of them
+# reach the same three Triton helper kernels (sparse-SWA prefill metadata,
+# indexer prefill-chunk metadata, combine-topk/SWA indices), so all of them
+# must be warmed. A backend missing here JITs on the first real request.
 _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
     {
         "FLASHMLA_SPARSE_DSV4",
         "FLASHINFER_MLA_SPARSE_DSV4",
+        "SPARKINFER_MLA_SPARSE_DSV4",
         "ROCM_FLASHMLA_SPARSE_DSV4",
         "DEEPSEEK_SPARSE_SWA",
     }
@@ -28,8 +33,6 @@ _GENERIC_SPARSE_MLA_BACKENDS = frozenset(
         "FLASHINFER_MLA_SPARSE_SM120",
     }
 )
-_INDEXER_PREFILL_CHUNK_METADATA_BACKENDS = frozenset({"DEEPSEEK_V32_INDEXER"})
-
 _INDEXER_PREFILL_CHUNK_METADATA_BACKENDS = frozenset({"DEEPSEEK_V32_INDEXER"})
 
 
