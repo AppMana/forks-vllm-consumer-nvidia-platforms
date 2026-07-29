@@ -132,8 +132,11 @@ The current Hilton node-local image is
 `docker.io/appmana/vllm-consumer:sm86-sm121` at
 OCI-index digest
 `sha256:8ef70c5d2699900dc3f560b6f278f8a09a165d345d65a184460db38495c03e73`;
-the arm64 manifest is `sha256:e1045275...` and the config/pod image ID is
-`sha256:5d516d8c...`. Both nodes match all three identities.
+the arm64 manifest is
+`sha256:e10452754b2d3d1b96db824b0e6ccd46e1ad6d93a7426a2d014b584528112f3b`
+and the config/pod image ID is
+`sha256:5d516d8c727a3821eda042ed3a7f9460741dda264288b6e5b401660b1b5a87b4`.
+Both nodes match all three identities.
 Installed-file hashes tie it to vLLM `85f78d8827` and sparkinfer `fb71dc89`;
 its OCI source/revision labels are wrong and must not be cited as provenance.
 It predates both NVFP4 fixes above. A tag match alone is insufficient: record
