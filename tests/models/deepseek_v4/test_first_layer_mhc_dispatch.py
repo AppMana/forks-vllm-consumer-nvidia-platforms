@@ -38,6 +38,7 @@ class _Recorder:
         self.mhc_pre_residuals: list[torch.Size] = []
         self.broadcast_inputs: list[torch.Size] = []
         self.attn_norm_calls = 0
+        self.fused_norm_weights: list[torch.Tensor | None] = []
 
 
 def _make_layer(recorder: _Recorder, *, hc_attn_fn_broadcast=None):
@@ -72,7 +73,8 @@ def _make_layer(recorder: _Recorder, *, hc_attn_fn_broadcast=None):
     attn_norm.weight = torch.ones(HIDDEN_SIZE)
     attn_norm.variance_epsilon = 1e-6
 
-    def mhc_fused_post_pre(x, residual, post_mix, res_mix, *args):
+    def mhc_fused_post_pre(x, residual, post_mix, res_mix, *args, **kwargs):
+        recorder.fused_norm_weights.append(kwargs.get("norm_weight"))
         return residual, post_mix, res_mix, x
 
     layer.mhc_pre = mhc_pre
@@ -80,7 +82,13 @@ def _make_layer(recorder: _Recorder, *, hc_attn_fn_broadcast=None):
     layer.attn_norm = attn_norm
     layer.attn = lambda positions, x, _: x
     layer.mhc_fused_post_pre = mhc_fused_post_pre
-    layer.ffn_norm = lambda x: x
+
+    def ffn_norm(x):
+        return x
+
+    ffn_norm.weight = torch.ones(HIDDEN_SIZE)
+    ffn_norm.variance_epsilon = 1e-6
+    layer.ffn_norm = ffn_norm
     layer.ffn = lambda x, input_ids: x
     return layer
 
@@ -167,6 +175,40 @@ def test_two_dimensional_first_layer_input_takes_the_broadcast_kernel(
     )
 
 
+def test_two_dimensional_first_layer_input_takes_sparkinfer_broadcast(
+    monkeypatch,
+) -> None:
+    """SparkInfer owns the 2D broadcast and folds the following RMSNorm."""
+    from vllm.models.deepseek_v4.nvidia import model as model_module
+    from vllm.models.deepseek_v4.nvidia_sm12x import mhc as sparkinfer_adapter
+
+    recorder = _Recorder()
+
+    def fake_broadcast(x, *args, **kwargs):
+        recorder.broadcast_inputs.append(x.shape)
+        residual = x.unsqueeze(-2).expand(-1, HC_MULT, -1).contiguous()
+        return (
+            residual,
+            torch.zeros(NUM_TOKENS, HC_MULT, 1),
+            torch.zeros(NUM_TOKENS, HC_MULT, HC_MULT),
+            x,
+        )
+
+    monkeypatch.setattr(model_module, "mhc_uses_tilelang", lambda: False)
+    monkeypatch.setattr(
+        sparkinfer_adapter, "sparkinfer_mhc_pre_broadcast", fake_broadcast
+    )
+    layer = _make_layer(recorder, hc_attn_fn_broadcast=torch.zeros(1))
+    layer.use_sparkinfer_mhc = True
+
+    _forward(layer, torch.zeros(NUM_TOKENS, HIDDEN_SIZE))
+
+    assert recorder.broadcast_inputs == [torch.Size([NUM_TOKENS, HIDDEN_SIZE])]
+    assert not recorder.mhc_pre_residuals
+    assert recorder.attn_norm_calls == 0
+    assert recorder.fused_norm_weights[-1] is layer.ffn_norm.weight
+
+
 def test_later_layers_keep_the_fused_post_pre_path(monkeypatch) -> None:
     """A layer handed a residual must not re-enter the first-layer branch."""
     from vllm.models.deepseek_v4.nvidia import model as model_module
@@ -193,6 +235,34 @@ def test_later_layers_keep_the_fused_post_pre_path(monkeypatch) -> None:
 
     assert not recorder.mhc_pre_residuals
     assert recorder.attn_norm_calls == 1
+
+
+def test_sparkinfer_later_layer_fuses_both_norms(monkeypatch) -> None:
+    from vllm.models.deepseek_v4.nvidia import model as model_module
+
+    monkeypatch.setattr(model_module, "mhc_uses_tilelang", lambda: False)
+    recorder = _Recorder()
+    layer = _make_layer(recorder)
+    layer.use_sparkinfer_mhc = True
+    residual = torch.zeros(NUM_TOKENS, HC_MULT, HIDDEN_SIZE)
+
+    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4DecoderLayer
+
+    DeepseekV4DecoderLayer.forward(
+        layer,
+        torch.zeros(NUM_TOKENS, HIDDEN_SIZE),
+        positions=torch.arange(NUM_TOKENS),
+        input_ids=None,
+        post_mix=torch.zeros(NUM_TOKENS, HC_MULT, 1),
+        res_mix=torch.zeros(NUM_TOKENS, HC_MULT, HC_MULT),
+        residual=residual,
+    )
+
+    assert recorder.attn_norm_calls == 0
+    assert recorder.fused_norm_weights == [
+        layer.attn_norm.weight,
+        layer.ffn_norm.weight,
+    ]
 
 
 # ---------------------------------------------------------------------------

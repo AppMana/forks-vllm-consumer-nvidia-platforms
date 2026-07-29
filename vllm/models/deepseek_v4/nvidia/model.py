@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -20,13 +19,6 @@ from vllm.distributed import (
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
-from vllm.model_executor.layers.mhc import (
-    HCHeadOp,
-    MHCFusedPostPreOp,
-    MHCPostOp,
-    MHCPreOp,
-    mhc_uses_tilelang,
-)
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -45,6 +37,14 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mhc import (
+    HCHeadOp,
+    MHCFusedPostPreOp,
+    MHCPostOp,
+    MHCPreOp,
+    mhc_uses_sparkinfer,
+    mhc_uses_tilelang,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -925,15 +925,29 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
-        # Lazy import registers the MHC custom ops without a top-level tilelang
-        # dependency. The ops self-dispatch tilelang (Hopper) / triton (sm_8x) /
-        # torch; norm is applied unfused (attn_norm/ffn_norm below) on every
-        # path, matching the amd backend.
+        # Lazy import registers the MHC custom ops without a top-level TileLang
+        # dependency. The ops dispatch the selected mHC component; SparkInfer
+        # fuses the following norms, while the default and fallback paths apply
+        # attn_norm/ffn_norm below.
         import vllm.model_executor.layers.mhc  # noqa: F401
 
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
+        self.use_sparkinfer_mhc = mhc_uses_sparkinfer()
+        if self.use_sparkinfer_mhc:
+            from vllm.models.deepseek_v4.nvidia_sm12x.mhc import (
+                validate_sparkinfer_mhc_contract,
+            )
+
+            validate_sparkinfer_mhc_contract(
+                hidden_size=self.hidden_size,
+                hc_mult=self.hc_mult,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                hc_post_alpha=self.hc_post_alpha,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+            )
 
     def hc_pre(
         self,
@@ -968,6 +982,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # kernel has no unfused mode, so the norm below must be skipped rather
         # than applied a second time.
         norm_already_applied = False
+        use_sparkinfer_mhc = getattr(self, "use_sparkinfer_mhc", False)
         if residual is None:
             # First layer. The embedding is (T, H): upstream removed the
             # unconditional expand-to-(T, hc_mult, H) as a perf win (#48137)
@@ -975,6 +990,27 @@ class DeepseekV4DecoderLayer(nn.Module):
             # dropping it left the 2-D case falling into the 3-D path, where
             # hc_mult = residual.shape[-2] reads the token count.
             if (
+                x.dim() == 2
+                and self.hc_attn_fn_broadcast is not None
+                and use_sparkinfer_mhc
+            ):
+                from vllm.models.deepseek_v4.nvidia_sm12x.mhc import (
+                    sparkinfer_mhc_pre_broadcast,
+                )
+
+                residual, post_mix, res_mix, x = sparkinfer_mhc_pre_broadcast(
+                    x,
+                    self.hc_attn_fn_broadcast,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    rms_eps=self.rms_norm_eps,
+                    hc_eps=self.hc_eps,
+                    sinkhorn_iters=self.hc_sinkhorn_iters,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
+                )
+                norm_already_applied = True
+            elif (
                 x.dim() == 2
                 and self.hc_attn_fn_broadcast is not None
                 and mhc_uses_tilelang()
@@ -1009,7 +1045,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
                 )
         else:
-            residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+            mhc_args = (
                 x,
                 residual,
                 post_mix,
@@ -1023,6 +1059,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
             )
+            if use_sparkinfer_mhc:
+                residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+                    *mhc_args,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
+                )
+                norm_already_applied = True
+            else:
+                residual, post_mix, res_mix, x = self.mhc_fused_post_pre(*mhc_args)
 
         # Norm is applied unfused (the MHC ops above do not fold it), except
         # on the broadcast path, which has already folded it.
@@ -1030,7 +1075,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = self.attn_norm(x)
         x = self.attn(positions, x, None)
 
-        residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+        mhc_args = (
             x,
             residual,
             post_mix,
@@ -1044,8 +1089,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
         )
-
-        x = self.ffn_norm(x)
+        if use_sparkinfer_mhc:
+            residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+                *mhc_args,
+                norm_weight=self.ffn_norm.weight,
+                norm_eps=self.ffn_norm.variance_epsilon,
+            )
+        else:
+            residual, post_mix, res_mix, x = self.mhc_fused_post_pre(*mhc_args)
+            x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 

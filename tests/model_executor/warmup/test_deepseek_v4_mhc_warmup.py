@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import types
+from types import SimpleNamespace
 
 import torch
 
@@ -27,6 +28,7 @@ class FakeMHCLayer(torch.nn.Module):
         self.hc_ffn_base = torch.empty(8, dtype=torch.float32)
         self.pre_calls: list[tuple[int, torch.Tensor]] = []
         self.fused_calls: list[tuple[int, torch.Tensor, int]] = []
+        self.fused_norms: list[torch.Tensor | None] = []
 
     def hc_pre(
         self,
@@ -61,6 +63,7 @@ class FakeMHCLayer(torch.nn.Module):
         hc_post_alpha: float,
         hc_sinkhorn_iters: int,
         n_splits: int,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         del layer_input, post_mix, comb_mix, scale, base
         assert rms_norm_eps == self.rms_norm_eps
@@ -69,6 +72,7 @@ class FakeMHCLayer(torch.nn.Module):
         assert hc_post_alpha == self.hc_post_alpha
         assert hc_sinkhorn_iters == self.hc_sinkhorn_iters
         self.fused_calls.append((residual.shape[0], fn, n_splits))
+        self.fused_norms.append(kwargs.get("norm_weight"))
         return (
             torch.empty_like(residual),
             torch.empty(residual.shape[0], self.hc_mult, 1, dtype=torch.float32),
@@ -110,3 +114,38 @@ def test_mhc_layer_discovery_matches_live_deepseek_v4_layer_shape() -> None:
     model.layer = FakeMHCLayer()
 
     assert _find_first_mhc_layer(model) is model.layer
+
+
+def test_sparkinfer_warmup_exercises_broadcast_and_fused_norm(
+    monkeypatch,
+) -> None:
+    from vllm.models.deepseek_v4.nvidia_sm12x import mhc as adapter
+
+    layer = FakeMHCLayer()
+    layer.use_sparkinfer_mhc = True
+    layer.hc_attn_fn_broadcast = torch.empty(8, 8, dtype=torch.float32)
+    layer.attn_norm = SimpleNamespace(weight=torch.ones(8), variance_epsilon=1.0e-6)
+    layer.ffn_norm = SimpleNamespace(weight=torch.ones(8), variance_epsilon=1.0e-6)
+    broadcast_sizes = []
+
+    def fake_broadcast(x, *args, **kwargs):
+        broadcast_sizes.append(x.shape[0])
+        residual = x[:, None, :].expand(-1, 2, -1).contiguous()
+        return (
+            residual,
+            torch.empty(x.shape[0], 2, 1),
+            torch.empty(x.shape[0], 2, 2),
+            x,
+        )
+
+    monkeypatch.setattr(adapter, "sparkinfer_mhc_pre_broadcast", fake_broadcast)
+
+    _warmup_layer_mhc(layer, [1, 4])
+
+    assert broadcast_sizes == [1, 4]
+    assert layer.fused_norms == [
+        layer.attn_norm.weight,
+        layer.ffn_norm.weight,
+        layer.attn_norm.weight,
+        layer.ffn_norm.weight,
+    ]

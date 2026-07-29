@@ -23,13 +23,13 @@ Principles:
    ``KERNEL_REGISTRY``.
 3. Fail closed: an unknown symbol is a hard startup error; two symbols
    claiming the same role is a hard error. A *selector* role (decode fp8,
-   decode int8, prefill: roles that always need one kernel) with no symbol
-   uses its documented default. When a block with a ``kernels`` list is
-   present it is authoritative for the *toggle* roles (indexer cache int8,
-   indexer query int8, dense experts int8 activation, indexer streaming
-   top-k prefill): unlisted means OFF. Without a block -- which is what
-   official upstream checkpoints ship -- roles are resolved from the
-   checkpoint's own dtypes and the device by ``blockless_role_defaults``:
+   decode int8, prefill, mHC: roles that always need one implementation) with
+   no symbol uses its documented default. When a block with a ``kernels`` list
+   is present it is authoritative for the *toggle* roles (indexer cache int8,
+   indexer query int8, dense experts int8 activation, indexer streaming top-k
+   prefill): unlisted means OFF. Without a block -- which is what official
+   upstream checkpoints ship -- roles are resolved from the checkpoint's own
+   dtypes and the device by ``blockless_role_defaults``:
    an int checkpoint gets the integer cache and integer kernels (with its
    indexer/dense integer paths on, because for those weights that is the
    intent rather than an opt-in), and an fp checkpoint gets the fp8 cache
@@ -45,8 +45,9 @@ Principles:
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -70,6 +71,7 @@ _ALLOWED_BLOCK_KEYS = frozenset(
 ROLE_SPARSE_MLA_DECODE_FP8 = "sparse_mla_decode_fp8"
 ROLE_SPARSE_MLA_DECODE_INT8 = "sparse_mla_decode_int8"
 ROLE_SPARSE_MLA_PREFILL = "sparse_mla_prefill"
+ROLE_MHC = "mhc"
 # Toggle roles: membership turns the path on; absence (in an explicit block)
 # turns it off.
 ROLE_INDEXER_CACHE_INT8 = "indexer_cache_int8"
@@ -83,8 +85,7 @@ ROLE_INDEXER_STREAMING_TOPK_PREFILL = "indexer_streaming_topk_prefill"
 
 SPARSE_MLA_DECODE_FP8_FLASH = "flash_mla.sparse_mla_decode_fp8"
 SPARSE_MLA_DECODE_FP8_TRITON = (
-    "vllm.models.deepseek_v4.nvidia_imma.triton_kernels."
-    "decode_sparse_attention_triton"
+    "vllm.models.deepseek_v4.nvidia_imma.triton_kernels.decode_sparse_attention_triton"
 )
 SPARSE_MLA_DECODE_INT8_TRITON = "flash_mla.sparse_mla_decode_int8_triton"
 SPARSE_MLA_DECODE_INT8_FLASH = "flash_mla.sparse_mla_decode_int8"
@@ -102,8 +103,7 @@ SPARSE_MLA_PREFILL_FLASH = "flash_mla.sparse_mla_prefill"
 SPARSE_MLA_PREFILL_INT8_FLASH = "flash_mla.sparse_mla_prefill_int8"
 INDEXER_CACHE_INT8_WRITER = "vllm._custom_ops.indexer_k_quant_and_cache_int8"
 INDEXER_QUERY_INT8_QUANT = (
-    "vllm.models.deepseek_v4.common.ops.fused_indexer_q."
-    "fused_indexer_q_rope_quant_int8"
+    "vllm.models.deepseek_v4.common.ops.fused_indexer_q.fused_indexer_q_rope_quant_int8"
 )
 DENSE_EXPERTS_INT8_ACTIVATION = (
     "vllm.model_executor.layers.quantization.utils.marlin_utils."
@@ -124,6 +124,11 @@ SPARSE_MLA_DECODE_FP8_SPARKINFER = (
 SPARSE_MLA_PREFILL_SPARKINFER = (
     "vllm.models.deepseek_v4.nvidia_sm12x.kernels.sparkinfer_sparse_mla_extend"
 )
+MHC_VLLM_AUTO = "vllm.model_executor.layers.mhc.MHCFusedPostPreOp"
+# Selecting this salient fused callable activates the narrow mHC component:
+# run_pre for first-layer broadcast, run_post_pre between sublayers, and
+# run_post for collapse. Attention and MoE roles remain independent.
+MHC_SPARKINFER = "vllm.models.deepseek_v4.nvidia_sm12x.mhc.sparkinfer_mhc_post_pre"
 
 KERNEL_REGISTRY: dict[str, str] = {
     SPARSE_MLA_DECODE_FP8_FLASH: ROLE_SPARSE_MLA_DECODE_FP8,
@@ -135,6 +140,8 @@ KERNEL_REGISTRY: dict[str, str] = {
     SPARSE_MLA_PREFILL_INT8_FLASH: ROLE_SPARSE_MLA_PREFILL,
     SPARSE_MLA_DECODE_FP8_SPARKINFER: ROLE_SPARSE_MLA_DECODE_FP8,
     SPARSE_MLA_PREFILL_SPARKINFER: ROLE_SPARSE_MLA_PREFILL,
+    MHC_VLLM_AUTO: ROLE_MHC,
+    MHC_SPARKINFER: ROLE_MHC,
     INDEXER_CACHE_INT8_WRITER: ROLE_INDEXER_CACHE_INT8,
     INDEXER_QUERY_INT8_QUANT: ROLE_INDEXER_QUERY_INT8,
     DENSE_EXPERTS_INT8_ACTIVATION: ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
@@ -145,6 +152,7 @@ SELECTOR_ROLE_DEFAULTS: dict[str, str] = {
     ROLE_SPARSE_MLA_DECODE_FP8: SPARSE_MLA_DECODE_FP8_FLASH,
     ROLE_SPARSE_MLA_DECODE_INT8: SPARSE_MLA_DECODE_INT8_TRITON,
     ROLE_SPARSE_MLA_PREFILL: SPARSE_MLA_PREFILL_TRITON,
+    ROLE_MHC: MHC_VLLM_AUTO,
 }
 
 TOGGLE_ROLES = frozenset(
@@ -160,6 +168,7 @@ _PROOF_ROLE_ORDER = (
     ROLE_SPARSE_MLA_DECODE_FP8,
     ROLE_SPARSE_MLA_DECODE_INT8,
     ROLE_SPARSE_MLA_PREFILL,
+    ROLE_MHC,
     ROLE_INDEXER_CACHE_INT8,
     ROLE_INDEXER_QUERY_INT8,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
@@ -394,7 +403,9 @@ def blockless_role_defaults(hf_config: Any) -> tuple[dict[str, str], str]:
         )
         roles = {
             ROLE_SPARSE_MLA_DECODE_INT8: (
-                SPARSE_MLA_DECODE_INT8_FLASH if native else SPARSE_MLA_DECODE_INT8_TRITON
+                SPARSE_MLA_DECODE_INT8_FLASH
+                if native
+                else SPARSE_MLA_DECODE_INT8_TRITON
             ),
             ROLE_SPARSE_MLA_PREFILL: (
                 SPARSE_MLA_PREFILL_INT8_FLASH if native else SPARSE_MLA_PREFILL_TRITON
@@ -480,7 +491,7 @@ def activate_kernel_config(
     resolved: ResolvedKernelConfig,
 ) -> None:
     global _ACTIVE_CONFIG
-    if _ACTIVE_CONFIG is not None and _ACTIVE_CONFIG != resolved:
+    if _ACTIVE_CONFIG is not None and resolved != _ACTIVE_CONFIG:
         logger.debug(
             "Replacing active kernel config %s with %s",
             _ACTIVE_CONFIG,
@@ -599,9 +610,7 @@ def apply_checkpoint_config(model_config: Any, cache_config: Any) -> None:
         cache_config.cache_dtype = resolved.cache_type
 
 
-def resolved_proof_line(
-    resolved: ResolvedKernelConfig, *, kv_cache_dtype: str
-) -> str:
+def resolved_proof_line(resolved: ResolvedKernelConfig, *, kv_cache_dtype: str) -> str:
     """Single stable-format line stating every active role -> symbol plus the
     resolved kv-cache dtype. This is the benchmark validity check."""
     parts = []

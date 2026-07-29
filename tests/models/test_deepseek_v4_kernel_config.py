@@ -11,25 +11,26 @@ the dense runtime, cache_type defaulting, and Ray unpickle gate propagation.
 import pickle
 from types import SimpleNamespace
 
-from vllm.platforms.interface import DeviceCapability
-
 import pytest
 import torch
 
 import vllm.model_executor.layers.quantization.dsv4_int as dsv4_int_module
 import vllm.transformers_utils.configs.dsv4.kernel_config as kernel_config
 from vllm.model_executor.layers.quantization.dsv4_int import Dsv4IntConfig
+from vllm.platforms.interface import DeviceCapability
 from vllm.transformers_utils.configs.dsv4.kernel_config import (
-    VLLM_CONFIG_KEY,
     DENSE_EXPERTS_INT8_ACTIVATION,
     INDEXER_CACHE_INT8_WRITER,
     INDEXER_QUERY_INT8_QUANT,
     INDEXER_STREAMING_TOPK_PREFILL,
     KERNEL_REGISTRY,
+    MHC_SPARKINFER,
+    MHC_VLLM_AUTO,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
     ROLE_INDEXER_CACHE_INT8,
     ROLE_INDEXER_QUERY_INT8,
     ROLE_INDEXER_STREAMING_TOPK_PREFILL,
+    ROLE_MHC,
     ROLE_SPARSE_MLA_DECODE_FP8,
     ROLE_SPARSE_MLA_DECODE_INT8,
     ROLE_SPARSE_MLA_PREFILL,
@@ -42,6 +43,7 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     SPARSE_MLA_PREFILL_INT8_FLASH,
     SPARSE_MLA_PREFILL_SPARKINFER,
     SPARSE_MLA_PREFILL_TRITON,
+    VLLM_CONFIG_KEY,
     activate_kernel_config,
     apply_checkpoint_config,
     dense_experts_int8_activation_enabled,
@@ -70,9 +72,7 @@ _INT_GROUPS = {
 @pytest.fixture(autouse=True)
 def _reset_kernel_config_globals(monkeypatch):
     monkeypatch.setattr(kernel_config, "_ACTIVE_CONFIG", None)
-    monkeypatch.setattr(
-        dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False
-    )
+    monkeypatch.setattr(dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False)
 
 
 # ---------------------------------------------------------------------------
@@ -94,20 +94,17 @@ def test_registry_symbols_are_importable_callables():
 def test_registry_covers_all_roles_with_expected_symbols():
     assert KERNEL_REGISTRY[SPARSE_MLA_DECODE_FP8_FLASH] == ROLE_SPARSE_MLA_DECODE_FP8
     assert KERNEL_REGISTRY[SPARSE_MLA_DECODE_FP8_TRITON] == ROLE_SPARSE_MLA_DECODE_FP8
-    assert (
-        KERNEL_REGISTRY[SPARSE_MLA_DECODE_INT8_TRITON] == ROLE_SPARSE_MLA_DECODE_INT8
-    )
-    assert (
-        KERNEL_REGISTRY[SPARSE_MLA_DECODE_INT8_FLASH] == ROLE_SPARSE_MLA_DECODE_INT8
-    )
+    assert KERNEL_REGISTRY[SPARSE_MLA_DECODE_INT8_TRITON] == ROLE_SPARSE_MLA_DECODE_INT8
+    assert KERNEL_REGISTRY[SPARSE_MLA_DECODE_INT8_FLASH] == ROLE_SPARSE_MLA_DECODE_INT8
     assert SPARSE_MLA_DECODE_INT8_FLASH == "flash_mla.sparse_mla_decode_int8"
     assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_TRITON] == ROLE_SPARSE_MLA_PREFILL
     assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_FLASH] == ROLE_SPARSE_MLA_PREFILL
     assert (
-        KERNEL_REGISTRY[SPARSE_MLA_DECODE_FP8_SPARKINFER]
-        == ROLE_SPARSE_MLA_DECODE_FP8
+        KERNEL_REGISTRY[SPARSE_MLA_DECODE_FP8_SPARKINFER] == ROLE_SPARSE_MLA_DECODE_FP8
     )
     assert KERNEL_REGISTRY[SPARSE_MLA_PREFILL_SPARKINFER] == ROLE_SPARSE_MLA_PREFILL
+    assert KERNEL_REGISTRY[MHC_VLLM_AUTO] == ROLE_MHC
+    assert KERNEL_REGISTRY[MHC_SPARKINFER] == ROLE_MHC
     assert KERNEL_REGISTRY[INDEXER_CACHE_INT8_WRITER] == ROLE_INDEXER_CACHE_INT8
     assert KERNEL_REGISTRY[INDEXER_QUERY_INT8_QUANT] == ROLE_INDEXER_QUERY_INT8
     assert (
@@ -138,9 +135,7 @@ def test_symbol_list_resolves_roles():
     assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_FLASH
     assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_TRITON
     # Unlisted selector role falls back to its documented default.
-    assert (
-        resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_TRITON
-    )
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_TRITON
     assert resolved.roles[ROLE_INDEXER_CACHE_INT8] == INDEXER_CACHE_INT8_WRITER
     assert resolved.roles[ROLE_INDEXER_QUERY_INT8] == INDEXER_QUERY_INT8_QUANT
     assert (
@@ -168,6 +163,32 @@ def test_sm12x_sparkinfer_symbols_resolve_roles():
     )
     assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_SPARKINFER
     assert resolved.cache_type == "fp8_ds_mla"
+
+
+def test_int8_override_selects_only_mhc_from_sparkinfer():
+    """A complete INT8 override keeps native INT kernels and swaps only mHC."""
+    override = {
+        "vllm": {
+            "kernels": [
+                SPARSE_MLA_DECODE_FP8_TRITON,
+                SPARSE_MLA_DECODE_INT8_FLASH,
+                SPARSE_MLA_PREFILL_INT8_FLASH,
+                INDEXER_CACHE_INT8_WRITER,
+                INDEXER_QUERY_INT8_QUANT,
+                DENSE_EXPERTS_INT8_ACTIVATION,
+                MHC_SPARKINFER,
+            ],
+            "cache_type": "int8_ds_mla",
+        }
+    }
+    resolved = resolve_kernel_config_from_hf_config(SimpleNamespace(**override))
+
+    assert resolved.roles[ROLE_MHC] == MHC_SPARKINFER
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_FLASH
+    assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_INT8_FLASH
+    assert resolved.roles[ROLE_INDEXER_CACHE_INT8] == INDEXER_CACHE_INT8_WRITER
+    assert resolved.roles[ROLE_INDEXER_QUERY_INT8] == INDEXER_QUERY_INT8_QUANT
+    assert resolved.cache_type == "int8_ds_mla"
 
 
 def test_sparkinfer_and_flash_decode_conflict_is_hard_error():
@@ -201,6 +222,11 @@ def test_duplicate_role_is_hard_error():
         )
 
 
+def test_duplicate_mhc_role_is_hard_error():
+    with pytest.raises(ValueError, match="same role"):
+        resolve_kernel_config({"kernels": [MHC_VLLM_AUTO, MHC_SPARKINFER]})
+
+
 def test_unknown_block_key_is_hard_error():
     with pytest.raises(ValueError, match="key"):
         resolve_kernel_config({"kernels": [], "cachetype": "fp8_ds_mla"})
@@ -220,10 +246,9 @@ def test_defaults_when_absent():
     resolved = resolve_kernel_config(None)
     assert not resolved.explicit
     assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_FLASH
-    assert (
-        resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_TRITON
-    )
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_TRITON
     assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_TRITON
+    assert resolved.roles[ROLE_MHC] == MHC_VLLM_AUTO
     # Blockless resolution never activates a toggle role.
     assert ROLE_INDEXER_CACHE_INT8 not in resolved.roles
     assert ROLE_INDEXER_QUERY_INT8 not in resolved.roles
@@ -306,7 +331,9 @@ def test_blockless_fp_checkpoint_on_sm12x_takes_sparkinfer(monkeypatch):
     )
     assert not resolved.explicit
     assert resolved.cache_type == "fp8_ds_mla"
-    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_SPARKINFER
+    assert (
+        resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_SPARKINFER
+    )
     assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_SPARKINFER
     # Toggle roles stay off for fp weights.
     assert ROLE_INDEXER_CACHE_INT8 not in resolved.roles
@@ -510,9 +537,7 @@ def test_dsv4_int_pickle_restores_kernel_block_gates(monkeypatch):
     payload = pickle.dumps(cfg)
 
     monkeypatch.setattr(kernel_config, "_ACTIVE_CONFIG", None)
-    monkeypatch.setattr(
-        dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False
-    )
+    monkeypatch.setattr(dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False)
     assert not indexer_cache_int8_enabled()
 
     restored = pickle.loads(payload)
@@ -533,9 +558,7 @@ def test_dsv4_int_pickle_restores_dense_runtime_gate(monkeypatch):
     )
     assert cfg.experimental_int8_runtime
     payload = pickle.dumps(cfg)
-    monkeypatch.setattr(
-        dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False
-    )
+    monkeypatch.setattr(dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False)
 
     restored = pickle.loads(payload)
 
@@ -622,6 +645,7 @@ def test_resolved_proof_line_is_single_stable_line():
         f" sparse_mla_decode_fp8={SPARSE_MLA_DECODE_FP8_FLASH}"
         f" sparse_mla_decode_int8={SPARSE_MLA_DECODE_INT8_TRITON}"
         f" sparse_mla_prefill={SPARSE_MLA_PREFILL_FLASH}"
+        f" mhc={MHC_VLLM_AUTO}"
         f" indexer_cache_int8={INDEXER_CACHE_INT8_WRITER}"
         f" indexer_query_int8={INDEXER_QUERY_INT8_QUANT}"
         f" dense_experts_int8_activation={DENSE_EXPERTS_INT8_ACTIVATION}"
@@ -638,6 +662,7 @@ def test_resolved_proof_line_marks_inactive_toggles_off():
     assert "indexer_query_int8=off" in line
     assert "dense_experts_int8_activation=off" in line
     assert "indexer_streaming_topk_prefill=off" in line
+    assert f"mhc={MHC_VLLM_AUTO}" in line
 
 
 # ---------------------------------------------------------------------------
@@ -692,9 +717,7 @@ def test_sm86_native_prefill_supports_fp8_and_int8_caches():
         validate_sm86_kernel_selection,
     )
 
-    resolved = resolve_kernel_config(
-        {"kernels": [SPARSE_MLA_PREFILL_FLASH]}
-    )
+    resolved = resolve_kernel_config({"kernels": [SPARSE_MLA_PREFILL_FLASH]})
     validate_sm86_kernel_selection(resolved, kv_cache_dtype="fp8_ds_mla")
     validate_sm86_kernel_selection(resolved, kv_cache_dtype="int8_ds_mla")
     # non-ds_mla caches still fail closed.
@@ -713,9 +736,7 @@ def test_sm86_int8_decode_native_selectable_triton_default():
         SELECTOR_ROLE_DEFAULTS[ROLE_SPARSE_MLA_DECODE_INT8]
         == SPARSE_MLA_DECODE_INT8_TRITON
     )
-    resolved = resolve_kernel_config(
-        {"kernels": [SPARSE_MLA_DECODE_INT8_FLASH]}
-    )
+    resolved = resolve_kernel_config({"kernels": [SPARSE_MLA_DECODE_INT8_FLASH]})
     assert resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_FLASH
     # Both int8 decode symbols claim one role: listing both is a hard error.
     with pytest.raises(ValueError, match="same role"):
@@ -745,9 +766,7 @@ def test_streaming_topk_prefill_symbol_registered():
 
 
 def test_streaming_topk_prefill_on_when_listed():
-    resolved = resolve_kernel_config(
-        {"kernels": [INDEXER_STREAMING_TOPK_PREFILL]}
-    )
+    resolved = resolve_kernel_config({"kernels": [INDEXER_STREAMING_TOPK_PREFILL]})
     activate_kernel_config(resolved)
     assert (
         resolved.roles[ROLE_INDEXER_STREAMING_TOPK_PREFILL]
@@ -777,15 +796,8 @@ def test_streaming_topk_prefill_off_with_no_active_config():
 
 
 def test_slab_rows_absent_is_none():
-    assert (
-        resolve_kernel_config(None).indexer_prefill_topk_slab_rows is None
-    )
-    assert (
-        resolve_kernel_config(
-            {"kernels": []}
-        ).indexer_prefill_topk_slab_rows
-        is None
-    )
+    assert resolve_kernel_config(None).indexer_prefill_topk_slab_rows is None
+    assert resolve_kernel_config({"kernels": []}).indexer_prefill_topk_slab_rows is None
 
 
 def test_slab_rows_round_trips_int():
@@ -801,9 +813,7 @@ def test_slab_rows_round_trips_int():
 @pytest.mark.parametrize("bad", [True, False, "16384", 16384.0, 0, -1])
 def test_slab_rows_invalid_is_hard_error(bad):
     with pytest.raises(ValueError, match="indexer_prefill_topk_slab_rows"):
-        resolve_kernel_config(
-            {"kernels": [], "indexer_prefill_topk_slab_rows": bad}
-        )
+        resolve_kernel_config({"kernels": [], "indexer_prefill_topk_slab_rows": bad})
 
 
 def test_slab_rows_resolves_from_hf_config():
@@ -853,9 +863,7 @@ def test_indexer_gate_reads_toggle_from_config(monkeypatch):
     assert not indexer.should_use_prefill_streaming_topk(1, False)
 
     activate_kernel_config(
-        resolve_kernel_config(
-            {"kernels": [INDEXER_STREAMING_TOPK_PREFILL]}
-        )
+        resolve_kernel_config({"kernels": [INDEXER_STREAMING_TOPK_PREFILL]})
     )
     assert indexer.should_use_prefill_streaming_topk(1, False)
 
@@ -869,9 +877,7 @@ def test_indexer_gate_guards_unchanged(monkeypatch):
     import vllm.model_executor.layers.sparse_attn_indexer as indexer
 
     activate_kernel_config(
-        resolve_kernel_config(
-            {"kernels": [INDEXER_STREAMING_TOPK_PREFILL]}
-        )
+        resolve_kernel_config({"kernels": [INDEXER_STREAMING_TOPK_PREFILL]})
     )
     monkeypatch.setattr(indexer, "current_platform", _fake_platform())
     assert indexer.should_use_prefill_streaming_topk(1, False)
@@ -880,9 +886,7 @@ def test_indexer_gate_guards_unchanged(monkeypatch):
     # FP4 cache: off.
     assert not indexer.should_use_prefill_streaming_topk(1, True)
     # Non-CUDA: off.
-    monkeypatch.setattr(
-        indexer, "current_platform", _fake_platform(is_cuda=False)
-    )
+    monkeypatch.setattr(indexer, "current_platform", _fake_platform(is_cuda=False))
     assert not indexer.should_use_prefill_streaming_topk(1, False)
     # Capability is a floor, not a family enumeration. Listing families 80 and
     # 120 excluded sm_90 and sm_100, which run this Triton kernel fine; only
@@ -892,9 +896,7 @@ def test_indexer_gate_guards_unchanged(monkeypatch):
             indexer, "current_platform", _fake_platform(capability=capability)
         )
         assert indexer.should_use_prefill_streaming_topk(1, False), capability
-    monkeypatch.setattr(
-        indexer, "current_platform", _fake_platform(capability=(7, 5))
-    )
+    monkeypatch.setattr(indexer, "current_platform", _fake_platform(capability=(7, 5)))
     assert not indexer.should_use_prefill_streaming_topk(1, False)
 
 
@@ -957,8 +959,6 @@ def test_indexer_slab_rows_resolution():
         == indexer.INDEXER_PREFILL_TOPK_SLAB_ROWS
     )
     activate_kernel_config(
-        resolve_kernel_config(
-            {"kernels": [], "indexer_prefill_topk_slab_rows": 4096}
-        )
+        resolve_kernel_config({"kernels": [], "indexer_prefill_topk_slab_rows": 4096})
     )
     assert indexer._resolved_prefill_topk_slab_rows() == 4096

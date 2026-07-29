@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Warm up DeepSeek V4 mHC TileLang kernels before serving requests.
+"""Warm up the selected DeepSeek V4 mHC kernels before serving requests.
 
 Ported from lucifer1004/vllm-jasl with the two env-var knobs removed
 (`VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP`, `VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES`).
@@ -116,9 +116,37 @@ def _warmup_layer_mhc(
 
     for size in token_sizes:
         residual_slice = residual[:size]
-        for fn, scale, base in (
-            (layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base),
-            (layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base),
+        use_sparkinfer = bool(getattr(layer, "use_sparkinfer_mhc", False))
+        if use_sparkinfer and layer.hc_attn_fn_broadcast is not None:
+            from vllm.models.deepseek_v4.nvidia_sm12x.mhc import (
+                sparkinfer_mhc_pre_broadcast,
+            )
+
+            sparkinfer_mhc_pre_broadcast(
+                residual_slice[:, 0],
+                layer.hc_attn_fn_broadcast,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                rms_eps=layer.rms_norm_eps,
+                hc_eps=layer.hc_eps,
+                sinkhorn_iters=layer.hc_sinkhorn_iters,
+                norm_weight=layer.attn_norm.weight,
+                norm_eps=layer.attn_norm.variance_epsilon,
+            )
+
+        for fn, scale, base, norm in (
+            (
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                getattr(layer, "attn_norm", None),
+            ),
+            (
+                layer.hc_ffn_fn,
+                layer.hc_ffn_scale,
+                layer.hc_ffn_base,
+                getattr(layer, "ffn_norm", None),
+            ),
         ):
             layer_input, post_mix, comb_mix = layer.hc_pre(
                 residual_slice,
@@ -129,7 +157,7 @@ def _warmup_layer_mhc(
 
             fused_post_pre = getattr(layer, "mhc_fused_post_pre", None)
             if fused_post_pre is not None:
-                fused_post_pre(
+                args = (
                     layer_input,
                     residual_slice,
                     post_mix,
@@ -144,6 +172,14 @@ def _warmup_layer_mhc(
                     layer.hc_sinkhorn_iters,
                     1,
                 )
+                if use_sparkinfer:
+                    fused_post_pre(
+                        *args,
+                        norm_weight=norm.weight,
+                        norm_eps=norm.variance_epsilon,
+                    )
+                else:
+                    fused_post_pre(*args)
 
 
 def _warmup_hc_head(
@@ -215,7 +251,7 @@ def deepseek_v4_mhc_warmup(
 
     started = time.perf_counter()
     logger.info(
-        "Warming up DeepSeek V4 mHC TileLang kernels for token sizes: %s",
+        "Warming up DeepSeek V4 mHC kernels for token sizes: %s",
         token_sizes,
     )
     with torch.inference_mode():
@@ -224,6 +260,6 @@ def deepseek_v4_mhc_warmup(
             _warmup_hc_head(deepseek_model, token_sizes)
         torch.accelerator.synchronize()
     logger.info(
-        "DeepSeek V4 mHC TileLang warmup finished in %.2f seconds.",
+        "DeepSeek V4 mHC warmup finished in %.2f seconds.",
         time.perf_counter() - started,
     )

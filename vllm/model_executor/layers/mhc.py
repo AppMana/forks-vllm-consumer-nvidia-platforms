@@ -15,7 +15,7 @@ from vllm.utils.import_utils import has_tilelang
 
 logger = init_logger(__name__)
 
-_MHC_CUDA_BACKENDS = {"auto", "tilelang", "triton"}
+_MHC_CUDA_BACKENDS = {"auto", "sparkinfer", "tilelang", "triton"}
 
 
 def _requested_mhc_cuda_backend() -> str:
@@ -26,6 +26,28 @@ def _requested_mhc_cuda_backend() -> str:
             f"Invalid VLLM_MHC_CUDA_BACKEND={backend!r}; expected one of {choices}"
         )
     return backend
+
+
+def _selected_mhc_cuda_backend() -> str:
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
+        MHC_SPARKINFER,
+        MHC_VLLM_AUTO,
+        ROLE_MHC,
+        active_kernel_config,
+    )
+
+    config = active_kernel_config()
+    if config is not None:
+        selected = config.symbol(ROLE_MHC)
+        if selected == MHC_SPARKINFER:
+            return "sparkinfer"
+        if selected == MHC_VLLM_AUTO and ROLE_MHC in config.listed_roles:
+            return "auto"
+    return _requested_mhc_cuda_backend()
+
+
+def mhc_uses_sparkinfer() -> bool:
+    return _selected_mhc_cuda_backend() == "sparkinfer"
 
 
 def _has_tilelang_mhc() -> bool:
@@ -52,7 +74,11 @@ def _should_use_mhc_torch_fallback() -> bool:
     if current_platform.is_rocm():
         return True
     if current_platform.is_cuda():
-        requested_backend = _requested_mhc_cuda_backend()
+        requested_backend = _selected_mhc_cuda_backend()
+        if requested_backend == "sparkinfer":
+            # SparkInfer supplies pre/post/post-pre. Its first-layer 3D and
+            # HCHead gaps use the existing Triton fallback, never TileLang.
+            return True
         if requested_backend == "triton":
             return True
         if requested_backend == "tilelang":
@@ -89,11 +115,10 @@ _MHC_TORCH_FALLBACK = _should_use_mhc_torch_fallback()
 def mhc_uses_tilelang() -> bool:
     """True when the MHC ops dispatch the tilelang kernels on this device.
 
-    The first-layer broadcast variant exists only in tilelang, so callers that
-    want it have to know whether this device is on the torch/triton fallback
-    instead.
+    Callers use this to distinguish the default TileLang broadcast path from
+    the SparkInfer broadcast and torch/Triton fallback paths.
     """
-    return not _MHC_TORCH_FALLBACK
+    return not mhc_uses_sparkinfer() and not _should_use_mhc_torch_fallback()
 
 
 _MHC_PRE_TRITON = (
@@ -163,6 +188,15 @@ def _use_mhc_post_triton() -> bool:
     )
 
 
+def _use_mhc_head_triton() -> bool:
+    return (
+        _use_mhc_torch_fallback()
+        and current_platform.is_cuda()
+        and torch.cuda.is_available()
+        and os.getenv("VLLM_MHC_HEAD_TRITON", "1") != "0"
+    )
+
+
 def _mhc_pre_triton(*args, **kwargs):
     return mhc_kernels.mhc_pre_triton(*args, **kwargs)
 
@@ -223,8 +257,8 @@ def _hc_head_triton(
 
 def _hc_head_fused_kernel(*args, **kwargs) -> None:
     hs_flat = args[0] if args else kwargs["hs_flat"]
-    if _MHC_TORCH_FALLBACK:
-        if hs_flat.is_cuda and _MHC_HEAD_TRITON:
+    if _use_mhc_torch_fallback():
+        if hs_flat.is_cuda and _use_mhc_head_triton():
             _hc_head_triton(*args, **kwargs)
             return
         _hc_head_fused_reference(*args, **kwargs)
@@ -293,6 +327,12 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    if mhc_uses_sparkinfer():
+        from vllm.models.deepseek_v4.nvidia_sm12x.mhc import (
+            sparkinfer_mhc_post,
+        )
+
+        return sparkinfer_mhc_post(x, residual, post_layer_mix, comb_res_mix)
     if _should_use_mhc_torch_fallback():
         if x.is_cuda and _use_mhc_post_triton():
             return mhc_kernels.mhc_post_triton(
@@ -332,8 +372,8 @@ class MHCPreOp(CustomOp):
         sinkhorn_repeat: int,
         n_splits: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _MHC_TORCH_FALLBACK:
-            if _MHC_PRE_TRITON and residual.is_cuda:
+        if _use_mhc_torch_fallback():
+            if _use_mhc_pre_triton() and residual.is_cuda:
                 return torch.ops.vllm.mhc_pre_triton(
                     residual,
                     fn,
@@ -476,8 +516,14 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        if _MHC_TORCH_FALLBACK:
-            if _MHC_POST_TRITON and x.is_cuda:
+        if mhc_uses_sparkinfer():
+            from vllm.models.deepseek_v4.nvidia_sm12x.mhc import (
+                sparkinfer_mhc_post,
+            )
+
+            return sparkinfer_mhc_post(x, residual, post_layer_mix, comb_res_mix)
+        if _use_mhc_torch_fallback():
+            if _use_mhc_post_triton() and x.is_cuda:
                 return torch.ops.vllm.mhc_post_triton(
                     x,
                     residual,
@@ -562,7 +608,7 @@ class HCHeadOp(CustomOp):
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
         num_tokens = hs_flat.shape[0]
 
-        if _MHC_TORCH_FALLBACK:
+        if _use_mhc_torch_fallback():
             out = torch.empty(
                 num_tokens,
                 hidden_size,
@@ -661,9 +707,30 @@ class MHCFusedPostPreOp(CustomOp):
         sinkhorn_repeat: int,
         n_splits: int = 1,
         tile_n: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if _MHC_TORCH_FALLBACK:
-            if _MHC_POST_TRITON and x.is_cuda:
+        if mhc_uses_sparkinfer():
+            from vllm.models.deepseek_v4.nvidia_sm12x.mhc import (
+                sparkinfer_mhc_post_pre,
+            )
+
+            return sparkinfer_mhc_post_pre(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps=rms_eps,
+                hc_eps=hc_pre_eps,
+                sinkhorn_iters=sinkhorn_repeat,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+        if _use_mhc_torch_fallback():
+            if _use_mhc_post_triton() and x.is_cuda:
                 return torch.ops.vllm.mhc_fused_post_pre_triton(
                     x,
                     residual,
