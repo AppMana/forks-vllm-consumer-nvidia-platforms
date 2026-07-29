@@ -7,8 +7,9 @@ A fork of [vLLM](https://github.com/vllm-project/vllm) that runs
 Hopper — on GPUs upstream does not support. One image serves two
 architectures: **Ampere (sm_86)** via ported sparse-MLA kernels and an
 INT4/INT8 checkpoint, and **GB10 / consumer Blackwell (sm_121)** through that
-same INT4/INT8 + FlashMLA/Marlin/Triton lane without SparkInfer. A separate,
-experimental NVFP4/FP8 checkpoint uses sparkinfer's CuTe-DSL kernels.
+same INT4/INT8 + FlashMLA/Marlin core. Its shared mHC backend is under
+rework. A separate, experimental NVFP4/FP8 checkpoint uses sparkinfer
+throughout its SM12x kernel lane.
 
 GPU count, pipeline size, interconnect, and context length are configuration,
 not assumptions.
@@ -18,7 +19,7 @@ not assumptions.
 | Arch | Gencode | Kernel source | Checkpoint | Status |
 | --- | --- | --- | --- | --- |
 | Ampere sm_86 (RTX 3090 / A5000, 24 GB) | `8.6` | Triton + fused native CUDA (`flash_mla`) | `appmana/deepseek-v4-int4-int8` | Validated, benchmarked |
-| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Marlin + Triton; no SparkInfer/TileLang | `appmana/deepseek-v4-int4-int8` | Validated on native-host TP=2; first LWS image not accepted |
+| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Marlin core; mHC backend under rework | `appmana/deepseek-v4-int4-int8` | Validated on native-host TP=2; first LWS image not accepted |
 | GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
 
 Both gencodes are built into one image (`docker/Dockerfile`,
@@ -151,8 +152,10 @@ cache moved to a per-rank persistent volume before the rollout can be accepted.
 Commit `8c8bcac623` adds `VLLM_MHC_CUDA_BACKEND=triton`, which forces the
 existing Triton/torch mHC fallback on SM121; `auto` retains TileLang. SparkInfer
 `norm.mhc` is not wired in because its planned-scratch contract is not a
-drop-in replacement. The new selector still requires a rebuilt image and live
-TP=2 validation.
+drop-in replacement. The selector is retained as an interim diagnostic, not
+the accepted Hilton backend. The intended narrow SparkInfer shared-mHC
+integration remains under implementation and must not be described as active
+until it passes live TP=2 validation.
 
 ## Deploy
 
