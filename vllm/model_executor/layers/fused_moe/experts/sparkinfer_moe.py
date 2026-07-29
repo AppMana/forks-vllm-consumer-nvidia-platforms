@@ -126,7 +126,13 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
             )
             self._pinned_sizes = frozenset(capture_sizes or ())
         except Exception:
+            # Could not read the capture list. Evicting blind risks freeing the
+            # scratch a captured graph points at, so leave the cache unbounded
+            # -- the old behaviour -- rather than guess.
             self._pinned_sizes = frozenset()
+            self._evict_enabled = False
+        else:
+            self._evict_enabled = True
         self._max_unpinned_plans = 8
 
     # -- capability gates (mirror FlashInferB12xExperts) --------------------
@@ -285,6 +291,8 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
         least recently inserted. Pinned (cudagraph-captured) sizes are skipped:
         their scratch address is baked into a captured graph.
         """
+        if not self._evict_enabled:
+            return
         unpinned = [k for k in self._plan_cache if k not in self._pinned_sizes]
         for key in unpinned[: max(0, len(unpinned) - self._max_unpinned_plans)]:
             del self._plan_cache[key]

@@ -63,6 +63,18 @@ def _should_use_mhc_torch_fallback() -> bool:
 
 
 _MHC_TORCH_FALLBACK = _should_use_mhc_torch_fallback()
+
+
+def mhc_uses_tilelang() -> bool:
+    """True when the MHC ops dispatch the tilelang kernels on this device.
+
+    The first-layer broadcast variant exists only in tilelang, so callers that
+    want it have to know whether this device is on the torch/triton fallback
+    instead.
+    """
+    return not _MHC_TORCH_FALLBACK
+
+
 _MHC_PRE_TRITON = (
     _MHC_TORCH_FALLBACK
     and current_platform.is_cuda()

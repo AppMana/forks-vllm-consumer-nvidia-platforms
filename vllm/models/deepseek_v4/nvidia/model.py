@@ -24,6 +24,7 @@ from vllm.model_executor.layers.mhc import (
     MHCFusedPostPreOp,
     MHCPostOp,
     MHCPreOp,
+    mhc_uses_tilelang,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -941,12 +942,50 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Set when the first-layer broadcast kernel folds attn_norm in; that
+        # kernel has no unfused mode, so the norm below must be skipped rather
+        # than applied a second time.
+        norm_already_applied = False
         if residual is None:
-            # Run standalone mhc_pre on first layer
-            residual = x
-            x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-            )
+            # First layer. The embedding is (T, H): upstream removed the
+            # unconditional expand-to-(T, hc_mult, H) as a perf win (#48137)
+            # and dispatches on the rank instead. Restore that dispatch --
+            # dropping it left the 2-D case falling into the 3-D path, where
+            # hc_mult = residual.shape[-2] reads the token count.
+            if (
+                x.dim() == 2
+                and self.hc_attn_fn_broadcast is not None
+                and mhc_uses_tilelang()
+            ):
+                from vllm.model_executor.kernels.mhc.tilelang import (
+                    mhc_pre_broadcast_tilelang,
+                )
+
+                residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
+                    x,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
+                    fn_broadcast=self.hc_attn_fn_broadcast,
+                )
+                norm_already_applied = True
+            else:
+                # No broadcast kernel on this device (it is tilelang-only, so
+                # sm_8x on the torch/triton fallback lands here): materialize
+                # the hc_mult streams and take the ordinary path.
+                if x.dim() == 2:
+                    x = x.unsqueeze(-2).expand(-1, self.hc_mult, -1).contiguous()
+                residual = x
+                x, post_mix, res_mix = self.hc_pre(
+                    x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                )
         else:
             residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
                 x,
@@ -963,8 +1002,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
 
-        # Norm is applied unfused (the MHC ops above do not fold it).
-        x = self.attn_norm(x)
+        # Norm is applied unfused (the MHC ops above do not fold it), except
+        # on the broadcast path, which has already folded it.
+        if not norm_already_applied:
+            x = self.attn_norm(x)
         x = self.attn(positions, x, None)
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
@@ -1144,13 +1185,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            # V4 carries hc_mult parallel residual streams, so the decoder
-            # layers work on (T, hc_mult, H); the embedding is (T, H). Every
-            # MHC kernel infers hc_mult from residual.shape[-2], so without
-            # this the first layer reads the TOKEN COUNT as hc_mult -- which
-            # trips the mhc_pre shape assert rather than degrading quietly.
-            # The amd backend expands here too.
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
