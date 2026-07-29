@@ -28,6 +28,7 @@ from __future__ import annotations
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -42,11 +43,35 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
-from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-
 logger = init_logger(__name__)
+
+
+def _modelopt_activation_gscales(
+    w13_input_scale: torch.Tensor,
+    w2_input_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert checkpoint input scales to SparkInfer reciprocal scales.
+
+    ModelOpt stores ``*.input_scale`` in dequant form. SparkInfer's
+    ``modelopt_nvfp4`` API instead takes its reciprocal as ``a*_gscale`` and
+    derives the W4A4 runtime alpha as::
+
+        weight_scale / a_gscale == weight_scale * checkpoint_input_scale
+
+    Gate and up projections share one fused FC1 activation quantizer, so use
+    the larger of their two checkpoint scales for each expert.
+    """
+    w13_scale = w13_input_scale.max(dim=-1).values.to(torch.float32)
+    w2_scale = w2_input_scale.to(torch.float32)
+    if not torch.all(torch.isfinite(w13_scale) & (w13_scale > 0)):
+        raise ValueError("w13_input_scale must be finite and positive")
+    if not torch.all(torch.isfinite(w2_scale) & (w2_scale > 0)):
+        raise ValueError("w2_input_scale must be finite and positive")
+    return torch.reciprocal(w13_scale).contiguous(), torch.reciprocal(
+        w2_scale
+    ).contiguous()
 
 
 def _sparkinfer_moe_unavailable_reason() -> str | None:
@@ -225,21 +250,21 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
             hidden_size=self.hidden_dim,
             intermediate_size=self.intermediate_size_per_partition,
         )
-        # Activation global scales: sparkinfer does DYNAMIC per-block FC1/FC2
-        # activation quant (bind input_scales_static=False), so the activation
-        # global scale is identity — one 1.0 per expert. We deliberately do
-        # NOT forward vLLM's calibrated a13_scale: for the fused gate+up (w13)
-        # layer it is per-(expert x {gate, up}) = 2*num_experts = 512, whereas
-        # sparkinfer's per-expert runtime-alpha vector is num_experts = 256.
-        # The weight global scale (w*_weight_scale_2) carries the FP4 dequant;
-        # with a_gscale = 1.0 the runtime alpha reduces to it exactly, matching
-        # FlashInferB12xExperts' W4A16 treatment.
-        device = layer.w13_weight.device
-        a1_gscale = torch.ones(
-            self.num_local_experts, device=device, dtype=torch.float32
+        # Preserve the checkpoint's calibrated W4A4 activation scaling.
+        # Dynamic per-block quantization does not make this global factor 1:
+        # SparkInfer's ModelOpt API takes its reciprocal and folds it into the
+        # runtime alpha as weight_scale / reciprocal.
+        a1_gscale, a2_gscale = _modelopt_activation_gscales(
+            layer.w13_input_scale,
+            layer.w2_input_scale,
         )
-        a2_gscale = torch.ones(
-            self.num_local_experts, device=device, dtype=torch.float32
+        logger.info_once(
+            "sparkinfer ModelOpt NVFP4 tensors: weight=%s block_scale=%s "
+            "weight_global=%s activation_global=%s",
+            layer.w13_weight.dtype,
+            layer.w13_weight_scale.dtype,
+            layer.w13_weight_scale_2.dtype,
+            a1_gscale.dtype,
         )
 
         self._experts = fused_moe.prepare_weights(
