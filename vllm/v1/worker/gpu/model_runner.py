@@ -902,7 +902,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            assert self.kv_block_zeroer is not None
+            if self.kv_block_zeroer is None:
+                # The scheduler only emits block ids when the config says
+                # zeroing is required, so reaching here means the worker's
+                # eager _init_kv_zero_meta() did not run. Build it now rather
+                # than fail: the alternative the v1 runner takes is to skip
+                # zeroing silently, which is worse -- these blocks are exactly
+                # the ones that decode stale bytes to NaN under a mixed
+                # precision cache.
+                logger.warning_once(
+                    "KV block zeroing was requested but the zeroer was not "
+                    "initialized; building it on first use."
+                )
+                self._init_kv_zero_meta()
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
