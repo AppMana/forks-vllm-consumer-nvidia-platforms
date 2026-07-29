@@ -6,8 +6,9 @@ A fork of [vLLM](https://github.com/vllm-project/vllm) that runs
 **DeepSeek-V4-Flash** — a model whose official kernel support starts at
 Hopper — on GPUs upstream does not support. One image serves two
 architectures: **Ampere (sm_86)** via ported sparse-MLA kernels and an
-INT4/INT8 checkpoint, and **GB10 / consumer Blackwell (sm_121)** via
-sparkinfer's CuTe-DSL kernels and an NVFP4/FP8 checkpoint.
+INT4/INT8 checkpoint, and **GB10 / consumer Blackwell (sm_121)** through
+either that same INT4/INT8 + FlashMLA lane or sparkinfer's CuTe-DSL kernels
+with an NVFP4/FP8 checkpoint.
 
 GPU count, pipeline size, interconnect, and context length are configuration,
 not assumptions.
@@ -17,7 +18,8 @@ not assumptions.
 | Arch | Gencode | Kernel source | Checkpoint | Status |
 | --- | --- | --- | --- | --- |
 | Ampere sm_86 (RTX 3090 / A5000, 24 GB) | `8.6` | Triton + fused native CUDA (`flash_mla`) | `appmana/deepseek-v4-int4-int8` | Validated, benchmarked |
-| GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) + `flash_mla` | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
+| GB10 sm_121 (DGX Spark) | `12.1a` | fused native CUDA (`flash_mla`) + IMMA | `appmana/deepseek-v4-int4-int8` | Validated on TP=2; Kubernetes LWS rollout in progress |
+| GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
 
 Both gencodes are built into one image (`docker/Dockerfile`,
 `torch_cuda_arch_list='8.6 12.1a'`). Kernel selection is per-checkpoint, not
@@ -30,7 +32,9 @@ per-build — see [the `vllm` config block](#configuration-the-vllm-checkpoint-c
 INT4 W4A16 Marlin routed experts, INT8 W8A16 AllSpark dense/shared/attention
 linears, `int8_ds_mla` KV cache and indexer, with three DSpark MTP draft
 stages grafted in. Serves a 1,000,000-token context on twelve 24 GB Ampere
-GPUs. **Validated and benchmarked.**
+GPUs. On two DGX Sparks it also serves correctly at TP=2 with the checkpoint's
+native `int8_ds_mla` cache and FlashMLA INT8-cache decode/prefill kernels.
+**Validated and benchmarked.**
 
 ### [`appmana/deepseek-v4-nvfp4-fp8`](https://huggingface.co/appmana/deepseek-v4-nvfp4-fp8)
 
@@ -44,6 +48,13 @@ expert format rather than NVFP4.
 sm_121.** It serves, resolves the sparkinfer kernels, and passes the kernel
 parity suite, but generation is incorrect. It has no model card and no
 published benchmarks. Do not use it for evaluation.
+
+Two SparkInfer integration defects have been found during this bring-up.
+Commit `a62dd0ab63` restores ModelOpt activation global scales; a live TP=2,
+target-only test changed logits but remained incorrect. Commit `3efbd54937`
+also normalizes fused gate/up ordering and swizzles the ModelOpt block scales.
+Its regression suite passes offline, but it has not yet been tested end to end
+on the Sparks. Neither fix is evidence that the checkpoint is correct.
 
 ## Sibling repositories
 
@@ -61,6 +72,10 @@ published benchmarks. Do not use it for evaluation.
   — NCCL with rail/fallback selection.
 - [`forks-kueue-chain-adjacency`](https://github.com/AppMana/forks-kueue-chain-adjacency)
   — allocates a pipeline as one contiguous chain run.
+- [`dragonintel` performance reference](https://github.com/hannesholste/dragonintel/blob/main/docs/dsv4-spark-performance-references.md)
+  — the evidence map for Hilton results, NVIDIA forum numbers, exact topology
+  and kernel contracts, missing provenance, and the acceptance gate for any
+  future NVFP4 performance claim.
 
 ## What this fork adds
 
@@ -113,6 +128,17 @@ kernel FQNs resolvable; and sparkinfer's PCIe extensions compiled.
 as `TORCH_CUDA_ARCH_LIST`. Regenerate it when the arch list changes, or a bake
 build produces an image missing a gencode.
 
+The current Hilton node-local image is
+`docker.io/appmana/vllm-consumer:sm86-sm121` at
+OCI-index digest
+`sha256:8ef70c5d2699900dc3f560b6f278f8a09a165d345d65a184460db38495c03e73`;
+the arm64 manifest is `sha256:e1045275...` and the config/pod image ID is
+`sha256:5d516d8c...`. Both nodes match all three identities.
+Installed-file hashes tie it to vLLM `85f78d8827` and sparkinfer `fb71dc89`;
+its OCI source/revision labels are wrong and must not be cited as provenance.
+It predates both NVFP4 fixes above. A tag match alone is insufficient: record
+the digest and installed-file hashes for every benchmark or rollout.
+
 ## Deploy
 
 ### Ampere, PP=12
@@ -123,10 +149,15 @@ boot script, same `prep_pp_shards.py` rank-local shard staging, same
 environment. The cluster's `tb-chain-webhook` injects `NCCL_SOCKET_IFNAME` and
 `VLLM_RAY_WORKER_IP_ORDER` from the admitted chain placement.
 
-### GB10, TP=2
+### GB10, TP=2: current INT4/INT8 LWS
 
-`demos-hilton/cluster/gitops/apps/base/inference/deepseek-v4-nvfp4.yaml` — a
-two-rank LeaderWorkerSet, one GB10 per node, RoCE between them:
+`demos-hilton/cluster/gitops/apps/base/inference/deepseek-v4-int4-int8.yaml`
+is the current two-rank LeaderWorkerSet, one GB10 per node, with the direct
+dual-rail RoCE fabric between them. It derives `--node-rank` from
+`LWS_WORKER_INDEX`, reads each host's fabric address from the RoCE interface,
+and adds `--headless` only on nonzero ranks. The leader remains pinned to
+`spark-2ab3` because the present point-to-point `/30` makes
+`10.255.0.1` the fixed rendezvous address.
 
 ```yaml
 - --tensor-parallel-size
@@ -142,7 +173,9 @@ two-rank LeaderWorkerSet, one GB10 per node, RoCE between them:
 - --tokenizer-mode
 - deepseek_v4
 - --max-model-len
-- "8192"
+- "16384"
+- --max-num-seqs
+- "2"
 - --gpu-memory-utilization
 - "0.68"
 - --kv-cache-memory-bytes
@@ -150,6 +183,18 @@ two-rank LeaderWorkerSet, one GB10 per node, RoCE between them:
 - --speculative-config
 - '{"method": "dspark", "num_speculative_tokens": 5, "draft_sample_method": "greedy"}'
 ```
+
+`--max-num-seqs=2` is a memory constraint, not a throughput preference.
+Activation and workspace buffers are preallocated at that ceiling; a value of
+8 caused `NV_ERR_NO_MEMORY` and Xid 31 during a single 8k prefill while the
+Gemma standby shared rank 1.
+
+### GB10, TP=2: shelved NVFP4 bring-up
+
+`demos-hilton/cluster/gitops/apps/base/inference/deepseek-v4-nvfp4.yaml` is
+commented out of the kustomization. It is retained as a bring-up manifest, not
+as a working deployment: both speculative and target-only generation are
+incorrect, and no throughput from it is publishable.
 
 Environment that matters on this topology:
 
@@ -281,6 +326,16 @@ The identical 1M configuration measures 56.8/57.5 tok/s decode with
 `--no-async-scheduling`. Needle retrieval is verbatim at 620k, 950k, and the
 1,048,576 window edge. Decode rates are per-stream output token throughput;
 prefill rates are input length over TTFT.
+
+On two DGX Sparks at TP=2, the native-host INT4/INT8 correctness run at
+8,004 prompt tokens and 1,128 completion tokens measured 5.23 s TTFT,
+approximately 1,532 input tok/s, and 38.5 decode tok/s. The embedded
+1,000-token needle passed at 0.94 word-level match ratio. This is a valid local
+baseline, but the exact installed source was not frozen and a Triton JIT miss
+occurred during inference, so it is not a release-quality benchmark artifact.
+See the
+[performance reference](https://github.com/hannesholste/dragonintel/blob/main/docs/dsv4-spark-performance-references.md)
+for its complete limitations.
 
 No benchmarks are published for `appmana/deepseek-v4-nvfp4-fp8`; its output is
 not yet correct.
