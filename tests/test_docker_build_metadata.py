@@ -27,6 +27,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile"
 VERSIONS_JSON = REPO_ROOT / "docker" / "versions.json"
+BAKE_HCL = REPO_ROOT / "docker" / "docker-bake.hcl"
 
 # The architectures this branch exists to serve: sm_86 (Ampere consumer) and
 # sm_121a (GB10 / DGX Spark).
@@ -50,6 +51,17 @@ def dockerfile_arg_defaults(name: str) -> list[str]:
 def bake_variable_default(name: str) -> str:
     versions = json.loads(VERSIONS_JSON.read_text(encoding="utf-8"))
     return versions["variable"][name]["default"]
+
+
+def bake_hcl_variable_default(name: str) -> str:
+    """The ``default = "..."`` of a top-level ``variable`` block in the bake file."""
+    pattern = re.compile(
+        rf'variable\s+"{re.escape(name)}"\s*\{{[^}}]*?default\s*=\s*"([^"]*)"',
+        re.DOTALL,
+    )
+    match = pattern.search(BAKE_HCL.read_text(encoding="utf-8"))
+    assert match, f'no variable "{name}" with a string default in {BAKE_HCL.name}'
+    return match.group(1)
 
 
 def dockerfile_run_blocks() -> list[str]:
@@ -97,6 +109,49 @@ def test_versions_json_matches_the_dockerfile() -> None:
             f"but docker/Dockerfile ARG {arg_name}={defaults[0]!r}; "
             f"regenerate with tools/generate_versions_json.py"
         )
+
+
+def test_bake_hcl_arch_list_matches_the_dockerfile() -> None:
+    """``docker buildx bake`` reads the .hcl even when versions.json is absent.
+
+    ``docker/docker-bake.hcl`` declares its own ``TORCH_CUDA_ARCH_LIST``
+    default and ``_common`` passes it into every target as
+    ``torch_cuda_arch_list``, so it *overrides* the Dockerfile ARG. The
+    README-documented ``cd docker && docker buildx bake`` passes no
+    ``-f docker/versions.json``, so versions.json cannot rescue a stale value
+    here. This is the a248f91ec5 failure mode at a third location.
+    """
+    dockerfile_default = dockerfile_arg_defaults("torch_cuda_arch_list")[0]
+    assert bake_hcl_variable_default("TORCH_CUDA_ARCH_LIST") == dockerfile_default, (
+        f"docker/docker-bake.hcl TORCH_CUDA_ARCH_LIST="
+        f"{bake_hcl_variable_default('TORCH_CUDA_ARCH_LIST')!r} but "
+        f"docker/Dockerfile ARG torch_cuda_arch_list={dockerfile_default!r}; "
+        f"a bake build would ship different SASS from a plain docker build"
+    )
+
+
+def test_gdrcopy_os_version_tracks_ubuntu_version() -> None:
+    """The gdrcopy .deb is per-distro-release and the URL is built from this.
+
+    ``tools/install_gdrcopy.sh`` interpolates ``GDRCOPY_OS_VERSION`` into both
+    the download path and the package filename. Upstream defaults it to
+    ``Ubuntu22_04`` and corrects it only inside the ``-ubuntu2404`` bake
+    targets; this fork's base image is 24.04, so the Dockerfile default has to
+    carry the correction or every plain ``openai``/``test`` build installs the
+    22.04 package into a 24.04 image.
+    """
+    ubuntu_version = dockerfile_arg_defaults("UBUNTU_VERSION")[0]
+    expected = f"Ubuntu{ubuntu_version.replace('.', '_')}"
+    actual = dockerfile_arg_defaults("GDRCOPY_OS_VERSION")[0]
+    assert actual == expected, (
+        f"docker/Dockerfile ARG UBUNTU_VERSION={ubuntu_version!r} implies "
+        f"GDRCOPY_OS_VERSION={expected!r}, found {actual!r}"
+    )
+    assert bake_variable_default("GDRCOPY_OS_VERSION") == expected, (
+        f"docker/versions.json GDRCOPY_OS_VERSION="
+        f"{bake_variable_default('GDRCOPY_OS_VERSION')!r} but the Dockerfile "
+        f"implies {expected!r}; regenerate with tools/generate_versions_json.py"
+    )
 
 
 def test_sparkinfer_is_installed_without_build_isolation() -> None:

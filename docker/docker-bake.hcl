@@ -19,8 +19,15 @@ variable "NVCC_THREADS" {
   default = 8
 }
 
+# Must equal the Dockerfile's `ARG torch_cuda_arch_list` default. `_common`
+# passes this variable into every target, so a stale value here silently
+# overrides the Dockerfile default and ships an image with no GB10 SASS --
+# the same failure a248f91ec5 hit via docker/versions.json. The documented
+# `cd docker && docker buildx bake` invocation reads this file *only*, so
+# versions.json does not rescue it.
+# Enforced by tests/test_docker_build_metadata.py.
 variable "TORCH_CUDA_ARCH_LIST" {
-  default = "8.0 8.9 9.0 10.0 11.0 12.0"
+  default = "8.6 12.1a"
 }
 
 variable "COMMIT" {
@@ -69,9 +76,18 @@ target "_common" {
   }
 }
 
+# Bake `labels` override the Dockerfile's LABEL instructions, so the source
+# URL has to be restated here or a bake build re-attributes the image to
+# upstream. It must match the Dockerfile's `ARG VLLM_SOURCE_REPO` default:
+# GHCR links a package to the repository this label names, and these images
+# are pushed under AppMana.
+variable "VLLM_SOURCE_REPO" {
+  default = "https://github.com/AppMana/forks-vllm-ampere"
+}
+
 target "_labels" {
   labels = {
-    "org.opencontainers.image.source"      = "https://github.com/vllm-project/vllm"
+    "org.opencontainers.image.source"      = VLLM_SOURCE_REPO
     "org.opencontainers.image.vendor"      = "vLLM"
     "org.opencontainers.image.title"       = "vLLM"
     "org.opencontainers.image.description" = "vLLM: A high-throughput and memory-efficient inference and serving engine for LLMs"
