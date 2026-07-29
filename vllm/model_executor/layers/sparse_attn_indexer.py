@@ -142,16 +142,35 @@ def should_use_prefill_streaming_topk(
     (indexer_streaming_topk_prefill role); the remaining guards are the
     DCP/FP4/platform constraints of the streaming implementation.
     """
-    return (
-        indexer_streaming_topk_prefill_enabled()
-        and dcp_world_size <= 1
-        and not use_fp4_cache
-        and current_platform.is_cuda()
-        and (
-            current_platform.is_device_capability_family(80)
-            or current_platform.is_device_capability_family(120)
+    if not indexer_streaming_topk_prefill_enabled():
+        return False
+    # Everything below is a constraint of the streaming implementation, not of
+    # the toggle. The toggle was explicitly asked for, so a refusal here has to
+    # say so: silently running the one-shot O(M*N) path while the proof line
+    # prints indexer_streaming_topk_prefill=<symbol> is how a 1M-context run
+    # can OOM for a reason the log denies.
+    capability = current_platform.get_device_capability()
+    reasons = []
+    if dcp_world_size > 1:
+        reasons.append(f"decode context parallel is on (dcp={dcp_world_size})")
+    if use_fp4_cache:
+        reasons.append("the fp4 indexer cache is in use")
+    if not current_platform.is_cuda():
+        reasons.append("the platform is not CUDA")
+    # A floor, not an enumeration: this is a Triton kernel over the same
+    # logits, and listing sm_8x and sm_12x excluded sm_90 and sm_100 for no
+    # stated reason.
+    elif capability is not None and capability.major < 8:
+        reasons.append(f"compute capability {capability.major}.{capability.minor} < 8.0")
+    if reasons:
+        logger.warning_once(
+            "Streaming prefill top-k was requested by the checkpoint's "
+            "kernel config but cannot run: %s. Falling back to the one-shot "
+            "prefill top-k, whose memory scales with context length.",
+            "; ".join(reasons),
         )
-    )
+        return False
+    return True
 
 # Centered order-preserving key of float32 -inf (bits 0xFF800000): columns
 # masked out by the logits kernel are exactly -inf; every in-range score is a

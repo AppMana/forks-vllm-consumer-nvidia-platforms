@@ -765,10 +765,15 @@ def test_slab_rows_override_reads_active_config():
 # ---------------------------------------------------------------------------
 
 
-def _fake_platform(is_cuda=True, families=(80,)):
+def _fake_platform(is_cuda=True, families=(80,), capability=(8, 6)):
+    from vllm.platforms.interface import DeviceCapability
+
     return SimpleNamespace(
         is_cuda=lambda: is_cuda,
         is_device_capability_family=lambda fam: fam in families,
+        get_device_capability=lambda device_id=0: (
+            None if capability is None else DeviceCapability(*capability)
+        ),
     )
 
 
@@ -810,15 +815,54 @@ def test_indexer_gate_guards_unchanged(monkeypatch):
         indexer, "current_platform", _fake_platform(is_cuda=False)
     )
     assert not indexer.should_use_prefill_streaming_topk(1, False)
-    # Unsupported capability family: off; family 120 stays supported.
+    # Capability is a floor, not a family enumeration. Listing families 80 and
+    # 120 excluded sm_90 and sm_100, which run this Triton kernel fine; only
+    # pre-Ampere is genuinely out.
+    for capability in ((8, 0), (8, 6), (9, 0), (10, 0), (12, 1)):
+        monkeypatch.setattr(
+            indexer, "current_platform", _fake_platform(capability=capability)
+        )
+        assert indexer.should_use_prefill_streaming_topk(1, False), capability
     monkeypatch.setattr(
-        indexer, "current_platform", _fake_platform(families=(90,))
+        indexer, "current_platform", _fake_platform(capability=(7, 5))
     )
     assert not indexer.should_use_prefill_streaming_topk(1, False)
-    monkeypatch.setattr(
-        indexer, "current_platform", _fake_platform(families=(120,))
+
+
+def test_indexer_gate_refusal_is_never_silent(monkeypatch):
+    """A refusal must be logged: the toggle was named in the checkpoint, and
+    the proof line prints it as on, so falling back to the one-shot path
+    without a word makes a context-length OOM unattributable."""
+    import logging
+
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer
+
+    activate_kernel_config(
+        resolve_kernel_config({"kernels": [INDEXER_STREAMING_TOPK_PREFILL]})
     )
-    assert indexer.should_use_prefill_streaming_topk(1, False)
+    monkeypatch.setattr(indexer, "current_platform", _fake_platform())
+    # warning_once memoizes on (logger, msg, *args), so an earlier test that
+    # tripped the same refusal would swallow this one. Clear it.
+    from vllm.logger import _print_warning_once
+
+    _print_warning_once.cache_clear()
+
+    # vLLM's logger does not propagate to root (so caplog stays empty) and its
+    # handler holds the pre-capture sys.stdout (so capsys misses it). Attach a
+    # handler to the module's own logger and read the records directly.
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture()
+    indexer.logger.addHandler(handler)
+    try:
+        assert not indexer.should_use_prefill_streaming_topk(2, False)
+    finally:
+        indexer.logger.removeHandler(handler)
+    assert any("decode context parallel" in m for m in records), records
 
 
 def test_indexer_forward_consumes_the_gate():

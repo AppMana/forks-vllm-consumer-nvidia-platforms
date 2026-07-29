@@ -23,7 +23,7 @@ casts, so no override is needed. INT8 FP8 tensor cores are absent on
 Ampere; the Triton kernels upcast FP8 inputs to bf16 internally.
 """
 
-import os
+import dataclasses
 
 import torch
 
@@ -63,6 +63,8 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     SPARSE_MLA_DECODE_INT8_FLASH,
     SPARSE_MLA_DECODE_INT8_TRITON,
     SPARSE_MLA_PREFILL_FLASH,
+    SPARSE_MLA_PREFILL_INT8_FLASH,
+    SPARSE_MLA_PREFILL_TRITON,
     ResolvedKernelConfig,
     resolve_kernel_config_from_hf_config,
     resolved_proof_line,
@@ -71,20 +73,52 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+# The two fused native flash_mla prefills. Distinct kernels for distinct cache
+# dtypes; _forward_prefill_flash picks between them by cache dtype.
+_NATIVE_PREFILL_SYMBOLS = frozenset(
+    {SPARSE_MLA_PREFILL_FLASH, SPARSE_MLA_PREFILL_INT8_FLASH}
+)
+
 
 def validate_sm86_kernel_selection(
     resolved: ResolvedKernelConfig, *, kv_cache_dtype: str
-) -> None:
-    """SM86-specific cross-checks between kernel selection and cache dtype."""
+) -> str:
+    """SM86 cross-checks; returns the prefill symbol that will actually run.
+
+    The two native prefill symbols are two different kernels, not one kernel
+    under two names: the int8 variant gathers int8 rows and dequantizes
+    in-kernel, while the fp8 one runs a whole-cache bf16 dequant pre-pass.
+    ``_forward_prefill_flash`` picks between them by cache dtype, so a block
+    naming either native symbol gets the one its cache dtype requires.
+
+    That dispatch is correct, and published checkpoints predate the int8
+    spelling existing -- so normalize rather than reject, and return the
+    effective symbol so the proof line names the kernel that runs instead of
+    the one that was written down.
+    """
     if kv_cache_dtype not in ("fp8_ds_mla", "int8_ds_mla"):
         raise ValueError(
             "DeepSeek V4 SM86 sparse MLA requires fp8_ds_mla or "
             f"int8_ds_mla KV cache, got {kv_cache_dtype}"
         )
-    # The fused native prefill consumes both fp8_ds_mla and int8_ds_mla paged
-    # caches (flash_mla 93bbf4e: whole-cache int8 dequant pass, runtime row
-    # stride); on int8 caches _forward_prefill_flash dispatches to the int8
-    # variant of the same kernel, so no cross-check is needed here.
+    prefill_symbol = resolved.roles[ROLE_SPARSE_MLA_PREFILL]
+    if prefill_symbol not in _NATIVE_PREFILL_SYMBOLS:
+        return prefill_symbol
+    effective = (
+        SPARSE_MLA_PREFILL_INT8_FLASH
+        if kv_cache_dtype == "int8_ds_mla"
+        else SPARSE_MLA_PREFILL_FLASH
+    )
+    if effective != prefill_symbol:
+        logger.info_once(
+            "DeepSeek V4 prefill: the %s KV cache selects %s; the checkpoint "
+            "names %s, which is the same kernel family under the other cache "
+            "dtype.",
+            kv_cache_dtype,
+            effective,
+            prefill_symbol,
+        )
+    return effective
 
 
 class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
@@ -95,10 +129,11 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         # Unified kernel selection: the "vllm" checkpoint config block.
         # Resolution fails closed on unknown symbols / duplicate roles.
         resolved = resolve_kernel_config_from_hf_config(self.config)
-        validate_sm86_kernel_selection(resolved, kv_cache_dtype=self.kv_cache_dtype)
+        self.prefill_symbol = validate_sm86_kernel_selection(
+            resolved, kv_cache_dtype=self.kv_cache_dtype
+        )
         self.fp8_decode_symbol = resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8]
         self.int8_decode_symbol = resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8]
-        self.prefill_symbol = resolved.roles[ROLE_SPARSE_MLA_PREFILL]
         if self.kv_cache_dtype == "int8_ds_mla":
             decode_symbol = self.int8_decode_symbol
         else:
@@ -112,8 +147,16 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         )
         # Startup proof line: every active role -> symbol plus the resolved
         # cache dtype, single line, stable format (benchmark validity check).
+        # Substitute the EFFECTIVE prefill symbol, as the sm12x class does:
+        # the cache dtype, not the written-down name, decides which of the two
+        # native prefills runs, and the line is only a validity check if it
+        # names the kernel that launches.
+        effective = dataclasses.replace(
+            resolved,
+            roles={**resolved.roles, ROLE_SPARSE_MLA_PREFILL: self.prefill_symbol},
+        )
         logger.info_once(
-            "%s", resolved_proof_line(resolved, kv_cache_dtype=self.kv_cache_dtype)
+            "%s", resolved_proof_line(effective, kv_cache_dtype=self.kv_cache_dtype)
         )
 
     @classmethod
@@ -124,10 +167,12 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         return num_heads
 
     def _prefill_uses_gather_workspace(self) -> bool:
-        # The native fused flash_mla prefill (_forward_prefill_flash) consumes
-        # the paged fp8/int8 caches directly and stages internally; only the
+        # The native fused flash_mla prefills (_forward_prefill_flash) consume
+        # the paged fp8/int8 caches directly and stage internally; only the
         # Triton gather prefill stages KV through the shared bf16 workspace.
-        return self.prefill_symbol != SPARSE_MLA_PREFILL_FLASH
+        # Both native symbols must be tested: comparing against the fp8 one
+        # alone grew the bf16 arena for a buffer the int8 path never touches.
+        return self.prefill_symbol not in _NATIVE_PREFILL_SYMBOLS
 
     def _forward_decode(
         self,
@@ -291,7 +336,7 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_metadata,
     ) -> None:
-        if self.prefill_symbol == SPARSE_MLA_PREFILL_FLASH:
+        if self.prefill_symbol in _NATIVE_PREFILL_SYMBOLS:
             self._forward_prefill_flash(
                 q=q,
                 positions=positions,
@@ -302,6 +347,15 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
                 swa_metadata=swa_metadata,
             )
             return
+        if self.prefill_symbol != SPARSE_MLA_PREFILL_TRITON:
+            # Fail closed, as the decode arms do. A bare equality with no else
+            # sent every unrecognized symbol -- including the sm12x sparkinfer
+            # ones -- to the Triton gather prefill while the proof line went on
+            # naming the symbol that was asked for.
+            raise ValueError(
+                "Unsupported DeepSeek V4 IMMA prefill kernel "
+                f"{self.prefill_symbol!r}"
+            )
         swa_only = attn_metadata is None
 
         num_prefill_tokens = swa_metadata.num_prefill_tokens
@@ -516,48 +570,6 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
             if extra_cache is not None:
                 extra_rows, extra_scales = get_int8_ds_mla_cache_views(
                     extra_cache, compressed_block_size
-                )
-            dump_dir = os.environ.get("APPMANA_DSV4_PREFILL_DUMP_DIR")
-            if dump_dir:
-                # IMA debugging: save the REAL argument tensors + cache-view
-                # geometry before launch (synthetic replays can pass while
-                # the real call faults). Last dump before a fault = the
-                # faulting call; it replays against zero caches of identical
-                # geometry, since IMA is addressing, not values.
-                idx = getattr(self, "_prefill_dump_idx", 0)
-                self._prefill_dump_idx = idx + 1
-                torch.cuda.synchronize()
-                payload = {
-                    "prefix": self.prefix if hasattr(self, "prefix") else "?",
-                    "q": q.cpu(),
-                    "swa_indices": swa_indices.cpu(),
-                    "swa_lens": swa_lens.cpu(),
-                    "extra_indices": None if extra_indices is None else extra_indices.cpu(),
-                    "extra_lens": None if extra_lens is None else extra_lens.cpu(),
-                    "attn_sink": self.attn_sink.cpu(),
-                    "scale": self.scale,
-                    "swa_rows_shape": tuple(swa_rows.shape),
-                    "swa_rows_stride": tuple(swa_rows.stride()),
-                    "swa_scales_shape": tuple(swa_scales.shape),
-                    "swa_scales_stride": tuple(swa_scales.stride()),
-                    "extra_rows_shape": None if extra_rows is None else tuple(extra_rows.shape),
-                    "extra_rows_stride": None if extra_rows is None else tuple(extra_rows.stride()),
-                    "extra_scales_shape": None if extra_scales is None else tuple(extra_scales.shape),
-                    "extra_scales_stride": None if extra_scales is None else tuple(extra_scales.stride()),
-                    "q_stride": tuple(q.stride()),
-                    "output_shape": tuple(output.shape),
-                    "output_stride": tuple(output.stride()),
-                }
-                pod = os.environ.get("POD_NAME", "pod")
-                torch.save(payload, f"{dump_dir}/prefill-{pod}-{idx:03d}.pt")
-                print(
-                    f"[prefill-dump] idx={idx} prefix={payload['prefix']} "
-                    f"q={tuple(q.shape)}/{tuple(q.stride())} "
-                    f"swa_idx={tuple(swa_indices.shape)} "
-                    f"swa_rows={payload['swa_rows_shape']}/{payload['swa_rows_stride']} "
-                    f"extra_rows={payload['extra_rows_shape']}/{payload['extra_rows_stride']} "
-                    f"out={payload['output_shape']}/{payload['output_stride']}",
-                    flush=True,
                 )
             out = sparse_mla_prefill_int8(
                 q=q,

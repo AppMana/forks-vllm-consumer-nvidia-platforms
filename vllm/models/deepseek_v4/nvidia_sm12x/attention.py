@@ -73,20 +73,21 @@ def validate_sm12x_kernel_selection(
     sm12x primary. Fails closed on explicit non-sm12x selections.
     """
     if kv_cache_dtype != "fp8_ds_mla":
-        # Not an arch limit: sm_12x runs int8_ds_mla fine (IMMA is available),
-        # it just cannot run it *through these kernels* -- sparkinfer's
-        # compressed_mla consumes the 584-byte fp8 page byte-for-byte. Reaching
-        # this function at all with an int8 cache means the class dispatch in
-        # nvidia/model.py routed here anyway, which only happens under an
-        # explicit --attention-backend. Say what is wrong and which knob moves
-        # it; an int8 checkpoint left alone selects the sm86 class instead.
-        logger.warning(
+        # Not an arch limit -- sm_12x runs int8_ds_mla fine, through
+        # nvidia_imma -- but these kernels cannot: sparkinfer's compressed_mla
+        # consumes the 584-byte fp8 page byte-for-byte, and _as_page_bytes
+        # accepts any uint8 3-D tensor without checking the token stride, so an
+        # int8_ds_mla cache (528 B/token) would be reinterpreted as fp8 pages
+        # and produce silent garbage rather than an error. Reaching here with a
+        # non-fp8 cache means an explicit --attention-backend overrode the
+        # class dispatch, which selects nvidia_imma for int8 on its own.
+        raise ValueError(
             "DeepSeek V4 sm12x sparkinfer kernels read the 584-byte "
-            "fp8_ds_mla page layout, but the KV cache is %s. The int8 sparse "
-            "MLA kernels are in DeepseekV4SM86Attention, which sm_12x can "
-            "use: drop --attention-backend and let the checkpoint's "
-            'cache_type select it, or set "cache_type": "fp8_ds_mla".',
-            kv_cache_dtype,
+            f"fp8_ds_mla page layout, but the KV cache is {kv_cache_dtype}. "
+            "The int8 sparse MLA kernels are in DeepseekV4TritonSM86Attention "
+            "(vllm/models/deepseek_v4/nvidia_imma), which sm_12x can use: drop "
+            "--attention-backend and let the checkpoint's cache_type select "
+            'it, or set "cache_type": "fp8_ds_mla".'
         )
     if not resolved.explicit:
         # No "vllm" kernels list: sparkinfer is the sm12x primary.
