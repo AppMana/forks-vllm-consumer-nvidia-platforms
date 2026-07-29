@@ -200,23 +200,11 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            # Deliberately NOT cache_dtype_str/model_version. Together they
-            # switch real_page_size_bytes onto the packed MLA row formula
-            # (584 B/token for fp8_ds_mla), but this spec describes the fp32
-            # compressor STATE, whose page is
-            # storage_block_size * state_dim * 4 -- several times larger. The
-            # non-packed reshape path uses torch.as_strided and does not
-            # bounds-check, so the result is overlapping state pages and
-            # silently wrong values rather than a failure.
-            #
-            # Measured on GB10: with these fields the model emits pure noise
-            # ("What is 17 times 23?" -> ": aplenty of dividers."); without
-            # them it produces coherent prose. Verified independent of the
-            # first-layer MHC path, which was A/B'd separately and made no
-            # difference either way.
+            cache_dtype_str=vllm_config.cache_config.cache_dtype,
             alignment=576
             if uses_fp8_ds_mla_layout
             else (528 if uses_int8_ds_mla_layout else 512),
+            model_version="deepseek_v4",
         )
 
     def forward(self): ...

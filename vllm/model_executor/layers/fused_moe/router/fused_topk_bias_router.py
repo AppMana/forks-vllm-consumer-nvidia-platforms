@@ -185,12 +185,26 @@ def fused_topk_bias(
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
 ):
-    if (
-        input_tokens is not None
-        and hash_indices_table is not None
-        and input_tokens.dtype != hash_indices_table.dtype
-    ):
-        input_tokens = input_tokens.to(dtype=hash_indices_table.dtype)
+    # The topk kernel dispatches dtype based on topk_ids (set by
+    # indices_type) and assumes input_tokens/hash_indices_table match.
+    #
+    # Restored from the pre-merge baseline. The merge replaced this with a cast
+    # of input_tokens to hash_indices_table's dtype, which enforces the wrong
+    # invariant: it makes the two arguments agree with each other but not with
+    # what the kernel dispatches on. hash_indices_dtype is int64 for mega-MoE
+    # and int32 otherwise, while indices_type comes from the MoE backend, so
+    # when they disagree ops.topk_hash_softplus_sqrt reads the
+    # [vocab_size, 6] table at the wrong element width and returns wrong expert
+    # ids. Those are the hash layers, i.e. the front of the stack, so the whole
+    # model degrades while staying fluent.
+    if indices_type is not None:
+        if input_tokens is not None and input_tokens.dtype != indices_type:
+            input_tokens = input_tokens.to(dtype=indices_type)
+        if (
+            hash_indices_table is not None
+            and hash_indices_table.dtype != indices_type
+        ):
+            hash_indices_table = hash_indices_table.to(dtype=indices_type)
 
     if not rocm_aiter_ops.is_fused_moe_enabled():
         assert hidden_states.size(0) == gating_output.size(0), (
