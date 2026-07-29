@@ -200,11 +200,24 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            # cache_dtype_str/model_version are deliberately NOT passed while
+            # this is under test: together they switch real_page_size_bytes to
+            # the packed MLA row formula (584B/token), but this spec describes
+            # the fp32 compressor STATE, whose page is
+            # storage_block_size * state_dim * 4. Gated by env so the two can
+            # be compared without a rebuild.
+            **(
+                {}
+                if __import__("os").environ.get("APPMANA_COMPRESSOR_PACKED_PAGE", "1")
+                != "1"
+                else {
+                    "cache_dtype_str": vllm_config.cache_config.cache_dtype,
+                    "model_version": "deepseek_v4",
+                }
+            ),
             alignment=576
             if uses_fp8_ds_mla_layout
             else (528 if uses_int8_ds_mla_layout else 512),
-            model_version="deepseek_v4",
         )
 
     def forward(self): ...
