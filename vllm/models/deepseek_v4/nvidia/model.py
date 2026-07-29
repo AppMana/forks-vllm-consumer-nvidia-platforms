@@ -957,9 +957,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x.dim() == 2
                 and self.hc_attn_fn_broadcast is not None
                 and mhc_uses_tilelang()
-                # Escape hatch while the broadcast path is under suspicion for
-                # first-layer numerics; set to 0 to force the expand path.
-                and os.environ.get("APPMANA_MHC_BROADCAST", "1") == "1"
             ):
                 from vllm.model_executor.kernels.mhc.tilelang import (
                     mhc_pre_broadcast_tilelang,
