@@ -148,6 +148,11 @@ connector selects TileLang and all compiler caches are ephemeral under `/tmp`.
 The INT4 experts and INT8 sparse attention are still Marlin and FlashMLA; the
 TileLang use is isolated to mHC. Hilton requires that use removed and every JIT
 cache moved to a per-rank persistent volume before the rollout can be accepted.
+Commit `8c8bcac623` adds `VLLM_MHC_CUDA_BACKEND=triton`, which forces the
+existing Triton/torch mHC fallback on SM121; `auto` retains TileLang. SparkInfer
+`norm.mhc` is not wired in because its planned-scratch contract is not a
+drop-in replacement. The new selector still requires a rebuilt image and live
+TP=2 validation.
 
 ## Deploy
 
