@@ -186,6 +186,11 @@ and adds `--headless` only on nonzero ranks. The leader remains pinned to
 The manifest is enabled, but the current rollout remains a validation run on
 the older TileLang-mHC image. Two node-local 5 Gi RWO volumes now persist every
 compiler/autotune/temp root under `/jit-cache`; they are rank-local, not shared.
+Short correctness probes and C1 1k/8k diagnostics completed, but a C1 15k
+prefill faulted both ranks with Xid 31. On the clean replacement group, a C2 1k
+run drained before both ranks faulted simultaneously with Xid 31. A canceled,
+accidentally C4 arm is excluded; no latency or throughput from these failed or
+contaminated cells is publication-grade.
 The SparkInfer-mHC adapter still needs a rebuilt image and live TP=2
 correctness gate. Do not describe it as the final production deployment yet.
 
