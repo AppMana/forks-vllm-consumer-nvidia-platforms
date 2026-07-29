@@ -1230,7 +1230,23 @@ RUN --mount=type=cache,target=/var/cache/apt \
         rm -f /etc/apt/apt.conf.d/docker-clean; \
         apt-get update -y && \
         apt-get install -y --no-install-recommends git ca-certificates && \
-        uv pip install --system "git+${SPARKINFER_REPO}@${SPARKINFER_REF}"; \
+        uv pip install --system --no-build-isolation \
+            "git+${SPARKINFER_REPO}@${SPARKINFER_REF}"; \
+    fi
+
+# sparkinfer's setup.py builds the PCIe comm CUDA extensions only if it can
+# import torch.utils.cpp_extension, and falls back to a pure-Python install
+# otherwise -- silently. Under build isolation that fallback ALWAYS fires,
+# which is why --no-build-isolation is above: torch is already in this
+# stage. Without the extensions the first collective nvcc-compiles inside a
+# live request. Assert the artifacts exist so this cannot regress unnoticed.
+RUN if [ -n "${SPARKINFER_REF}" ] && [ "${SPARKINFER_SKIP_EXT_BUILD:-0}" != "1" ]; then \
+        python3 -c "\
+import glob, sysconfig; \
+sp = sysconfig.get_paths()['platlib']; \
+found = glob.glob(sp + '/sparkinfer_pcie_*_ext*.so'); \
+assert found, 'sparkinfer PCIe extensions were not built (pure-Python fallback); check build isolation'; \
+print(f'sparkinfer AOT extensions: {len(found)}')"; \
     fi
 
 # Fail the build, not the first request, if the sm12x kernel FQNs stop
