@@ -8,8 +8,9 @@ Hopper — on GPUs upstream does not support. One image serves two
 architectures: **Ampere (sm_86)** via ported sparse-MLA kernels and an
 INT4/INT8 checkpoint, and **GB10 / consumer Blackwell (sm_121)** through that
 same INT4/INT8 + FlashMLA/Marlin core. Its shared mHC backend is under
-rework. A separate, experimental NVFP4/FP8 checkpoint uses sparkinfer
-throughout its SM12x kernel lane.
+offline validation through a narrow SparkInfer adapter. A separate,
+experimental NVFP4/FP8 checkpoint uses sparkinfer throughout its SM12x kernel
+lane.
 
 GPU count, pipeline size, interconnect, and context length are configuration,
 not assumptions.
@@ -19,7 +20,7 @@ not assumptions.
 | Arch | Gencode | Kernel source | Checkpoint | Status |
 | --- | --- | --- | --- | --- |
 | Ampere sm_86 (RTX 3090 / A5000, 24 GB) | `8.6` | Triton + fused native CUDA (`flash_mla`) | `appmana/deepseek-v4-int4-int8` | Validated, benchmarked |
-| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Marlin core; mHC backend under rework | `appmana/deepseek-v4-int4-int8` | Validated on native-host TP=2; first LWS image not accepted |
+| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Marlin core; SparkInfer shared mHC offline only | `appmana/deepseek-v4-int4-int8` | Validated on native-host TP=2; current LWS image not accepted |
 | GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
 
 Both gencodes are built into one image (`docker/Dockerfile`,
@@ -145,17 +146,22 @@ the digest and installed-file hashes for every benchmark or rollout.
 
 This is the first LWS validation image, not the accepted deployment image. It
 proved the two-rank image/topology/kernel wiring, but its SM12x DeepSeek-V4 mHC
-connector selects TileLang and all compiler caches are ephemeral under `/tmp`.
-The INT4 experts and INT8 sparse attention are still Marlin and FlashMLA; the
-TileLang use is isolated to mHC. Hilton requires that use removed and every JIT
-cache moved to a per-rank persistent volume before the rollout can be accepted.
+connector selects TileLang. The initial manifest also placed compiler caches
+under ephemeral `/tmp`; GitOps now redirects them to per-rank persistent
+volumes. The INT4 experts and INT8 sparse attention are still Marlin and
+FlashMLA; the TileLang use is isolated to mHC.
 Commit `8c8bcac623` adds `VLLM_MHC_CUDA_BACKEND=triton`, which forces the
-existing Triton/torch mHC fallback on SM121; `auto` retains TileLang. SparkInfer
-`norm.mhc` is not wired in because its planned-scratch contract is not a
-drop-in replacement. The selector is retained as an interim diagnostic, not
-the accepted Hilton backend. The intended narrow SparkInfer shared-mHC
-integration remains under implementation and must not be described as active
-until it passes live TP=2 validation.
+existing Triton/torch mHC fallback on SM121; `auto` retains TileLang. That
+selector is retained as an interim diagnostic, not the accepted Hilton
+backend.
+
+Commit `75b9aff02c` adds the narrow SparkInfer shared-mHC adapter and the `mhc`
+selector role. It delegates first-layer 2D broadcast plus fused norm,
+inter-layer fused post/pre plus norm, and final post to `sparkinfer.norm.mhc`.
+HCHead and the standalone 3D pre operation have no matching SparkInfer API and
+stay on Triton, never TileLang. Its offline suite passed 126 tests with two
+hardware skips, but no image containing it has been built or live-tested on
+SM121. It is not deployment proof.
 
 ## Deploy
 
@@ -177,9 +183,11 @@ and adds `--headless` only on nonzero ranks. The leader remains pinned to
 `spark-2ab3` because the present point-to-point `/30` makes
 `10.255.0.1` the fixed rendezvous address.
 
-The manifest is enabled, but the current rollout remains a validation run
-pending a rebuilt no-TileLang image and two node-local persistent JIT-cache
-volumes. Do not describe it as the final production deployment yet.
+The manifest is enabled, but the current rollout remains a validation run on
+the older TileLang-mHC image. Two node-local 5 Gi RWO volumes now persist every
+compiler/autotune/temp root under `/jit-cache`; they are rank-local, not shared.
+The SparkInfer-mHC adapter still needs a rebuilt image and live TP=2
+correctness gate. Do not describe it as the final production deployment yet.
 
 ```yaml
 - --tensor-parallel-size
@@ -430,6 +438,11 @@ the whole block rather than merging it, so build overrides from the
 checkpoint's own block plus whatever you are adding — a dropped kernel entry
 degrades silently.
 
+The published INT4 checkpoint block predates the `mhc` role, so it resolves to
+the documented vLLM device-auto mHC default. Selecting SparkInfer mHC requires
+the complete override shown below; it does not change the INT8 attention,
+indexer, or Marlin roles.
+
 Resolution, the role table, and the legacy-FQN aliasing live in
 [`kernel_config.py`](vllm/transformers_utils/configs/dsv4/kernel_config.py).
 
@@ -449,6 +462,8 @@ selects the documented default rather than disabling it.
 | | `flash_mla.sparse_mla_prefill_int8` | same repo — native fused int8, dequant in-kernel, allocates nothing sized by the KV pool |
 | | `vllm.models.deepseek_v4.nvidia_sm12x.kernels.sparkinfer_sparse_mla_extend` | [`nvidia_sm12x/kernels.py`](vllm/models/deepseek_v4/nvidia_sm12x/kernels.py) |
 | | `vllm.models.deepseek_v4.nvidia_imma.triton_kernels.sparse_attention_triton` | [`nvidia_imma/triton_kernels.py`](vllm/models/deepseek_v4/nvidia_imma/triton_kernels.py) |
+| `mhc` | `vllm.model_executor.layers.mhc.MHCFusedPostPreOp` | vLLM device-auto default |
+| | `vllm.models.deepseek_v4.nvidia_sm12x.mhc.sparkinfer_mhc_post_pre` | [`nvidia_sm12x/mhc.py`](vllm/models/deepseek_v4/nvidia_sm12x/mhc.py) → `sparkinfer.norm.mhc`; shared mHC only |
 
 **Toggle roles** — presence turns the path on; absence *in an explicit block*
 turns it off.
@@ -511,16 +526,18 @@ A/B that isolates sparkinfer's contribution with no rebuild:
 ], "cache_type": "fp8_ds_mla"}}'
 ```
 
-**IMMA int8, any arch from sm_80 up.** The int4-int8 checkpoint's own block;
-runs on GB10 as well as Ampere:
+**GB10 IMMA int8 with SparkInfer shared mHC.** This complete SM121 variant
+keeps every native INT8 role and selects only shared mHC from SparkInfer:
 
 ```bash
 --hf-overrides '{"vllm": {"kernels": [
+  "vllm.models.deepseek_v4.nvidia_imma.triton_kernels.decode_sparse_attention_triton",
   "flash_mla.sparse_mla_decode_int8",
   "flash_mla.sparse_mla_prefill_int8",
   "vllm._custom_ops.indexer_k_quant_and_cache_int8",
   "vllm.models.deepseek_v4.common.ops.fused_indexer_q.fused_indexer_q_rope_quant_int8",
-  "vllm.model_executor.layers.quantization.utils.marlin_utils.marlin_act_int8_process_scales"
+  "vllm.model_executor.layers.quantization.utils.marlin_utils.marlin_act_int8_process_scales",
+  "vllm.models.deepseek_v4.nvidia_sm12x.mhc.sparkinfer_mhc_post_pre"
 ], "cache_type": "int8_ds_mla"}}'
 ```
 
@@ -529,11 +546,13 @@ Triton equivalent, to attribute a regression to that kernel:
 
 ```bash
 --hf-overrides '{"vllm": {"kernels": [
+  "vllm.models.deepseek_v4.nvidia_imma.triton_kernels.decode_sparse_attention_triton",
   "flash_mla.sparse_mla_decode_int8_triton",
   "flash_mla.sparse_mla_prefill_int8",
   "vllm._custom_ops.indexer_k_quant_and_cache_int8",
   "vllm.models.deepseek_v4.common.ops.fused_indexer_q.fused_indexer_q_rope_quant_int8",
-  "vllm.model_executor.layers.quantization.utils.marlin_utils.marlin_act_int8_process_scales"
+  "vllm.model_executor.layers.quantization.utils.marlin_utils.marlin_act_int8_process_scales",
+  "vllm.models.deepseek_v4.nvidia_sm12x.mhc.sparkinfer_mhc_post_pre"
 ], "cache_type": "int8_ds_mla"}}'
 ```
 
