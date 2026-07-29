@@ -1141,8 +1141,19 @@ class GPUModelRunner(
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if hasattr(self, "_kv_block_zeroer"):
-            self._kv_block_zeroer.zero_block_ids(block_ids)
+        if not hasattr(self, "_kv_block_zeroer"):
+            # The caller only passes block ids when the config says zeroing is
+            # required, so reaching here means the worker's eager
+            # _init_kv_zero_meta() did not run. Build it now rather than skip:
+            # skipping silently is the worse failure -- these blocks are
+            # exactly the ones that decode stale bytes to NaN under a mixed
+            # precision cache. Mirrors the v2 runner.
+            logger.warning_once(
+                "KV block zeroing was requested but the zeroer was not "
+                "initialized; building it on first use."
+            )
+            self._init_kv_zero_meta()
+        self._kv_block_zeroer.zero_block_ids(block_ids)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:

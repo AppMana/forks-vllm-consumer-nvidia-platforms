@@ -57,7 +57,7 @@ def test_sm86_attention_class_resolution_proof_string() -> None:
 
     proof_string = f"sm86_dsv4_attn_cls={resolved.__module__}.{resolved.__qualname__}"
     assert proof_string == (
-        "sm86_dsv4_attn_cls=vllm.models.deepseek_v4.nvidia_sm86.attention."
+        "sm86_dsv4_attn_cls=vllm.models.deepseek_v4.nvidia_imma.attention."
         "DeepseekV4TritonSM86Attention"
     ), proof_string
 

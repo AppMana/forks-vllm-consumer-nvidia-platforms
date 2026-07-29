@@ -760,7 +760,7 @@ class DeepseekV4Indexer(nn.Module):
         self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
         # Log the TRUE payload format (mxfp4/fp8/int8) and query mode so
         # benchmark rows can be validated from the logs.
-        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
             indexer_cache_is_int8,
             indexer_imma_enabled,
         )
@@ -896,8 +896,8 @@ class DeepseekV4Indexer(nn.Module):
             # INT8 IMMA indexer query: emit a symmetric INT8 query (scale folded
             # into indexer_weights) so the logits run as s8 x s8 integer-MMA.
             # Gated on the INT8 indexer cache + checkpoint-enabled IMMA path;
-            # lazy import avoids a base<->nvidia_sm86 import cycle.
-            from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+            # lazy import avoids a base<->nvidia_imma import cycle.
+            from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
                 indexer_imma_enabled,
             )
 

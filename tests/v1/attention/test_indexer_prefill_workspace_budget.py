@@ -181,7 +181,7 @@ def _run_flashmla_warmup(stub, monkeypatch):
 def test_sm86_flash_prefill_warmup_skips_bf16_gather_workspace(monkeypatch):
     """SPARSE_MLA_PREFILL_FLASH consumes the paged caches directly and never
     touches the bf16 gather workspace; warmup must not reserve it."""
-    from vllm.models.deepseek_v4.nvidia_sm86.attention import (
+    from vllm.models.deepseek_v4.nvidia_imma.attention import (
         DeepseekV4TritonSM86Attention,
     )
     from vllm.transformers_utils.configs.dsv4.kernel_config import (
@@ -227,7 +227,7 @@ def test_gather_prefill_warmup_still_reserves_bf16_workspace(
         max_num_batched_tokens=8192,
     )
     if use_sm86_triton_prefill:
-        from vllm.models.deepseek_v4.nvidia_sm86.attention import (
+        from vllm.models.deepseek_v4.nvidia_imma.attention import (
             DeepseekV4TritonSM86Attention,
         )
         from vllm.transformers_utils.configs.dsv4.kernel_config import (
@@ -272,7 +272,7 @@ def test_workspace_arena_accounting_at_production_geometry(monkeypatch):
     from vllm.transformers_utils.configs.dsv4.kernel_config import (
         SPARSE_MLA_PREFILL_FLASH,
     )
-    from vllm.models.deepseek_v4.nvidia_sm86.attention import (
+    from vllm.models.deepseek_v4.nvidia_imma.attention import (
         DeepseekV4TritonSM86Attention,
     )
     from vllm.v1.worker.workspace import WorkspaceManager

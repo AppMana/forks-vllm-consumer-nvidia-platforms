@@ -41,7 +41,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (  # noqa: E402
     oneshot_prefill_topk_reference,
     streaming_prefill_topk,
 )
-from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (  # noqa: E402
+from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (  # noqa: E402
     mqa_logits_workspace_triton,
 )
 

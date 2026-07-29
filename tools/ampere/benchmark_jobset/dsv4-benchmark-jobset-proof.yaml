@@ -1110,7 +1110,7 @@ spec:
                     - name: VLLM_TENSOR_PARALLEL_SIZE
                       value: "1"
                     - name: VLLM_USE_V2_MODEL_RUNNER
-                      value: "0"
+                      value: "1"
                     - name: VLLM_MHC_POST_TRITON
                       value: "1"
                     - name: VLLM_MHC_HEAD_TRITON

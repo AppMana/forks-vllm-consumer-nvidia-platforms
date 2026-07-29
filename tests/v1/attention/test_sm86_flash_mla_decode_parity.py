@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """sm_86 integration gate: the precompiled flash_mla CUDA sparse-MLA decode kernel
-(now wired into ``nvidia_sm86`` attention) must match the Triton decode primitive it
+(now wired into ``nvidia_imma`` attention) must match the Triton decode primitive it
 replaces, on identical fp8_ds_mla inputs. Both target the same oracle, so they must
 agree; this guards the ``_forward_decode`` flash_mla dispatch.
 
@@ -17,10 +17,10 @@ import torch
 flash_mla = pytest.importorskip("flash_mla")
 from flash_mla import sparse_mla_decode_fp8, sparse_mla_prefill  # noqa: E402
 
-from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (  # noqa: E402
+from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (  # noqa: E402
     decode_sparse_attention_triton,
 )
-from vllm.models.deepseek_v4.nvidia_sm86.attention import (  # noqa: E402
+from vllm.models.deepseek_v4.nvidia_imma.attention import (  # noqa: E402
     DeepseekV4SM86Attention,
 )
 from vllm.transformers_utils.configs.dsv4.kernel_config import (  # noqa: E402
@@ -374,7 +374,7 @@ def test_sm86_fp8_decode_dispatch_supports_native_and_triton_fqns() -> None:
         "flash_mla.sparse_mla_decode_fp8"
     )
     assert SPARSE_MLA_DECODE_FP8_TRITON == (
-        "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels."
+        "vllm.models.deepseek_v4.nvidia_imma.triton_kernels."
         "decode_sparse_attention_triton"
     )
     source = inspect.getsource(DeepseekV4SM86Attention._forward_decode)

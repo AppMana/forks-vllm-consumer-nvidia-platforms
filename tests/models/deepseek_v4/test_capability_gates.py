@@ -58,11 +58,21 @@ def test_fp8e4nv_gate_floor_is_sm89(capability, expected, patch_capability):
 @pytest.mark.parametrize("capability,expected", FP8E4NV_CASES)
 def test_every_fp8e4nv_call_site_agrees(capability, expected, patch_capability):
     """The four dispatch sites must not drift apart again."""
+    import importlib
+
     from vllm.models.deepseek_v4.common.ops import (
         cache_utils,
         fp8_einsum,
         fused_indexer_q,
-        fused_inv_rope_fp8_quant,
+    )
+
+    # ops/__init__ re-exports a *function* named fused_inv_rope_fp8_quant,
+    # which shadows the submodule of the same name -- importing it from the
+    # package yields the function, whose _supports_fp8e4nv_in_triton lookup
+    # raises AttributeError. Resolve the module by path so this fourth call
+    # site is actually checked rather than silently erroring out.
+    fused_inv_rope_fp8_quant = importlib.import_module(
+        "vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant"
     )
 
     patch_capability(*capability)
@@ -98,11 +108,17 @@ def test_fp8e4nv_gate_without_capability(monkeypatch):
         ((8, 6), True),  # the arch DeepseekV4TritonSM86Attention serves
         ((9, 0), True),
         ((10, 0), True),
+        ((12, 1), True),  # GB10: IMMA is available, so int8_ds_mla is servable
         ((7, 5), False),
     ],
 )
 def test_dsv4_flashmla_backend_admits_ampere(capability, expected):
-    """The backend must not reject the arch its own subclass runs on."""
+    """The backend must not reject the arch its own subclass runs on.
+
+    The gate is a floor, not an enumeration: listing majors excluded sm_12x,
+    where these int8 kernels run fine, and made an int8_ds_mla checkpoint
+    unservable on GB10.
+    """
     from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLABackend
 
     assert (
@@ -137,3 +153,37 @@ def test_sparkinfer_backend_is_selectable_by_flag():
     assert AttentionBackendEnum.SPARKINFER_MLA_SPARSE_DSV4.value.endswith(
         "DeepseekV4SparkInferMLABackend"
     )
+
+
+@pytest.mark.parametrize(
+    "capability,cache_dtype,expected_qualname",
+    [
+        # int8_ds_mla selects the class that reads int8 pages, at any arch that
+        # has IMMA -- including sm_12x, where arch-first dispatch used to send
+        # it to sparkinfer and fail.
+        ((8, 6), "int8_ds_mla", "DeepseekV4TritonSM86Attention"),
+        ((12, 1), "int8_ds_mla", "DeepseekV4TritonSM86Attention"),
+        # fp8_ds_mla keeps the per-arch default.
+        ((12, 1), "fp8_ds_mla", "DeepseekV4SparkInferSM12xAttention"),
+        ((8, 6), "fp8_ds_mla", "DeepseekV4TritonSM86Attention"),
+    ],
+)
+def test_attn_cls_dispatch_follows_cache_dtype(
+    patch_capability, capability, cache_dtype, expected_qualname
+):
+    """The attention class is chosen by what the checkpoint asks for, with
+    capability as a floor -- not by arch alone.
+
+    sparkinfer's kernels read the 584-byte fp8 page byte-for-byte, so the KV
+    cache dtype, not the device, decides which class can serve. Selecting on
+    arch first made int8_ds_mla unreachable on sm_12x.
+    """
+    from vllm.models.deepseek_v4.nvidia.model import _select_dsv4_attn_cls
+
+    patch_capability(*capability)
+
+    class _StubVllmConfig:
+        attention_config = type("_A", (), {"backend": None})()
+        cache_config = type("_C", (), {"cache_dtype": cache_dtype})()
+
+    assert _select_dsv4_attn_cls(_StubVllmConfig()).__qualname__ == expected_qualname

@@ -12,7 +12,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
     _reserve_prefill_gather_workspace,
     _should_use_sm120_short_row_topk_decode,
 )
-from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
+from vllm.models.deepseek_v4.nvidia_imma import triton_kernels as dsv4_sm86
 from vllm.transformers_utils.configs.dsv4 import kernel_config
 
 

@@ -27,7 +27,7 @@ import torch
 import flash_mla
 from flash_mla import flash_sparse_mla_decode, flash_sparse_mla_prefill
 
-from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
     decode_sparse_attention_triton,
 )
 

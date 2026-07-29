@@ -129,11 +129,16 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # sm_8x is served by DeepseekV4TritonSM86Attention, which reuses this
-        # backend's metadata builder and paged layout unchanged and only swaps
-        # the kernel launches. The backend must not reject the arch its own
-        # subclass runs on.
-        return capability.major in (8, 9, 10)
+        # A floor, not a set. sm_8x is served by DeepseekV4TritonSM86Attention,
+        # which reuses this backend's metadata builder and paged layout
+        # unchanged and only swaps the kernel launches; the backend must not
+        # reject the arch its own subclass runs on. Enumerating majors also
+        # excluded sm_12x, where the int8 kernels this backend selects run
+        # fine -- an arch newer than the ones listed is not a reason to refuse.
+        #
+        # The floor is sm_80 rather than IMMA's own sm_75: these kernels use
+        # cp.async, which Turing does not have.
+        return capability.major >= 8
 
     @staticmethod
     def get_kv_cache_shape(

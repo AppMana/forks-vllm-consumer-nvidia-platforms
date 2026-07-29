@@ -515,7 +515,7 @@ def mhc_pre_triton(
     sinkhorn_repeat: int,
     n_splits: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         tf32_hc_prenorm_gemm_triton,
     )
 

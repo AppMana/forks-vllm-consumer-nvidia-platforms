@@ -11,7 +11,7 @@ Answers two Phase-6 questions that gate kernel policy on sm12x:
    it" gets a data-driven answer.
 
 Runs standalone on a spark (no vLLM install): the Triton kernel module chain
-(vllm.triton_utils -> fp8e4m3_arith -> nvidia_sm86.triton_kernels) is stubbed
+(vllm.triton_utils -> fp8e4m3_arith -> nvidia_imma.triton_kernels) is stubbed
 and loaded by file path. Both kernels see identical caches, indices, lengths.
 
 Usage (from a source rsync):  python tools/ampere/bench_sm12x_sparse_mla_decode.py
@@ -45,7 +45,7 @@ def _load_by_path(dotted: str, path: pathlib.Path):
 
 def _load_triton_decode():
     try:
-        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
             decode_sparse_attention_triton,
         )
 
@@ -69,8 +69,8 @@ def _load_triton_decode():
         REPO / "vllm/models/deepseek_v4/common/ops/fp8e4m3_arith.py",
     )
     mod = _load_by_path(
-        "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels",
-        REPO / "vllm/models/deepseek_v4/nvidia_sm86/triton_kernels.py",
+        "vllm.models.deepseek_v4.nvidia_imma.triton_kernels",
+        REPO / "vllm/models/deepseek_v4/nvidia_imma/triton_kernels.py",
     )
     return mod.decode_sparse_attention_triton
 

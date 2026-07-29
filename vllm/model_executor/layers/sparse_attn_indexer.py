@@ -225,7 +225,7 @@ def oneshot_prefill_topk_reference(
     """One-shot reference: full [M, N] logits, single top-k over the same
     unique-key total order as the streaming path. Returns [M, topk] int32
     request-LOCAL indices (column - cu_seqlen_ks), -1 padded."""
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         mqa_logits_workspace_triton,
     )
 
@@ -272,7 +272,7 @@ def streaming_prefill_topk(
     the top-k temporaries. Selection is bit-identical to
     oneshot_prefill_topk_reference (see module comment for the proof).
     """
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         indexer_imma_enabled,
         mqa_logits_workspace_triton,
     )
@@ -698,7 +698,7 @@ def sparse_attn_indexer(
     # INT8 bit patterns with plain fp32 absmax/127 scales; decode kernels branch
     # on K_IS_INT8 and prefill consumers receive an int8-viewed gather, so their
     # generic float conversions stay correct.
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         indexer_cache_is_int8,
     )
 

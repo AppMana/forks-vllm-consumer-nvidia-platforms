@@ -584,7 +584,7 @@ def _fp8_mqa_logits_sm12x(
 ) -> torch.Tensor:
     q_values, q_scale = q
     if q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
-        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
             fp8_mqa_logits_triton,
             indexer_imma_enabled,
             mqa_logits_workspace_triton,
@@ -710,7 +710,7 @@ def _fp8_paged_mqa_logits_torch(
     assert weights.shape == (batch_size * next_n, num_heads)
     assert context_lens.shape == (batch_size, next_n)
 
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         _view_packed_fp8_paged_mqa_kv_cache,
     )
 
@@ -815,7 +815,7 @@ def fp8_fp4_paged_mqa_logits(
         current_platform.is_device_capability_family(80)
         or current_platform.is_device_capability_family(120)
     ):
-        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
             fp8_paged_mqa_logits_triton,
         )
 

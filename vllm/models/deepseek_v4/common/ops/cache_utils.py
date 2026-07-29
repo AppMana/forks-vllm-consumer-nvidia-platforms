@@ -1698,7 +1698,7 @@ class CombineTopkSwaIndicesKernel(
 def _combine_topk_swa_pointer_inputs(topk_widths: tuple[int, ...]) -> Any:
     """Pointer-alignment variants the live prefill chunk loop can produce.
 
-    Every live caller (nvidia/flashmla.py, nvidia_sm86/attention.py,
+    Every live caller (nvidia/flashmla.py, nvidia_imma/attention.py,
     amd/rocm.py) slices the same way::
 
         topk_indices[query_start:query_end]

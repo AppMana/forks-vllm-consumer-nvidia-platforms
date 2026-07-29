@@ -78,5 +78,6 @@ cohere_melody>=0.9.0 # required for cohere command reasoning parser test
 # Older versions are in conflict with teerratorch requirements.
 datasets>=3.3.0,<=3.6.0
 
+pyflakes # required for the DSV4 undefined-name gate (tests/models/deepseek_v4/test_static_name_resolution.py)
 openpyxl # required for perf comparison excel report
 plotly # required for perf comparison html report

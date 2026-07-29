@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """sm_86 correctness gate: the fused Triton sparse-MLA decode kernel that
-``nvidia_sm86`` calls, against the pure-torch reference oracle.
+``nvidia_imma`` calls, against the pure-torch reference oracle.
 
 Imports the kernel directly rather than through ``deepseek_v4/attention.py``,
 so a decode-kernel regression is attributable without standing up a model.
@@ -69,9 +69,9 @@ def _write_fp8_ds_mla_token(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_decode_sparse_attention_triton_fused_kernel_matches_reference() -> None:
-    """The fused fp8 decode attention kernel (what nvidia_sm86 actually calls)
+    """The fused fp8 decode attention kernel (what nvidia_imma actually calls)
     vs the pure-torch oracle. Swa-only (no compressed extra cache)."""
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         decode_sparse_attention_triton,
     )
 

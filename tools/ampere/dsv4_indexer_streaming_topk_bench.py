@@ -10,7 +10,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
     oneshot_prefill_topk_reference,
     streaming_prefill_topk,
 )
-from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
     mqa_logits_workspace_triton,
 )
 

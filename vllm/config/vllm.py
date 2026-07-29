@@ -68,6 +68,12 @@ logger = init_logger(__name__)
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "DeepseekV2ForCausalLM",
+        # DSV4 is MoE, so without an entry here the `not is_moe` fallback
+        # leaves it on the v1 runner. It reached v2 only when a speculative
+        # config happened to force it, which made the runner an accident of
+        # the serve flags rather than a property of the model.
+        "DeepseekV4ForCausalLM",
+        "DSparkDraftModel",
         "GraniteMoeForCausalLM",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",

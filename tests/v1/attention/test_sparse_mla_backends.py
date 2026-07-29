@@ -187,7 +187,7 @@ def test_sm120_fp8_paged_mqa_logits_fallback_matches_reference(
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
 
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         fp8_paged_mqa_logits_triton,
     )
 
@@ -205,7 +205,7 @@ def test_sm120_fp8_paged_mqa_logits_fallback_matches_reference(
 def test_sm120_fp8_paged_mqa_logits_dispatches_rowwise_for_mtp(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from vllm.models.deepseek_v4.nvidia_sm86 import (
+    from vllm.models.deepseek_v4.nvidia_imma import (
         triton_kernels as kernels,
     )
 
@@ -297,7 +297,7 @@ def test_sm120_fp8_paged_mqa_rowwise_logits_matches_reference(next_n: int):
         % num_blocks
     )
 
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         fp8_paged_mqa_logits_rowwise_triton,
     )
 
@@ -363,7 +363,7 @@ def test_sm120_fp8_paged_mqa_logits_windows_match_reference(
         % num_blocks
     )
 
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         fp8_paged_mqa_logits_triton,
     )
 
@@ -439,7 +439,7 @@ def test_sm120_fp8_paged_mqa_rowwise_logits_windows_match_reference(
         % num_blocks
     )
 
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         fp8_paged_mqa_logits_rowwise_triton,
     )
 
@@ -517,7 +517,7 @@ def test_fp8_paged_mqa_logits_ampere_window_buckets_match_reference(
         % num_blocks
     )
 
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         fp8_paged_mqa_logits_rowwise_triton,
         fp8_paged_mqa_logits_triton,
     )

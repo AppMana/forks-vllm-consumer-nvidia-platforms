@@ -153,7 +153,7 @@ def main() -> int:
         verbose=True,
     )
 
-    # Windowed-SWA geometry (mirrors nvidia_sm86/attention.py call 2 at 16k):
+    # Windowed-SWA geometry (mirrors nvidia_imma/attention.py call 2 at 16k):
     # the request's absolute context is 16k tokens, but the sliding-window SWA
     # block table only has enough COLUMNS for the window. block_in_seq is
     # computed from the ABSOLUTE logical position -> it walks off the end of the

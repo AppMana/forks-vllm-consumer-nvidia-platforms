@@ -882,6 +882,8 @@ pydantic-settings==2.14.2
     # via
     #   fastapi
     #   mcp
+pyflakes==3.4.0
+    # via -r requirements/test/cuda.in
 pygments==2.18.0
     # via
     #   pytest

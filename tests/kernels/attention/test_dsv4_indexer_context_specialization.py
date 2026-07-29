@@ -31,7 +31,7 @@ import time  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (  # noqa: E402
+from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (  # noqa: E402
     mqa_logits_workspace_triton,
 )
 

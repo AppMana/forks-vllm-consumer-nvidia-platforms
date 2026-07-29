@@ -366,7 +366,7 @@ def test_sm86_forward_decode_narrows_c128a_extra_indices(monkeypatch):
     """_forward_decode must pass the flash_mla kernel a contiguous C128A index
     view narrowed to the batch's max compressed context (not the 8192-wide
     persistent buffer)."""
-    from vllm.models.deepseek_v4.nvidia_sm86 import attention as sm86_attention
+    from vllm.models.deepseek_v4.nvidia_imma import attention as sm86_attention
     from vllm.transformers_utils.configs.dsv4.kernel_config import (
         SPARSE_MLA_DECODE_INT8_FLASH,
     )

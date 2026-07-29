@@ -276,7 +276,7 @@ def test_resolve_from_hf_config_without_block_uses_defaults():
 def test_blockless_dsv4_int_config_leaves_dense_and_indexer_off():
     """Without a "vllm" block, the dense W4A8 runtime and both indexer int8
     paths stay OFF, even on a checkpoint carrying INT4/INT8 weight groups."""
-    from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels as dsv4_sm86
 
     cfg = Dsv4IntConfig.from_config(
         {
@@ -310,7 +310,7 @@ def test_vllm_block_enables_dense_runtime():
 
 def test_vllm_block_enables_indexer_int8_without_dense_runtime():
     """Indexer int8 is activatable independently of the dense runtime."""
-    from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels as dsv4_sm86
 
     cfg = Dsv4IntConfig.from_config(
         {
@@ -335,7 +335,7 @@ def test_vllm_block_enables_indexer_int8_without_dense_runtime():
 def test_vllm_block_dense_runtime_does_not_ride_indexer_int8():
     """Listing only the dense symbol keeps both indexer int8 paths OFF: the
     indexer never rides the dense runtime."""
-    from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels as dsv4_sm86
 
     cfg = Dsv4IntConfig.from_config(
         {
@@ -367,7 +367,7 @@ def test_dense_symbol_requires_int_weight_groups():
 
 def test_vanilla_checkpoint_block_enables_indexer_int8_without_quant_config():
     """The kernels list works on vanilla-weights deployments (no dsv4_int)."""
-    from vllm.models.deepseek_v4.nvidia_sm86 import triton_kernels as dsv4_sm86
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels as dsv4_sm86
 
     resolved = resolve_kernel_config(
         {"kernels": [INDEXER_CACHE_INT8_WRITER, INDEXER_QUERY_INT8_QUANT]}
@@ -580,7 +580,7 @@ def test_resolved_proof_line_marks_inactive_toggles_off():
 def test_sm86_attention_dispatches_all_registered_prefill_symbols():
     import inspect
 
-    from vllm.models.deepseek_v4.nvidia_sm86.attention import (
+    from vllm.models.deepseek_v4.nvidia_imma.attention import (
         DeepseekV4SM86Attention,
     )
 
@@ -619,7 +619,7 @@ def test_sm86_native_prefill_supports_fp8_and_int8_caches():
     """The fused native prefill consumes BOTH fp8_ds_mla and int8_ds_mla paged
     caches (flash_mla 93bbf4e: int8 whole-cache dequant pass, runtime row
     stride), so selecting it must validate under either cache dtype."""
-    from vllm.models.deepseek_v4.nvidia_sm86.attention import (
+    from vllm.models.deepseek_v4.nvidia_imma.attention import (
         validate_sm86_kernel_selection,
     )
 

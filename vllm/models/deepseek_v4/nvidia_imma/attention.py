@@ -46,7 +46,7 @@ from vllm.models.deepseek_v4.common.ops.cache_utils import (
     get_int8_ds_mla_cache_views,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
-from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
     decode_sparse_attention_triton,
     sparse_attention_triton,
 )

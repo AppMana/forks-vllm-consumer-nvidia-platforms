@@ -7,7 +7,7 @@ A single ``"vllm"`` block at the top level of the checkpoint's
 
     "vllm": {
       "kernels": ["flash_mla.sparse_mla_decode_fp8",
-                  "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels"
+                  "vllm.models.deepseek_v4.nvidia_imma.triton_kernels"
                   ".sparse_attention_triton",
                   "vllm._custom_ops.indexer_k_quant_and_cache_int8",
                   "vllm.models.deepseek_v4.common.ops.fused_indexer_q"
@@ -76,15 +76,23 @@ ROLE_INDEXER_STREAMING_TOPK_PREFILL = "indexer_streaming_topk_prefill"
 
 SPARSE_MLA_DECODE_FP8_FLASH = "flash_mla.sparse_mla_decode_fp8"
 SPARSE_MLA_DECODE_FP8_TRITON = (
-    "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels."
+    "vllm.models.deepseek_v4.nvidia_imma.triton_kernels."
     "decode_sparse_attention_triton"
 )
 SPARSE_MLA_DECODE_INT8_TRITON = "flash_mla.sparse_mla_decode_int8_triton"
 SPARSE_MLA_DECODE_INT8_FLASH = "flash_mla.sparse_mla_decode_int8"
 SPARSE_MLA_PREFILL_TRITON = (
-    "vllm.models.deepseek_v4.nvidia_sm86.triton_kernels.sparse_attention_triton"
+    "vllm.models.deepseek_v4.nvidia_imma.triton_kernels.sparse_attention_triton"
 )
 SPARSE_MLA_PREFILL_FLASH = "flash_mla.sparse_mla_prefill"
+# The int8 variant of the same fused native prefill. It is a distinct symbol
+# because it is a distinct kernel: it gathers int8 rows and dequantizes
+# in-kernel, with none of the fp8 path's whole-cache bf16 dequant pre-pass
+# (that pre-pass allocated 2 KiB/slot and OOM'd 24 GB ranks at production pool
+# sizes). nvidia_imma/attention.py calls it whenever the cache is int8_ds_mla,
+# so a block naming only SPARSE_MLA_PREFILL_FLASH alongside an int8 cache
+# describes a kernel that does not run.
+SPARSE_MLA_PREFILL_INT8_FLASH = "flash_mla.sparse_mla_prefill_int8"
 INDEXER_CACHE_INT8_WRITER = "vllm._custom_ops.indexer_k_quant_and_cache_int8"
 INDEXER_QUERY_INT8_QUANT = (
     "vllm.models.deepseek_v4.common.ops.fused_indexer_q."
@@ -117,6 +125,7 @@ KERNEL_REGISTRY: dict[str, str] = {
     SPARSE_MLA_DECODE_INT8_FLASH: ROLE_SPARSE_MLA_DECODE_INT8,
     SPARSE_MLA_PREFILL_TRITON: ROLE_SPARSE_MLA_PREFILL,
     SPARSE_MLA_PREFILL_FLASH: ROLE_SPARSE_MLA_PREFILL,
+    SPARSE_MLA_PREFILL_INT8_FLASH: ROLE_SPARSE_MLA_PREFILL,
     SPARSE_MLA_DECODE_FP8_SPARKINFER: ROLE_SPARSE_MLA_DECODE_FP8,
     SPARSE_MLA_PREFILL_SPARKINFER: ROLE_SPARSE_MLA_PREFILL,
     INDEXER_CACHE_INT8_WRITER: ROLE_INDEXER_CACHE_INT8,
@@ -200,6 +209,24 @@ def _allowed_cache_types() -> tuple[str, ...]:
     return tuple(_flatten(CacheDType))
 
 
+# Module renames the checkpoints cannot follow. A published checkpoint names
+# its kernels by FQN and is not editable retroactively, so a rename has to keep
+# the old spelling resolving to the same role. nvidia_sm86 -> nvidia_imma: the
+# module is named for what it requires (IMMA + cp.async, sm_80 and up) rather
+# than for the arch it was written on.
+_LEGACY_SYMBOL_PREFIXES = {
+    "vllm.models.deepseek_v4.nvidia_sm86.": "vllm.models.deepseek_v4.nvidia_imma.",
+}
+
+
+def _canonical_symbol(symbol: str) -> str:
+    """Map a legacy kernel FQN onto its current spelling."""
+    for old, new in _LEGACY_SYMBOL_PREFIXES.items():
+        if symbol.startswith(old):
+            return new + symbol[len(old) :]
+    return symbol
+
+
 def resolve_kernel_config(block: Any) -> ResolvedKernelConfig:
     """Resolve and validate the ``vllm`` block (fail closed)."""
     explicit = False
@@ -255,6 +282,7 @@ def resolve_kernel_config(block: Any) -> ResolvedKernelConfig:
 
     roles: dict[str, str] = {}
     for symbol in kernels:
+        symbol = _canonical_symbol(symbol)
         role = KERNEL_REGISTRY.get(symbol)
         if role is None:
             raise ValueError(

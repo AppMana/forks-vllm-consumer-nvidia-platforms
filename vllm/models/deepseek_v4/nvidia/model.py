@@ -808,7 +808,28 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             )
         return DeepseekV4FlashMLAAttention
 
-    if device_capability is not None and device_capability.major == 12:
+    # No explicit backend: the checkpoint decides, and capability only sets a
+    # floor. What the class must be able to do is read the KV cache the
+    # checkpoint asked for -- selecting on arch first made cache dtype
+    # unreachable, so an int8_ds_mla checkpoint on sm_12x could never reach the
+    # only class that reads int8 pages, despite IMMA being available there.
+    cache_dtype = getattr(
+        getattr(vllm_config, "cache_config", None), "cache_dtype", None
+    )
+
+    if cache_dtype == "int8_ds_mla":
+        # int8 sparse-MLA decode lives only in the nvidia_imma class, which
+        # carries no capability gate of its own: what it needs is IMMA plus
+        # cp.async -- sm_80 and up, which includes sm_12x. The module is named
+        # for that requirement rather than for sm_86, the arch it was written
+        # on. Lazy import: nvidia_imma imports this module's siblings.
+        from vllm.models.deepseek_v4.nvidia_imma.attention import (
+            DeepseekV4SM86Attention,
+        )
+
+        return DeepseekV4SM86Attention
+
+    if device_capability is not None and device_capability.major >= 12:
         # GB10/sm_12x default: sparkinfer (kernel choice within the class is
         # the FQN "vllm" config block; the FlashInfer SM120 class stays
         # reachable via --attention-backend FLASHINFER_MLA_SPARSE_DSV4 above).
@@ -818,11 +839,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         )
 
         return DeepseekV4SparkInferSM12xAttention
-    if device_capability is not None and device_capability.major == 8:
-        # Ampere (sm_8x): use the DSv4-specific sm86 path. It may mix native
-        # FlashMLA decode with Triton prefill/indexer depending on cache dtype.
-        # Lazy import: nvidia_sm86 imports this module's siblings.
-        from vllm.models.deepseek_v4.nvidia_sm86.attention import (
+    if device_capability is not None and device_capability.major >= 8:
+        # Ampere and later: the DSv4-specific IMMA path (floor sm_80 -- these
+        # kernels use cp.async, which Turing lacks). It may mix native FlashMLA
+        # decode with Triton prefill/indexer depending on cache dtype.
+        from vllm.models.deepseek_v4.nvidia_imma.attention import (
             DeepseekV4SM86Attention,
         )
 

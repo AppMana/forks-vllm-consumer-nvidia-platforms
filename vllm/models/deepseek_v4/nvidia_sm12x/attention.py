@@ -73,9 +73,20 @@ def validate_sm12x_kernel_selection(
     sm12x primary. Fails closed on explicit non-sm12x selections.
     """
     if kv_cache_dtype != "fp8_ds_mla":
-        raise ValueError(
-            "DeepSeek V4 sm12x sparse MLA requires the fp8_ds_mla KV cache, "
-            f"got {kv_cache_dtype}"
+        # Not an arch limit: sm_12x runs int8_ds_mla fine (IMMA is available),
+        # it just cannot run it *through these kernels* -- sparkinfer's
+        # compressed_mla consumes the 584-byte fp8 page byte-for-byte. Reaching
+        # this function at all with an int8 cache means the class dispatch in
+        # nvidia/model.py routed here anyway, which only happens under an
+        # explicit --attention-backend. Say what is wrong and which knob moves
+        # it; an int8 checkpoint left alone selects the sm86 class instead.
+        logger.warning(
+            "DeepSeek V4 sm12x sparkinfer kernels read the 584-byte "
+            "fp8_ds_mla page layout, but the KV cache is %s. The int8 sparse "
+            "MLA kernels are in DeepseekV4SM86Attention, which sm_12x can "
+            "use: drop --attention-backend and let the checkpoint's "
+            'cache_type select it, or set "cache_type": "fp8_ds_mla".',
+            kv_cache_dtype,
         )
     if not resolved.explicit:
         # No "vllm" kernels list: sparkinfer is the sm12x primary.
@@ -127,7 +138,8 @@ class DeepseekV4SparkInferMLABackend(DeepseekV4FlashMLABackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 12
+        # Floor: sparkinfer's CuTe-DSL kernels target sm_120/121 and later.
+        return capability.major >= 12
 
 
 class DeepseekV4SparkInferSM12xAttention(DeepseekV4FlashInferSM120Attention):
@@ -152,7 +164,7 @@ class DeepseekV4SparkInferSM12xAttention(DeepseekV4FlashInferSM120Attention):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Unified kernel selection: the "vllm" checkpoint config block
-        # (fail-closed), same machinery as nvidia_sm86.
+        # (fail-closed), same machinery as nvidia_imma.
         resolved = resolve_kernel_config_from_hf_config(self.config)
         self.decode_symbol, self.prefill_symbol = validate_sm12x_kernel_selection(
             resolved, kv_cache_dtype=self.kv_cache_dtype
@@ -244,7 +256,7 @@ class DeepseekV4SparkInferSM12xAttention(DeepseekV4FlashInferSM120Attention):
             return
         # Portable Triton fallback (bf16-Q over the same fp8_ds_mla bytes);
         # per-row independent, so it serves prefill rows unchanged.
-        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
             decode_sparse_attention_triton,
         )
 

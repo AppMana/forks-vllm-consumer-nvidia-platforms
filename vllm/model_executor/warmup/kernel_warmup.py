@@ -327,7 +327,7 @@ def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
         combine_topk_swa_indices,
         dequantize_and_gather_k_cache,
     )
-    from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         sparse_attention_triton,
     )
 

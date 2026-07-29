@@ -164,7 +164,7 @@ def deep_gemm_fp8_o_proj(
         from vllm.models.deepseek_v4.common.ops.fp8_einsum import (
             deepseek_v4_sm12x_fp8_einsum,
         )
-        from vllm.models.deepseek_v4.nvidia_sm86.triton_kernels import (
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
             _normalize_deepseek_v4_fp8_einsum_inputs,
         )
 
