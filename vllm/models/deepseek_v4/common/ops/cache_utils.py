@@ -28,6 +28,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
 )
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import next_power_of_2
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
@@ -1662,6 +1663,60 @@ class CombineTopkSwaIndicesKernel(
             WINDOW_SIZE=WINDOW_SIZE,
             PADDED_TOP_K=next_power_of_2(topk_indices.shape[-1]),
         )
+
+
+# Worker programs along grid dim 1; the kernel reads it back via
+# tl.num_programs(1) to stride its loops. Upstream 7ca017778f lifted this
+# out of the call site as a module constant so the warmup and the live
+# launch use one value; the merge kept both uses and dropped the
+# definition, so every combine-topk-swa launch raised NameError.
+# Recovered from upstream 7ca017778f: the merge kept the call sites in the
+# combine-topk-swa warmup and dropped these four definitions with it.
+_COMBINE_TOPK_SWA_POINTER_INPUTS = zip_inputs(
+    dict(
+        topk_indices=True,
+        query_start_loc=True,
+        seq_lens=True,
+        gather_lens=True,
+    ),
+    dict(
+        topk_indices=True,
+        query_start_loc=False,
+        seq_lens=False,
+        gather_lens=True,
+    ),
+    dict(
+        topk_indices=False,
+        query_start_loc=False,
+        seq_lens=False,
+        gather_lens=False,
+    ),
+)
+
+
+_DSV4_COMBINE_TOPK_SWA_WARMUP_INPUTS = zip_inputs(
+    # DSv4-Flash / SWA-only and C4A.
+    dict(compress_ratio=1, topk=0, topk_width=512),
+    dict(compress_ratio=4, topk=512, topk_width=512),
+    # DSv4-Pro C4A.
+    dict(compress_ratio=4, topk=1024, topk_width=1024),
+    # DSv4-Pro C128A.
+    dict(compress_ratio=128, topk=8192, topk_width=8192),
+)
+
+
+def _hf_config_int(vllm_config: Any, name: str, default: int) -> int:
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    return int(getattr(hf_config, name, default) or default)
+
+
+def _scheduler_config_int(vllm_config: Any, name: str, default: int) -> int:
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    return int(getattr(scheduler_config, name, default) or default)
+
+
+_COMBINE_TOPK_SWA_NUM_WORKERS = 128
 
 
 _COMBINE_TOPK_SWA_INDICES_KERNEL = CombineTopkSwaIndicesKernel()
