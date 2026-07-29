@@ -940,7 +940,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Install gdrcopy (saves ~6s per build)
 # TODO (huydhn): There is no prebuilt gdrcopy package on 12.9 at the moment
 ARG GDRCOPY_CUDA_VERSION=12.8
-ARG GDRCOPY_OS_VERSION=Ubuntu22_04
+# Tracks UBUNTU_VERSION above (24.04). Upstream defaults this to Ubuntu22_04
+# and corrects it only in the -ubuntu2404 bake targets; since this fork's base
+# is 24.04, leaving that default would install the 22.04 gdrcopy package into a
+# 24.04 image on every plain `openai`/`test` build.
+ARG GDRCOPY_OS_VERSION=Ubuntu24_04
 ARG TARGETPLATFORM
 COPY tools/install_gdrcopy.sh /tmp/install_gdrcopy.sh
 RUN set -eux; \
