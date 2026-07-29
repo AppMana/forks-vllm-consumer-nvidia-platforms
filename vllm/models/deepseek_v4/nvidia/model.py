@@ -1144,6 +1144,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            # V4 carries hc_mult parallel residual streams, so the decoder
+            # layers work on (T, hc_mult, H); the embedding is (T, H). Every
+            # MHC kernel infers hc_mult from residual.shape[-2], so without
+            # this the first layer reads the TOKEN COUNT as hc_mult -- which
+            # trips the mhc_pre shape assert rather than degrading quietly.
+            # The amd backend expands here too.
+            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]

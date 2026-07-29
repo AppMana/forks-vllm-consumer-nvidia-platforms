@@ -8,13 +8,34 @@
       "default": "3.12"
     },
     "UBUNTU_VERSION": {
-      "default": "22.04"
+      "default": "24.04"
     },
     "BUILD_BASE_IMAGE": {
-      "default": "nvidia/cuda:13.0.3-devel-ubuntu22.04"
+      "default": "nvidia/cuda:13.0.3-devel-ubuntu24.04"
     },
     "FINAL_BASE_IMAGE": {
-      "default": "nvidia/cuda:13.0.3-base-ubuntu22.04"
+      "default": "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+    },
+    "APPMANA_NCCL_GENCODE": {
+      "default": "-gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_121,code=compute_121"
+    },
+    "APPMANA_NCCL_GIT_REPO": {
+      "default": "https://github.com/AppMana/forks-nccl-rdma-routing.git"
+    },
+    "APPMANA_NCCL_GIT_REF": {
+      "default": "22355b63ea9ffd869e208e4f6d381e6f31b471d9"
+    },
+    "APPMANA_THUNDERBOLT_RELEASE_REPO": {
+      "default": "https://github.com/AppMana/forks-thunderbolt"
+    },
+    "INSTALL_USB4_RDMA_PROVIDER": {
+      "default": "true"
+    },
+    "USB4_RDMA_PROVIDER_VERSION": {
+      "default": "0.2.20"
+    },
+    "APPMANA_THUNDERBOLT_RELEASE_TAG": {
+      "default": "v0.2.20"
     },
     "BUILD_OS": {
       "default": "ubuntu"
@@ -34,15 +55,6 @@
     "INSTALL_KV_CONNECTORS": {
       "default": "false"
     },
-    "TORCH_CUDA_ARCH_LIST": {
-      "default": "7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0"
-    },
-    "MAX_JOBS": {
-      "default": "2"
-    },
-    "NVCC_THREADS": {
-      "default": "8"
-    },
     "SCCACHE_BUCKET_NAME": {
       "default": "vllm-build-sccache"
     },
@@ -53,13 +65,19 @@
       "default": "0"
     },
     "TORCH_CUDA_ARCH_LIST": {
-      "default": "7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0"
+      "default": "8.6 12.1a"
     },
     "MAX_JOBS": {
       "default": "2"
     },
     "NVCC_THREADS": {
       "default": "8"
+    },
+    "SCCACHE_VERSION": {
+      "default": "v0.16.0"
+    },
+    "SCCACHE_RECACHE": {
+      "default": "0"
     },
     "vllm_target_device": {
       "default": "cuda"
@@ -96,6 +114,27 @@
     },
     "RUNAI_MODEL_STREAMER_VERSION": {
       "default": ">=0.15.7"
+    },
+    "REPLACE_TORCH_BUNDLED_NCCL": {
+      "default": "true"
+    },
+    "LMCACHE_GIT_REF": {
+      "default": "cd51f3a15766e326f92998c072264a5a6caa4efe"
+    },
+    "FLASHMLA_INDEX_URL": {
+      "default": "https://appmana.github.io/forks-flash-mla-ampere-dsv4/"
+    },
+    "FLASHMLA_SPEC": {
+      "default": "flash-mla"
+    },
+    "VLLM_SOURCE_REPO": {
+      "default": "https://github.com/AppMana/forks-vllm-ampere"
+    },
+    "SPARKINFER_REPO": {
+      "default": "https://github.com/AppMana/forks-sparkinfer"
+    },
+    "SPARKINFER_REF": {
+      "default": "appmana/main"
     }
   }
 }

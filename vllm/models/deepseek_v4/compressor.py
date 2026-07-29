@@ -194,17 +194,24 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         uses_int8_ds_mla_layout = (
             vllm_config.cache_config.cache_dtype == "int8_ds_mla"
         )
+        # Deliberately NOT cache_dtype_str/model_version, unlike the sparse-SWA
+        # spec this otherwise mirrors. Those two together switch
+        # real_page_size_bytes onto the packed MLA row formula (584B/token for
+        # fp8_ds_mla, 528B for int8_ds_mla). That formula describes the KV rows;
+        # this spec describes the fp32 compressor STATE, whose real page is
+        # storage_block_size * state_dim * 4. Setting them under-reports the
+        # page several-fold, and the non-packed reshape path uses
+        # torch.as_strided, which does not bounds-check -- so the result is
+        # overlapping state pages rather than a clean failure.
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            cache_dtype_str=vllm_config.cache_config.cache_dtype,
             alignment=576
             if uses_fp8_ds_mla_layout
             else (528 if uses_int8_ds_mla_layout else 512),
-            model_version="deepseek_v4",
         )
 
     def forward(self): ...

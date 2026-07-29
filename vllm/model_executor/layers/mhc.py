@@ -41,7 +41,24 @@ def _should_use_mhc_torch_fallback() -> bool:
         return True
     if current_platform.is_cuda():
         capability = current_platform.get_device_capability()
-        return capability is not None and capability.major == 8
+        if capability is None:
+            return False
+        if capability.major == 8:
+            return True
+        # Everything else (sm_9x, sm_10x, sm_12x) runs the tilelang kernels --
+        # but only if tilelang is actually installed. Without this check the
+        # CUDA path calls torch.ops.vllm.mhc_*_tilelang regardless, and
+        # tilelang_kernels raises ImportError from inside the op body: op
+        # registration succeeds, so the failure lands mid-forward on the first
+        # request rather than at startup.
+        if not HAS_TILELANG_MHC:
+            logger.warning(
+                "tilelang is not installed; MHC falls back to the torch/triton "
+                "kernels on compute capability %s.",
+                capability,
+            )
+            return True
+        return False
     return False
 
 
@@ -361,8 +378,6 @@ class MHCPreOp(CustomOp):
                 hc_post_mult_value,
                 sinkhorn_repeat,
                 n_splits,
-                norm_weight,
-                norm_eps,
             )
         else:
             return self.forward_native(
@@ -376,8 +391,6 @@ class MHCPreOp(CustomOp):
                 hc_post_mult_value,
                 sinkhorn_repeat,
                 n_splits,
-                norm_weight,
-                norm_eps,
             )
 
     def forward_native(
@@ -562,8 +575,21 @@ class HCHeadOp(CustomOp):
         out = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
-        torch.ops._xpu_C.hc_head_fused(
-            hs_flat, hc_fn, hc_scale, hc_base, out, rms_norm_eps, hc_eps
+        # Triton, not torch.ops._xpu_C: that namespace does not exist on a ROCm
+        # build. It is here because forward_xpu was deleted and its body was
+        # left attached to this header, so every ROCm hc_head raised. There is
+        # no aiter/ROCm hc_head kernel, and triton is the one implementation
+        # that runs on both.
+        torch.ops.vllm.hc_head_triton(
+            hs_flat,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            out,
+            hidden_size,
+            rms_norm_eps,
+            hc_eps,
+            hc_mult,
         )
         return out.view(*outer_shape, hidden_size)
 

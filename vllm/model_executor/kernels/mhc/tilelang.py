@@ -145,10 +145,19 @@ def mhc_pre_tilelang(
     hc_mult3 = hc_mult * 2 + hc_mult2
 
     hc_hidden_size = hc_mult * hidden_size
-    assert fn.shape[0] == hc_mult3
-    assert fn.shape[1] == hc_hidden_size
-    assert hc_scale.shape == (3,)
-    assert hc_base.shape == (hc_mult3,)
+    # Report the shapes: hc_mult is inferred from the residual, so a mismatch
+    # here means the caller's residual and weights disagree, and a bare
+    # AssertionError gives no way to tell which of the two is wrong.
+    shapes = (
+        f"residual={tuple(residual.shape)} fn={tuple(fn.shape)} "
+        f"hc_scale={tuple(hc_scale.shape)} hc_base={tuple(hc_base.shape)} "
+        f"inferred hc_mult={hc_mult} hidden_size={hidden_size} "
+        f"expected fn=({hc_mult3}, {hc_hidden_size})"
+    )
+    assert fn.shape[0] == hc_mult3, f"mhc_pre fn.shape[0]: {shapes}"
+    assert fn.shape[1] == hc_hidden_size, f"mhc_pre fn.shape[1]: {shapes}"
+    assert hc_scale.shape == (3,), f"mhc_pre hc_scale: {shapes}"
+    assert hc_base.shape == (hc_mult3,), f"mhc_pre hc_base: {shapes}"
 
     if norm_weight is not None:
         assert norm_weight.shape == (hidden_size,)
