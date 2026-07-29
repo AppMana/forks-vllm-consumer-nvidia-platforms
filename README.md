@@ -202,8 +202,67 @@ Verify in this order:
 5. **`dmesg` clean** of `Xid` and `NV_ERR_NO_MEMORY` across load, prefill and
    sustained decode.
 
-Benchmarks run through `cluster/harness/llm_bench.py`
-(`--base-url`, `--model`, `--arm`, `--out`), or `vllm bench serve`.
+## Running the benchmarks
+
+Three harnesses, for three different questions. All of them need a server that
+already answered `/health` with 200 and printed its `vllm kernels resolved:`
+line — a number taken before that line is not attributable to a kernel set.
+
+### Needle-in-a-haystack (correctness *and* throughput)
+
+[`tools/ampere/dsv4_needle_bench.py`](tools/ampere/dsv4_needle_bench.py) is the
+one to reach for by default: it measures throughput and verifies the output at
+the same time, so a fast run that has stopped being correct cannot be reported
+as a win.
+
+Each request embeds a unique passage at a request-specific depth inside a
+unique haystack, sized with the real tokenizer so prompt lengths hit the target,
+and asks the model to reproduce it verbatim — which makes the expected output
+length known and correctness an exact containment check. Every haystack starts
+with a request-unique salt, so prefix caching cannot serve one request's prefill
+from another's.
+
+```bash
+python tools/ampere/dsv4_needle_bench.py \
+  --base-url http://localhost:8000 \
+  --model appmana/deepseek-v4-int4-int8 \
+  --input-tokens 8000 --needle-tokens 1000 \
+  --concurrency 8 \
+  --output-json needle-8k-1k.json
+```
+
+Set `--concurrency` no higher than the server's `--max-num-seqs`: a sweep above
+it is silently capped by the scheduler and every arm above the cap looks
+identical. `--tokenizer` defaults to `--model`.
+
+### Parallelism arms
+
+`cluster/harness/serve_dsv4.sh <arm> <rank>` in the `demos-hilton` repo serves
+the same checkpoint under arguments that differ in exactly one dimension — `A`
+TP=2 dual-rail, `B` TP=2 single rail, `C` PP=2, `D` TP=2 + expert parallel — and
+`cluster/harness/llm_bench.py` (`--base-url`, `--model`, `--arm`, `--out`)
+records them to one CSV. `MODEL=` and `REVISION=` select the checkpoint, so both
+checkpoints run through the same launcher rather than a forked copy.
+
+Run rank 1 first; it is `--headless` and waits for the leader.
+
+```bash
+MODEL=appmana/deepseek-v4-int4-int8 REVISION= ./serve_dsv4.sh A 1   # worker
+MODEL=appmana/deepseek-v4-int4-int8 REVISION= ./serve_dsv4.sh A 0   # leader
+```
+
+`EAGER=1` (the default) skips cudagraph capture — capture buys throughput, not
+correctness, and belongs in the benchmark arms rather than in a debugging loop.
+Set `EAGER=0` when the captured graphs are the point. `SPEC=0` drops speculative
+decoding. `JIT_MONITOR=error` turns any post-warmup Triton JIT into a hard
+failure, which is the direct test that the warmup key set matches what the live
+path dispatches.
+
+### Standard vLLM serving benchmark
+
+`vllm bench serve` for TTFT/TPOT distributions and the published decode/prefill
+numbers below. Use `--async-scheduling` on the server; it is worth ~10 tok/s at
+1M context and the published figures assume it.
 
 ## Serving benchmarks
 

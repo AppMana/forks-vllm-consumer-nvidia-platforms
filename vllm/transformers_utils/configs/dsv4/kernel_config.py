@@ -27,8 +27,14 @@ Principles:
    uses its documented default. When a block with a ``kernels`` list is
    present it is authoritative for the *toggle* roles (indexer cache int8,
    indexer query int8, dense experts int8 activation, indexer streaming
-   top-k prefill): unlisted means OFF. Without a block, selector roles
-   resolve to their documented defaults and every toggle role is OFF.
+   top-k prefill): unlisted means OFF. Without a block -- which is what
+   official upstream checkpoints ship -- roles are resolved from the
+   checkpoint's own dtypes and the device by ``blockless_role_defaults``:
+   an int checkpoint gets the integer cache and integer kernels (with its
+   indexer/dense integer paths on, because for those weights that is the
+   intent rather than an opt-in), and an fp checkpoint gets the fp8 cache
+   with sparkinfer on sm_12x or the Triton upcasting kernels wherever the
+   device has no accelerated fp8.
 4. Overriding everything is trivial: vLLM applies dict-valued
    ``--hf-overrides`` entries by *replacing* the whole attribute
    (``ModelConfig._apply_dict_overrides`` does ``setattr`` for plain-dict
@@ -38,6 +44,7 @@ Principles:
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -321,11 +328,144 @@ def resolve_kernel_config(block: Any) -> ResolvedKernelConfig:
     )
 
 
+def _checkpoint_kernel_family(hf_config: Any) -> str:
+    """``"int"`` or ``"fp"`` -- which kernel and cache family a checkpoint needs.
+
+    Read from what the checkpoint declares about its own weights, not from the
+    device: an int4/int8 checkpoint needs the integer cache and the IMMA
+    kernels on every architecture that has them.
+    """
+    quant = getattr(hf_config, "quantization_config", None) or {}
+    if isinstance(quant, Mapping):
+        method = str(quant.get("quant_method", "") or "").lower()
+    else:
+        method = str(getattr(quant, "quant_method", "") or "").lower()
+    expert_dtype = str(getattr(hf_config, "expert_dtype", "") or "").lower()
+    if method.startswith("dsv4_int") or expert_dtype.startswith("int"):
+        return "int"
+    return "fp"
+
+
+def _flash_mla_has(*symbols: str) -> bool:
+    """Whether the installed flash_mla exposes these kernels.
+
+    A probe, not an assumption: the wheel is built per architecture and per
+    CUDA version, so presence is a property of the install rather than of the
+    source tree.
+    """
+    try:
+        import flash_mla
+    except ImportError:
+        return False
+    return all(hasattr(flash_mla, name) for name in symbols)
+
+
+def blockless_role_defaults(hf_config: Any) -> tuple[dict[str, str], str]:
+    """Kernel roles and cache type for a checkpoint carrying no ``vllm`` block.
+
+    Official DeepSeek checkpoints ship no block, so the defaults cannot be a
+    single flat table -- they have to follow the checkpoint's own dtypes and
+    the platform:
+
+    * **int checkpoints** take the integer cache and the integer kernels,
+      preferring the fused native ones where the arch has IMMA plus
+      ``cp.async`` (sm_80 and up, which includes sm_121) and the wheel
+      actually carries them, and the portable Triton ones otherwise. Their
+      indexer and dense-activation integer paths are on: for these weights
+      that is the checkpoint's intent, not an opt-in.
+    * **fp checkpoints** take the fp8 cache. Kernel choice is by capability:
+      sparkinfer on sm_12x, and the Triton upcasting kernels wherever the
+      device has no accelerated fp8 (below sm_89), which is what makes
+      sm_80/sm_86 work at all.
+
+    The FlashInfer path is chosen by the attention *class* rather than named
+    here (its kernels are not registry symbols), so an mxfp4/mxfp8 checkpoint
+    on a FlashInfer-capable device reaches it through ``_select_dsv4_attn_cls``
+    with the fp8 cache this returns.
+    """
+    from vllm.platforms import current_platform
+
+    capability = current_platform.get_device_capability()
+    major = capability.major if capability is not None else 0
+
+    if _checkpoint_kernel_family(hf_config) == "int":
+        native = major >= 8 and _flash_mla_has(
+            "sparse_mla_decode_int8", "sparse_mla_prefill_int8"
+        )
+        roles = {
+            ROLE_SPARSE_MLA_DECODE_INT8: (
+                SPARSE_MLA_DECODE_INT8_FLASH if native else SPARSE_MLA_DECODE_INT8_TRITON
+            ),
+            ROLE_SPARSE_MLA_PREFILL: (
+                SPARSE_MLA_PREFILL_INT8_FLASH if native else SPARSE_MLA_PREFILL_TRITON
+            ),
+            # Inapplicable under an int8 cache; carried so the role is always
+            # resolvable, never launched.
+            ROLE_SPARSE_MLA_DECODE_FP8: SPARSE_MLA_DECODE_FP8_TRITON,
+            ROLE_INDEXER_CACHE_INT8: INDEXER_CACHE_INT8_WRITER,
+            ROLE_INDEXER_QUERY_INT8: INDEXER_QUERY_INT8_QUANT,
+            ROLE_DENSE_EXPERTS_INT8_ACTIVATION: DENSE_EXPERTS_INT8_ACTIVATION,
+        }
+        return roles, "int8_ds_mla"
+
+    if major >= 12:
+        roles = {
+            ROLE_SPARSE_MLA_DECODE_FP8: SPARSE_MLA_DECODE_FP8_SPARKINFER,
+            ROLE_SPARSE_MLA_PREFILL: SPARSE_MLA_PREFILL_SPARKINFER,
+            ROLE_SPARSE_MLA_DECODE_INT8: SPARSE_MLA_DECODE_INT8_TRITON,
+        }
+        return roles, "fp8_ds_mla"
+
+    # Native-vs-Triton is a question about the installed wheel, NOT about the
+    # device's fp8 support. The fused flash_mla fp8 kernels are what runs on
+    # sm_86 -- carrying Ampere is the reason that fork exists -- and they take
+    # fp8 cache rows into bf16 tensor-core math rather than needing fp8 dot
+    # instructions. cuda_supports_fp8e4nv_in_triton answers a different
+    # question (can *Triton* lower tl.dot on fp8), and the Triton kernels
+    # consume it internally to pick native fp8 ops or the arithmetic upcast
+    # codec. Gating native selection on it would send sm_86 to Triton for a
+    # reason that does not apply.
+    roles = {
+        ROLE_SPARSE_MLA_DECODE_FP8: (
+            SPARSE_MLA_DECODE_FP8_FLASH
+            if _flash_mla_has("sparse_mla_decode_fp8")
+            else SPARSE_MLA_DECODE_FP8_TRITON
+        ),
+        ROLE_SPARSE_MLA_PREFILL: (
+            SPARSE_MLA_PREFILL_FLASH
+            if _flash_mla_has("sparse_mla_prefill")
+            else SPARSE_MLA_PREFILL_TRITON
+        ),
+        ROLE_SPARSE_MLA_DECODE_INT8: SPARSE_MLA_DECODE_INT8_TRITON,
+    }
+    return roles, "fp8_ds_mla"
+
+
 def resolve_kernel_config_from_hf_config(
     hf_config: Any,
 ) -> ResolvedKernelConfig:
-    """Resolve from an HF config object's ``vllm`` block."""
-    return resolve_kernel_config(getattr(hf_config, VLLM_CONFIG_KEY, None))
+    """Resolve from an HF config object's ``vllm`` block.
+
+    With no block, the defaults follow the checkpoint's dtypes and the device
+    rather than a flat table -- see ``blockless_role_defaults``.
+    """
+    block = getattr(hf_config, VLLM_CONFIG_KEY, None)
+    resolved = resolve_kernel_config(block)
+    if resolved.explicit:
+        return resolved
+    roles, cache_type = blockless_role_defaults(hf_config)
+    resolved = dataclasses.replace(
+        resolved,
+        roles={**resolved.roles, **roles},
+        cache_type=resolved.cache_type or cache_type,
+    )
+    logger.info_once(
+        "DeepSeek V4: checkpoint carries no %r block; defaults resolved from "
+        "its dtypes and this device -> cache_type=%s",
+        VLLM_CONFIG_KEY,
+        resolved.cache_type,
+    )
+    return resolved
 
 
 # ---------------------------------------------------------------------------

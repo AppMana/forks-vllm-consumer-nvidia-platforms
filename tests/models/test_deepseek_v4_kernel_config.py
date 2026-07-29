@@ -11,6 +11,8 @@ the dense runtime, cache_type defaulting, and Ray unpickle gate propagation.
 import pickle
 from types import SimpleNamespace
 
+from vllm.platforms.interface import DeviceCapability
+
 import pytest
 import torch
 
@@ -37,6 +39,7 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     SPARSE_MLA_DECODE_INT8_FLASH,
     SPARSE_MLA_DECODE_INT8_TRITON,
     SPARSE_MLA_PREFILL_FLASH,
+    SPARSE_MLA_PREFILL_INT8_FLASH,
     SPARSE_MLA_PREFILL_SPARKINFER,
     SPARSE_MLA_PREFILL_TRITON,
     activate_kernel_config,
@@ -256,16 +259,82 @@ def test_resolve_from_hf_config_reads_block():
     assert resolved.cache_type == "fp8_ds_mla"
 
 
-def test_resolve_from_hf_config_without_block_uses_defaults():
-    resolved = resolve_kernel_config_from_hf_config(SimpleNamespace())
-    assert not resolved.explicit
-    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_FLASH
-    assert (
-        resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_TRITON
+def test_blockless_int_checkpoint_takes_the_int_family(monkeypatch):
+    """An int checkpoint with no "vllm" block gets the integer cache and the
+    integer kernels, with its indexer and dense integer paths on.
+
+    Official checkpoints ship no block, so a flat default table decided the
+    kernels without ever consulting what the weights are. For int4/int8
+    weights the integer paths are the checkpoint's intent, not an opt-in.
+    """
+    import vllm.transformers_utils.configs.dsv4.kernel_config as kc
+
+    monkeypatch.setattr(kc, "_flash_mla_has", lambda *s: True)
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(
+        type(current_platform),
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(12, 1)),
     )
-    assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_TRITON
+
+    hf_config = SimpleNamespace(
+        quantization_config={"quant_method": "dsv4_int"}, expert_dtype="int4"
+    )
+    resolved = resolve_kernel_config_from_hf_config(hf_config)
+    assert not resolved.explicit
+    assert resolved.cache_type == "int8_ds_mla"
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_FLASH
+    assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_INT8_FLASH
+    # The integer paths belong to these weights, so they are on by default.
+    assert resolved.roles[ROLE_INDEXER_CACHE_INT8] == INDEXER_CACHE_INT8_WRITER
+    assert ROLE_DENSE_EXPERTS_INT8_ACTIVATION in resolved.roles
+
+
+def test_blockless_fp_checkpoint_on_sm12x_takes_sparkinfer(monkeypatch):
+    """An fp checkpoint with no block gets the fp8 cache, and on sm_12x the
+    sparkinfer kernels rather than the sm86-flavoured global defaults."""
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(
+        type(current_platform),
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(12, 1)),
+    )
+    resolved = resolve_kernel_config_from_hf_config(
+        SimpleNamespace(quantization_config={"quant_method": "fp8"}, expert_dtype="fp4")
+    )
+    assert not resolved.explicit
+    assert resolved.cache_type == "fp8_ds_mla"
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_SPARKINFER
+    assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_SPARKINFER
+    # Toggle roles stay off for fp weights.
     assert ROLE_INDEXER_CACHE_INT8 not in resolved.roles
-    assert ROLE_DENSE_EXPERTS_INT8_ACTIVATION not in resolved.roles
+
+
+def test_blockless_fp_falls_back_to_triton_without_flash_mla(monkeypatch):
+    """Native-vs-Triton is a question about the installed wheel, not about the
+    device's fp8 support: the fused flash_mla fp8 kernels are exactly what runs
+    on sm_86, so gating them on fp8 arithmetic support would send Ampere to
+    Triton for a reason that does not apply."""
+    import vllm.transformers_utils.configs.dsv4.kernel_config as kc
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(
+        type(current_platform),
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(8, 6)),
+    )
+    monkeypatch.setattr(kc, "_flash_mla_has", lambda *s: False)
+    resolved = resolve_kernel_config_from_hf_config(SimpleNamespace())
+    assert resolved.cache_type == "fp8_ds_mla"
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_TRITON
+    assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_TRITON
+
+    monkeypatch.setattr(kc, "_flash_mla_has", lambda *s: True)
+    resolved = resolve_kernel_config_from_hf_config(SimpleNamespace())
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_FP8] == SPARSE_MLA_DECODE_FP8_FLASH
+    assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_FLASH
 
 
 # ---------------------------------------------------------------------------
