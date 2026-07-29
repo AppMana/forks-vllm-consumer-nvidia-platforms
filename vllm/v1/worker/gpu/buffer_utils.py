@@ -85,8 +85,13 @@ class UvaBufferPool:
         # — the tail programs read past the buffer and fault with an illegal
         # memory access. Reallocate to the new high-water mark (kept for reuse
         # so growth is amortized, not per-call).
-        if n > self._first_dim(self.size):
-            self.size = n
+        # Test THIS buffer's capacity, not the pool-wide high-water mark.
+        # Growing only the current buffer while raising self.size made every
+        # other buffer in the round robin look big enough on its next turn, so
+        # the following call skipped the grow and wrote n elements into a
+        # still-short buffer.
+        if n > buf.cpu.shape[0]:
+            self.size = max(n, self._first_dim(self.size))
             self._uva_bufs[self._curr] = buf = UvaBuffer(n, self.dtype)
         # CPU-to-CPU copy
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np

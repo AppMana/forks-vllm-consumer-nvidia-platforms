@@ -241,7 +241,9 @@ class BuildPrefillChunkMetadataKernel(
         input_variant: TritonPointerInputVariant
 
     @staticmethod
-    @triton.jit
+    # do_not_specialize on the slice bounds: they vary per chunk, so
+    # specializing on them re-JITs at every chunk boundary at runtime.
+    @triton.jit(do_not_specialize=["query_slice_start", "query_slice_stop"])
     def kernel(
         # Inputs
         query_start_loc_ptr,
@@ -1202,80 +1204,3 @@ def warmup_prefill_chunk_metadata_kernel(
     )
     torch.accelerator.synchronize()
     _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS.add(key)
-
-
-@triton.jit(do_not_specialize=["query_slice_start", "query_slice_stop"])
-def _build_prefill_chunk_metadata_kernel(
-    # Inputs
-    query_start_loc_ptr,
-    uncompressed_seq_lens_ptr,
-    cu_compressed_seq_lens_ptr,
-    # Row-start base for cu_seq_len_ks/ke: local cumulative lens under DCP,
-    # aliases cu_compressed_seq_lens_ptr otherwise.
-    row_start_cu_compressed_seq_lens_ptr,
-    # Outputs
-    token_to_seq_ptr,
-    cu_compressed_seq_len_ks_ptr,
-    cu_compressed_seq_len_ke_ptr,
-    query_slice_start,
-    query_slice_stop,
-    DCP_RANK,
-    DCP_WORLD,
-    DCP_INTERLEAVE,
-    BLOCK_SIZE: tl.constexpr,
-    COMPRESS_RATIO: tl.constexpr,
-):
-    batch_idx = tl.program_id(0)
-
-    query_start = tl.load(query_start_loc_ptr + batch_idx)
-    query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
-    query_len = query_end - query_start
-
-    seq_start = tl.load(cu_compressed_seq_lens_ptr + batch_idx)
-    seq_end = tl.load(cu_compressed_seq_lens_ptr + batch_idx + 1)
-    compressed_seq_len = seq_end - seq_start
-
-    # Row start for the (possibly localized) cu_seq_len_ks/ke. Equals seq_start
-    # when DCP is disabled (the pointer aliases cu_compressed_seq_lens_ptr).
-    row_start = tl.load(row_start_cu_compressed_seq_lens_ptr + batch_idx)
-
-    uncompressed_seq_len = tl.load(uncompressed_seq_lens_ptr + batch_idx)
-    start_pos = uncompressed_seq_len - query_len
-
-    for i in range(0, query_len, BLOCK_SIZE):
-        offset = i + tl.arange(0, BLOCK_SIZE)
-        abs_pos = query_start + offset
-        mask = (
-            (offset < query_len)
-            & (abs_pos >= query_slice_start)
-            & (abs_pos < query_slice_stop)
-        )
-        out_pos = abs_pos - query_slice_start
-
-        # cu_seq_len_ks: row start in the gathered K buffer.
-        tl.store(cu_compressed_seq_len_ks_ptr + out_pos, row_start, mask=mask)
-
-        # cu_seq_len_ke: row start + per-token context length. Under DCP the
-        # global per-token length is sharded across ranks.
-        global_ctx = start_pos + 1 + offset
-        len_per_token = global_ctx // COMPRESS_RATIO
-        if DCP_WORLD > 1:
-            # Per-rank local context length under interleave-aware DCP, matching
-            # get_dcp_local_seq_lens. K == 1 reduces to (len + world-1-rank)//world.
-            base = (len_per_token // DCP_INTERLEAVE // DCP_WORLD) * DCP_INTERLEAVE
-            remainder = len_per_token - base * DCP_WORLD
-            remainder = tl.minimum(
-                tl.maximum(remainder - DCP_RANK * DCP_INTERLEAVE, 0), DCP_INTERLEAVE
-            )
-            len_per_token = base + remainder
-        tl.store(
-            cu_compressed_seq_len_ke_ptr + out_pos,
-            row_start + len_per_token,
-            mask=mask,
-        )
-
-    # Compute token_to_seq
-    for i in range(0, compressed_seq_len, BLOCK_SIZE):
-        offset = i + tl.arange(0, BLOCK_SIZE)
-        mask = offset < compressed_seq_len
-        tl.store(token_to_seq_ptr + seq_start + offset, batch_idx, mask=mask)

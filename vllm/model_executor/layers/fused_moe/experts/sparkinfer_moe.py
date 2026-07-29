@@ -109,8 +109,25 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
         # scratch layout is regime-specific — one plan cannot serve both a
         # decode batch (micro) and a prefill batch (dynamic). Keying by exact
         # token count gives each CUDA-graph-captured decode size its own stable
-        # scratch address (capture-safe) while prefill sizes rebuild eagerly.
+        # scratch address, which capture requires.
         self._plan_cache: dict[int, tuple] = {}
+        # Captured decode sizes must keep their scratch address for the life of
+        # the graph, so they are never evicted. Every other size — prefill and
+        # chunked-prefill token counts — is unbounded, so it is served by a
+        # bounded LRU. Without the bound the cache grew a plan plus a scratch
+        # tensor per distinct prefill length and never released one, which is a
+        # steady GPU-memory climb over a long-lived server rather than a leak
+        # that shows up in a short run.
+        try:
+            from vllm.config import get_current_vllm_config
+
+            capture_sizes = (
+                get_current_vllm_config().compilation_config.cudagraph_capture_sizes
+            )
+            self._pinned_sizes = frozenset(capture_sizes or ())
+        except Exception:
+            self._pinned_sizes = frozenset()
+        self._max_unpinned_plans = 8
 
     # -- capability gates (mirror FlashInferB12xExperts) --------------------
 
@@ -258,7 +275,19 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
         (spec,) = plan.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
         self._plan_cache[num_tokens] = (plan, scratch)
+        self._evict_unpinned()
         return plan, scratch
+
+    def _evict_unpinned(self) -> None:
+        """Drop the oldest non-captured plans once past the bound.
+
+        dict preserves insertion order, so the first non-pinned key is the
+        least recently inserted. Pinned (cudagraph-captured) sizes are skipped:
+        their scratch address is baked into a captured graph.
+        """
+        unpinned = [k for k in self._plan_cache if k not in self._pinned_sizes]
+        for key in unpinned[: max(0, len(unpinned) - self._max_unpinned_plans)]:
+            del self._plan_cache[key]
 
     def apply(
         self,

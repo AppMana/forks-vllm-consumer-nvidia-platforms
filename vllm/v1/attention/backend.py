@@ -654,18 +654,6 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         supports_spec_as_decode: bool = False,
         supports_dcp_with_varlen: bool = False,
     ) -> None:
-        # Diagnostic/fix toggle: route multi-token spec-verify steps to the
-        # PREFILL attention path (proper causal multi-query) instead of the
-        # spec-as-decode kernel. The DSV4 sparse decode kernel is parameterized
-        # by s_q (query width per request) and collapses all query positions to
-        # one logit on the first post-prefill verify (see the dspark PP=10
-        # bring-up). Forcing the threshold to 1 makes only true single-token
-        # steps take the decode path.
-        import os as _os
-
-        if _os.environ.get("APPMANA_DSPARK_SPEC_AS_PREFILL") == "1":
-            self.reorder_batch_threshold = 1
-            return
         self.reorder_batch_threshold = reorder_batch_threshold
         if self.reorder_batch_threshold is not None and supports_spec_as_decode:
             # If the backend supports spec-as-decode kernels, then we can set
@@ -691,6 +679,27 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
             and not supports_dcp_with_varlen
         ):
             self.reorder_batch_threshold = 1
+
+        # Diagnostic toggle: route multi-token spec-verify steps to the PREFILL
+        # (causal multi-query) path instead of the spec-as-decode kernel. The
+        # DSV4 sparse decode kernel is templated on s_q and collapses all query
+        # positions to one logit on the first post-prefill verify.
+        #
+        # Scoped to DeepSeek V4, and applied last. It used to run first in this
+        # method, for every backend, with an early return: that collapsed the
+        # thresholds of unrelated backends (flashmla_sparse 128-256,
+        # flashinfer_mla_sparse up to 1024) so query lengths their decode
+        # kernels served correctly were re-routed to prefill, and it skipped
+        # the decode_context_parallel guard above.
+        import os as _os
+
+        if _os.environ.get("APPMANA_DSPARK_SPEC_AS_PREFILL") == "1":
+            hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
+            architectures = getattr(hf_config, "architectures", None) or ()
+            if any(
+                "DeepseekV4" in arch or "DeepSeekV4" in arch for arch in architectures
+            ):
+                self.reorder_batch_threshold = 1
 
     @abstractmethod
     def build(
