@@ -8,6 +8,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -870,7 +872,15 @@ class DeepseekV4Indexer(nn.Module):
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
-            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
+            # APPMANA_SHORT_CTX_BYPASS=0 forces the real indexer even when every
+            # candidate would be selected, so the bypass can be A/B'd. It has no
+            # parity test and is the largest behavioural delta on the hot path
+            # for short prompts -- which is every prompt in the repro.
+            if (
+                indexer_metadata.max_seq_len // self.compress_ratio
+                <= self.topk_tokens
+                and os.environ.get("APPMANA_SHORT_CTX_BYPASS", "1") == "1"
+            ):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
                 compressor(compressed_kv_score, positions, rotary_emb)
