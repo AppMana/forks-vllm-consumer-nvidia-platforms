@@ -18,7 +18,7 @@ not assumptions.
 | Arch | Gencode | Kernel source | Checkpoint | Status |
 | --- | --- | --- | --- | --- |
 | Ampere sm_86 (RTX 3090 / A5000, 24 GB) | `8.6` | Triton + fused native CUDA (`flash_mla`) | `appmana/deepseek-v4-int4-int8` | Validated, benchmarked |
-| GB10 sm_121 (DGX Spark) | `12.1a` | fused native CUDA (`flash_mla`) + IMMA | `appmana/deepseek-v4-int4-int8` | Validated on TP=2; Kubernetes LWS rollout in progress |
+| GB10 sm_121 (DGX Spark) | `12.1a` | fused native CUDA (`flash_mla`) + IMMA | `appmana/deepseek-v4-int4-int8` | Validated on native-host TP=2; first LWS image not accepted |
 | GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
 
 Both gencodes are built into one image (`docker/Dockerfile`,
@@ -142,6 +142,13 @@ its OCI source/revision labels are wrong and must not be cited as provenance.
 It predates both NVFP4 fixes above. A tag match alone is insufficient: record
 the digest and installed-file hashes for every benchmark or rollout.
 
+This is the first LWS validation image, not the accepted deployment image. It
+proved the two-rank image/topology/kernel wiring, but its SM12x DeepSeek-V4 mHC
+connector selects TileLang and all compiler caches are ephemeral under `/tmp`.
+The INT4 experts and INT8 sparse attention are still Marlin and FlashMLA; the
+TileLang use is isolated to mHC. Hilton requires that use removed and every JIT
+cache moved to a per-rank persistent volume before the rollout can be accepted.
+
 ## Deploy
 
 ### Ampere, PP=12
@@ -161,6 +168,10 @@ dual-rail RoCE fabric between them. It derives `--node-rank` from
 and adds `--headless` only on nonzero ranks. The leader remains pinned to
 `spark-2ab3` because the present point-to-point `/30` makes
 `10.255.0.1` the fixed rendezvous address.
+
+The manifest is enabled, but the current rollout remains a validation run
+pending a rebuilt no-TileLang image and two node-local persistent JIT-cache
+volumes. Do not describe it as the final production deployment yet.
 
 ```yaml
 - --tensor-parallel-size
