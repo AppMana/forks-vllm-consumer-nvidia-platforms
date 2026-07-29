@@ -145,6 +145,39 @@ def test_every_dsv4_backend_is_warmed():
         assert backend.get_name() in _DEEPSEEK_V4_SPARSE_MLA_BACKENDS
 
 
+def test_mhc_cuda_backend_can_force_triton_on_sm121(monkeypatch, patch_capability):
+    """The INT4/INT8 deployment can explicitly exclude TileLang mHC."""
+    from vllm.model_executor.layers import mhc
+
+    patch_capability(12, 1)
+    monkeypatch.setenv("VLLM_MHC_CUDA_BACKEND", "triton")
+    monkeypatch.setattr(mhc, "HAS_TILELANG_MHC", True)
+
+    assert mhc._should_use_mhc_torch_fallback() is True
+
+
+def test_mhc_cuda_backend_auto_keeps_sm121_tilelang(monkeypatch, patch_capability):
+    """The new deployment override must not change the default policy."""
+    from vllm.model_executor.layers import mhc
+
+    patch_capability(12, 1)
+    monkeypatch.setenv("VLLM_MHC_CUDA_BACKEND", "auto")
+    monkeypatch.setattr(mhc, "HAS_TILELANG_MHC", True)
+
+    assert mhc._should_use_mhc_torch_fallback() is False
+
+
+def test_mhc_cuda_backend_rejects_unknown_value(monkeypatch, patch_capability):
+    """A misspelled backend must fail at startup instead of using TileLang."""
+    from vllm.model_executor.layers import mhc
+
+    patch_capability(12, 1)
+    monkeypatch.setenv("VLLM_MHC_CUDA_BACKEND", "trtion")
+
+    with pytest.raises(ValueError, match="Invalid VLLM_MHC_CUDA_BACKEND"):
+        mhc._should_use_mhc_torch_fallback()
+
+
 def test_sparkinfer_backend_is_selectable_by_flag():
     """The sm_12x backend needs a registry entry or --attention-backend
     cannot name it."""

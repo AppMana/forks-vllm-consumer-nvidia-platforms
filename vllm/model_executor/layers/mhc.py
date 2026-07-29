@@ -15,6 +15,18 @@ from vllm.utils.import_utils import has_tilelang
 
 logger = init_logger(__name__)
 
+_MHC_CUDA_BACKENDS = {"auto", "tilelang", "triton"}
+
+
+def _requested_mhc_cuda_backend() -> str:
+    backend = os.getenv("VLLM_MHC_CUDA_BACKEND", "auto").strip().lower()
+    if backend not in _MHC_CUDA_BACKENDS:
+        choices = ", ".join(sorted(_MHC_CUDA_BACKENDS))
+        raise ValueError(
+            f"Invalid VLLM_MHC_CUDA_BACKEND={backend!r}; expected one of {choices}"
+        )
+    return backend
+
 
 def _has_tilelang_mhc() -> bool:
     if not has_tilelang():
@@ -40,6 +52,15 @@ def _should_use_mhc_torch_fallback() -> bool:
     if current_platform.is_rocm():
         return True
     if current_platform.is_cuda():
+        requested_backend = _requested_mhc_cuda_backend()
+        if requested_backend == "triton":
+            return True
+        if requested_backend == "tilelang":
+            if not HAS_TILELANG_MHC:
+                raise RuntimeError(
+                    "VLLM_MHC_CUDA_BACKEND=tilelang requires tilelang to be installed"
+                )
+            return False
         capability = current_platform.get_device_capability()
         if capability is None:
             return False
@@ -169,9 +190,7 @@ def _hc_head_fused_reference(
 ) -> None:
     x_flat = hs_flat.flatten(-2)
     x_float = x_flat.float()
-    rstd = torch.rsqrt(
-        x_float.square().mean(dim=-1, keepdim=True) + rms_eps
-    )
+    rstd = torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + rms_eps)
     x_normed = (x_float * rstd).to(hs_flat.dtype).float()
     mixes = F.linear(x_normed, fn)
     pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
@@ -276,7 +295,9 @@ def mhc_post(
 ) -> torch.Tensor:
     if _should_use_mhc_torch_fallback():
         if x.is_cuda and _use_mhc_post_triton():
-            return mhc_kernels.mhc_post_triton(x, residual, post_layer_mix, comb_res_mix)
+            return mhc_kernels.mhc_post_triton(
+                x, residual, post_layer_mix, comb_res_mix
+            )
         out = mhc_kernels.mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
         _synchronize_mhc_torch_fallback()
         return out
@@ -661,19 +682,17 @@ class MHCFusedPostPreOp(CustomOp):
             residual_cur = mhc_kernels.mhc_post_torch(
                 x, residual, post_layer_mix, comb_res_mix
             )
-            post_mix_cur, comb_mix_cur, layer_input_cur = (
-                mhc_kernels.mhc_pre_torch(
-                    residual_cur,
-                    fn,
-                    hc_scale,
-                    hc_base,
-                    rms_eps,
-                    hc_pre_eps,
-                    hc_sinkhorn_eps,
-                    hc_post_mult_value,
-                    sinkhorn_repeat,
-                    n_splits,
-                )
+            post_mix_cur, comb_mix_cur, layer_input_cur = mhc_kernels.mhc_pre_torch(
+                residual_cur,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
             )
             return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
