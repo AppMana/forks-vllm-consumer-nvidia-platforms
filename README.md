@@ -6,9 +6,9 @@ A fork of [vLLM](https://github.com/vllm-project/vllm) that runs
 **DeepSeek-V4-Flash** — a model whose official kernel support starts at
 Hopper — on GPUs upstream does not support. One image serves two
 architectures: **Ampere (sm_86)** via ported sparse-MLA kernels and an
-INT4/INT8 checkpoint, and **GB10 / consumer Blackwell (sm_121)** through
-either that same INT4/INT8 + FlashMLA lane or sparkinfer's CuTe-DSL kernels
-with an NVFP4/FP8 checkpoint.
+INT4/INT8 checkpoint, and **GB10 / consumer Blackwell (sm_121)** through that
+same INT4/INT8 + FlashMLA/Marlin/Triton lane without SparkInfer. A separate,
+experimental NVFP4/FP8 checkpoint uses sparkinfer's CuTe-DSL kernels.
 
 GPU count, pipeline size, interconnect, and context length are configuration,
 not assumptions.
@@ -18,7 +18,7 @@ not assumptions.
 | Arch | Gencode | Kernel source | Checkpoint | Status |
 | --- | --- | --- | --- | --- |
 | Ampere sm_86 (RTX 3090 / A5000, 24 GB) | `8.6` | Triton + fused native CUDA (`flash_mla`) | `appmana/deepseek-v4-int4-int8` | Validated, benchmarked |
-| GB10 sm_121 (DGX Spark) | `12.1a` | fused native CUDA (`flash_mla`) + IMMA | `appmana/deepseek-v4-int4-int8` | Validated on native-host TP=2; first LWS image not accepted |
+| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Marlin + Triton; no SparkInfer/TileLang | `appmana/deepseek-v4-int4-int8` | Validated on native-host TP=2; first LWS image not accepted |
 | GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
 
 Both gencodes are built into one image (`docker/Dockerfile`,
