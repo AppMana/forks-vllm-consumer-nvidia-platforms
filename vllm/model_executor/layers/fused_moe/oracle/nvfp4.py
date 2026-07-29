@@ -21,12 +21,16 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
+    reorder_w1w3_to_w3w1,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     prepare_nvfp4_moe_layer_for_marlin,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     kE2M1ToFloat_handle,
+)
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    swizzle_blockscale,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -465,11 +469,15 @@ def convert_to_nvfp4_moe_kernel_format(
         a13_scale = 1.0 / a13_scale.max().to(torch.float32)
         a2_scale = 1.0 / a2_scale.max().to(torch.float32)
     elif nvfp4_backend == NvFp4MoeBackend.SPARKINFER:
-        # No layer-side weight transform: SparkInferExperts consumes the raw
-        # modelopt NVFP4 tensors (U8 E2M1 weight, E4M3 blockscale, F32 global
-        # scale) directly in its own process_weights_after_loading via
-        # sparkinfer's plan_weights/prepare_weights. Leave everything as-is.
-        pass
+        # vLLM loads fused FC1 in [w1 gate; w3 up] order. SparkInfer's
+        # micro/dynamic kernels consume [up; gate], so normalize both weights
+        # and their row-aligned scales at load time. Its grouped scale views
+        # also require FlashInfer vec16-swizzled storage rather than the
+        # checkpoint's linear [expert, row, K/16] layout.
+        if is_act_and_mul:
+            w13, w13_scale = reorder_w1w3_to_w3w1(w13, w13_scale)
+        w13_scale = swizzle_blockscale(w13_scale)
+        w2_scale = swizzle_blockscale(w2_scale)
     else:
         raise ValueError(f"Unknown NvFp4 backend for MoE: {nvfp4_backend}")
 
