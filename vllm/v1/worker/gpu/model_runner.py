@@ -901,7 +901,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
+        if scheduler_output.new_block_ids_to_zero and os.environ.get(
+            "APPMANA_KV_ZERO", "1"
+        ) == "1":
             if self.kv_block_zeroer is None:
                 # The scheduler only emits block ids when the config says
                 # zeroing is required, so reaching here means the worker's
