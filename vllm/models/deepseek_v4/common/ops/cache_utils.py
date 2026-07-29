@@ -26,6 +26,7 @@ from vllm.model_executor.warmup.jit_warmup import VllmJitKernel, zip_inputs
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonPointerInputVariant,
     TritonWarmupTensor,
+    is_triton_aligned,
 )
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import next_power_of_2
@@ -745,7 +746,11 @@ def _dequantize_global_slots_k_cache_torch(
     out[token_ids[valid], candidate_ids[valid]] = decoded
 
 
-@triton.jit
+# num_tokens is a per-batch token count, so Triton's default int specialization
+# (==1 and divisible-by-16) compiles up to three variants of an otherwise
+# identical kernel. It is only ever compared against, never used in address
+# arithmetic, so pinning it off specialization cannot cost vectorization.
+@triton.jit(do_not_specialize=["num_tokens"])
 def quantize_and_insert_k_kernel(
     # Input tensors
     k_ptr,  # [num_tokens, 512] bf16
@@ -941,7 +946,13 @@ def quantize_and_insert_k_cache(
 # index pointers take varying alignments, so without this pin Triton recompiles a new
 # variant per request, pinning one PP rank in compilation while the chain blocks on the
 # collective (the "rank stuck at 100%, others 0%" wedge).
+# `offset` is the chunk's base column in the gather output, so it varies per
+# prefill chunk and picks up the same ==1 / divisible-by-16 int specialization.
+# It only feeds `(offset + i) * out_stride1`, and out_stride1 is already pinned
+# off alignment specialization just below, so the product's alignment is
+# unprovable either way and this cannot cost vectorization.
 @triton.jit(
+    do_not_specialize=["offset"],
     do_not_specialize_on_alignment=[
         "out_ptr",
         "out_stride0",
@@ -950,7 +961,7 @@ def quantize_and_insert_k_cache(
         "seq_lens_ptr",
         "block_table_ptr",
         "gather_lens_ptr",
-    ]
+    ],
 )
 def _dequantize_and_gather_k_kernel(
     out_ptr,
@@ -1602,9 +1613,13 @@ class CombineTopkSwaIndicesKernel(
             return []
 
         window_size = _hf_config_int(vllm_config, "sliding_window", 128)
+        layer_inputs = _dsv4_combine_topk_swa_warmup_inputs(vllm_config)
+        topk_widths = tuple(
+            int(row["topk_width"]) for row in layer_inputs.rows  # type: ignore[index]
+        )
         return self._trace_dispatch(self.dispatch)(
-            _DSV4_COMBINE_TOPK_SWA_WARMUP_INPUTS,
-            _COMBINE_TOPK_SWA_POINTER_INPUTS,
+            layer_inputs,
+            _combine_topk_swa_pointer_inputs(topk_widths),
             WINDOW_SIZE=window_size,
         )
 
@@ -1647,6 +1662,21 @@ class CombineTopkSwaIndicesKernel(
         WINDOW_SIZE: int,
     ) -> None:
         num_reqs = seq_lens.shape[0]
+        # Route the live launch through dispatch() so the warmup and the hot
+        # path evaluate one expression tree. get_warmup_keys traces this same
+        # dispatch body (jit_warmup._trace_compile_key_dispatch), so recomputing
+        # PADDED_TOP_K inline here would let the two drift apart silently -- the
+        # exact failure mode that left the C128A width warmed at the wrong value.
+        compile_key = self.dispatch(
+            topk_width=topk_indices.shape[-1],
+            topk_indices=is_triton_aligned(topk_indices),
+            query_start_loc=is_triton_aligned(query_start_loc),
+            seq_lens=is_triton_aligned(seq_lens),
+            gather_lens=is_triton_aligned(gather_lens),
+            topk=TOP_K,
+            compress_ratio=COMPRESS_RATIO,
+            WINDOW_SIZE=WINDOW_SIZE,
+        )
         self.kernel[(num_reqs, _COMBINE_TOPK_SWA_NUM_WORKERS)](
             combined_indices,
             combined_indices.stride(0),
@@ -1658,51 +1688,125 @@ class CombineTopkSwaIndicesKernel(
             gather_lens,
             M,
             N,
-            TOP_K=TOP_K,
-            COMPRESS_RATIO=COMPRESS_RATIO,
-            WINDOW_SIZE=WINDOW_SIZE,
-            PADDED_TOP_K=next_power_of_2(topk_indices.shape[-1]),
+            TOP_K=compile_key.TOP_K,
+            COMPRESS_RATIO=compile_key.COMPRESS_RATIO,
+            WINDOW_SIZE=compile_key.WINDOW_SIZE,
+            PADDED_TOP_K=compile_key.PADDED_TOP_K,
         )
 
 
-# Worker programs along grid dim 1; the kernel reads it back via
-# tl.num_programs(1) to stride its loops. Upstream 7ca017778f lifted this
-# out of the call site as a module constant so the warmup and the live
-# launch use one value; the merge kept both uses and dropped the
-# definition, so every combine-topk-swa launch raised NameError.
-# Recovered from upstream 7ca017778f: the merge kept the call sites in the
-# combine-topk-swa warmup and dropped these four definitions with it.
-_COMBINE_TOPK_SWA_POINTER_INPUTS = zip_inputs(
-    dict(
-        topk_indices=True,
-        query_start_loc=True,
-        seq_lens=True,
-        gather_lens=True,
-    ),
-    dict(
-        topk_indices=True,
-        query_start_loc=False,
-        seq_lens=False,
-        gather_lens=True,
-    ),
-    dict(
-        topk_indices=False,
-        query_start_loc=False,
-        seq_lens=False,
-        gather_lens=False,
-    ),
-)
+def _combine_topk_swa_pointer_inputs(topk_widths: tuple[int, ...]) -> Any:
+    """Pointer-alignment variants the live prefill chunk loop can produce.
+
+    Every live caller (nvidia/flashmla.py, nvidia_sm86/attention.py,
+    amd/rocm.py) slices the same way::
+
+        topk_indices[query_start:query_end]
+        query_start_loc[num_decodes + chunk_start : num_decodes + chunk_end + 1]
+        seq_lens[chunk_start:chunk_end]
+        gather_lens[chunk_start:chunk_end]
+
+    Torch allocations are far more than 16-byte aligned, so each argument's
+    alignment class is decided purely by its slice offset in bytes:
+
+    * ``seq_lens`` and ``gather_lens`` are both 1-D int32 sliced by the *same*
+      ``chunk_start``, so their alignment classes are always equal. The pairing
+      (seq_lens unaligned, gather_lens aligned) that used to be enumerated here
+      is unreachable, and warming it spends a compile on a variant no request
+      can ever hit.
+    * ``query_start_loc`` is offset by ``num_decodes + chunk_start`` instead, so
+      it varies independently of the other two.
+    * ``topk_indices`` is a row slice of an ``[num_tokens, topk_width]`` int32
+      buffer, so it is aligned iff ``query_start * topk_width * 4`` is a
+      multiple of 16. When every live width satisfies ``topk_width % 4 == 0``
+      -- true for every real DSv4 width, since index_topk is a power of two and
+      the C128A width is a multiple of _C128A_TOPK_ALIGNMENT -- it is aligned
+      unconditionally and the unaligned variant is likewise unreachable. A
+      checkpoint with an odd width re-enables it rather than silently missing.
+    """
+    topk_variants = (
+        (True,) if all(width % 4 == 0 for width in topk_widths) else (True, False)
+    )
+    return zip_inputs(
+        *(
+            dict(
+                topk_indices=topk_aligned,
+                query_start_loc=query_start_loc_aligned,
+                # gather_lens tracks seq_lens exactly; see above.
+                seq_lens=seq_lens_aligned,
+                gather_lens=seq_lens_aligned,
+            )
+            for topk_aligned in topk_variants
+            for query_start_loc_aligned in (True, False)
+            for seq_lens_aligned in (True, False)
+        )
+    )
 
 
-_DSV4_COMBINE_TOPK_SWA_WARMUP_INPUTS = zip_inputs(
-    # DSv4-Flash / SWA-only and C4A.
-    dict(compress_ratio=1, topk=0, topk_width=512),
-    dict(compress_ratio=4, topk=512, topk_width=512),
-    # DSv4-Pro C4A.
-    dict(compress_ratio=4, topk=1024, topk_width=1024),
-    # DSv4-Pro C128A.
-    dict(compress_ratio=128, topk=8192, topk_width=8192),
-)
+def _dsv4_combine_topk_swa_warmup_inputs(vllm_config: Any) -> Any:
+    """One warmup row per DeepSeek-V4 layer type this checkpoint actually has.
+
+    Mirrors the live branch in ``DeepseekV4FlashMLAImpl._forward_prefill``:
+    SWA-only layers pin ``TOP_K=0`` but still pass the full-width
+    ``topk_indices_buffer``; C4A layers pass that same buffer and derive
+    ``top_k`` from its width; every other ratio reads the C128A prefill buffer,
+    whose width comes from ``max_model_len``. Deriving all three from config
+    rather than hardcoding them is what keeps the warmed key set equal to the
+    live one -- the previous hardcoded C128A row (8192) was only correct at a
+    ~1M-token max_model_len.
+    """
+    index_topk = _hf_config_int(vllm_config, "index_topk", 2048)
+    model_config = getattr(vllm_config, "model_config", None)
+    max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+
+    rows: list[dict[str, int]] = []
+    for compress_ratio in _dsv4_compress_ratios(vllm_config):
+        if compress_ratio <= 1:
+            # SWA-only layer. The caller normalizes the ratio with max(1, ...)
+            # (models/deepseek_v4/attention.py), so a checkpoint that stores 0
+            # for these layers still reaches the kernel as COMPRESS_RATIO=1.
+            rows.append(dict(compress_ratio=1, topk=0, topk_width=index_topk))
+        elif compress_ratio == 4:
+            rows.append(
+                dict(
+                    compress_ratio=4,
+                    topk=index_topk,
+                    topk_width=index_topk,
+                )
+            )
+        else:
+            from vllm.models.deepseek_v4.sparse_mla import (
+                c128a_prefill_topk_width,
+            )
+
+            width = c128a_prefill_topk_width(max_model_len, compress_ratio)
+            rows.append(
+                dict(
+                    compress_ratio=compress_ratio,
+                    topk=width,
+                    topk_width=width,
+                )
+            )
+
+    # Deduplicate while preserving order; zip_inputs requires >= 1 row.
+    unique_rows = list({tuple(sorted(row.items())): row for row in rows}.values())
+    return zip_inputs(*unique_rows)
+
+
+def _dsv4_compress_ratios(vllm_config: Any) -> tuple[int, ...]:
+    """Per-layer compress ratios, normalized the way the model normalizes them.
+
+    ``models/deepseek_v4/attention.py`` builds each layer's ratio as
+    ``max(1, config.compress_ratios[layer_id])``, and both
+    ``sparse_swa._layer_type_for`` and ``flashmla``'s ``swa_only`` test treat
+    ``<= 1`` as SWA-only -- so a checkpoint may legitimately store 0 for its
+    SWA-only layers. Applying the same clamp here keeps warmup from enumerating
+    a COMPRESS_RATIO the live path never produces while missing the one it does.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    ratios = getattr(hf_config, "compress_ratios", None) or (1,)
+    return tuple(sorted({max(1, int(ratio)) for ratio in ratios}))
 
 
 def _hf_config_int(vllm_config: Any, name: str, default: int) -> int:
@@ -1716,6 +1820,9 @@ def _scheduler_config_int(vllm_config: Any, name: str, default: int) -> int:
     return int(getattr(scheduler_config, name, default) or default)
 
 
+# Worker programs along grid dim 1; the kernel reads it back via
+# tl.num_programs(1) to stride its loops. It is a module constant so the warmup
+# and the live launch cannot disagree about the grid.
 _COMBINE_TOPK_SWA_NUM_WORKERS = 128
 
 

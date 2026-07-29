@@ -32,6 +32,22 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 _C128A_TOPK_ALIGNMENT = 128
 
 
+def c128a_prefill_topk_width(max_model_len: int, compress_ratio: int) -> int:
+    """Full column width of the padded C128A topk index buffers.
+
+    This is the width of ``c128a_prefill_topk_indices`` / the global decode
+    buffer, and therefore the ``PADDED_TOP_K`` that
+    ``CombineTopkSwaIndicesKernel`` specializes on. It is a single function so
+    the buffer allocation below and the kernel's warmup key set cannot drift
+    apart -- a mismatch there means the kernel JITs on the first C128A prefill
+    instead of during warmup.
+    """
+    return (
+        cdiv(cdiv(max_model_len, compress_ratio), _C128A_TOPK_ALIGNMENT)
+        * _C128A_TOPK_ALIGNMENT
+    )
+
+
 def c128a_decode_topk_width(
     max_seq_len: int, compress_ratio: int, full_width: int
 ) -> int:
@@ -198,12 +214,8 @@ class DeepseekV4FlashMLAMetadataBuilder(
 
         # Pre-allocate C128A topk buffers for CUDA graph address stability.
         if self.compress_ratio == 128:
-            c128a_max_compressed = cdiv(
+            c128a_max_compressed = c128a_prefill_topk_width(
                 self.model_config.max_model_len, self.compress_ratio
-            )
-            c128a_max_compressed = (
-                cdiv(c128a_max_compressed, _C128A_TOPK_ALIGNMENT)
-                * _C128A_TOPK_ALIGNMENT
             )
             # Stored so _build_c128a_metadata passes it as the kernel's
             # max_compressed_tokens, matching the buffer stride. Otherwise the
@@ -369,7 +381,18 @@ def build_c128a_topk_metadata(
     return global_decode, decode_lens, prefill_local
 
 
-@triton.jit
+# positions / token_to_req_indices / slot_mapping are per-step slices of the
+# model runner's batch buffers, so their 16-byte alignment class changes with
+# the decode/prefill split and Triton would compile a variant per combination.
+# num_decode_tokens is a per-batch count and is only ever compared against.
+@triton.jit(
+    do_not_specialize=["num_decode_tokens"],
+    do_not_specialize_on_alignment=[
+        "positions_ptr",
+        "token_to_req_indices_ptr",
+        "slot_mapping_ptr",
+    ],
+)
 def _build_c128a_topk_metadata_kernel(
     # Decode outputs
     global_decode_ptr,

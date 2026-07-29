@@ -12,6 +12,21 @@ from vllm.model_executor.warmup.jit_warmup import (
 )
 
 
+# Triton specializes pointer arguments on 16-byte alignment: pointers whose
+# address is a multiple of this compile to a different variant than those that
+# are not. TritonWarmupTensor models the two classes with data_ptr() 0 and 1.
+TRITON_POINTER_ALIGNMENT = 16
+
+
+def is_triton_aligned(tensor: Any) -> bool:
+    """Alignment class Triton will specialize this pointer argument on.
+
+    Accepts real tensors and TritonWarmupTensor alike, so a live dispatch and a
+    warmup dispatch can build their pointer variants the same way.
+    """
+    return tensor.data_ptr() % TRITON_POINTER_ALIGNMENT == 0
+
+
 @dataclass(frozen=True)
 class TritonWarmupTensor:
     # Compile-only tensor descriptor for Triton pointer specialization.

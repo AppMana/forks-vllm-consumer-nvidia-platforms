@@ -349,9 +349,21 @@ class BuildPrefillChunkMetadataKernel(
         dcp_world = parallel_config.decode_context_parallel_size
         dcp_interleave = parallel_config.cp_kv_cache_interleave_size
         dcp_rank = get_dcp_group().rank_in_group if dcp_world > 1 else 0
+        # Clamp exactly as the live path does. The layer builds its ratio as
+        # max(1, config.compress_ratios[layer_id])
+        # (models/deepseek_v4/attention.py) before it reaches MLAAttentionSpec
+        # and then this kernel, so a checkpoint that stores 0 for its SWA-only
+        # layers arrives here as 1. Without the clamp warmup would compile
+        # COMPRESS_RATIO=0 -- a constexpr divisor of zero in the
+        # `global_ctx // COMPRESS_RATIO` below -- and never compile the
+        # COMPRESS_RATIO=1 the live path actually launches.
         compress_ratios = tuple(
-            int(ratio)
-            for ratio in (getattr(hf_config, "compress_ratios", None) or (1,))
+            sorted(
+                {
+                    max(1, int(ratio))
+                    for ratio in (getattr(hf_config, "compress_ratios", None) or (1,))
+                }
+            )
         )
         return self._trace_dispatch(self.dispatch)(
             query_slice_start=WarmupIntRange(0, 2),
