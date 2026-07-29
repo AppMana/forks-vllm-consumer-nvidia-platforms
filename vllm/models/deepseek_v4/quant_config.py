@@ -50,6 +50,7 @@ class DeepseekV4FP8Config(Fp8Config):
         super().__init__(*args, **kwargs)
         self._resolved_expert_dtype: str | None = None
         self._resolved_moe_quant_algo: str | None = None
+        self._quantized_layers: dict | None = None
         self._nvfp4_config: ModelOptNvFp4Config | None = None
         # ``is_scale_e8m0`` is a property that resolves on first read,
         # by which time the current vllm_config has been set.
@@ -92,12 +93,73 @@ class DeepseekV4FP8Config(Fp8Config):
             return
         quant_cfg = getattr(hf_config, "quantization_config", None) or {}
         algo = (quant_cfg.get("moe_quant_algo") or "").upper() or None
+        quantized_layers = quant_cfg.get("quantized_layers")
+        if isinstance(quantized_layers, dict) and quantized_layers:
+            self._quantized_layers = quantized_layers
         self._resolved_moe_quant_algo = algo or ""
 
     @property
     def moe_quant_algo(self) -> str:
         self._resolve_moe_overrides()
         return self._resolved_moe_quant_algo or ""
+
+    @staticmethod
+    def _checkpoint_layer_key(prefix: str) -> str | None:
+        """Runtime module prefix -> the key the checkpoint uses for it.
+
+        Runtime prefixes are rooted at the model wrapper
+        (``model.layers.7.ffn.experts``); the exporter writes them rooted at
+        the transformer (``layers.7.ffn.experts``).
+        """
+        idx = prefix.find("layers.")
+        if idx == -1:
+            return None
+        return prefix[idx:]
+
+    def moe_quant_algo_for(self, prefix: str) -> str:
+        """The MoE quantization algorithm for one specific expert module.
+
+        The top-level ``moe_quant_algo`` describes only the modules the
+        exporter's NVFP4 pass actually rewrote. Exports that carry a
+        ``quantized_layers`` table list those modules explicitly, and pair it
+        with an ``ignore`` list -- e.g. ``appmana/deepseek-v4-nvfp4-fp8``
+        lists ``layers.0..42.ffn.experts`` and ignores ``mtp.*``. The MTP /
+        DSpark blocks keep the base checkpoint's MXFP4 experts (e8m0 scales,
+        group 32) while the backbone is NVFP4 (e4m3 scales, group 16, plus
+        ``weight_scale_2``/``input_scale`` global scales).
+
+        The DSpark draft model builds full ``DeepseekV4DecoderLayer``s under
+        the *target's* vllm_config, so without this per-module lookup its
+        experts are given NVFP4 parameters that no checkpoint tensor fills:
+        the global scales keep their ``torch.empty`` contents and the block
+        scales are half-filled with e8m0 bytes reinterpreted as e4m3.
+
+        Checkpoints with no ``quantized_layers`` table keep the previous
+        whole-model behaviour.
+        """
+        self._resolve_moe_overrides()
+        table = self._quantized_layers
+        if not table:
+            return self.moe_quant_algo
+        key = self._checkpoint_layer_key(prefix)
+        if key is None:
+            # Unrecognized prefix shape: do not silently downgrade.
+            return self.moe_quant_algo
+        entry = table.get(key)
+        if entry is None:
+            from vllm.logger import init_logger
+
+            init_logger(__name__).warning_once(
+                "%s is absent from the checkpoint's quantization_config."
+                "quantized_layers table, so its experts are NOT %s; using the "
+                "base expert format instead. (This is how the MTP/DSpark "
+                "blocks of an NVFP4-backbone checkpoint are meant to load.)",
+                prefix,
+                self.moe_quant_algo or "quantized",
+            )
+            return ""
+        algo = entry.get("quant_algo") if isinstance(entry, dict) else None
+        return (algo or "").upper()
 
     def _get_nvfp4_config(self) -> ModelOptNvFp4Config:
         if self._nvfp4_config is None:
@@ -175,7 +237,7 @@ class DeepseekV4FP8Config(Fp8Config):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
-                if self.moe_quant_algo == "NVFP4":
+                if self.moe_quant_algo_for(prefix) == "NVFP4":
                     from vllm.model_executor.layers.quantization.modelopt import (
                         ModelOptNvFp4FusedMoE,
                     )
@@ -192,4 +254,4 @@ class DeepseekV4FP8Config(Fp8Config):
     def is_mxfp4_quant(self, prefix, layer):
         if not isinstance(layer, RoutedExperts) or self.expert_dtype != "fp4":
             return False
-        return self.moe_quant_algo != "NVFP4"
+        return self.moe_quant_algo_for(prefix) != "NVFP4"

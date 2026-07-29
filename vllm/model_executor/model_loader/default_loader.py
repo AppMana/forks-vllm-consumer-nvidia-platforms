@@ -472,40 +472,82 @@ class DefaultModelLoader(BaseModelLoader):
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
         )
-        # We only enable strict check for non-quantized models
-        # that have loaded weights tracking by default.
-        default_enable_weights_track = (
-            model_config.quantization is None and loaded_weights is not None
-        )
-        enable_weights_track = (
-            self.enable_weights_track
-            if self.enable_weights_track is not None
-            else default_enable_weights_track
-        )
-        if enable_weights_track:
-            self.track_weights_loading(model, loaded_weights)
+        if loaded_weights is None or self.enable_weights_track is False:
+            # No tracking data, or the audit was explicitly turned off.
+            return
+        # A missing parameter is only *provably* a bug for a non-quantized
+        # model, where every parameter must come from the checkpoint; that
+        # case stays fatal. Quantized models are audited too -- they used to
+        # be skipped entirely, which is how a silently uninitialized scale
+        # survived -- but report rather than raise, because quantization
+        # methods legitimately derive some parameters after loading. The one
+        # exception, fatal in both modes, is a parameter a quantization
+        # method has declared it cannot derive (see
+        # QuantizeMethodBase.checkpoint_required_params).
+        strict = bool(self.enable_weights_track) or model_config.quantization is None
+        self.track_weights_loading(model, loaded_weights, strict=strict)
 
     def track_weights_loading(
-        self, model: nn.Module, loaded_weights: set[str] | None
+        self,
+        model: nn.Module,
+        loaded_weights: set[str] | None,
+        strict: bool = True,
     ) -> None:
+        if loaded_weights is None:
+            return
         weights_to_load = {name for name, _ in model.named_parameters()}
-        if loaded_weights is not None:
-            # ignore online quantization scales
-            for name, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                has_online_quant = getattr(quant_method, "uses_meta_device", False)
-                has_postprocess_quant = getattr(
-                    quant_method, "process_weights_after_loading", None
-                )
-                # ignore kv_cache scale and online quant scale,
-                # which can be missing in checkpoints
-                if has_online_quant or has_postprocess_quant:
-                    for param_name, _ in module.named_parameters():
-                        full_name = f"{name}.{param_name}" if name else param_name
-                        loaded_weights.add(full_name)
-            weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
-                raise ValueError(
-                    "Following weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
-                )
+        # Parameters that may legitimately be absent from the checkpoint:
+        # kv-cache scales and online-quantization scales, plus anything a
+        # module with a process_weights_after_loading hook may fill in later.
+        derivable: set[str] = set()
+        # ... except what the quantization method itself declares it must
+        # read from the checkpoint. Those are collected across every module
+        # first, so an ancestor module's blanket whitelist cannot re-hide a
+        # descendant's required parameter.
+        required_not_loaded: set[str] = set()
+        for name, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is None:
+                continue
+            has_online_quant = getattr(quant_method, "uses_meta_device", False)
+            has_postprocess_quant = getattr(
+                quant_method, "process_weights_after_loading", None
+            )
+            if not (has_online_quant or has_postprocess_quant):
+                continue
+            get_required = getattr(quant_method, "checkpoint_required_params", None)
+            required = get_required(module) if get_required is not None else frozenset()
+            for param_name, _ in module.named_parameters():
+                full_name = f"{name}.{param_name}" if name else param_name
+                if param_name in required and full_name not in loaded_weights:
+                    required_not_loaded.add(full_name)
+                else:
+                    derivable.add(full_name)
+        derivable -= required_not_loaded
+
+        if required_not_loaded:
+            raise ValueError(
+                "Following weights were not initialized from checkpoint and "
+                "cannot be derived by the quantization method, so they would "
+                "be read as uninitialized memory: "
+                f"{sorted(required_not_loaded)}"
+            )
+
+        weights_not_loaded = weights_to_load - loaded_weights - derivable
+        if not weights_not_loaded:
+            return
+        if strict:
+            raise ValueError(
+                "Following weights were not initialized from "
+                f"checkpoint: {weights_not_loaded}"
+            )
+        listed = sorted(weights_not_loaded)
+        logger.warning(
+            "%d weights were not initialized from the checkpoint: %s%s. The "
+            "model is quantized, so some of these may be filled in by "
+            "process_weights_after_loading; any that are not are "
+            "uninitialized memory.",
+            len(listed),
+            listed[:32],
+            "" if len(listed) <= 32 else f" (+{len(listed) - 32} more)",
+        )

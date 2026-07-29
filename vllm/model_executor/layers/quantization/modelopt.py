@@ -1438,6 +1438,26 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """
         return True
 
+    def checkpoint_required_params(self, layer: torch.nn.Module) -> frozenset[str]:
+        # create_weights asserts is_checkpoint_nvfp4_serialized, so every
+        # weight-side tensor below exists on disk and nothing here derives
+        # them. process_weights_after_loading reads all of them; if one is
+        # missing the kernel dequantizes with whatever torch.empty returned.
+        # Activation (input) scales are deliberately left out: the W4A16
+        # variant drops them and some backends fold them away, so their
+        # absence is not on its own proof of a broken load.
+        del layer
+        return frozenset(
+            {
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_weight_scale_2",
+                "w2_weight_scale_2",
+            }
+        )
+
     def create_weights(
         self,
         layer: RoutedExperts,

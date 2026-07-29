@@ -36,6 +36,24 @@ class QuantizeMethodBase(ABC):
         The weights will be set as attributes of the layer."""
         raise NotImplementedError
 
+    def checkpoint_required_params(self, layer: torch.nn.Module) -> frozenset[str]:
+        """Parameter names this method cannot derive and must load.
+
+        The loader's "not initialized from checkpoint" audit whitelists every
+        parameter of a module whose quant method defines
+        ``process_weights_after_loading``, because online quantization
+        legitimately synthesizes scales that no checkpoint tensor fills. That
+        whitelist is what lets a *serialized* scale go missing in silence: the
+        parameter keeps whatever ``torch.empty`` returned and the model runs
+        on uninitialized memory.
+
+        A method that reads a parameter in ``process_weights_after_loading``
+        without ever writing it first should name it here. Names are the leaf
+        attribute names on ``layer`` (e.g. ``"w13_weight_scale_2"``). The
+        default is empty, i.e. exactly the pre-existing behaviour.
+        """
+        return frozenset()
+
     @abstractmethod
     def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
         """Apply the weights in layer to the input tensor.
