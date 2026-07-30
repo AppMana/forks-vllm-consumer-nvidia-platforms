@@ -126,6 +126,32 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
 
 
+def test_deepseek_v4_attaches_tools_to_existing_system_message():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "system", "content": "Follow the user instructions."},
+            {"role": "user", "content": "Weather?"},
+        ],
+        tools=tools,
+        tokenize=False,
+    )
+
+    assert prompt.startswith(
+        "<｜begin▁of▁sentence｜>Follow the user instructions.\n\n## Tools"
+    )
+    assert prompt.count("## Tools") == 1
+
+
 def test_deepseek_v4_renders_parsed_history_tool_arguments():
     messages = [
         {"role": "user", "content": "List the repo"},
@@ -286,5 +312,7 @@ def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
 def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
     prompt = _render_reference_case(case_id, **kwargs)
 
-    expected = (FIXTURES_DIR / f"test_output_{case_id}.txt").read_text()
+    expected = (
+        (FIXTURES_DIR / f"test_output_{case_id}.txt").read_text().removesuffix("\n")
+    )
     assert prompt == expected
