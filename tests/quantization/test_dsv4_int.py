@@ -1010,6 +1010,23 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
         == "absmax7"
     )
     assert cfg["num_hidden_layers"] == 2
+    assert cfg["vllm"] == {
+        "kernels": [
+            "flash_mla.sparse_mla_decode_fp8",
+            "flash_mla.sparse_mla_decode_int8",
+            "flash_mla.sparse_mla_prefill_int8",
+            "vllm._custom_ops.indexer_k_quant_and_cache_int8",
+            (
+                "vllm.models.deepseek_v4.common.ops.fused_indexer_q"
+                ".fused_indexer_q_rope_quant_int8"
+            ),
+            (
+                "vllm.model_executor.layers.quantization.utils.marlin_utils"
+                ".marlin_act_int8_process_scales"
+            ),
+        ],
+        "cache_type": "int8_ds_mla",
+    }
 
     index = json.loads((dst / "model.safetensors.index.json").read_text())
     assert "layers.42.attn.wq_a.weight" not in index["weight_map"]
