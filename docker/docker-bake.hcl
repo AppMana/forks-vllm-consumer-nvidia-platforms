@@ -117,7 +117,7 @@ target "test" {
 target "openai" {
   inherits = ["_common", "_labels"]
   target   = "vllm-openai"
-  tags     = ["vllm:openai"]
+  tags     = [VLLM_IMAGE_TAG]
   output   = ["type=docker"]
 }
 

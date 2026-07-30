@@ -133,6 +133,21 @@ def test_bake_hcl_arch_list_matches_the_dockerfile() -> None:
     )
 
 
+def test_bake_openai_target_uses_requested_image_tag() -> None:
+    """The immutable release tag must name the image, not only label it."""
+    openai_target = re.search(
+        r'target\s+"openai"\s*\{(?P<body>.*?)^\}',
+        BAKE_HCL.read_text(encoding="utf-8"),
+        re.DOTALL | re.MULTILINE,
+    )
+    assert openai_target, 'no target "openai" in docker/docker-bake.hcl'
+    assert re.search(
+        r"^\s*tags\s*=\s*\[\s*VLLM_IMAGE_TAG\s*\]\s*$",
+        openai_target.group("body"),
+        re.MULTILINE,
+    ), "the openai bake target ignores VLLM_IMAGE_TAG and emits a mutable local tag"
+
+
 def test_cuda13_supported_arch_filter_preserves_sm121a(tmp_path: Path) -> None:
     """The global CUDA-13 allow-list must not collapse 12.1a to 12.0.
 
