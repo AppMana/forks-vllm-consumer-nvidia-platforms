@@ -127,6 +127,10 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
 
 
 def test_deepseek_v4_attaches_tools_to_existing_system_message():
+    messages = [
+        {"role": "system", "content": "Follow the user instructions."},
+        {"role": "user", "content": "Weather?"},
+    ]
     tools = [
         {
             "type": "function",
@@ -138,10 +142,7 @@ def test_deepseek_v4_attaches_tools_to_existing_system_message():
     ]
 
     prompt = _tokenizer().apply_chat_template(
-        [
-            {"role": "system", "content": "Follow the user instructions."},
-            {"role": "user", "content": "Weather?"},
-        ],
+        messages,
         tools=tools,
         tokenize=False,
     )
@@ -150,6 +151,7 @@ def test_deepseek_v4_attaches_tools_to_existing_system_message():
         "<｜begin▁of▁sentence｜>Follow the user instructions.\n\n## Tools"
     )
     assert prompt.count("## Tools") == 1
+    assert "tools" not in messages[0]
 
 
 def test_deepseek_v4_renders_parsed_history_tool_arguments():
