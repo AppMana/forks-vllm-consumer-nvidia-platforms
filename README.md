@@ -20,7 +20,7 @@ not assumptions.
 | Arch | Gencode | Kernel source | Checkpoint | Status |
 | --- | --- | --- | --- | --- |
 | Ampere sm_86 (RTX 3090 / A5000, 24 GB) | `8.6` | Triton + fused native CUDA (`flash_mla`) | `appmana/deepseek-v4-int4-int8` | Validated, benchmarked |
-| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Triton INT8 indexer + Marlin; SM121 AllSpark rebuild in progress | `appmana/deepseek-v4-int4-int8-instruct` | PP=2 instruct matrix passes C1/C2 through actual 43,086 tokens; DSML, Mastra execution and exact needle pass |
+| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Triton INT8 indexer + Marlin; native SM121 AllSpark image in validation | `appmana/deepseek-v4-int4-int8` at `597471bc…` | Canonical checkpoint audit passes; historical PP=2 C1/C2 matrix passed through 43,086 tokens, but the repaired checkpoint and rebuilt image still require live acceptance |
 | GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
 
 Both gencodes are built into one image (`docker/Dockerfile`,
@@ -29,44 +29,34 @@ per-build — see [the `vllm` config block](#configuration-the-vllm-checkpoint-c
 
 ## Checkpoints
 
-### [`appmana/deepseek-v4-int4-int8-instruct`](https://huggingface.co/appmana/deepseek-v4-int4-int8-instruct)
-
-The current Hilton model is the complete post-trained instruct-derived
-checkpoint, pinned to immutable Hugging Face revision
-`fa1e3b4728508795a68fb88972f8cfff2f0700ab`. Converter fix `a389f65984`
-emits its concrete `int8_ds_mla` runtime block, and tokenizer fix `2266aeb64c`
-preserves the released tool-prompt encoding when a request already has a system
-message. GitOps `626a51d` overlays the required runtime changes until a new
-attributable image is built.
-
-On two DGX Sparks, PP=2/TP=1 without DSpark passes the clean actual
-1,112-/8,831-/43,086-token C1/C2 matrix: 6/6 cells with both pods Ready and
-restart count zero. DSML and Mastra code execution pass; an exact 43,125-token
-needle returns `ORCHID7429COPPER`. The raw artifact is
-`demos-hilton/cluster/harness/dsv4-int4-int8-instruct-fa1e3b-pp2-2026-07-30.csv`.
-Hilton still launches with `--max-model-len 65536`; this does not validate
-250K context.
-
-### [`appmana/deepseek-v4-int4-int8`](https://huggingface.co/appmana/deepseek-v4-int4-int8) (historical Base-derived checkpoint)
+### [`appmana/deepseek-v4-int4-int8`](https://huggingface.co/appmana/deepseek-v4-int4-int8)
 
 INT4 W4A16 Marlin routed experts, INT8 W8A16 dense/shared/attention linears,
 `int8_ds_mla` KV cache and indexer, with three DSpark MTP draft stages grafted
-in. AllSpark keeps the dense linears compact on validated Ampere builds. The
-current Hilton SM121 binary contains only SM86 AllSpark cubins, so its guarded
-fallback expands those linears to resident BF16 (measured overhead:
-approximately 2.1--2.3 GiB per PP rank). Commit `0f83861dac` adds native
-SM120/SM121 AllSpark compilation and hardware tests; it is not deployment
-proof until its uniquely tagged image passes those tests on GB10.
+in. The canonical immutable revision is
+`597471bc544b541771306ddcdb7089ad740bb6d3`: historical non-Base target
+shards from `57d8af1c…`, the DSpark three-stage MTP graft, and the latest
+kernel configuration. Its complete 72,320-tensor header/index audit passes;
+the target and all three MTP heads match the official non-Base head hash.
+The former `-instruct` repository was deleted and must not be used.
+
+AllSpark keeps the dense linears compact on validated Ampere builds. The old
+Hilton SM121 image contained AllSpark code compiled as `sm_120a`, which
+produced invalid results on GB10 and forced the deployed fallback to expand
+compact linears to BF16. Commits `948c69d7f8` and `17080ac8a1` preserve
+`sm_121a` through CUDA 13 architecture filtering and produce an immutable
+image tag. That rebuilt image is not deployment proof until its direct
+AllSpark numerical probe passes on GB10.
 
 This checkpoint serves a 1,000,000-token context on twelve 24 GB Ampere GPUs.
 On two DGX Sparks, its historical PP=2 run without DSpark passed the clean actual
 1,110-/8,829-/43,084-token C1/C2 matrix with the native INT8-cache FlashMLA
 decode/prefill kernels and the int64-addressed Triton indexer. All 6/6 cells
 completed with zero pod restarts and no CUDA, Xid, or illegal-address log.
-That was a serving-stability control, not evidence for the current
-instruct-derived model. Revision `748621a0fe36dc4d3b7f45a318ecff610f18455e`
+That was a serving-stability control, not evidence for canonical revision
+`597471bc…`. Revision `748621a0fe36dc4d3b7f45a318ecff610f18455e`
 replaced only `head.weight` from a release donor and was an isolated experiment;
-it is also not the live checkpoint.
+it is not the live checkpoint.
 
 ### [`appmana/deepseek-v4-nvfp4-fp8`](https://huggingface.co/appmana/deepseek-v4-nvfp4-fp8)
 
@@ -446,7 +436,7 @@ not yet correct.
 python tools/ampere/benchmark_jobset/generate_dsv4_benchmark_jobset.py \
   --template tools/ampere/benchmark_jobset/dsv4-benchmark-jobset-proof.yaml \
   --name dsv4-bench-001 \
-  --image harbor.appmana.com/appmana/vllm-ampere:<tag> \
+  --image ghcr.io/appmana/vllm-consumer:<immutable-tag> \
   --world-size 12 \
   --indexed \
   --env APPMANA_DSV4_MAX_MODEL_LEN=1000000 \
