@@ -20,7 +20,7 @@ not assumptions.
 | Arch | Gencode | Kernel source | Checkpoint | Status |
 | --- | --- | --- | --- | --- |
 | Ampere sm_86 (RTX 3090 / A5000, 24 GB) | `8.6` | Triton + fused native CUDA (`flash_mla`) | `appmana/deepseek-v4-int4-int8` | Validated, benchmarked |
-| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Triton INT8 indexer + Marlin; SM121 AllSpark rebuild in progress | `appmana/deepseek-v4-int4-int8` | PP=2 accepted through actual 43,084-token C1/C2 matrix; 6/6 cells, zero restarts or GPU faults |
+| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Triton INT8 indexer + Marlin; SM121 AllSpark rebuild in progress | `appmana/deepseek-v4-int4-int8-instruct` | PP=2 instruct matrix passes C1/C2 through actual 43,086 tokens; DSML, Mastra execution and exact needle pass |
 | GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
 
 Both gencodes are built into one image (`docker/Dockerfile`,
@@ -29,7 +29,25 @@ per-build — see [the `vllm` config block](#configuration-the-vllm-checkpoint-c
 
 ## Checkpoints
 
-### [`appmana/deepseek-v4-int4-int8`](https://huggingface.co/appmana/deepseek-v4-int4-int8)
+### [`appmana/deepseek-v4-int4-int8-instruct`](https://huggingface.co/appmana/deepseek-v4-int4-int8-instruct)
+
+The current Hilton model is the complete post-trained instruct-derived
+checkpoint, pinned to immutable Hugging Face revision
+`fa1e3b4728508795a68fb88972f8cfff2f0700ab`. Converter fix `a389f65984`
+emits its concrete `int8_ds_mla` runtime block, and tokenizer fix `2266aeb64c`
+preserves the released tool-prompt encoding when a request already has a system
+message. GitOps `626a51d` overlays the required runtime changes until a new
+attributable image is built.
+
+On two DGX Sparks, PP=2/TP=1 without DSpark passes the clean actual
+1,112-/8,831-/43,086-token C1/C2 matrix: 6/6 cells with both pods Ready and
+restart count zero. DSML and Mastra code execution pass; an exact 43,125-token
+needle returns `ORCHID7429COPPER`. The raw artifact is
+`demos-hilton/cluster/harness/dsv4-int4-int8-instruct-fa1e3b-pp2-2026-07-30.csv`.
+Hilton still launches with `--max-model-len 65536`; this does not validate
+250K context.
+
+### [`appmana/deepseek-v4-int4-int8`](https://huggingface.co/appmana/deepseek-v4-int4-int8) (historical Base-derived checkpoint)
 
 INT4 W4A16 Marlin routed experts, INT8 W8A16 dense/shared/attention linears,
 `int8_ds_mla` KV cache and indexer, with three DSpark MTP draft stages grafted
@@ -40,13 +58,15 @@ approximately 2.1--2.3 GiB per PP rank). Commit `0f83861dac` adds native
 SM120/SM121 AllSpark compilation and hardware tests; it is not deployment
 proof until its uniquely tagged image passes those tests on GB10.
 
-The checkpoint serves a 1,000,000-token context on twelve 24 GB Ampere GPUs.
-On two DGX Sparks, PP=2 without DSpark passes the clean actual
+This checkpoint serves a 1,000,000-token context on twelve 24 GB Ampere GPUs.
+On two DGX Sparks, its historical PP=2 run without DSpark passed the clean actual
 1,110-/8,829-/43,084-token C1/C2 matrix with the native INT8-cache FlashMLA
 decode/prefill kernels and the int64-addressed Triton indexer. All 6/6 cells
 completed with zero pod restarts and no CUDA, Xid, or illegal-address log.
-Hilton still launches with `--max-model-len 65536`; this does not validate
-250K context.
+That was a serving-stability control, not evidence for the current
+instruct-derived model. Revision `748621a0fe36dc4d3b7f45a318ecff610f18455e`
+replaced only `head.weight` from a release donor and was an isolated experiment;
+it is also not the live checkpoint.
 
 ### [`appmana/deepseek-v4-nvfp4-fp8`](https://huggingface.co/appmana/deepseek-v4-nvfp4-fp8)
 
@@ -154,12 +174,14 @@ its OCI source/revision labels are wrong and must not be cited as provenance.
 It predates both NVFP4 fixes above. A tag match alone is insufficient: record
 the digest and installed-file hashes for every benchmark or rollout.
 
-The base image predates the accepted paged-indexer fix. GitOps `101c036`
-provides a checked init overlay equivalent to vLLM `5b0285ecd3`; the accepted
-result must therefore be attributed to the image config digest plus that
-overlay, not to the image alone. Compiler caches live on per-rank persistent
-volumes. INT4 experts and INT8 sparse attention remain Marlin and FlashMLA,
-while the accepted launch forces Triton for the indexer and mHC.
+The base image predates the accepted paged-indexer, pinned-loader and tokenizer
+fixes. GitOps `626a51d` supplies checked runtime overlays, including tokenizer
+fix `2266aeb64c`, while the immutable instruct checkpoint carries the runtime
+block emitted by converter fix `a389f65984`. The live result must therefore be
+attributed to the image config digest, overlays, and pinned checkpoint together,
+not to the image alone. Compiler caches live on per-rank persistent volumes.
+INT4 experts and INT8 sparse attention remain Marlin and FlashMLA, while the
+accepted launch forces Triton for the indexer and mHC.
 Commit `8c8bcac623` adds `VLLM_MHC_CUDA_BACKEND=triton`, which forces the
 existing Triton/torch mHC fallback on SM121; `auto` retains TileLang. That
 selector is the accepted Hilton mHC backend; TileLang mHC remains a separate
@@ -193,19 +215,22 @@ and adds `--headless` only on nonzero ranks. The leader remains pinned to
 `spark-2ab3` because the present point-to-point `/30` makes
 `10.255.0.1` the fixed rendezvous address.
 
-The manifest is enabled. Two node-local
+The manifest is enabled at GitOps `626a51d` and serves
+`appmana/deepseek-v4-int4-int8-instruct` revision
+`fa1e3b4728508795a68fb88972f8cfff2f0700ab`. Two node-local
 5 Gi RWO volumes persist every compiler/autotune/temp root under `/jit-cache`;
 they are rank-local, not shared. The accepted lane uses PP=2, TP=1,
 `max_num_batched_tokens=1024`, a 4096-token long-prefill threshold, eager
-execution, no DSpark, and `--max-model-len 65536`. GitOps `101c036` mounts a
-checked init overlay of vLLM `5b0285ecd3` onto image config digest
+execution, no DSpark, pinned safetensors, and `--max-model-len 65536`. The
+checked runtime overlays are mounted onto image config digest
 `sha256:5d516d8c727a3821eda042ed3a7f9460741dda264288b6e5b401660b1b5a87b4`.
-The overlay widens Triton paged-cache page products to int64. Clean actual
-1,110-, 8,829-, and 43,084-token prompts passed at C1 and C2: 6/6 cells, zero
-pod restarts, and no CUDA, Xid, or illegal-address log. The raw artifact is
-`demos-hilton/cluster/harness/dsv4-int4-pp2-triton-i64-2026-07-30.csv`.
-This is the first accepted post-fault PP2 stability point; 250K context is not
-validated.
+Clean actual 1,112-, 8,831-, and 43,086-token prompts passed at C1 and C2:
+6/6 cells, Ready/Ready, restart count zero. PP0 loaded weights in 47.27 s and
+the model in 55.714 s at 78.09 GiB; PP1 took 49.74 s and 58.668 s at
+81.55 GiB. DSML and Mastra code execution passed, and the exact 43,125-token
+needle returned `ORCHID7429COPPER`. The raw artifact is
+`demos-hilton/cluster/harness/dsv4-int4-int8-instruct-fa1e3b-pp2-2026-07-30.csv`.
+The accepted launch remains capped at 65,536; 250K context is not validated.
 
 With DSpark enabled, the same 3 GiB cache admitted about 101K tokens; without
 DSpark it admits 190K tokens (2.90 concurrent 65,536-token requests). DSpark
@@ -328,7 +353,7 @@ from another's.
 ```bash
 python tools/ampere/dsv4_needle_bench.py \
   --base-url http://localhost:8000 \
-  --model appmana/deepseek-v4-int4-int8 \
+  --model deepseek-v4-int4-int8 \
   --input-tokens 8000 --needle-tokens 1000 \
   --concurrency 8 \
   --output-json needle-8k-1k.json
@@ -336,7 +361,9 @@ python tools/ampere/dsv4_needle_bench.py \
 
 Set `--concurrency` no higher than the server's `--max-num-seqs`: a sweep above
 it is silently capped by the scheduler and every arm above the cap looks
-identical. `--tokenizer` defaults to `--model`.
+identical. `--tokenizer` defaults to `--model`; the Hilton API retains
+`deepseek-v4-int4-int8` as its served alias even though the backing Hub repo is
+the instruct checkpoint.
 
 ### Parallelism arms
 
@@ -350,8 +377,12 @@ checkpoints run through the same launcher rather than a forked copy.
 Run rank 1 first; it is `--headless` and waits for the leader.
 
 ```bash
-MODEL=appmana/deepseek-v4-int4-int8 REVISION= ./serve_dsv4.sh A 1   # worker
-MODEL=appmana/deepseek-v4-int4-int8 REVISION= ./serve_dsv4.sh A 0   # leader
+MODEL=appmana/deepseek-v4-int4-int8-instruct \
+REVISION=fa1e3b4728508795a68fb88972f8cfff2f0700ab \
+./serve_dsv4.sh A 1   # worker
+MODEL=appmana/deepseek-v4-int4-int8-instruct \
+REVISION=fa1e3b4728508795a68fb88972f8cfff2f0700ab \
+./serve_dsv4.sh A 0   # leader
 ```
 
 `EAGER=1` (the default) skips cudagraph capture — capture buys throughput, not
