@@ -198,7 +198,9 @@ def should_use_prefill_streaming_topk(
     # logits, and listing sm_8x and sm_12x excluded sm_90 and sm_100 for no
     # stated reason.
     elif capability is not None and capability.major < 8:
-        reasons.append(f"compute capability {capability.major}.{capability.minor} < 8.0")
+        reasons.append(
+            f"compute capability {capability.major}.{capability.minor} < 8.0"
+        )
     if reasons:
         logger.warning_once(
             "Streaming prefill top-k was requested by the checkpoint's "
