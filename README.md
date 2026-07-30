@@ -21,8 +21,7 @@ does not define the INT4/INT8 kernel choices documented here.
 | RTX 3090 |
 | DGX Spark GB10 |
 
-One image serves both GPUs. Kernel selection is checkpoint-driven, so
-“Ampere image” and “Spark image” are not separate source trees.
+One image serves both GPUs. Kernel selection is checkpoint-driven.
 
 ## Checkpoint
 
@@ -32,12 +31,13 @@ three MTP stages come from `deepseek-ai/DeepSeek-V4-Flash-DSpark`.
 
 ## INT4/INT8 kernel map
 
-Ampere and Spark use the same implementations unless a row says otherwise.
+RTX 3090 and DGX Spark use the same implementations unless a row says
+otherwise.
 
 | Function | Stored/accumulation format | RTX 3090 | DGX Spark GB10 | Implementation source |
 | --- | --- | --- | --- | --- |
 | Routed-expert MoE GEMM | INT4 weights, BF16 activations/accumulation | Marlin W4A16 MoE | Marlin W4A16 MoE | vLLM vendored Marlin plus the `dsv4_int` loader |
-| Dense, shared-expert and attention linear GEMMs | biased UINT8 weights with channel scales, BF16 activations/accumulation | AllSpark W8A16 | AllSpark W8A16 compiled for `sm_121a` | vLLM AllSpark integration and native C++/CUDA extension |
+| Dense, shared-expert and attention linear GEMMs | biased UINT8 weights with channel scales, BF16 activations/accumulation | AllSpark W8A16 | AllSpark W8A16 compiled for GB10 | vLLM AllSpark integration and native C++/CUDA extension |
 | Sparse-MLA decode over the INT8 cache | packed INT8 cache rows, scale applied in the kernel, BF16 output | `flash_mla.sparse_mla_decode_int8` | same | separately installed `flash_mla` wheel from `AppMana/forks-flash-mla-ampere-dsv4` |
 | Sparse-MLA prefill over the INT8 cache | packed INT8 cache rows, dequantized in-kernel, BF16 output | `flash_mla.sparse_mla_prefill_int8` | same | same `flash_mla` wheel |
 | Indexer K write/cache | BF16 K quantized into symmetric INT8 plus scale | `vllm._custom_ops.indexer_k_quant_and_cache_int8` | same | vLLM native C++/CUDA cache extension |
@@ -66,7 +66,7 @@ Important boundaries:
 - TileLang is not selected by the Hilton INT4/INT8 deployment. It sets
   `VLLM_MHC_CUDA_BACKEND=triton`; every compiler and temporary cache,
   including the Triton cache, lives on a rank-local PVC rather than `/tmp`.
-- AllSpark is built for both `sm_86` and `sm_121a`.
+- AllSpark is built for both tested GPUs.
 
 ### Why the checkpoint lists an FP8 decode symbol
 
@@ -114,7 +114,7 @@ changing the attention kernel list.
 - AllSpark W8A16 dense linear support and Marlin INT4 routed experts.
 - The packed `int8_ds_mla` cache and INT8 indexer paths.
 - Checkpoint-config-driven, fail-closed kernel resolution.
-- Ampere/consumer-Blackwell sparse-MLA attention through the external
+- RTX 3090 and GB10 sparse-MLA attention through the external
   `flash_mla` wheel.
 - Correct pipeline partitioning and rank-local checkpoint staging.
 - Model runner v2 and asynchronous scheduling support for DSV4 and DSpark.
@@ -129,7 +129,7 @@ changing the attention kernel list.
 bash docker/build-consumer-platforms.sh --push
 ```
 
-`docker/Dockerfile` builds one image with `sm_86` and `sm_121a`, the AppMana
+`docker/Dockerfile` builds one image for RTX 3090 and GB10, the AppMana
 NCCL fork, the external `flash_mla` wheel, SparkInfer for the separate SM12x
 lane, and the native vLLM extensions. `docker/versions.json` is generated from
 the Dockerfile arguments and fed back into the build; stale architecture
@@ -145,7 +145,7 @@ The build verifies:
 
 ## Serving
 
-### Ampere
+### RTX 3090
 
 The validated large-context configuration uses PP across a chain of 24 GiB
 GPUs, rank-local shard staging, async scheduling, model runner v2, and DSpark.
@@ -214,7 +214,7 @@ Do not publish throughput from a run that fails output correctness. Use
 `tools/ampere/dsv4_needle_bench.py` when possible because it records
 throughput and verifies a request-unique needle in the same run.
 
-### Ampere results
+### RTX 3090 results
 
 `vllm bench serve`, C=1, PP=12 Thunderbolt chain, async scheduling:
 
