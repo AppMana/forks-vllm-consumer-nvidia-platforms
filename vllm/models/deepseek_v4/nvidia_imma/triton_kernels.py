@@ -4,10 +4,10 @@
 
 import torch
 
-from vllm.triton_utils import LOG2E, tl, triton
 from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
     fp8e4m3_decode_to_fp32,
 )
+from vllm.triton_utils import LOG2E, tl, triton
 
 DEEPSEEK_V4_MLA_HEAD_DIM = 512
 FP8_DS_MLA_FP8_DIM = 448
@@ -975,9 +975,10 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
         other=0,
     )
     valid_block = valid_block_rank & (block_idx >= 0) & (block_idx < kv_num_blocks)
+    block_idx_i64 = block_idx.to(tl.int64)
 
     scale = tl.load(
-        scale_ptr + block_idx * stride_sb + block_offset * stride_ss,
+        scale_ptr + block_idx_i64 * stride_sb + block_offset * stride_ss,
         mask=valid_block,
         other=0.0,
     )
@@ -1005,7 +1006,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
                 )
                 k_u8 = tl.load(
                     kv_ptr
-                    + block_idx[None, :] * stride_kvb
+                    + block_idx_i64[None, :] * stride_kvb
                     + block_offset[None, :] * stride_kvs
                     + d[:, None] * stride_kvd,
                     mask=valid_block[None, :] & (d[:, None] < head_dim),
@@ -1033,7 +1034,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
                 q = fp8e4m3_decode_to_fp32(q_u8)
                 k_u8 = tl.load(
                     kv_ptr
-                    + block_idx[None, :] * stride_kvb
+                    + block_idx_i64[None, :] * stride_kvb
                     + block_offset[None, :] * stride_kvs
                     + d[:, None] * stride_kvd,
                     mask=valid_block[None, :] & (d[:, None] < head_dim),
