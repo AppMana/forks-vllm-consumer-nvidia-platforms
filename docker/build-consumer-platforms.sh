@@ -16,7 +16,7 @@ set -euo pipefail
 
 PLATFORM="${PLATFORM:-linux/arm64}"
 IMAGE="${IMAGE:-ghcr.io/appmana/vllm-consumer:sm86-sm121}"
-REPO_URL="${REPO_URL:-https://github.com/AppMana/forks-vllm-ampere.git}"
+REPO_URL="${REPO_URL:-https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms.git}"
 REF="${REF:-appmana/vllm-consumer-nvidia-platforms}"
 CONTEXT_NS="${CONTEXT_NS:-buildkit}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-remote}"

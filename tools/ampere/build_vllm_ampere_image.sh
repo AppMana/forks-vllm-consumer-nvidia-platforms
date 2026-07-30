@@ -50,7 +50,7 @@ install_usb4_rdma_provider="${INSTALL_USB4_RDMA_PROVIDER:-true}"
 usb4_rdma_provider_version="${USB4_RDMA_PROVIDER_VERSION:-0.2.20}"
 appmana_thunderbolt_release_tag="${APPMANA_THUNDERBOLT_RELEASE_TAG:-v0.2.20}"
 appmana_thunderbolt_release_repo="${APPMANA_THUNDERBOLT_RELEASE_REPO:-https://github.com/AppMana/forks-thunderbolt}"
-vllm_source_repo="${VLLM_SOURCE_REPO:-https://github.com/AppMana/forks-vllm-ampere}"
+vllm_source_repo="${VLLM_SOURCE_REPO:-https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms}"
 flashmla_wheel_url="${FLASHMLA_WHEEL_URL:-}"
 
 secret_args=()

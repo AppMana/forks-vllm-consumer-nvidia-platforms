@@ -1142,7 +1142,7 @@ ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
-ARG VLLM_SOURCE_REPO=https://github.com/AppMana/forks-vllm-ampere
+ARG VLLM_SOURCE_REPO=https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms
 ARG APPMANA_NCCL_GIT_REPO
 ARG APPMANA_NCCL_GIT_REF
 

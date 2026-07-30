@@ -82,7 +82,7 @@ target "_common" {
 # GHCR links a package to the repository this label names, and these images
 # are pushed under AppMana.
 variable "VLLM_SOURCE_REPO" {
-  default = "https://github.com/AppMana/forks-vllm-ampere"
+  default = "https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms"
 }
 
 target "_labels" {

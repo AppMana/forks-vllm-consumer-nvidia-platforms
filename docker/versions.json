@@ -128,7 +128,7 @@
       "default": "flash-mla"
     },
     "VLLM_SOURCE_REPO": {
-      "default": "https://github.com/AppMana/forks-vllm-ampere"
+      "default": "https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms"
     },
     "SPARKINFER_REPO": {
       "default": "https://github.com/AppMana/forks-sparkinfer"
