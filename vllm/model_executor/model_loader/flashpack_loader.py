@@ -43,7 +43,6 @@ from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
 from vllm.model_executor.model_loader.pp_weight_filter import (
     should_skip_pp_weight,
 )
-from vllm.model_executor.models.utils import is_pp_missing_parameter
 from vllm.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
@@ -429,6 +428,12 @@ class FlashPackModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # Import lazily: models.utils imports model_loader.reload, which first
+        # initializes this package's __init__ and registers this loader.
+        # Importing models.utils at module scope therefore forms a cycle before
+        # is_pp_missing_parameter has been defined.
+        from vllm.model_executor.models.utils import is_pp_missing_parameter
+
         index = self._load_index(model_config)
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()

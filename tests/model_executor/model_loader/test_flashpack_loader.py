@@ -4,6 +4,8 @@
 import gc
 import hashlib
 import json
+import subprocess
+import sys
 import weakref
 from types import SimpleNamespace
 
@@ -90,6 +92,17 @@ def test_flashpack_load_format_is_registered():
     assert isinstance(
         get_model_loader(LoadConfig(load_format="flashpack")),
         FlashPackModelLoader,
+    )
+
+
+def test_flashpack_registration_does_not_cycle_model_utils_import():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from vllm.model_executor.models.utils import is_pp_missing_parameter",
+        ],
+        check=True,
     )
 
 
