@@ -20,6 +20,7 @@ Both are text checks and cost nothing.
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile"
 VERSIONS_JSON = REPO_ROOT / "docker" / "versions.json"
 BAKE_HCL = REPO_ROOT / "docker" / "docker-bake.hcl"
+CMAKE_LISTS = REPO_ROOT / "CMakeLists.txt"
+CMAKE_UTILS = REPO_ROOT / "cmake" / "utils.cmake"
 
 # The architectures this branch exists to serve: sm_86 (Ampere consumer) and
 # sm_121a (GB10 / DGX Spark).
@@ -127,6 +130,45 @@ def test_bake_hcl_arch_list_matches_the_dockerfile() -> None:
         f"{bake_hcl_variable_default('TORCH_CUDA_ARCH_LIST')!r} but "
         f"docker/Dockerfile ARG torch_cuda_arch_list={dockerfile_default!r}; "
         f"a bake build would ship different SASS from a plain docker build"
+    )
+
+
+def test_cuda13_supported_arch_filter_preserves_sm121a(tmp_path: Path) -> None:
+    """The global CUDA-13 allow-list must not collapse 12.1a to 12.0.
+
+    A native GB10 build can contain apparently relevant SM12x code while the
+    AllSpark translation units are actually only sm_120a.  On SM121 that
+    launched but returned corrupt values, so checking the Docker ARG alone is
+    insufficient.
+    """
+    cuda13_branch = re.search(
+        r"CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13\.0\).*?"
+        r'set\(CUDA_SUPPORTED_ARCHS "([^"]+)"\)',
+        CMAKE_LISTS.read_text(encoding="utf-8"),
+        re.DOTALL,
+    )
+    assert cuda13_branch, "could not find the CUDA >= 13 supported-arch list"
+    supported_archs = cuda13_branch.group(1)
+
+    script = tmp_path / "check-sm121-filter.cmake"
+    script.write_text(
+        "cmake_minimum_required(VERSION 3.26)\n"
+        f'include("{CMAKE_UTILS.as_posix()}")\n'
+        "cuda_archs_loose_intersection("
+        f'FILTERED "{supported_archs}" "8.6;12.1a")\n'
+        "list(LENGTH FILTERED FILTERED_COUNT)\n"
+        'if(NOT "8.6" IN_LIST FILTERED OR '
+        'NOT "12.1a" IN_LIST FILTERED OR '
+        "NOT FILTERED_COUNT EQUAL 2)\n"
+        '  message(FATAL_ERROR "SM121 collapsed to: ${FILTERED}")\n'
+        "endif()\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["cmake", "-P", str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
     )
 
 
