@@ -109,7 +109,7 @@ class PPHandler:
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
 
-    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
+    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor | None] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
         """
@@ -136,7 +136,11 @@ class PPHandler:
 
         self.main_stream.wait_event(slot.event)
         sampled_tokens = slot.payload[:, : self.max_sample_len]
-        proposed_tokens = slot.payload[:, self.max_sample_len : self.tokens_width]
+        proposed_tokens = (
+            slot.payload[:, self.max_sample_len : self.tokens_width]
+            if self.num_speculative_steps > 0
+            else None
+        )
         num_sampled = slot.payload[:, self.tokens_width].to(torch.int32)
         num_rejected = slot.payload[:, self.tokens_width + 1].to(torch.int32)
         return dict(
