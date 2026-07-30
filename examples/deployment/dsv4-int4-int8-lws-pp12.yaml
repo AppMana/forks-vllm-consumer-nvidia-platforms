@@ -1,0 +1,152 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: dsv4-int4-int8-pp12
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 12
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          app: dsv4-int4-int8-pp12
+          role: leader
+      spec:
+        containers:
+          - name: vllm
+            image: ghcr.io/appmana/vllm-consumer:sm86-sm121-17080ac8a1
+            command:
+              - bash
+              - -ceu
+              - |
+                rank_cache="/cache/rank-${LWS_WORKER_INDEX}"
+                mkdir -p "${rank_cache}/triton" "${rank_cache}/torch" /cache/tmp
+                export TRITON_CACHE_DIR="${rank_cache}/triton"
+                export TORCHINDUCTOR_CACHE_DIR="${rank_cache}/torch"
+                bash /vllm-workspace/examples/ray_serving/multi-node-serving.sh \
+                  leader \
+                  --ray_cluster_size="${LWS_GROUP_SIZE}"
+                vllm serve appmana/deepseek-v4-int4-int8 \
+                  --revision 8488a867c8adcc3e10b329a2df48e7bc1999437a \
+                  --tokenizer-mode deepseek_v4 \
+                  --reasoning-parser deepseek_v4 \
+                  --enable-auto-tool-choice \
+                  --tool-call-parser deepseek_v4 \
+                  --pipeline-parallel-size "${LWS_GROUP_SIZE}" \
+                  --tensor-parallel-size 1 \
+                  --distributed-executor-backend ray \
+                  --safetensors-load-strategy pinned \
+                  --trust-remote-code \
+                  --async-scheduling \
+                  --host 0.0.0.0 \
+                  --port 8000
+            env:
+              - name: APPMANA_DSV4_PP_LAYER_PARTITION
+                value: 3,4,4,4,4,4,4,4,4,4,4,0
+              - name: VLLM_PP_LAYER_PARTITION
+                value: 3,4,4,4,4,4,4,4,4,4,4,0
+              - name: HF_HOME
+                value: /cache/huggingface
+              - name: TMPDIR
+                value: /cache/tmp
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: huggingface
+                    key: token
+              - name: VLLM_RAY_WORKER_IP_ORDER
+                valueFrom:
+                  configMapKeyRef:
+                    name: dsv4-network
+                    key: worker-ip-order
+                    optional: true
+              - name: NCCL_SOCKET_IFNAME
+                valueFrom:
+                  configMapKeyRef:
+                    name: dsv4-network
+                    key: nccl-socket-ifname
+                    optional: true
+            ports:
+              - name: http
+                containerPort: 8000
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: http
+              periodSeconds: 10
+            resources:
+              limits:
+                nvidia.com/gpu: "1"
+            volumeMounts:
+              - name: cache
+                mountPath: /cache
+        volumes:
+          - name: cache
+            persistentVolumeClaim:
+              claimName: dsv4-cache
+    workerTemplate:
+      spec:
+        containers:
+          - name: vllm
+            image: ghcr.io/appmana/vllm-consumer:sm86-sm121-17080ac8a1
+            command:
+              - bash
+              - -ceu
+              - |
+                rank_cache="/cache/rank-${LWS_WORKER_INDEX}"
+                mkdir -p "${rank_cache}/triton" "${rank_cache}/torch" /cache/tmp
+                export TRITON_CACHE_DIR="${rank_cache}/triton"
+                export TORCHINDUCTOR_CACHE_DIR="${rank_cache}/torch"
+                bash /vllm-workspace/examples/ray_serving/multi-node-serving.sh \
+                  worker \
+                  --ray_address="${LWS_LEADER_ADDRESS}"
+            env:
+              - name: APPMANA_DSV4_PP_LAYER_PARTITION
+                value: 3,4,4,4,4,4,4,4,4,4,4,0
+              - name: VLLM_PP_LAYER_PARTITION
+                value: 3,4,4,4,4,4,4,4,4,4,4,0
+              - name: HF_HOME
+                value: /cache/huggingface
+              - name: TMPDIR
+                value: /cache/tmp
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: huggingface
+                    key: token
+              - name: VLLM_RAY_WORKER_IP_ORDER
+                valueFrom:
+                  configMapKeyRef:
+                    name: dsv4-network
+                    key: worker-ip-order
+                    optional: true
+              - name: NCCL_SOCKET_IFNAME
+                valueFrom:
+                  configMapKeyRef:
+                    name: dsv4-network
+                    key: nccl-socket-ifname
+                    optional: true
+            resources:
+              limits:
+                nvidia.com/gpu: "1"
+            volumeMounts:
+              - name: cache
+                mountPath: /cache
+        volumes:
+          - name: cache
+            persistentVolumeClaim:
+              claimName: dsv4-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsv4-int4-int8-pp12
+spec:
+  selector:
+    app: dsv4-int4-int8-pp12
+    role: leader
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

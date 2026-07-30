@@ -1136,7 +1136,7 @@ ARG LMCACHE_GIT_REF=cd51f3a15766e326f92998c072264a5a6caa4efe
 # FlashMLA (int8 + sparse MLA) comes from the fork's PEP 503 simple index, not
 # a pinned wheel URL: the URL baked in an x86_64 filename, so an aarch64 build
 # could not install it at all. The index lets pip resolve per platform.
-ARG FLASHMLA_INDEX_URL=https://appmana.github.io/forks-flash-mla-ampere-dsv4/
+ARG FLASHMLA_INDEX_URL=https://appmana.github.io/forks-flash-mla-int/
 ARG FLASHMLA_SPEC=flash-mla
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE

@@ -122,7 +122,7 @@
       "default": "cd51f3a15766e326f92998c072264a5a6caa4efe"
     },
     "FLASHMLA_INDEX_URL": {
-      "default": "https://appmana.github.io/forks-flash-mla-ampere-dsv4/"
+      "default": "https://appmana.github.io/forks-flash-mla-int/"
     },
     "FLASHMLA_SPEC": {
       "default": "flash-mla"
