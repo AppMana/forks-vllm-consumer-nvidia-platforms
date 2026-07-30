@@ -20,7 +20,7 @@ not assumptions.
 | Arch | Gencode | Kernel source | Checkpoint | Status |
 | --- | --- | --- | --- | --- |
 | Ampere sm_86 (RTX 3090 / A5000, 24 GB) | `8.6` | Triton + fused native CUDA (`flash_mla`) | `appmana/deepseek-v4-int4-int8` | Validated, benchmarked |
-| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Marlin core; SparkInfer shared mHC offline only | `appmana/deepseek-v4-int4-int8` | Validated on native-host TP=2; current LWS image not accepted |
+| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Marlin core; SM121 AllSpark rebuild in progress | `appmana/deepseek-v4-int4-int8` | PP=2 passes C1/C2 at 17.6K without DSpark; 35.3K still Xid-faults |
 | GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
 
 Both gencodes are built into one image (`docker/Dockerfile`,
@@ -31,12 +31,20 @@ per-build — see [the `vllm` config block](#configuration-the-vllm-checkpoint-c
 
 ### [`appmana/deepseek-v4-int4-int8`](https://huggingface.co/appmana/deepseek-v4-int4-int8)
 
-INT4 W4A16 Marlin routed experts, INT8 W8A16 AllSpark dense/shared/attention
-linears, `int8_ds_mla` KV cache and indexer, with three DSpark MTP draft
-stages grafted in. Serves a 1,000,000-token context on twelve 24 GB Ampere
-GPUs. On two DGX Sparks it also serves correctly at TP=2 with the checkpoint's
-native `int8_ds_mla` cache and FlashMLA INT8-cache decode/prefill kernels.
-**Validated and benchmarked.**
+INT4 W4A16 Marlin routed experts, INT8 W8A16 dense/shared/attention linears,
+`int8_ds_mla` KV cache and indexer, with three DSpark MTP draft stages grafted
+in. AllSpark keeps the dense linears compact on validated Ampere builds. The
+current Hilton SM121 binary contains only SM86 AllSpark cubins, so its guarded
+fallback expands those linears to resident BF16 (measured overhead:
+approximately 2.1--2.3 GiB per PP rank). Commit `0f83861dac` adds native
+SM120/SM121 AllSpark compilation and hardware tests; it is not deployment
+proof until its uniquely tagged image passes those tests on GB10.
+
+The checkpoint serves a 1,000,000-token context on twelve 24 GB Ampere GPUs.
+On two DGX Sparks, PP=2 without DSpark passes C1/C2 at an actual 17,644-token
+prompt with the native INT8-cache FlashMLA decode/prefill kernels. An actual
+35K prompt still faults the final pipeline rank, so the Hilton long-context
+deployment is not yet accepted.
 
 ### [`appmana/deepseek-v4-nvfp4-fp8`](https://huggingface.co/appmana/deepseek-v4-nvfp4-fp8)
 
@@ -173,7 +181,7 @@ boot script, same `prep_pp_shards.py` rank-local shard staging, same
 environment. The cluster's `tb-chain-webhook` injects `NCCL_SOCKET_IFNAME` and
 `VLLM_RAY_WORKER_IP_ORDER` from the admitted chain placement.
 
-### GB10, TP=2: current INT4/INT8 LWS
+### GB10, PP=2: current INT4/INT8 LWS
 
 `demos-hilton/cluster/gitops/apps/base/inference/deepseek-v4-int4-int8.yaml`
 is the current two-rank LeaderWorkerSet, one GB10 per node, with the direct
@@ -183,19 +191,24 @@ and adds `--headless` only on nonzero ranks. The leader remains pinned to
 `spark-2ab3` because the present point-to-point `/30` makes
 `10.255.0.1` the fixed rendezvous address.
 
-The manifest is enabled, but the current rollout remains a validation run on
-the older TileLang-mHC image. Two node-local 5 Gi RWO volumes now persist every
-compiler/autotune/temp root under `/jit-cache`; they are rank-local, not shared.
-Short correctness probes and C1 1k/8k diagnostics completed, but a C1 15k
-prefill faulted both ranks with Xid 31. On the clean replacement group, a C2 1k
-run drained before both ranks faulted simultaneously with Xid 31. A canceled,
-accidentally C4 arm is excluded; no latency or throughput from these failed or
-contaminated cells is publication-grade.
-The SparkInfer-mHC adapter still needs a rebuilt image and live TP=2
-correctness gate. Do not describe it as the final production deployment yet.
+The manifest is enabled, but the rollout remains diagnostic. Two node-local
+5 Gi RWO volumes persist every compiler/autotune/temp root under `/jit-cache`;
+they are rank-local, not shared. The stable diagnostic lane uses PP=2, TP=1,
+`max_num_batched_tokens=1024`, a 4096-token long-prefill threshold, eager
+execution, and no DSpark. It passes C1 and C2 with an actual 17,644-token
+prompt. The same process faults PP1 on an actual 35K prompt, even with about
+18 GiB available host memory, so that deeper failure is not explained by
+DSpark or simple OOM pressure.
+
+With DSpark enabled, the same 3 GiB cache admitted about 101K tokens; without
+DSpark it admits 190K tokens (2.90 concurrent 65,536-token requests). DSpark
+therefore materially increased cache/scheduler working set and caused the
+earlier C2 17.6K failure, but it is not the sole 35K fault.
 
 ```yaml
 - --tensor-parallel-size
+- "1"
+- --pipeline-parallel-size
 - "2"
 - --distributed-executor-backend
 - mp
@@ -208,15 +221,17 @@ correctness gate. Do not describe it as the final production deployment yet.
 - --tokenizer-mode
 - deepseek_v4
 - --max-model-len
-- "16384"
+- "65536"
 - --max-num-seqs
 - "2"
+- --max-num-batched-tokens
+- "1024"
+- --long-prefill-token-threshold
+- "4096"
 - --gpu-memory-utilization
 - "0.68"
 - --kv-cache-memory-bytes
-- "8589934592"
-- --speculative-config
-- '{"method": "dspark", "num_speculative_tokens": 5, "draft_sample_method": "greedy"}'
+- "3221225472"
 ```
 
 `--max-num-seqs=2` is a memory constraint, not a throughput preference.
