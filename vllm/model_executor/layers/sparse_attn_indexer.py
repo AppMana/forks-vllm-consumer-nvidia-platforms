@@ -45,7 +45,10 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH = 4096
-SM120_SHORT_ROW_TOPK_MAX_WIDTH = 12288
+# GB10's DSV4 C4 indexer is at most 65,536 compressed rows for the planned
+# 250k-token admission limit. Keep its decode on the row-local kernel we
+# authored for consumer Blackwell instead of re-entering persistent_topk.
+SM120_SHORT_ROW_TOPK_MAX_WIDTH = 65536
 SM120_SHORT_ROW_TOPK_MAX_ROWS = 16
 
 
@@ -99,6 +102,23 @@ def _decode_logits_token_count(max_context_len: int, max_model_len: int) -> int:
         round_up(max(max_context_len, 1), DECODE_LOGITS_WIDTH_ALIGNMENT),
         max_model_len,
     )
+
+
+def _decode_logits_token_count_for_platform(
+    max_context_len: int,
+    max_model_len: int,
+    is_cuda_sm120: bool,
+) -> int:
+    """Keep GB10 on the known-safe power-of-two/full-width decode layout.
+
+    The adaptive width is a useful memory optimization on Ampere, but the
+    SM12x paged indexer faults at live non-power-of-two widths even though its
+    isolated kernels pass. The production 65k configuration reserves only one
+    16,384-float row per decode request, so full width is inexpensive.
+    """
+    if is_cuda_sm120:
+        return max_model_len
+    return _decode_logits_token_count(max_context_len, max_model_len)
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -979,8 +999,11 @@ def sparse_attn_indexer(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
                 clean_logits=False,
-                token_count=_decode_logits_token_count(
-                    decode_metadata.max_context_len, max_model_len
+                token_count=_decode_logits_token_count_for_platform(
+                    decode_metadata.max_context_len,
+                    max_model_len,
+                    current_platform.is_cuda()
+                    and current_platform.is_device_capability_family(120),
                 ),
             )
         num_rows = logits.shape[0]

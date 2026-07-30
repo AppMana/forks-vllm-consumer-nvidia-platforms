@@ -11,6 +11,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
     SM120_SHORT_ROW_TOPK_MAX_ROWS,
     SM120_SHORT_ROW_TOPK_MAX_WIDTH,
     _reserve_prefill_gather_workspace,
+    _decode_logits_token_count_for_platform,
     _should_use_sm120_short_row_topk_decode,
 )
 from vllm.models.deepseek_v4.nvidia_imma import triton_kernels as dsv4_sm86
@@ -24,7 +25,8 @@ from vllm.transformers_utils.configs.dsv4 import kernel_config
         (512, 8192, SM120_SHORT_ROW_TOPK_MAX_ROWS, True, True),
         (512, 8320, 1, True, True),
         (512, 8192, SM120_SHORT_ROW_TOPK_MAX_ROWS + 1, True, False),
-        (512, 12288, 1, True, False),
+        (512, 12288, 1, True, True),
+        (512, SM120_SHORT_ROW_TOPK_MAX_WIDTH - 128, 1, True, True),
         (512, SM120_SHORT_ROW_TOPK_MAX_WIDTH, 1, True, False),
         (512, 4096, 1, False, False),
         (2048, 4096, 1, True, False),
@@ -46,6 +48,12 @@ def test_sm120_short_row_topk_decode_selector(
         )
         is expected
     )
+
+
+def test_sm120_decode_logits_keep_full_power_of_two_width() -> None:
+    assert _decode_logits_token_count_for_platform(8211, 16384, True) == 16384
+    assert _decode_logits_token_count_for_platform(10773, 16384, True) == 16384
+    assert _decode_logits_token_count_for_platform(8211, 16384, False) == 8320
 
 
 def test_dsv4_int_vllm_block_enables_int8_indexer_imma(monkeypatch) -> None:
