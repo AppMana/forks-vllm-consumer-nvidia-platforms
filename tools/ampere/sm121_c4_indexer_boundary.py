@@ -44,7 +44,7 @@ def make_inputs(context_len: int):
     return q, raw.unsqueeze(-2), weights, context_lens, block_table, schedule
 
 
-def exercise(context_len: int, token_count: int) -> None:
+def exercise(context_len: int, token_count: int, backend: str) -> None:
     q, cache, weights, lens, table, schedule = make_inputs(context_len)
     logits = deep_gemm.fp8_fp4_paged_mqa_logits(
         (q, None),
@@ -58,21 +58,37 @@ def exercise(context_len: int, token_count: int) -> None:
         token_count=token_count,
     )
     indices = torch.full((1, TOPK), -1, dtype=torch.int32, device="cuda")
-    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
-    torch.ops._C.persistent_topk(
-        logits, lens, indices, workspace, TOPK, logits.shape[1]
-    )
+    if backend == "authored":
+        torch.ops._C.top_k_per_row_decode(
+            logits,
+            1,
+            lens,
+            indices,
+            1,
+            logits.stride(0),
+            logits.stride(1),
+            TOPK,
+        )
+    else:
+        workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+        torch.ops._C.persistent_topk(
+            logits, lens, indices, workspace, TOPK, logits.shape[1]
+        )
     torch.cuda.synchronize()
     assert logits.shape == (1, token_count)
     assert torch.isfinite(logits[0, :context_len]).all()
     assert (indices >= 0).all() and (indices < context_len).all()
-    print(f"PASS context_len={context_len} token_count={token_count}")
+    print(
+        f"PASS backend={backend} context_len={context_len} "
+        f"token_count={token_count}"
+    )
 
 
 def main() -> None:
     assert torch.cuda.get_device_capability() == (12, 1)
-    exercise(8_192, 8_192)
-    exercise(8_211, 8_320)
+    for backend in ("persistent", "authored"):
+        exercise(8_192, 8_192, backend)
+        exercise(8_211, 8_320, backend)
 
 
 if __name__ == "__main__":
