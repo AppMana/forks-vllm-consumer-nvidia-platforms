@@ -603,8 +603,9 @@ COPY --from=rust-build /workspace/vllm/vllm-rs vllm/vllm-rs
 COPY --from=rust-build /workspace/vllm/_rust_*.so vllm/
 
 ARG GIT_REPO_CHECK=0
-RUN --mount=type=bind,source=.git,target=.git \
-    if [ "$GIT_REPO_CHECK" != "0" ]; then bash tools/check_repo.sh ; fi
+COPY .git .git
+RUN if [ "$GIT_REPO_CHECK" != "0" ]; then bash tools/check_repo.sh; fi \
+    && rm -rf .git
 
 ARG vllm_target_device="cuda"
 ENV VLLM_TARGET_DEVICE=${vllm_target_device}
