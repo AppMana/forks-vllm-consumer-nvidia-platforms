@@ -9,6 +9,7 @@ from vllm.model_executor.layers.quantization.utils.allspark_utils import (
     ALLSPARK_AMPERE_K_ALIGN,
     ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD,
     ALLSPARK_AMPERE_N_ALIGN,
+    is_allspark_supported_device_capability,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import quantize_weights
 from vllm.platforms import current_platform
@@ -16,16 +17,14 @@ from vllm.scalar_type import scalar_types
 from vllm.utils.platform_utils import num_compute_units
 
 
-def is_gptq_allspark_supported(min_capability: int, max_capability: int) -> bool:
+def is_gptq_allspark_supported() -> bool:
     if not current_platform.is_cuda():
         return False
 
     capability = current_platform.get_device_capability()
     assert capability is not None
 
-    return (
-        capability.to_int() >= min_capability and capability.to_int() <= max_capability
-    )
+    return is_allspark_supported_device_capability(capability.to_int())
 
 
 MNK_FACTORS = [
@@ -54,8 +53,8 @@ def rand_data(shape, dtype=torch.float16):
 
 
 @pytest.mark.skipif(
-    not is_gptq_allspark_supported(80, 89),
-    reason="AllSpark Ampere kernel is not supported on this GPU type.",
+    not is_gptq_allspark_supported(),
+    reason="AllSpark W8A16 kernel is not supported on this GPU type.",
 )
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
 @pytest.mark.parametrize("group_size", [-1])

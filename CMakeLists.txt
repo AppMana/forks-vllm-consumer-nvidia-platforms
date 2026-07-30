@@ -728,7 +728,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   # Only build AllSpark kernels if we are building for at least some compatible archs.
-  cuda_archs_loose_intersection(ALLSPARK_ARCHS "8.0;8.6;8.7;8.9" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(
+    ALLSPARK_ARCHS "8.0;8.6;8.7;8.9;12.0a;12.1a" "${CUDA_ARCHS}")
   if (ALLSPARK_ARCHS)
     set(ALLSPARK_SRCS
        "csrc/libtorch_stable/quantization/gptq_allspark/allspark_repack.cu"

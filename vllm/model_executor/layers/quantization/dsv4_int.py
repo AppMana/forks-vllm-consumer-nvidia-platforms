@@ -91,6 +91,7 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.allspark_utils import (
     ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD,
+    is_allspark_supported_device_capability,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
@@ -946,7 +947,7 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
             device_index = torch.cuda.current_device()
         properties = torch.cuda.get_device_properties(device_index)
         sm_version = properties.major * 10 + properties.minor
-        if sm_version < 80 or sm_version >= 90:
+        if not is_allspark_supported_device_capability(sm_version):
             return False
         if (
             layer.input_size_per_partition % 16 != 0

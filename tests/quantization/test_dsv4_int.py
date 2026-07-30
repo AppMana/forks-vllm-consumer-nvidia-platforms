@@ -457,8 +457,8 @@ def test_deepseek_v4_int4_mapper_keeps_expert_scale_suffix():
 def test_dsv4_channel_int8_linear_method_prefers_allspark_on_ampere():
     props = torch.cuda.get_device_properties()
     sm_version = props.major * 10 + props.minor
-    if sm_version < 80 or sm_version >= 90:
-        pytest.skip("Ampere W8A16 channel paths only run on sm_8x")
+    if not (80 <= sm_version <= 89 or sm_version in (120, 121)):
+        pytest.skip("AllSpark W8A16 channel path is unsupported on this GPU")
 
     torch.manual_seed(14)
     m = 12
@@ -503,7 +503,7 @@ def test_dsv4_channel_int8_linear_method_prefers_allspark_on_ampere():
         torch.ops._C, "allspark_w8a16_gemm"
     )
     if allspark_available:
-        # AllSpark is the sole Ampere channel-W8A16 kernel (the Triton channel
+        # AllSpark is the compact channel-W8A16 kernel (the Triton channel
         # path was removed: identical alignment gate, 2-5x slower). When the op
         # is present and dims are aligned, AllSpark takes the layer.
         assert layer._dsv4_int_allspark
@@ -528,8 +528,8 @@ def test_allspark_channel_int8_linear_method_matches_dequant_reference():
         pytest.skip("AllSpark W8A16 op is not available")
     props = torch.cuda.get_device_properties()
     sm_version = props.major * 10 + props.minor
-    if sm_version < 80 or sm_version >= 90:
-        pytest.skip("AllSpark Ampere path only runs on sm_8x")
+    if not (80 <= sm_version <= 89 or sm_version in (120, 121)):
+        pytest.skip("AllSpark W8A16 path is unsupported on this GPU")
 
     torch.manual_seed(12)
     m = 12

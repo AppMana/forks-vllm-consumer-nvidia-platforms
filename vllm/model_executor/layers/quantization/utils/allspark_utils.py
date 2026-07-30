@@ -12,6 +12,11 @@ ALLSPARK_AMPERE_N_ALIGN = 16
 ALLSPARK_AMPERE_K_ALIGN = 16
 
 
+def is_allspark_supported_device_capability(device_capability: int) -> bool:
+    """Return whether this build has a validated AllSpark W8A16 target."""
+    return 80 <= device_capability <= 89 or device_capability in (120, 121)
+
+
 def check_allspark_supported_dtype_shape(
     input_size_per_partition: int,
     output_size_per_partition: int,
@@ -22,19 +27,18 @@ def check_allspark_supported_dtype_shape(
     capability_tuple = current_platform.get_device_capability()
     device_capability = -1 if capability_tuple is None else capability_tuple.to_int()
 
-    # For Ampere GPU
-    if device_capability >= 80 and device_capability < 90:
+    if is_allspark_supported_device_capability(device_capability):
         if group_size != -1:
             return (
                 False,
-                "For Ampere GPU, AllSpark does not support group_size "
+                "AllSpark does not support group_size "
                 f"= {group_size}. Only group_size = -1 are supported.",
             )
 
         if weight_dtype not in ALLSPARK_SUPPORTED_QUANT_TYPES:
             return (
                 False,
-                "For Ampere GPU, AllSpark does not support "
+                "AllSpark does not support "
                 f"quant type ({weight_dtype}). Only quant type "
                 f"({ALLSPARK_SUPPORTED_QUANT_TYPES}) are supported.",
             )
@@ -48,14 +52,14 @@ def check_allspark_supported_dtype_shape(
                 "AllSpark needs input_size_per_partition % "
                 f"{ALLSPARK_AMPERE_K_ALIGN} = 0 and "
                 f"output_size_per_partition % {ALLSPARK_AMPERE_N_ALIGN} = 0 "
-                "for Ampere GPU optimized kernels.",
+                "for optimized kernels.",
             )
 
         if act_dtype != torch.float16 and act_dtype != torch.bfloat16:
             return (
                 False,
-                "AllSpark only supports act_dtype = float16 or bfloat16,"
-                f"for Ampere GPU, but got act_dtype = {act_dtype}.",
+                "AllSpark only supports act_dtype = float16 or bfloat16, "
+                f"but got act_dtype = {act_dtype}.",
             )
     else:
         return (
