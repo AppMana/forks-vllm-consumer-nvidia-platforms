@@ -9,7 +9,7 @@ This fork serves DeepSeek-V4-Flash on consumer NVIDIA GPUs:
 
 The supported INT4/INT8 checkpoint is
 [`appmana/deepseek-v4-int4-int8`](https://huggingface.co/appmana/deepseek-v4-int4-int8)
-at revision `8488a867c8adcc3e10b329a2df48e7bc1999437a`. The experimental
+at revision `ace78a6e9b5d90a43476fa1c098bfee1eb46c1de`. The experimental
 `appmana/deepseek-v4-nvfp4-fp8` checkpoint is a separate SparkInfer path and
 does not define the INT4/INT8 kernel choices documented here.
 

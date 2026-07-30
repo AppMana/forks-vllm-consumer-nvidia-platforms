@@ -28,7 +28,7 @@ spec:
                   leader \
                   --ray_cluster_size="${LWS_GROUP_SIZE}"
                 vllm serve appmana/deepseek-v4-int4-int8 \
-                  --revision 8488a867c8adcc3e10b329a2df48e7bc1999437a \
+                  --revision ace78a6e9b5d90a43476fa1c098bfee1eb46c1de \
                   --tokenizer-mode deepseek_v4 \
                   --reasoning-parser deepseek_v4 \
                   --enable-auto-tool-choice \
