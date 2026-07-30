@@ -40,6 +40,9 @@ class LoadConfig:
     - "instanttensor" will load the Safetensors weights on CUDA devices using
       InstantTensor, which enables distributed loading with pipelined prefetching
       and fast direct I/O.
+    - "flashpack" will load a manifest-sharded FlashPack checkpoint one
+      pipeline-local part at a time while preserving model-specific weight
+      loading behavior.
     - "npcache" will load the weights in pytorch format and store a numpy cache
       to speed up the loading.
     - "dummy" will initialize the weights with random values, which is mainly
