@@ -3,7 +3,8 @@
 """Unit tests for the sparse MLA backends and utilities."""
 
 import math
-from types import MethodType, SimpleNamespace
+import sys
+from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -115,6 +116,61 @@ def test_sm120_fp8_mqa_logits_chunk_sizes_cap_large_scores():
     assert deep_gemm_utils._fp8_mqa_logits_head_chunk_size(8192, 8192, 32) == 1
     assert deep_gemm_utils._fp8_mqa_logits_k_chunk_size(128, 128, 8) == 128
     assert deep_gemm_utils._fp8_mqa_logits_k_chunk_size(8192, 8192, 1) == 2048
+
+
+def test_sm120_int8_paged_mqa_logits_dispatches_to_sparkinfer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = {}
+    kernel_module = ModuleType("sparkinfer.attention.nsa_indexer.kernel")
+
+    def fake_run_paged_logits_kernel(**kwargs):
+        calls.update(kwargs)
+        return torch.arange(384, dtype=torch.float32).reshape(2, 192)
+
+    kernel_module.run_paged_logits_kernel = fake_run_paged_logits_kernel
+    package_modules = {
+        "sparkinfer": ModuleType("sparkinfer"),
+        "sparkinfer.attention": ModuleType("sparkinfer.attention"),
+        "sparkinfer.attention.nsa_indexer": ModuleType(
+            "sparkinfer.attention.nsa_indexer"
+        ),
+        "sparkinfer.attention.nsa_indexer.kernel": kernel_module,
+    }
+    for name, module in package_modules.items():
+        if name != "sparkinfer.attention.nsa_indexer.kernel":
+            module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(
+        deep_gemm_utils.current_platform,
+        "is_device_capability_family",
+        lambda family: family == 120,
+    )
+
+    q = torch.empty(2, 1, 64, 128, dtype=torch.int8)
+    kv_cache = torch.empty(4, 64, 1, 132, dtype=torch.uint8)
+    weights = torch.empty(2, 64, dtype=torch.float32)
+    context_lens = torch.tensor([[17], [23]], dtype=torch.int32)
+    block_tables = torch.tensor([[3, 2, 1], [0, 1, 2]], dtype=torch.int32)
+
+    actual = deep_gemm_utils.fp8_fp4_paged_mqa_logits(
+        (q, None),
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata=torch.empty(0, dtype=torch.int32),
+        max_model_len=192,
+        clean_logits=False,
+        token_count=130,
+    )
+
+    assert calls["q_fp8"].shape == (2, 64, 128)
+    assert calls["index_k_cache"] is kv_cache
+    assert calls["real_page_table"].shape == (2, 3)
+    assert calls["seqlens_per_query"].tolist() == [17, 23]
+    assert calls["page_size"] == 64
+    assert actual.shape == (2, 130)
 
 
 @pytest.mark.skipif(
