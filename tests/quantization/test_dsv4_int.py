@@ -810,6 +810,13 @@ def test_requant_checkpoint_emits_bf16_wo_a_without_scale(tmp_path):
     )
     wq_a_fp8 = torch.randn(128, 128).clamp(-2, 2).to(torch.float8_e4m3fn)
     expert_packed = _pack_nibbles(torch.randint(0, 16, (4, 64), dtype=torch.uint8))
+    preserved_final_tensors = {
+        "hc_head_base": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        "hc_head_fn": torch.arange(32, dtype=torch.float32).reshape(4, 8),
+        "hc_head_scale": torch.tensor([0.25]),
+        "head.weight": torch.arange(64, dtype=torch.bfloat16).reshape(8, 8),
+        "norm.weight": torch.arange(8, dtype=torch.bfloat16),
+    }
     tensors = {
         "layers.0.attn.wo_a.weight": wo_a_fp8,
         "layers.0.attn.wo_a.scale": wo_a_scale,
@@ -821,6 +828,7 @@ def test_requant_checkpoint_emits_bf16_wo_a_without_scale(tmp_path):
         "layers.0.ffn.experts.0.w1.scale": torch.full(
             (4, 2), 127, dtype=torch.uint8
         ),
+        **preserved_final_tensors,
     }
     save_file(tensors, str(src / shard_name))
     (src / "config.json").write_text(
@@ -867,6 +875,8 @@ def test_requant_checkpoint_emits_bf16_wo_a_without_scale(tmp_path):
         assert wo_a.dtype is torch.bfloat16
         assert torch.equal(wo_a, reference)
         assert handle.get_tensor("layers.0.attn.wq_a.weight").dtype is torch.int8
+        for name, source_tensor in preserved_final_tensors.items():
+            assert torch.equal(handle.get_tensor(name), source_tensor)
 
 
 def test_checkpoint_audit_classifies_deepseek_v4_precision_roles():
