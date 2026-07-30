@@ -1138,7 +1138,7 @@ ARG LMCACHE_GIT_REF=cd51f3a15766e326f92998c072264a5a6caa4efe
 # a pinned wheel URL: the URL baked in an x86_64 filename, so an aarch64 build
 # could not install it at all. The index lets pip resolve per platform.
 ARG FLASHMLA_INDEX_URL=https://appmana.github.io/forks-flash-mla-int/
-ARG FLASHMLA_SPEC=flash-mla
+ARG FLASHMLA_SPEC=flash-mla==2.0.0
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
@@ -1222,11 +1222,21 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             --extra-index-url "${FLASHMLA_INDEX_URL}" "${FLASHMLA_SPEC}"; \
     fi
 
-# sparkinfer supplies the sm12x (GB10) kernels the DSV4 registry resolves to.
+# Fail the build if the published wheel loses either native INT8 sparse-MLA
+# entry point. The int4-int8 checkpoint selects these symbols explicitly.
+RUN python3 -c "\
+import flash_mla; \
+assert flash_mla.__version__ == '2.0.0', flash_mla.__version__; \
+assert callable(flash_mla.sparse_mla_decode_int8); \
+assert callable(flash_mla.sparse_mla_prefill_int8); \
+print('flash_mla 2.0.0 native INT8 decode/prefill importable')"
+
+# sparkinfer supplies the sm12x (GB10) kernels used by the shared image's
+# FP8/NVFP4 paths. The int4-int8 checkpoint selects flash_mla instead.
 # Install order matters -- it pins nvidia-cutlass-dsl, which quack must not
 # drag backwards; requirements/cuda.txt already pins 4.6.0 for both.
 ARG SPARKINFER_REPO=https://github.com/AppMana/forks-sparkinfer
-ARG SPARKINFER_REF=appmana/main
+ARG SPARKINFER_REF=7811b848c16a90841c7c0c852125d31ec4504f99
 # uv shells out to git for a `git+` requirement, and this stage has no git.
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt \

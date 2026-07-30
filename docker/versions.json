@@ -125,7 +125,7 @@
       "default": "https://appmana.github.io/forks-flash-mla-int/"
     },
     "FLASHMLA_SPEC": {
-      "default": "flash-mla"
+      "default": "flash-mla==2.0.0"
     },
     "VLLM_SOURCE_REPO": {
       "default": "https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms"
@@ -134,7 +134,7 @@
       "default": "https://github.com/AppMana/forks-sparkinfer"
     },
     "SPARKINFER_REF": {
-      "default": "appmana/main"
+      "default": "7811b848c16a90841c7c0c852125d31ec4504f99"
     }
   }
 }
