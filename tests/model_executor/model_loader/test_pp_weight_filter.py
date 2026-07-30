@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.model_executor.model_loader import weight_utils
 from vllm.model_executor.model_loader.pp_weight_filter import (
     classify_shards,
     parse_layer_id,
@@ -287,6 +288,27 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
         )
         for name, tensor in filtered.items():
             assert torch.equal(tensor, all_weights[name]), f"Tensor mismatch for {name}"
+
+    def test_pinned_strategy_stages_only_local_weights(self, tmp_path, monkeypatch):
+        files, _ = self._make_synthetic_files(tmp_path, num_layers=4)
+        pinned_names = []
+
+        def record_pin(tensor):
+            pinned_names.append(tensor.data_ptr())
+            return tensor
+
+        monkeypatch.setattr(weight_utils, "_pin_weight_memory", record_pin)
+        loaded = dict(
+            safetensors_weights_iterator(
+                files,
+                False,
+                safetensors_load_strategy="pinned",
+                local_layer_range=(1, 2),
+            )
+        )
+
+        assert len(pinned_names) == len(loaded)
+        assert {parse_layer_id(name) for name in loaded} == {None, 1}
 
 
 class TestSafetensorsWeightsIteratorNoModelPrefix:

@@ -1673,6 +1673,11 @@ def test_load_config_rejects_invalid_safetensors_load_strategy():
         LoadConfig(safetensors_load_strategy="not_a_real_strategy")
 
 
+def test_load_config_accepts_pinned_safetensors_load_strategy():
+    config = LoadConfig(safetensors_load_strategy="pinned")
+    assert config.safetensors_load_strategy == "pinned"
+
+
 @pytest.mark.parametrize("bad_load_format", [None, 123])
 def test_load_config_rejects_non_string_load_format(bad_load_format):
     with pytest.raises(pydantic.ValidationError):

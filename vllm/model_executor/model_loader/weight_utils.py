@@ -884,6 +884,8 @@ def safetensors_weights_iterator(
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
+    elif safetensors_load_strategy == "pinned":
+        loading_desc += " (pinned)"
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
 
@@ -1006,7 +1008,13 @@ def safetensors_weights_iterator(
                     ) or should_skip_pp_weight(name, local_layer_range):
                         continue
                     param = f.get_tensor(name)
+                    if safetensors_load_strategy == "pinned":
+                        param = _pin_weight_memory(param)
                     yield name, param
+
+
+def _pin_weight_memory(param: torch.Tensor) -> torch.Tensor:
+    return param.pin_memory()
 
 
 def multi_thread_safetensors_weights_iterator(

@@ -11,7 +11,9 @@ from vllm.utils.hashing import safe_hash
 
 DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS = 8
 DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE = 16 * 1024 * 1024
-SafetensorsLoadStrategy: TypeAlias = Literal["lazy", "eager", "prefetch", "torchao"]
+SafetensorsLoadStrategy: TypeAlias = Literal[
+    "lazy", "eager", "prefetch", "pinned", "torchao"
+]
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader import LoadFormats
@@ -77,6 +79,10 @@ class LoadConfig:
     - "prefetch": Checkpoint files are read into the OS page cache before
       workers load them, speeding up the model loading phase. Useful on
       network or high-latency storage.
+    - "pinned": Weights are memory-mapped and copied into pinned host memory
+      before being passed to the model's weight loaders. This accelerates
+      host-to-device copies on platforms where pageable memory transfers are
+      slow, at the cost of an additional host-memory copy.
     - "torchao": Weights are loaded in upfront and then reconstructed
       into torchao tensor subclasses. This is used when the checkpoint
       was quantized using torchao and saved using safetensors.
