@@ -45,7 +45,8 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH = 4096
-SM120_SHORT_ROW_TOPK_MAX_WIDTH = 8192
+SM120_SHORT_ROW_TOPK_MAX_WIDTH = 12288
+SM120_SHORT_ROW_TOPK_MAX_ROWS = 16
 
 
 def _should_use_sm120_short_row_topk_decode(
@@ -58,7 +59,23 @@ def _should_use_sm120_short_row_topk_decode(
         return False
     if logits_width <= SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH:
         return True
-    return num_rows >= 16 and logits_width <= SM120_SHORT_ROW_TOPK_MAX_WIDTH
+    return (
+        logits_width < SM120_SHORT_ROW_TOPK_MAX_WIDTH
+        and num_rows <= SM120_SHORT_ROW_TOPK_MAX_ROWS
+    )
+
+
+def _use_sm120_short_row_topk_decode(
+    logits: torch.Tensor,
+    topk_tokens: int,
+) -> bool:
+    return _should_use_sm120_short_row_topk_decode(
+        topk_tokens,
+        logits.shape[1],
+        logits.shape[0],
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120),
+    )
 
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
@@ -982,7 +999,18 @@ def sparse_attn_indexer(
             1024,
             2048,
         )
-        if use_cooperative_topk:
+        if _use_sm120_short_row_topk_decode(logits, topk_tokens):
+            ops.top_k_per_row_decode(
+                logits,
+                next_n,
+                seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
+        elif use_cooperative_topk:
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
