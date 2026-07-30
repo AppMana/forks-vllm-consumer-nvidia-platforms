@@ -43,6 +43,16 @@ workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"; [ -n "${pf_pid:-}" ] && kill "$pf_pid" 2>/dev/null || true' EXIT
 chmod 700 "$workdir"
 
+resolved_commit="$(git ls-remote "$REPO_URL" "refs/heads/$REF" | awk 'NR == 1 { print $1 }')"
+if [ -z "$resolved_commit" ]; then
+    resolved_commit="$(git ls-remote "$REPO_URL" "refs/tags/$REF^{}" "refs/tags/$REF" | awk 'NR == 1 { print $1 }')"
+fi
+if ! [[ "$resolved_commit" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "could not resolve $REF to an exact commit" >&2
+    exit 1
+fi
+wheel_version="${VLLM_VERSION_OVERRIDE:-0.0.0+consumer.${resolved_commit:0:10}}"
+
 # buildkitd requires mTLS; the client keypair lives in the cluster.
 kubectl --context "$KUBE_CONTEXT" get secret buildkit-client-tls -n "$CONTEXT_NS" -o json \
   | python3 -c "
@@ -66,7 +76,7 @@ kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" svc/buildkitd \
 pf_pid=$!
 sleep 5
 
-echo "building $IMAGE for $PLATFORM from $REF"
+echo "building $IMAGE for $PLATFORM from $REF at $resolved_commit"
 
 # BUILDKIT_CONTEXT_KEEP_GIT_DIR: a git context strips .git by default, but the
 # Dockerfile bind-mounts it for tools/check_repo.sh, which otherwise fails with
@@ -79,13 +89,15 @@ exec buildctl \
     --tlsservername buildkitd \
     build \
     --frontend dockerfile.v0 \
-    --opt "context=${REPO_URL}#${REF}" \
+    --opt "context=${REPO_URL}#${resolved_commit}" \
     --opt filename=docker/Dockerfile \
     --opt target=vllm-openai \
     --opt "platform=$PLATFORM" \
     --opt build-arg:BUILDKIT_CONTEXT_KEEP_GIT_DIR=1 \
     --opt "build-arg:max_jobs=$MAX_JOBS" \
     --opt "build-arg:nvcc_threads=$NVCC_THREADS" \
+    --opt "build-arg:VLLM_BUILD_COMMIT=$resolved_commit" \
+    --opt "build-arg:VLLM_VERSION_OVERRIDE=$wheel_version" \
     --opt build-arg:RUN_WHEEL_CHECK=false \
     --secret "id=GIT_AUTH_TOKEN,src=$workdir/ghtoken" \
     --output "type=image,name=$IMAGE,push=true" \
