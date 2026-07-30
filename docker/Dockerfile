@@ -507,6 +507,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi
 
 ARG vllm_target_device="cuda"
+ARG VLLM_VERSION_OVERRIDE
 ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 ENV CCACHE_DIR=/root/.cache/ccache
 RUN --mount=type=cache,target=/root/.cache/ccache \
