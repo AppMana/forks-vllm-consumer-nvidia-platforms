@@ -20,7 +20,7 @@ not assumptions.
 | Arch | Gencode | Kernel source | Checkpoint | Status |
 | --- | --- | --- | --- | --- |
 | Ampere sm_86 (RTX 3090 / A5000, 24 GB) | `8.6` | Triton + fused native CUDA (`flash_mla`) | `appmana/deepseek-v4-int4-int8` | Validated, benchmarked |
-| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Marlin core; SM121 AllSpark rebuild in progress | `appmana/deepseek-v4-int4-int8` | PP=2 passes C1/C2 at 17.6K without DSpark; 35.3K still Xid-faults |
+| GB10 sm_121 (DGX Spark) | `12.1a` | FlashMLA + Triton INT8 indexer + Marlin; SM121 AllSpark rebuild in progress | `appmana/deepseek-v4-int4-int8` | PP=2 accepted through actual 43,084-token C1/C2 matrix; 6/6 cells, zero restarts or GPU faults |
 | GB10 sm_121 (DGX Spark) | `12.1a` | sparkinfer (CuTe-DSL) | `appmana/deepseek-v4-nvfp4-fp8` | Bring-up; output not yet correct |
 
 Both gencodes are built into one image (`docker/Dockerfile`,
@@ -41,10 +41,12 @@ SM120/SM121 AllSpark compilation and hardware tests; it is not deployment
 proof until its uniquely tagged image passes those tests on GB10.
 
 The checkpoint serves a 1,000,000-token context on twelve 24 GB Ampere GPUs.
-On two DGX Sparks, PP=2 without DSpark passes C1/C2 at an actual 17,644-token
-prompt with the native INT8-cache FlashMLA decode/prefill kernels. An actual
-35K prompt still faults the final pipeline rank, so the Hilton long-context
-deployment is not yet accepted.
+On two DGX Sparks, PP=2 without DSpark passes the clean actual
+1,110-/8,829-/43,084-token C1/C2 matrix with the native INT8-cache FlashMLA
+decode/prefill kernels and the int64-addressed Triton indexer. All 6/6 cells
+completed with zero pod restarts and no CUDA, Xid, or illegal-address log.
+Hilton still launches with `--max-model-len 65536`; this does not validate
+250K context.
 
 ### [`appmana/deepseek-v4-nvfp4-fp8`](https://huggingface.co/appmana/deepseek-v4-nvfp4-fp8)
 
@@ -152,16 +154,16 @@ its OCI source/revision labels are wrong and must not be cited as provenance.
 It predates both NVFP4 fixes above. A tag match alone is insufficient: record
 the digest and installed-file hashes for every benchmark or rollout.
 
-This is the first LWS validation image, not the accepted deployment image. It
-proved the two-rank image/topology/kernel wiring, but its SM12x DeepSeek-V4 mHC
-connector selects TileLang. The initial manifest also placed compiler caches
-under ephemeral `/tmp`; GitOps now redirects them to per-rank persistent
-volumes. The INT4 experts and INT8 sparse attention are still Marlin and
-FlashMLA; the TileLang use is isolated to mHC.
+The base image predates the accepted paged-indexer fix. GitOps `101c036`
+provides a checked init overlay equivalent to vLLM `5b0285ecd3`; the accepted
+result must therefore be attributed to the image config digest plus that
+overlay, not to the image alone. Compiler caches live on per-rank persistent
+volumes. INT4 experts and INT8 sparse attention remain Marlin and FlashMLA,
+while the accepted launch forces Triton for the indexer and mHC.
 Commit `8c8bcac623` adds `VLLM_MHC_CUDA_BACKEND=triton`, which forces the
 existing Triton/torch mHC fallback on SM121; `auto` retains TileLang. That
-selector is retained as an interim diagnostic, not the accepted Hilton
-backend.
+selector is the accepted Hilton mHC backend; TileLang mHC remains a separate
+implementation concern.
 
 Commit `75b9aff02c` adds the narrow SparkInfer shared-mHC adapter and the `mhc`
 selector role. It delegates first-layer 2D broadcast plus fused norm,
@@ -191,19 +193,25 @@ and adds `--headless` only on nonzero ranks. The leader remains pinned to
 `spark-2ab3` because the present point-to-point `/30` makes
 `10.255.0.1` the fixed rendezvous address.
 
-The manifest is enabled, but the rollout remains diagnostic. Two node-local
+The manifest is enabled. Two node-local
 5 Gi RWO volumes persist every compiler/autotune/temp root under `/jit-cache`;
-they are rank-local, not shared. The stable diagnostic lane uses PP=2, TP=1,
+they are rank-local, not shared. The accepted lane uses PP=2, TP=1,
 `max_num_batched_tokens=1024`, a 4096-token long-prefill threshold, eager
-execution, and no DSpark. It passes C1 and C2 with an actual 17,644-token
-prompt. The same process faults PP1 on an actual 35K prompt, even with about
-18 GiB available host memory, so that deeper failure is not explained by
-DSpark or simple OOM pressure.
+execution, no DSpark, and `--max-model-len 65536`. GitOps `101c036` mounts a
+checked init overlay of vLLM `5b0285ecd3` onto image config digest
+`sha256:5d516d8c727a3821eda042ed3a7f9460741dda264288b6e5b401660b1b5a87b4`.
+The overlay widens Triton paged-cache page products to int64. Clean actual
+1,110-, 8,829-, and 43,084-token prompts passed at C1 and C2: 6/6 cells, zero
+pod restarts, and no CUDA, Xid, or illegal-address log. The raw artifact is
+`demos-hilton/cluster/harness/dsv4-int4-pp2-triton-i64-2026-07-30.csv`.
+This is the first accepted post-fault PP2 stability point; 250K context is not
+validated.
 
 With DSpark enabled, the same 3 GiB cache admitted about 101K tokens; without
 DSpark it admits 190K tokens (2.90 concurrent 65,536-token requests). DSpark
 therefore materially increased cache/scheduler working set and caused the
-earlier C2 17.6K failure, but it is not the sole 35K fault.
+earlier C2 17.6K failure. The separate pre-fix 35K fault was signed-32-bit
+overflow in Triton paged-cache addressing, now fixed by `5b0285ecd3`.
 
 ```yaml
 - --tensor-parallel-size
@@ -560,6 +568,10 @@ keeps every native INT8 role and selects only shared mHC from SparkInfer:
   "vllm.models.deepseek_v4.nvidia_sm12x.mhc.sparkinfer_mhc_post_pre"
 ], "cache_type": "int8_ds_mla"}}'
 ```
+
+This override does not select the local native SparkInfer INT8 indexer
+prototype. That prototype exists only as uncommitted changes across the vLLM
+and SparkInfer worktrees and has not executed on GB10.
 
 **IMMA int8, portable decode.** Swaps only the fused native CUDA decode for its
 Triton equivalent, to attribute a regression to that kernel:
