@@ -17,6 +17,20 @@ import torch
 from vllm.platforms import current_platform
 
 _SUPPORTED_HIDDEN_SIZES = (4096, 7168)
+_HC_MULT = 4
+
+
+def _sparkinfer_mhc_split_k(hidden_size: int, block_k: int) -> int:
+    """Return the exact K partition count required by SparkInfer mHC."""
+    total_k = _HC_MULT * int(hidden_size)
+    block_k = int(block_k)
+    if block_k <= 0 or total_k % block_k != 0:
+        raise ValueError(
+            "SparkInfer mHC requires hc_mult * hidden_size to be divisible by "
+            f"block_k, got hc_mult={_HC_MULT}, hidden_size={hidden_size}, "
+            f"block_k={block_k}"
+        )
+    return total_k // block_k
 
 
 def _fail_on_uncompiled_cuda_graph(tensor: torch.Tensor) -> None:
@@ -98,6 +112,7 @@ def sparkinfer_mhc_pre_broadcast(
     from sparkinfer.norm import mhc
 
     _fail_on_uncompiled_cuda_graph(x)
+    split_k = _sparkinfer_mhc_split_k(x.shape[-1], mhc.DEFAULT_BLOCK_K)
     residual, post, comb, y = mhc.run_pre(
         x,
         fn_broadcast,
@@ -108,6 +123,7 @@ def sparkinfer_mhc_pre_broadcast(
         sinkhorn_iters=sinkhorn_iters,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        split_k=split_k,
     )
     return residual, post.unsqueeze(-1), comb, y
 
@@ -143,6 +159,7 @@ def sparkinfer_mhc_post_pre(
     from sparkinfer.norm import mhc
 
     _fail_on_uncompiled_cuda_graph(x)
+    split_k = _sparkinfer_mhc_split_k(residual.shape[-1], mhc.DEFAULT_BLOCK_K)
     residual_cur, post, comb, y = mhc.run_post_pre(
         x,
         residual,
@@ -156,5 +173,6 @@ def sparkinfer_mhc_post_pre(
         sinkhorn_iters=sinkhorn_iters,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        split_k=split_k,
     )
     return residual_cur, post.unsqueeze(-1), comb, y
