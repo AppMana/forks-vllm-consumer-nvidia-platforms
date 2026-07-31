@@ -36,16 +36,21 @@ def make_inputs():
         dtype=torch.uint8,
         device=device,
     )
-    page = raw[LIVE_MAX_PAGE, :, 0]
-    page[:, :HEAD_DIM].copy_(
+    # The indexer page is planar even though its allocation has a final
+    # ``HEAD_DIM + sizeof(float)`` byte extent: all token values come first,
+    # followed by all per-token fp32 scales. Match the cache writer and the
+    # paged-logits view instead of treating each tensor row as interleaved.
+    page = raw[LIVE_MAX_PAGE].reshape(-1)
+    value_bytes = BLOCK_SIZE * HEAD_DIM
+    page[:value_bytes].copy_(
         torch.arange(BLOCK_SIZE * HEAD_DIM, dtype=torch.int32, device=device)
         .remainder_(29)
         .sub_(14)
         .to(torch.int8)
         .view(torch.uint8)
-        .reshape(BLOCK_SIZE, HEAD_DIM)
+        .reshape(-1)
     )
-    page[:, HEAD_DIM:].view(torch.float32).fill_(0.02)
+    page[value_bytes:].view(torch.float32).fill_(0.02)
     weights = torch.linspace(
         0.25, 1.25, HEADS, dtype=torch.float32, device=device
     ).reshape(1, HEADS)
