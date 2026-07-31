@@ -40,7 +40,7 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_blocks"])
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
     block_ids_ptr,

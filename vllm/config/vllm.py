@@ -110,6 +110,24 @@ IS_DENSE = False
 # See https://github.com/vllm-project/vllm/issues/25689.
 
 
+BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES = frozenset(
+    {
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
+
+
+def _should_auto_enable_breakable_cudagraph(model_config: ModelConfig) -> bool:
+    """Return whether an architecture requires the eager breakable graph path."""
+    return any(
+        architecture in BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES
+        for architecture in model_config.architectures
+    )
+
+
 def enable_norm_fusion(cfg: "VllmConfig") -> bool:
     """Enable if either RMS norm or quant FP8 custom op is active;
     otherwise Inductor handles fusion."""
@@ -1201,25 +1219,15 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # For model classes don't carry @support_torch_compile,
-        # the breakable cudagraph is the supported PIECEWISE path. Auto-enable
-        # it unless the user has explicitly opted out via the env var.
+        # For model classes that do not carry @support_torch_compile, the
+        # breakable cudagraph is the supported PIECEWISE path. DeepSeek-V4 is
+        # deliberately excluded: breakable mode disables its torch.compile
+        # pipeline and regresses prefill and decode performance.
         if (
             self.model_config is not None
             and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
             and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
-            and any(
-                a
-                in (
-                    "DeepseekV4ForCausalLM",
-                    "DeepSeekV4MTPModel",
-                    "InklingForCausalLM",
-                    "InklingForConditionalGeneration",
-                    "MiniMaxM3SparseForCausalLM",
-                    "MiniMaxM3SparseForConditionalGeneration",
-                )
-                for a in self.model_config.architectures
-            )
+            and _should_auto_enable_breakable_cudagraph(self.model_config)
         ):
             os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
             logger.info_once(

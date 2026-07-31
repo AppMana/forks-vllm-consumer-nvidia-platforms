@@ -186,6 +186,51 @@ def test_unlisted_default_role_keeps_diagnostic_env_compatibility(monkeypatch):
     assert mhc._selected_mhc_cuda_backend() == "sparkinfer"
 
 
+def test_compiled_mhc_dispatch_uses_refreshed_constants(monkeypatch):
+    from vllm.model_executor.layers import mhc
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(mhc, "_MHC_SPARKINFER", True)
+    monkeypatch.setattr(mhc, "_MHC_TORCH_FALLBACK", True)
+    monkeypatch.setattr(mhc, "_MHC_PRE_TRITON", True)
+    monkeypatch.setattr(mhc, "_MHC_POST_TRITON", False)
+    monkeypatch.setattr(mhc, "_MHC_HEAD_TRITON", True)
+    monkeypatch.setattr(
+        mhc,
+        "_selected_mhc_cuda_backend",
+        lambda: pytest.fail("compiled dispatch re-entered Python configuration"),
+    )
+    monkeypatch.setattr(
+        mhc,
+        "_should_use_mhc_torch_fallback",
+        lambda: pytest.fail("compiled dispatch re-entered platform detection"),
+    )
+
+    assert mhc.mhc_uses_sparkinfer()
+    assert not mhc.mhc_uses_tilelang()
+    assert mhc._use_mhc_torch_fallback()
+    assert mhc._use_mhc_pre_triton()
+    assert not mhc._use_mhc_post_triton()
+    assert mhc._use_mhc_head_triton()
+
+
+def test_refresh_mhc_dispatch_runs_after_kernel_config_activation(monkeypatch):
+    from vllm.model_executor.layers import mhc
+
+    monkeypatch.setattr(mhc, "_selected_mhc_cuda_backend", lambda: "sparkinfer")
+    monkeypatch.setattr(mhc, "_should_use_mhc_torch_fallback", lambda: True)
+    monkeypatch.setattr(mhc.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    mhc.refresh_mhc_backend_selection()
+
+    assert mhc._MHC_SPARKINFER
+    assert mhc._MHC_TORCH_FALLBACK
+    assert mhc._MHC_PRE_TRITON
+    assert mhc._MHC_POST_TRITON
+    assert mhc._MHC_HEAD_TRITON
+
+
 def test_uncompiled_raw_cuda_graph_capture_fails_closed(monkeypatch):
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)

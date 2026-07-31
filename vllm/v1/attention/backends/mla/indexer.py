@@ -62,7 +62,7 @@ def sparse_indexer_max_logits_bytes(is_sm12x: bool | None = None) -> int:
     return default_mb * 1024 * 1024
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_decode_len"])
 def _prepare_uniform_decode_kernel(
     seq_lens_ptr,
     decode_seq_lens_ptr,

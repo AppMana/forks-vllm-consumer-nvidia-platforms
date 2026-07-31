@@ -47,6 +47,8 @@ def _selected_mhc_cuda_backend() -> str:
 
 
 def mhc_uses_sparkinfer() -> bool:
+    if torch.compiler.is_compiling():
+        return _MHC_SPARKINFER
     return _selected_mhc_cuda_backend() == "sparkinfer"
 
 
@@ -68,6 +70,7 @@ def _has_tilelang_mhc() -> bool:
 # flag. The CUDA sm_8x path below uses the torch/triton fallback dispatch.
 HAS_TILELANG_MHC = _has_tilelang_mhc()
 HAS_AITER_MHC = is_aiter_found_and_supported()
+_MHC_SPARKINFER = _selected_mhc_cuda_backend() == "sparkinfer"
 
 
 def _should_use_mhc_torch_fallback() -> bool:
@@ -118,6 +121,8 @@ def mhc_uses_tilelang() -> bool:
     Callers use this to distinguish the default TileLang broadcast path from
     the SparkInfer broadcast and torch/Triton fallback paths.
     """
+    if torch.compiler.is_compiling():
+        return not _MHC_SPARKINFER and not _MHC_TORCH_FALLBACK
     return not mhc_uses_sparkinfer() and not _should_use_mhc_torch_fallback()
 
 
@@ -141,7 +146,44 @@ _MHC_HEAD_TRITON = (
 )
 
 
+def refresh_mhc_backend_selection() -> None:
+    """Cache configured CUDA dispatch for the compiled model forward.
+
+    The checkpoint kernel configuration is activated after this module can be
+    imported. Refreshing during model construction makes the values visible as
+    Python constants to Dynamo without freezing a stale import-time choice.
+    """
+    global _MHC_SPARKINFER
+    global _MHC_TORCH_FALLBACK
+    global _MHC_PRE_TRITON
+    global _MHC_POST_TRITON
+    global _MHC_HEAD_TRITON
+
+    _MHC_SPARKINFER = _selected_mhc_cuda_backend() == "sparkinfer"
+    _MHC_TORCH_FALLBACK = _should_use_mhc_torch_fallback()
+    _MHC_PRE_TRITON = (
+        _MHC_TORCH_FALLBACK
+        and current_platform.is_cuda()
+        and torch.cuda.is_available()
+        and os.getenv("VLLM_MHC_PRE_TRITON", "1") != "0"
+    )
+    _MHC_POST_TRITON = (
+        _MHC_TORCH_FALLBACK
+        and current_platform.is_cuda()
+        and torch.cuda.is_available()
+        and os.getenv("VLLM_MHC_POST_TRITON", "1") != "0"
+    )
+    _MHC_HEAD_TRITON = (
+        _MHC_TORCH_FALLBACK
+        and current_platform.is_cuda()
+        and torch.cuda.is_available()
+        and os.getenv("VLLM_MHC_HEAD_TRITON", "1") != "0"
+    )
+
+
 def _use_mhc_torch_fallback() -> bool:
+    if torch.compiler.is_compiling():
+        return _MHC_TORCH_FALLBACK
     return _should_use_mhc_torch_fallback()
 
 
@@ -171,6 +213,8 @@ def _synchronize_mhc_torch_fallback() -> None:
 
 
 def _use_mhc_pre_triton() -> bool:
+    if torch.compiler.is_compiling():
+        return _MHC_PRE_TRITON
     return (
         _use_mhc_torch_fallback()
         and current_platform.is_cuda()
@@ -180,6 +224,8 @@ def _use_mhc_pre_triton() -> bool:
 
 
 def _use_mhc_post_triton() -> bool:
+    if torch.compiler.is_compiling():
+        return _MHC_POST_TRITON
     return (
         _use_mhc_torch_fallback()
         and current_platform.is_cuda()
@@ -189,6 +235,8 @@ def _use_mhc_post_triton() -> bool:
 
 
 def _use_mhc_head_triton() -> bool:
+    if torch.compiler.is_compiling():
+        return _MHC_HEAD_TRITON
     return (
         _use_mhc_torch_fallback()
         and current_platform.is_cuda()

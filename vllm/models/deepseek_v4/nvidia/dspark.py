@@ -17,6 +17,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
@@ -30,7 +31,11 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mhc import HCHeadOp, MHCPostOp
+from vllm.model_executor.layers.mhc import (
+    HCHeadOp,
+    MHCPostOp,
+    refresh_mhc_backend_selection,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -59,9 +64,11 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+@support_torch_compile
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        refresh_mhc_backend_selection()
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
@@ -286,7 +293,10 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
-    if cache_dtype == torch.uint8 and getattr(attn, "kv_cache_dtype", None) == "int8_ds_mla":
+    if (
+        cache_dtype == torch.uint8
+        and getattr(attn, "kv_cache_dtype", None) == "int8_ds_mla"
+    ):
         # int8_ds_mla paged layout: 512 signed-int8 bytes + fp32 row scale per
         # token (528B stride). MUST NOT fall through to the csrc fp8_ds_mla
         # writer below: both caches are uint8-typed, but that kernel writes

@@ -4,7 +4,11 @@
 import pytest
 import torch
 
-from vllm.v1.worker.utils import KVBlockZeroer
+from vllm.v1.worker.utils import KVBlockZeroer, _zero_kv_blocks_kernel
+
+
+def test_zero_kernel_does_not_specialize_allocation_count():
+    assert "n_blocks" in _zero_kv_blocks_kernel.do_not_specialize
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

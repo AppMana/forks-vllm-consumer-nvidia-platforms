@@ -12,7 +12,6 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-from vllm.utils.import_utils import has_cutedsl
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
     compress_norm_rope_store_two_stage_triton,
@@ -22,6 +21,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_cutedsl
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -309,6 +309,36 @@ class DeepseekCompressor(nn.Module):
         )
 
         self._int8_ds_mla = vllm_config.cache_config.cache_dtype == "int8_ds_mla"
+        self._pdl_kwargs = (
+            {}
+            if current_platform.is_rocm() or current_platform.is_xpu()
+            else {"launch_pdl": False}
+        )
+        self._cuda_c128_boundary_shortcut = (
+            current_platform.is_cuda()
+            and self.head_dim == 512
+            and self.compress_ratio == 128
+        )
+        self._use_cutedsl_compressor = (
+            current_platform.is_cuda()
+            and self.head_dim == 512
+            and has_cutedsl()
+            and not current_platform.is_device_capability_family(80)
+            and not current_platform.is_device_capability_family(120)
+        )
+        if self._use_cutedsl_compressor:
+            from .nvidia.ops.sparse_attn_compress_cutedsl import (
+                compress_norm_rope_store_cutedsl,
+            )
+
+            self._compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
+        elif self._use_two_stage_fused_compressor:
+            self._compress_norm_rope_store_fn = (
+                compress_norm_rope_store_two_stage_triton
+            )
+        else:
+            self._compress_norm_rope_store_fn = compress_norm_rope_store_triton
+
         if self.head_dim == 512:
             assert not use_fp4_cache, (
                 "MXFP4 cache is only supported for indexer (head=128)"
@@ -368,12 +398,6 @@ class DeepseekCompressor(nn.Module):
         state_cache = self.state_cache.kv_cache
         # kv_state stored in first half, score_state stored in second half
         state_width = state_cache.shape[-1] // 2
-        pdl_kwargs = (
-            {}
-            if current_platform.is_rocm() or current_platform.is_xpu()
-            else {"launch_pdl": False}
-        )
-
         # Store the KV and score (with fused APE addition) in the state.
         # NOTE: PDL is disabled: both this kernel and the compress kernels
         # below depend on preceding kernel outputs (kv/score from the cublas
@@ -390,14 +414,12 @@ class DeepseekCompressor(nn.Module):
             block_size=block_size,
             state_width=state_width,
             compress_ratio=self.compress_ratio,
-            pdl_kwargs=pdl_kwargs,
+            pdl_kwargs=self._pdl_kwargs,
         )
 
         # full graph cannot branch on per-step CPU metadata after capture
         if (
-            current_platform.is_cuda()
-            and self.head_dim == 512
-            and self.compress_ratio == 128
+            self._cuda_c128_boundary_shortcut
             and forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
             and state_metadata.c128_boundary is False
         ):
@@ -427,25 +449,10 @@ class DeepseekCompressor(nn.Module):
 
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
-        compress_norm_rope_store_fn: Any
-        # Ampere (sm_8x) and consumer Blackwell (sm_12x) route through the
-        # Triton sparse kernel, which also handles head_dim == 512. The
-        # capability exclusion is independent of has_cutedsl()'s own quack /
-        # sm_90 floor and stays until the cutedsl compressor is validated there.
-        _cutedsl_ok = (
-            has_cutedsl()
-            and not current_platform.is_device_capability_family(80)
-            and not current_platform.is_device_capability_family(120)
-        )
-        if current_platform.is_cuda() and self.head_dim == 512 and _cutedsl_ok:
-            from .nvidia.ops.sparse_attn_compress_cutedsl import (
-                compress_norm_rope_store_cutedsl,
-            )
-
+        if self._use_cutedsl_compressor:
             # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
             # layout and the plain full-cache layout. The full-cache flags
             # are consumed only here.
-            compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
             extra_kwargs: dict[str, Any] = dict(
                 store_full_kv=store_full_kv,
                 store_full_fp8=store_full_fp8,
@@ -455,17 +462,15 @@ class DeepseekCompressor(nn.Module):
             # head=512 cr>=128 (no overlap): two-pass split compressor on the
             # prefill suffix, single-pass on the decode prefix.
             assert state_metadata.num_decode_tokens is not None
-            compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
             extra_kwargs = {
                 "num_decode_tokens": state_metadata.num_decode_tokens,
                 "compress_scratch": self._compress_scratch,
             }
         else:
             # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
-            compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 
-        compress_norm_rope_store_fn(
+        self._compress_norm_rope_store_fn(
             state_cache=state_cache,
             num_actual=num_actual,
             token_to_req_indices=token_to_req_indices,
@@ -477,7 +482,7 @@ class DeepseekCompressor(nn.Module):
             cos_sin_cache=cos_sin_cache,
             kv_cache=kv_cache,
             k_cache_metadata=k_cache_metadata,
-            pdl_kwargs=pdl_kwargs,
+            pdl_kwargs=self._pdl_kwargs,
             head_dim=self.head_dim,
             rope_head_dim=self.rope_head_dim,
             compress_ratio=self.compress_ratio,

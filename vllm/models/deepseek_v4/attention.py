@@ -8,8 +8,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,7 +27,12 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_q_kv_rmsnorm,
     fused_qnorm_rope_kv_int8_ds_mla_insert,
 )
-from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
+from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
+    MXFP4_BLOCK_SIZE,
+    _supports_fp8e4nv_in_triton,
+)
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_cutedsl
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -50,6 +53,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.transformers_utils.configs.dsv4.kernel_config import (
+    activate_kernel_config,
+    resolve_kernel_config_from_hf_config,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -59,10 +66,6 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
-)
-from vllm.transformers_utils.configs.dsv4.kernel_config import (
-    activate_kernel_config,
-    resolve_kernel_config_from_hf_config,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import (
@@ -529,7 +532,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
                 enable=aux_streams is not None
-                and hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+                and hidden_states.shape[0]
+                <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
@@ -771,6 +775,13 @@ class DeepseekV4Indexer(nn.Module):
         else:
             _indexer_cache_fmt = "int8" if indexer_cache_is_int8() else "fp8"
             _indexer_query_mode = "int8-imma" if indexer_imma_enabled() else "fp8"
+        self._indexer_query_is_int8 = indexer_imma_enabled() and not self.use_fp4_kv
+        self._indexer_use_cutedsl = has_cutedsl()
+        self._indexer_is_xpu = current_platform.is_xpu()
+        self._indexer_fp8_dtype = current_platform.fp8_dtype()
+        self._indexer_supports_fp8e4nv_in_triton = (
+            _supports_fp8e4nv_in_triton()
+        )
         logger.info_once(
             "Lightning Indexer: cache_payload=%s query=%s",
             _indexer_cache_fmt,
@@ -895,12 +906,6 @@ class DeepseekV4Indexer(nn.Module):
         def wq_b_and_q_quant():
             # INT8 IMMA indexer query: emit a symmetric INT8 query (scale folded
             # into indexer_weights) so the logits run as s8 x s8 integer-MMA.
-            # Gated on the INT8 indexer cache + checkpoint-enabled IMMA path;
-            # lazy import avoids a base<->nvidia_imma import cycle.
-            from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
-                indexer_imma_enabled,
-            )
-
             # ReplicatedLinear returns (output, bias); bias is None.
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
@@ -912,7 +917,13 @@ class DeepseekV4Indexer(nn.Module):
                 self.softmax_scale,
                 self.n_head**-0.5,
                 use_fp4=self.use_fp4_kv,
-                q_is_int8=indexer_imma_enabled() and not self.use_fp4_kv,
+                q_is_int8=self._indexer_query_is_int8,
+                use_cutedsl=self._indexer_use_cutedsl,
+                is_xpu=self._indexer_is_xpu,
+                fp8_dtype=self._indexer_fp8_dtype,
+                supports_fp8e4nv_in_triton=(
+                    self._indexer_supports_fp8e4nv_in_triton
+                ),
             )
 
         # compressor returns None and writes K to the indexer KV cache; the

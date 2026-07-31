@@ -356,7 +356,8 @@ def _fused_indexer_q_rope_fp8_torch(
     q_f32 = index_q.to(torch.float32)
     q_nope = q_f32[..., :nope_dim]
     q_rope = q_f32[..., nope_dim:]
-    # The Triton kernel uses fwd RoPE (rope_q): pair (even, odd) -> (cos*even - sin*odd, cos*odd + sin*even).
+    # The Triton kernel uses fwd RoPE (rope_q): pair (even, odd) becomes
+    # (cos*even - sin*odd, cos*odd + sin*even).
     # Match the fp32 → bf16 → fp32 round-trip used by the Triton path so the
     # ue8m0 absmax matches bit-for-bit.
     x_even = q_rope[..., 0::2].to(torch.bfloat16).to(torch.float32)
@@ -452,6 +453,11 @@ def fused_indexer_q_rope_quant(
     index_weights_head_scale: float,
     use_fp4: bool = False,
     q_is_int8: bool = False,
+    *,
+    use_cutedsl: bool | None = None,
+    is_xpu: bool | None = None,
+    fp8_dtype: torch.dtype | None = None,
+    supports_fp8e4nv_in_triton: bool | None = None,
 ) -> tuple[
     torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     torch.Tensor,
@@ -485,6 +491,14 @@ def fused_indexer_q_rope_quant(
     assert index_q.ndim == 3
     assert index_q_cos_sin_cache.ndim == 2
 
+    # Model forwards pass these process-static backend choices from module
+    # construction.  Keep the defaults for direct callers and tests, but do
+    # not query Python package/platform state while Dynamo traces a forward.
+    if use_cutedsl is None:
+        use_cutedsl = has_cutedsl()
+    if is_xpu is None:
+        is_xpu = current_platform.is_xpu()
+
     num_tokens = positions.shape[0]
     num_index_q_heads = index_q.shape[1]
     index_q_head_dim = index_q.shape[2]
@@ -507,7 +521,7 @@ def fused_indexer_q_rope_quant(
             dtype=torch.uint8,
             device=index_q.device,
         )
-        if has_cutedsl():
+        if use_cutedsl:
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                 fused_indexer_q_rope_quant_mxfp4_cutedsl,
@@ -524,7 +538,7 @@ def fused_indexer_q_rope_quant(
                 index_q_scale,
                 index_weights_out,
             )
-        elif current_platform.is_xpu():
+        elif is_xpu:
             torch.ops.vllm.xpu_deepseek_fused_indexer_q_rope_mxfp4(
                 index_q,
                 positions,
@@ -583,12 +597,15 @@ def fused_indexer_q_rope_quant(
             index_weights_out=index_weights_out,
         )
 
-    fp8_dtype = current_platform.fp8_dtype()
+    if fp8_dtype is None:
+        fp8_dtype = current_platform.fp8_dtype()
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
     fp8_max = 224.0 if use_fnuz else 448.0
     index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
 
-    if _supports_fp8e4nv_in_triton() and has_cutedsl():
+    if supports_fp8e4nv_in_triton is None:
+        supports_fp8e4nv_in_triton = _supports_fp8e4nv_in_triton()
+    if supports_fp8e4nv_in_triton and use_cutedsl:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             fused_indexer_q_rope_quant_fp8_cutedsl,
@@ -606,7 +623,7 @@ def fused_indexer_q_rope_quant(
         )
         return index_q_fp8, index_weights_out
 
-    if current_platform.is_xpu():
+    if is_xpu:
         torch.ops.vllm.xpu_deepseek_fused_indexer_q_rope_fp8(
             index_q,
             positions,

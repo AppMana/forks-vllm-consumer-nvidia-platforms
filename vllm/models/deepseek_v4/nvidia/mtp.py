@@ -18,6 +18,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -30,7 +31,11 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mhc import HCHeadOp, MHCPostOp
+from vllm.model_executor.layers.mhc import (
+    HCHeadOp,
+    MHCPostOp,
+    refresh_mhc_backend_selection,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -260,9 +265,11 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         return logits
 
 
+@support_torch_compile
 class DeepSeekV4MTP(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        refresh_mhc_backend_selection()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
         self.pad_shared_expert = (

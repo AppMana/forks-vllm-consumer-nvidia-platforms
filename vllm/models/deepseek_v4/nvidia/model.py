@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -44,6 +45,7 @@ from vllm.model_executor.layers.mhc import (
     MHCPreOp,
     mhc_uses_sparkinfer,
     mhc_uses_tilelang,
+    refresh_mhc_backend_selection,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -941,6 +943,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
         self.use_sparkinfer_mhc = mhc_uses_sparkinfer()
+        self.use_tilelang_mhc = mhc_uses_tilelang()
         if self.use_sparkinfer_mhc:
             from vllm.models.deepseek_v4.nvidia_sm12x.mhc import (
                 validate_sparkinfer_mhc_contract,
@@ -1019,7 +1022,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             elif (
                 x.dim() == 2
                 and self.hc_attn_fn_broadcast is not None
-                and mhc_uses_tilelang()
+                and self.use_tilelang_mhc
             ):
                 from vllm.model_executor.kernels.mhc.tilelang import (
                     mhc_pre_broadcast_tilelang,
@@ -1108,9 +1111,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
+@support_torch_compile
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        refresh_mhc_backend_selection()
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
