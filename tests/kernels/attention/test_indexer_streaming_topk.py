@@ -26,6 +26,7 @@ if not current_platform.is_cuda() or capability is None or capability.major < 8:
     )
 
 from vllm.model_executor.layers.sparse_attn_indexer import (  # noqa: E402
+    _fp32_sort_keys_into,
     oneshot_prefill_topk_reference,
     streaming_prefill_topk,
 )
@@ -60,6 +61,54 @@ def _make_inputs(m, n, *, qk_int8, seed=0, ctx_start=None, device="cuda"):
         max=n
     )
     return q, k, k_scale, weights, ks, ke
+
+
+def _torch_int8_mqa_logits(q, k, k_scale, weights, ks, ke):
+    """Known-correct eager form of the INT8 indexer logits equation."""
+    scores = torch.einsum("mhd,nd->mhn", q.float(), k.float())
+    logits = (torch.relu(scores * k_scale[None, None, :]) * weights[:, :, None]).sum(
+        dim=1
+    )
+    columns = torch.arange(k.shape[0], device=q.device)
+    valid = (columns[None, :] >= ks[:, None]) & (columns[None, :] < ke[:, None])
+    return logits.masked_fill(~valid, -torch.inf)
+
+
+def test_int8_logits_and_streaming_topk_match_torch_eager():
+    """Prove both the modified logits path and streamed selection against eager."""
+    m, n, topk = 4, 4097, 512
+    q, k, k_scale, weights, ks, ke = _make_inputs(
+        m, n, qk_int8=True, seed=17, ctx_start=n - m
+    )
+
+    eager_logits = _torch_int8_mqa_logits(q, k, k_scale, weights, ks, ke)
+    native_logits = mqa_logits_workspace_triton(
+        q, (k, k_scale), weights, ks, ke, qk_int8=True
+    )
+    torch.testing.assert_close(native_logits, eager_logits, rtol=2e-5, atol=2e-3)
+
+    eager_keys = torch.empty((m, n), dtype=torch.int64, device="cuda")
+    _fp32_sort_keys_into(eager_logits, 0, eager_keys)
+    eager_top_keys = torch.topk(
+        eager_keys, topk, dim=1, largest=True, sorted=True
+    ).values
+    eager_indices = ((1 << 32) - 1 - (eager_top_keys & 0xFFFFFFFF)).to(
+        torch.int32
+    ) - ks[:, None]
+
+    actual = torch.empty(m, topk, dtype=torch.int32, device="cuda")
+    streaming_prefill_topk(
+        q,
+        (k, k_scale),
+        weights,
+        ks,
+        ke,
+        actual,
+        topk,
+        slab_rows=2048,
+        qk_int8=True,
+    )
+    _assert_sets_equal_mod_boundary_ties(actual, eager_indices, eager_logits, ke, topk)
 
 
 @pytest.mark.parametrize("qk_int8", [True, False])
