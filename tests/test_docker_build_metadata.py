@@ -35,6 +35,7 @@ CMAKE_UTILS = REPO_ROOT / "cmake" / "utils.cmake"
 # The architectures this branch exists to serve: sm_86 (Ampere consumer) and
 # sm_121a (GB10 / DGX Spark).
 REQUIRED_ARCHES = ("8.6", "12.1a")
+REQUIRED_SPARKINFER_REF = "78cc92eaad3bf0378d199c44621bbaee75d0cb47"
 
 
 def dockerfile_arg_defaults(name: str) -> list[str]:
@@ -228,6 +229,13 @@ def test_sparkinfer_is_installed_without_build_isolation() -> None:
             "falls back to a pure-Python install and the AOT CUDA extensions "
             f"are never built: {line.strip()}"
         )
+
+
+def test_sparkinfer_ref_includes_native_int8_indexer_kernels() -> None:
+    """The shared image needs both paged decode and contiguous prefill."""
+    defaults = dockerfile_arg_defaults("SPARKINFER_REF")
+    assert defaults == [REQUIRED_SPARKINFER_REF]
+    assert bake_variable_default("SPARKINFER_REF") == REQUIRED_SPARKINFER_REF
 
 
 def test_sparkinfer_extension_artifacts_are_asserted() -> None:
