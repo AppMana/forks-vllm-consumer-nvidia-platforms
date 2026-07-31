@@ -271,6 +271,65 @@ def test_top_k_per_row(
     ), "CUDA top_k_per_row_prefill results don't match torch.topk"
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_top_k_per_row_prefill_native_streaming_merge() -> None:
+    """Two native slab selections plus a native merge equal one-shot top-k."""
+    set_random_seed(7)
+    rows, slab, top_k = 32, 8192, 512
+    logits = torch.randn(rows, 2 * slab, dtype=torch.float32, device="cuda")
+    row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    first_ends = torch.full((rows,), slab, dtype=torch.int32, device="cuda")
+    second_ends = torch.randint(
+        slab // 2, slab + 1, (rows,), dtype=torch.int32, device="cuda"
+    )
+
+    candidate_indices = torch.empty((rows, 2 * top_k), dtype=torch.int32, device="cuda")
+    candidate_values = torch.empty(
+        (rows, 2 * top_k), dtype=torch.float32, device="cuda"
+    )
+    torch.ops._C.top_k_per_row_prefill_candidates(
+        logits[:, :slab],
+        row_starts,
+        first_ends,
+        candidate_indices[:, :top_k],
+        candidate_values[:, :top_k],
+        top_k,
+        0,
+    )
+    torch.ops._C.top_k_per_row_prefill_candidates(
+        logits[:, slab:],
+        row_starts,
+        second_ends,
+        candidate_indices[:, top_k:],
+        candidate_values[:, top_k:],
+        top_k,
+        slab,
+    )
+
+    merged_indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    merged_values = torch.empty((rows, top_k), dtype=torch.float32, device="cuda")
+    torch.ops._C.top_k_per_row_merge_candidates(
+        candidate_values,
+        candidate_indices,
+        merged_indices,
+        merged_values,
+        top_k,
+    )
+
+    full_ends = second_ends + slab
+    validate_topk_against_reference(
+        logits,
+        merged_indices,
+        row_starts,
+        full_ends,
+        top_k,
+        "native streaming prefill top-k",
+    )
+    gathered = logits.gather(1, merged_indices.to(torch.int64))
+    assert torch.equal(gathered, merged_values)
+
+
 def _run_top_k_per_row_decode_test(
     top_k: int,
     batch_size: int,

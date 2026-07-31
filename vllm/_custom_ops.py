@@ -2965,6 +2965,42 @@ def top_k_per_row_prefill(
     )
 
 
+def top_k_per_row_prefill_candidates(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    topk_tokens: int,
+    column_offset: int,
+) -> None:
+    torch.ops._C.top_k_per_row_prefill_candidates(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        values,
+        topk_tokens,
+        column_offset,
+    )
+
+
+def top_k_per_row_merge_candidates(
+    candidate_values: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    torch.ops._C.top_k_per_row_merge_candidates(
+        candidate_values,
+        candidate_indices,
+        indices,
+        values,
+        topk_tokens,
+    )
+
+
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,

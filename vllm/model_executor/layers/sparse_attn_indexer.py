@@ -120,6 +120,7 @@ def _decode_logits_token_count_for_platform(
         return max_model_len
     return _decode_logits_token_count(max_context_len, max_model_len)
 
+
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
@@ -198,7 +199,9 @@ def should_use_prefill_streaming_topk(
     # logits, and listing sm_8x and sm_12x excluded sm_90 and sm_100 for no
     # stated reason.
     elif capability is not None and capability.major < 8:
-        reasons.append(f"compute capability {capability.major}.{capability.minor} < 8.0")
+        reasons.append(
+            f"compute capability {capability.major}.{capability.minor} < 8.0"
+        )
     if reasons:
         logger.warning_once(
             "Streaming prefill top-k was requested by the checkpoint's "
@@ -208,6 +211,7 @@ def should_use_prefill_streaming_topk(
         )
         return False
     return True
+
 
 # Centered order-preserving key of float32 -inf (bits 0xFF800000): columns
 # masked out by the logits kernel are exactly -inf; every in-range score is a
@@ -229,9 +233,9 @@ def _pack_sort_keys_kernel(
     pid_n = tl.program_id(1)
     offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = offs < num_cols
-    bits32 = tl.load(
-        logits_ptr + row * stride_lm + offs, mask=mask, other=0.0
-    ).to(tl.int32, bitcast=True)
+    bits32 = tl.load(logits_ptr + row * stride_lm + offs, mask=mask, other=0.0).to(
+        tl.int32, bitcast=True
+    )
     bits = bits32.to(tl.int64) & 0xFFFFFFFF
     c = tl.where(bits < (1 << 31), bits, (1 << 31) - 1 - bits)
     key = (c << 32) + ((1 << 32) - 1 - (col_offset + offs).to(tl.int64))
@@ -305,9 +309,7 @@ def _decode_topk_keys(
     value_part = top_keys >> 32
     cols = ((1 << 32) - 1 - (top_keys & 0xFFFFFFFF)).to(torch.int32)
     local = cols - cu_seqlen_ks.to(torch.int32).unsqueeze(1)
-    return torch.where(
-        value_part > _NEG_INF_CENTERED_KEY, local, local.new_tensor(-1)
-    )
+    return torch.where(value_part > _NEG_INF_CENTERED_KEY, local, local.new_tensor(-1))
 
 
 def streaming_prefill_topk(
@@ -321,12 +323,12 @@ def streaming_prefill_topk(
     slab_rows: int | None = None,
     qk_int8: bool | None = None,
 ) -> None:
-    """Exact slab-tiled replacement for full-logits + top_k_per_row_prefill.
+    """Native slab-tiled replacement for full-logits + prefill top-k.
 
-    Peak memory is O(M x slab_rows) instead of O(M x N): per slab it holds
-    the slab logits [M, S] fp32, the candidate keys [M, topk + S] int64, and
-    the top-k temporaries. Selection is bit-identical to
-    oneshot_prefill_topk_reference (see module comment for the proof).
+    Each slab's candidates and every running merge are selected by the same
+    CUDA radix/histogram implementation as the one-shot prefill path. Two
+    ping-pong buffers retain ``(score, global_index)`` candidates, so peak
+    memory is O(M x slab_rows) without a generic ``torch.topk`` launch.
     """
     from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         indexer_imma_enabled,
@@ -349,15 +351,18 @@ def streaming_prefill_topk(
     ks32 = cu_seqlen_ks.to(torch.int32)
     ke32 = cu_seqlen_ke.to(torch.int32)
 
-    # Candidate buffer: running top-k keys in [:, :k_top], slab keys after.
-    # int64.min is below every real key (real column ids are < 2^31), so
-    # unfilled running slots never win a merge.
-    cand = torch.full(
-        (m, k_top + slab_rows),
-        torch.iinfo(torch.int64).min,
-        dtype=torch.int64,
-        device=device,
-    )
+    # The first half of the current buffer holds the running candidates. The
+    # next slab is written into its second half, then the native merge writes
+    # the new running set into the other buffer's first half.
+    candidate_indices = [
+        torch.empty((m, 2 * k_top), dtype=torch.int32, device=device) for _ in range(2)
+    ]
+    candidate_values = [
+        torch.empty((m, 2 * k_top), dtype=torch.float32, device=device)
+        for _ in range(2)
+    ]
+    current = 0
+    first = True
     for n0 in range(0, n, slab_rows):
         n1 = min(n0 + slab_rows, n)
         s = n1 - n0
@@ -371,16 +376,35 @@ def streaming_prefill_topk(
             ke_local,
             qk_int8=qk_int8,
         )
-        _fp32_sort_keys_into(slab_logits, n0, cand[:, k_top : k_top + s])
-        # sorted=False: the merge invariant only needs the running SET of the
-        # k_top largest keys; order is imposed once at the end.
-        merged, _ = torch.topk(
-            cand[:, : k_top + s], k_top, dim=1, largest=True, sorted=False
+        half = 0 if first else k_top
+        slab_indices = candidate_indices[current][:, half : half + k_top]
+        slab_values = candidate_values[current][:, half : half + k_top]
+        ops.top_k_per_row_prefill_candidates(
+            slab_logits,
+            ks_local,
+            ke_local,
+            slab_indices,
+            slab_values,
+            k_top,
+            n0,
         )
-        cand[:, :k_top] = merged
+        if first:
+            first = False
+            continue
 
-    final, _ = torch.topk(cand[:, :k_top], k_top, dim=1, largest=True, sorted=True)
-    topk_indices_out.copy_(_decode_topk_keys(final, ks32))
+        other = 1 - current
+        ops.top_k_per_row_merge_candidates(
+            candidate_values[current],
+            candidate_indices[current],
+            candidate_indices[other][:, :k_top],
+            candidate_values[other][:, :k_top],
+            k_top,
+        )
+        current = other
+
+    final = candidate_indices[current][:, :k_top]
+    local = final - ks32.unsqueeze(1)
+    topk_indices_out.copy_(torch.where(final >= 0, local, final))
 
 
 def _assert_cutedsl_dcp_merge_supported(

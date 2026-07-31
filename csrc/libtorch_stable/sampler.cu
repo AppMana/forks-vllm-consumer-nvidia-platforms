@@ -268,6 +268,9 @@ __device__ bool processHistogramStep(
 
         if constexpr (mergeBlocks) {
           smemOutput[dstIdx] = indices[idx];
+          if constexpr (multipleBlocksPerRow) {
+            reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
+          }
         } else if constexpr (multipleBlocksPerRow) {
           smemOutput[dstIdx] = idx + rowStart;
           reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
@@ -296,6 +299,9 @@ __device__ bool processHistogramStep(
           if (dstIdx < topK) {
             if constexpr (mergeBlocks) {
               smemOutput[dstIdx] = indices[idx];
+              if constexpr (multipleBlocksPerRow) {
+                reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
+              }
             } else if constexpr (multipleBlocksPerRow) {
               smemOutput[dstIdx] = idx + rowStart;
               reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logit;
@@ -564,6 +570,47 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
       nullptr, logits, rowStart, rowEnd, outIndices, nullptr, stride1, topK);
 }
 
+template <int kNumThreadsPerBlock, bool useRadixSort>
+static __global__
+__launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefillCandidates(
+    const float* logits, const int* rowStarts, const int* rowEnds,
+    int* outIndices, float* outLogits, int stride0, int stride1, int outStride0,
+    const int topK, const int columnOffset) {
+  static constexpr int kNumBins = 2048;
+  const int rowIdx = blockIdx.x;
+  const int rowStart = rowStarts[rowIdx];
+  const int rowEnd = rowEnds[rowIdx];
+  outIndices += static_cast<int64_t>(rowIdx) * outStride0;
+  outLogits += static_cast<int64_t>(rowIdx) * outStride0;
+  logits += static_cast<int64_t>(rowIdx) * stride0;
+
+  topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, true>(
+      nullptr, logits, rowStart, rowEnd, outIndices, outLogits, stride1, topK);
+  __syncthreads();
+  for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock) {
+    if (outIndices[i] >= 0) {
+      outIndices[i] += columnOffset;
+    }
+  }
+}
+
+template <int kNumThreadsPerBlock, bool useRadixSort>
+static __global__
+__launch_bounds__(kNumThreadsPerBlock) void topKPerRowMergeCandidates(
+    const float* candidateLogits, const int* candidateIndices, int* outIndices,
+    float* outLogits, int candidateStride0, int outStride0, const int topK) {
+  static constexpr int kNumBins = 2048;
+  const int rowIdx = blockIdx.x;
+  candidateLogits += static_cast<int64_t>(rowIdx) * candidateStride0;
+  candidateIndices += static_cast<int64_t>(rowIdx) * candidateStride0;
+  outIndices += static_cast<int64_t>(rowIdx) * outStride0;
+  outLogits += static_cast<int64_t>(rowIdx) * outStride0;
+
+  topKPerRowJob<kNumThreadsPerBlock, kNumBins, useRadixSort, true, true>(
+      candidateIndices, candidateLogits, 0, 2 * topK, outIndices, outLogits, 1,
+      topK);
+}
+
 template <int kNumThreadsPerBlock, bool useRadixSort,
           bool multipleBlocksPerRow = false, bool mergeBlocks = false>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(
@@ -753,4 +800,46 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
             static_cast<int>(stride0), static_cast<int>(stride1),
             static_cast<int>(topK), kSortingAlgorithmThreshold);
   }
+}
+
+void top_k_per_row_prefill_candidates(const torch::stable::Tensor& logits,
+                                      const torch::stable::Tensor& rowStarts,
+                                      const torch::stable::Tensor& rowEnds,
+                                      torch::stable::Tensor& indices,
+                                      torch::stable::Tensor& values,
+                                      int64_t topK, int64_t columnOffset) {
+  constexpr int kNumThreadsPerBlock = 512;
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      logits.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+  const int64_t numRows = logits.size(0);
+
+  vllm::topKPerRowPrefillCandidates<kNumThreadsPerBlock, false>
+      <<<numRows, kNumThreadsPerBlock, 2 * topK * sizeof(int32_t), stream>>>(
+          logits.const_data_ptr<float>(), rowStarts.const_data_ptr<int>(),
+          rowEnds.const_data_ptr<int>(), indices.mutable_data_ptr<int>(),
+          values.mutable_data_ptr<float>(), static_cast<int>(logits.stride(0)),
+          static_cast<int>(logits.stride(1)),
+          static_cast<int>(indices.stride(0)), static_cast<int>(topK),
+          static_cast<int>(columnOffset));
+}
+
+void top_k_per_row_merge_candidates(
+    const torch::stable::Tensor& candidateValues,
+    const torch::stable::Tensor& candidateIndices,
+    torch::stable::Tensor& indices, torch::stable::Tensor& values,
+    int64_t topK) {
+  constexpr int kNumThreadsPerBlock = 512;
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      candidateValues.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+  const int64_t numRows = candidateValues.size(0);
+
+  vllm::topKPerRowMergeCandidates<kNumThreadsPerBlock, false>
+      <<<numRows, kNumThreadsPerBlock, 2 * topK * sizeof(int32_t), stream>>>(
+          candidateValues.const_data_ptr<float>(),
+          candidateIndices.const_data_ptr<int>(),
+          indices.mutable_data_ptr<int>(), values.mutable_data_ptr<float>(),
+          static_cast<int>(candidateValues.stride(0)),
+          static_cast<int>(indices.stride(0)), static_cast<int>(topK));
 }

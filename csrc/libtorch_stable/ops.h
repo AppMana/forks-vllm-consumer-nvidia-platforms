@@ -334,6 +334,19 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
                            torch::stable::Tensor& indices, int64_t numRows,
                            int64_t stride0, int64_t stride1, int64_t topK);
 
+void top_k_per_row_prefill_candidates(const torch::stable::Tensor& logits,
+                                      const torch::stable::Tensor& rowStarts,
+                                      const torch::stable::Tensor& rowEnds,
+                                      torch::stable::Tensor& indices,
+                                      torch::stable::Tensor& values,
+                                      int64_t topK, int64_t columnOffset);
+
+void top_k_per_row_merge_candidates(
+    const torch::stable::Tensor& candidateValues,
+    const torch::stable::Tensor& candidateIndices,
+    torch::stable::Tensor& indices, torch::stable::Tensor& values,
+    int64_t topK);
+
 void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
                           const torch::stable::Tensor& seqLens,
                           torch::stable::Tensor& indices, int64_t numRows,

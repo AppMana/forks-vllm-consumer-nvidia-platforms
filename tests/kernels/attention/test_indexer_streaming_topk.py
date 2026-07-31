@@ -1,28 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Activation chunking for the DSV4 sparse-attention indexer prefill.
+"""Native activation chunking for the DSV4 sparse-attention indexer prefill.
 
 During chunked prefill the indexer materializes the full score row
 ``logits[M, N]`` (fp32, N = compressed prior context) before top-k selection,
 so peak memory is O(chunk x window). The streaming path tiles the context
-dimension into slabs and maintains a running top-k merged through a strict
-total order over (score, column) packed into unique int64 keys, so the
-selection is EXACTLY the one-shot top-k under that order -- no approximation.
-
-Exactness argument:
-- The sm86 logits kernel (mqa_logits_workspace_triton) computes each output
-  column independently (per-(row, n-block) program, fixed BLOCK_H/BLOCK_D
-  accumulation order, no atomics), so slicing K rows into slabs yields
-  bit-identical per-column scores.
-- Keys are unique (column index is part of the key), so top-k over keys has
-  no ties at all, and top-k of a totally ordered set is associative:
-  topk(A u B) == topk(topk(A) u B). Streaming merge == one-shot, bit for bit.
-
-Tie semantics: among equal scores the key order prefers the SMALLER column.
-The production CUDA kernel (top_k_per_row_prefill) resolves boundary ties in
-an unspecified order (atomic collection order in shared memory), so against
-it we compare the selected SET only on tie-free data; the streaming path is
-compared bit-for-bit against the one-shot key-based reference.
+dimension into slabs. Each slab and every running candidate merge use the
+native CUDA prefill radix/histogram selector. Since top-k over a union equals
+top-k over the union of each input's top-k, the result has the same score
+multiset as one-shot selection. Boundary ties may choose different columns,
+matching the existing native selector's documented semantics.
 """
 
 import pytest
@@ -54,7 +41,9 @@ def _make_inputs(m, n, *, qk_int8, seed=0, ctx_start=None, device="cuda"):
     [0, ctx_start + i + 1) of its gathered compressed context."""
     torch.manual_seed(seed)
     if qk_int8:
-        q = torch.randint(-16, 16, (m, HEADS, HEAD_DIM), dtype=torch.int8, device=device)
+        q = torch.randint(
+            -16, 16, (m, HEADS, HEAD_DIM), dtype=torch.int8, device=device
+        )
         k = torch.randint(-16, 16, (n, HEAD_DIM), dtype=torch.int8, device=device)
     else:
         q = (torch.randn(m, HEADS, HEAD_DIM, device=device) * 0.3).to(
@@ -74,9 +63,8 @@ def _make_inputs(m, n, *, qk_int8, seed=0, ctx_start=None, device="cuda"):
 
 @pytest.mark.parametrize("qk_int8", [True, False])
 @pytest.mark.parametrize("slab_rows", [4096, 16384, 8191])
-def test_streaming_matches_oneshot_bitwise(qk_int8, slab_rows):
-    """Slab-tiled selection must equal the one-shot selection bit for bit,
-    for slab sizes both aligned and unaligned to the kernel BLOCK_N."""
+def test_streaming_matches_oneshot_scores(qk_int8, slab_rows):
+    """Slab-tiled native selection matches one-shot scores."""
     m, n, topk = 512, 65536, 2048  # 256k-token window at CSA-4, chunk 512
     q, k, k_scale, weights, ks, ke = _make_inputs(m, n, qk_int8=qk_int8)
 
@@ -85,10 +73,20 @@ def test_streaming_matches_oneshot_bitwise(qk_int8, slab_rows):
     )
     out = torch.empty(m, topk, dtype=torch.int32, device="cuda")
     streaming_prefill_topk(
-        q, (k, k_scale), weights, ks, ke, out, topk,
-        slab_rows=slab_rows, qk_int8=qk_int8,
+        q,
+        (k, k_scale),
+        weights,
+        ks,
+        ke,
+        out,
+        topk,
+        slab_rows=slab_rows,
+        qk_int8=qk_int8,
     )
-    assert torch.equal(out, ref)
+    logits = mqa_logits_workspace_triton(
+        q, (k, k_scale), weights, ks, ke, qk_int8=qk_int8
+    )
+    _assert_sets_equal_mod_boundary_ties(out, ref, logits, ke, topk)
 
 
 def _assert_sets_equal_mod_boundary_ties(out, prod, logits, ke, topk):
@@ -104,7 +102,8 @@ def _assert_sets_equal_mod_boundary_ties(out, prod, logits, ke, topk):
         if o == p:
             continue
         row = logits[r, : int(ke_cpu[r])]
-        kth = torch.topk(row, topk).values[-1]
+        assert row.numel() > 0
+        kth = torch.topk(row, min(topk, row.numel())).values[-1]
         # Same score multiset...
         lo = row[torch.tensor(sorted(o), device=row.device)].sort().values
         lp = row[torch.tensor(sorted(p), device=row.device)].sort().values
@@ -131,16 +130,21 @@ def test_streaming_matches_production_kernel_set(qk_int8):
 
     out = torch.empty(m, topk, dtype=torch.int32, device="cuda")
     streaming_prefill_topk(
-        q, (k, k_scale), weights, ks, ke, out, topk, slab_rows=8192,
+        q,
+        (k, k_scale),
+        weights,
+        ks,
+        ke,
+        out,
+        topk,
+        slab_rows=8192,
         qk_int8=qk_int8,
     )
     _assert_sets_equal_mod_boundary_ties(out, prod, logits, ke, topk)
 
 
-def test_streaming_ties_slab_invariant():
-    """Massive score ties (duplicated K rows, coarse int8 values) must resolve
-    identically for every slab size -- the unique-key order makes tie handling
-    deterministic and tile-invariant."""
+def test_streaming_ties_preserve_score_multiset():
+    """Slab size may permute boundary ties but not selected scores."""
     m, n, topk = 128, 16384, 2048
     torch.manual_seed(2)
     q = torch.randint(-2, 3, (m, HEADS, HEAD_DIM), dtype=torch.int8, device="cuda")
@@ -157,10 +161,20 @@ def test_streaming_ties_slab_invariant():
     for slab in (1024, 4096, 5000, 16384):
         out = torch.empty(m, topk, dtype=torch.int32, device="cuda")
         streaming_prefill_topk(
-            q, (k, k_scale), weights, ks, ke, out, topk, slab_rows=slab,
+            q,
+            (k, k_scale),
+            weights,
+            ks,
+            ke,
+            out,
+            topk,
+            slab_rows=slab,
             qk_int8=True,
         )
-        assert torch.equal(out, ref), f"tie resolution changed at slab={slab}"
+        logits = mqa_logits_workspace_triton(
+            q, (k, k_scale), weights, ks, ke, qk_int8=True
+        )
+        _assert_sets_equal_mod_boundary_ties(out, ref, logits, ke, topk)
 
 
 def test_short_rows_pad_minus_one():
@@ -180,7 +194,8 @@ def test_short_rows_pad_minus_one():
     streaming_prefill_topk(
         q, (k, k_scale), weights, ks, ke, out, topk, slab_rows=4096, qk_int8=True
     )
-    assert torch.equal(out, ref)
+    logits = mqa_logits_workspace_triton(q, (k, k_scale), weights, ks, ke, qk_int8=True)
+    _assert_sets_equal_mod_boundary_ties(out, ref, logits, ke, topk)
     assert (out[0] == -1).all()
     ke_cpu = ke.cpu()
     for i in range(m):
@@ -207,22 +222,16 @@ def test_multi_request_row_offsets():
         n1 + n2 - half + torch.arange(half, dtype=torch.int32, device="cuda") + 1
     )
 
-    ref = oneshot_prefill_topk_reference(
-        q, (k, k_scale), weights, ks, ke, topk, qk_int8=True
-    )
     out = torch.empty(m, topk, dtype=torch.int32, device="cuda")
     streaming_prefill_topk(
         q, (k, k_scale), weights, ks, ke, out, topk, slab_rows=4096, qk_int8=True
     )
-    assert torch.equal(out, ref)
     # Local index ranges: request 2's rows must all be < n2.
     assert out[half:].max().item() < n2
 
     # Set-compare against the production kernel too. Its indices are local;
     # re-localize both against ks=0 for the helper by adding row starts back.
-    logits = mqa_logits_workspace_triton(
-        q, (k, k_scale), weights, ks, ke, qk_int8=True
-    )
+    logits = mqa_logits_workspace_triton(q, (k, k_scale), weights, ks, ke, qk_int8=True)
     prod = torch.full((m, topk), -1, dtype=torch.int32, device="cuda")
     ops.top_k_per_row_prefill(
         logits, ks, ke, prod, m, logits.stride(0), logits.stride(1), topk
@@ -230,9 +239,7 @@ def test_multi_request_row_offsets():
     ks_col = ks.unsqueeze(1)
     out_glob = torch.where(out >= 0, out + ks_col, out)
     prod_glob = torch.where(prod >= 0, prod + ks_col, prod)
-    _assert_sets_equal_mod_boundary_ties(
-        out_glob, prod_glob, logits, ke, topk
-    )
+    _assert_sets_equal_mod_boundary_ties(out_glob, prod_glob, logits, ke, topk)
 
 
 def test_vllm_block_gates_streaming_and_sets_slab_rows(monkeypatch):
@@ -263,7 +270,6 @@ def test_vllm_block_gates_streaming_and_sets_slab_rows(monkeypatch):
     )
     # No explicit slab_rows: the config-block value (5000, unaligned) is used.
     out = torch.empty(m, topk, dtype=torch.int32, device="cuda")
-    streaming_prefill_topk(
-        q, (k, k_scale), weights, ks, ke, out, topk, qk_int8=True
-    )
-    assert torch.equal(out, ref)
+    streaming_prefill_topk(q, (k, k_scale), weights, ks, ke, out, topk, qk_int8=True)
+    logits = mqa_logits_workspace_triton(q, (k, k_scale), weights, ks, ke, qk_int8=True)
+    _assert_sets_equal_mod_boundary_ties(out, ref, logits, ke, topk)
