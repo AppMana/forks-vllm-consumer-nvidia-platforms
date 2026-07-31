@@ -18,9 +18,10 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 
-if not current_platform.is_device_capability_family(80):
+capability = current_platform.get_device_capability()
+if not current_platform.is_cuda() or capability is None or capability.major < 8:
     pytest.skip(
-        "sm86 indexer streaming top-k prototype targets Ampere",
+        "indexer streaming top-k requires CUDA compute capability 8.0+",
         allow_module_level=True,
     )
 
