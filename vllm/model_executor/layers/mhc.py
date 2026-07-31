@@ -188,7 +188,10 @@ def _use_mhc_torch_fallback() -> bool:
 
 
 def _mhc_torch_fallback_synchronize() -> bool:
-    return os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1") != "0"
+    # A hard stream/device synchronization is useful for localizing an
+    # asynchronous kernel fault, but it serializes the request path. Keep the
+    # diagnostic available without imposing it on normal fallback execution.
+    return os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "0") != "0"
 
 
 def _synchronize_mhc_torch_fallback() -> None:

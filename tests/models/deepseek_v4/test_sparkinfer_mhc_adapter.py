@@ -266,6 +266,39 @@ def test_refresh_mhc_dispatch_runs_after_kernel_config_activation(monkeypatch):
     assert mhc._MHC_HEAD_TRITON
 
 
+def test_mhc_torch_fallback_does_not_synchronize_by_default(monkeypatch):
+    from vllm.model_executor.layers import mhc
+
+    monkeypatch.delenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", raising=False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: pytest.fail("default MHC fallback synchronized the CUDA stream"),
+    )
+
+    assert not mhc._mhc_torch_fallback_synchronize()
+    mhc._synchronize_mhc_torch_fallback()
+
+
+def test_mhc_torch_fallback_synchronizes_when_explicitly_enabled(monkeypatch):
+    from vllm.model_executor.layers import mhc
+
+    calls = []
+    stream = SimpleNamespace(synchronize=lambda: calls.append("stream"))
+    monkeypatch.setenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1")
+    monkeypatch.delenv("VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", raising=False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    assert mhc._mhc_torch_fallback_synchronize()
+    mhc._synchronize_mhc_torch_fallback()
+
+    assert calls == ["stream"]
+
+
 def test_uncompiled_raw_cuda_graph_capture_fails_closed(monkeypatch):
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
