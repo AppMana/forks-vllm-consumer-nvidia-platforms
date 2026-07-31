@@ -455,6 +455,8 @@ def test_deepseek_v4_int4_mapper_keeps_expert_scale_suffix():
 
 def test_dsv4_allspark_sm12x_diagnostic_switch(monkeypatch):
     monkeypatch.delenv("VLLM_DSV4_ALLSPARK_SM12X", raising=False)
+    assert not dsv4_int_module._dsv4_allspark_supported_device_capability(121)
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "1")
     assert dsv4_int_module._dsv4_allspark_supported_device_capability(121)
     monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "0")
     assert not dsv4_int_module._dsv4_allspark_supported_device_capability(121)
@@ -479,11 +481,15 @@ def test_dsv4_allspark_sm12x_cublas_threshold(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_dsv4_channel_int8_linear_method_prefers_allspark_on_ampere():
+def test_dsv4_channel_int8_linear_method_prefers_allspark_on_supported_device(
+    monkeypatch,
+):
     props = torch.cuda.get_device_properties()
     sm_version = props.major * 10 + props.minor
     if not (80 <= sm_version <= 89 or sm_version in (120, 121)):
         pytest.skip("AllSpark W8A16 channel path is unsupported on this GPU")
+    if sm_version in (120, 121):
+        monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "1")
 
     torch.manual_seed(14)
     m = 12
@@ -546,7 +552,7 @@ def test_dsv4_channel_int8_linear_method_prefers_allspark_on_ampere():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_allspark_channel_int8_linear_method_matches_dequant_reference():
+def test_allspark_channel_int8_linear_method_matches_dequant_reference(monkeypatch):
     if not hasattr(torch.ops, "_C") or not hasattr(
         torch.ops._C, "allspark_w8a16_gemm"
     ):
@@ -555,6 +561,8 @@ def test_allspark_channel_int8_linear_method_matches_dequant_reference():
     sm_version = props.major * 10 + props.minor
     if not (80 <= sm_version <= 89 or sm_version in (120, 121)):
         pytest.skip("AllSpark W8A16 path is unsupported on this GPU")
+    if sm_version in (120, 121):
+        monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "1")
 
     torch.manual_seed(12)
     m = 12
