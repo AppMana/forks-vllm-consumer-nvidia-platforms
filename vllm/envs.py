@@ -59,6 +59,12 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_MHC_CUDA_BACKEND: str = "auto"
+    VLLM_MHC_PRE_TRITON: bool = True
+    VLLM_MHC_POST_TRITON: bool = True
+    VLLM_MHC_HEAD_TRITON: bool = True
+    VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE: bool = True
+    VLLM_MHC_TORCH_FALLBACK_SYNC_MODE: str = "stream"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -744,6 +750,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
         os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+    ),
+    # DSV4 mHC dispatch changes the traced model graph and must participate in
+    # torch.compile cache identity. Keeping these controls in the env registry
+    # also makes validate_environ reject misspellings instead of warning about
+    # the supported fork-specific variables.
+    "VLLM_MHC_CUDA_BACKEND": lambda: os.environ.get("VLLM_MHC_CUDA_BACKEND", "auto"),
+    "VLLM_MHC_PRE_TRITON": lambda: os.environ.get("VLLM_MHC_PRE_TRITON", "1") != "0",
+    "VLLM_MHC_POST_TRITON": lambda: os.environ.get("VLLM_MHC_POST_TRITON", "1") != "0",
+    "VLLM_MHC_HEAD_TRITON": lambda: os.environ.get("VLLM_MHC_HEAD_TRITON", "1") != "0",
+    "VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE": lambda: (
+        os.environ.get("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1") != "0"
+    ),
+    "VLLM_MHC_TORCH_FALLBACK_SYNC_MODE": lambda: os.environ.get(
+        "VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", "stream"
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').

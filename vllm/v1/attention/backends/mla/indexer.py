@@ -45,6 +45,23 @@ logger = init_logger(__name__)
 _PREFILL_CHUNK_METADATA_KERNEL_WARMUPS: set[tuple[int, int]] = set()
 
 
+def paged_mqa_logits_needs_deep_gemm_metadata(
+    use_fp4_indexer_cache: bool,
+    *,
+    is_sm8x: bool | None = None,
+    is_sm12x: bool | None = None,
+) -> bool:
+    """Whether decode will consume DeepGEMM's paged-MQA schedule metadata."""
+    if is_sm8x is None:
+        is_sm8x = current_platform.is_device_capability_family(80)
+    if is_sm12x is None:
+        is_sm12x = current_platform.is_device_capability_family(120)
+    # FP8 and INT8 indexer caches use the portable Triton paged-logits kernel
+    # on consumer CUDA architectures. That kernel ignores DeepGEMM metadata,
+    # and the vendored DeepGEMM build may not expose the metadata API at all.
+    return use_fp4_indexer_cache or not (is_sm8x or is_sm12x)
+
+
 def sparse_indexer_max_logits_bytes(is_sm12x: bool | None = None) -> int:
     """The indexer's prefill logits budget, halved on sm12x.
 
@@ -1008,8 +1025,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and paged_mqa_logits_needs_deep_gemm_metadata(
+                    self.use_fp4_indexer_cache
+                )
+            ):
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.storage_block_size,
