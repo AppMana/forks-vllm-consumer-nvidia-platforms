@@ -37,9 +37,13 @@ _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE = False
 
 def _dsv4_allspark_supported_device_capability(sm_version: int) -> bool:
     if sm_version in (120, 121):
-        enabled = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X", "1")
-        if enabled.lower() in ("0", "false", "off"):
-            return False
+        # The Ampere kernel compiles for SM12x, but its large-M fallback
+        # dequantizes the complete weight on every call. More importantly, a
+        # real layer-0 checkpoint probe first diverges at these projections and
+        # returns bit-exact logits when SM12x AllSpark is disabled. Keep the
+        # experimental path opt-in until its real-weight contract is fixed.
+        enabled = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X", "0")
+        return enabled.lower() in ("1", "true", "on")
     return is_allspark_supported_device_capability(sm_version)
 
 
@@ -54,6 +58,7 @@ def _dsv4_allspark_cublas_m_threshold(sm_version: int) -> int:
                 )
             return threshold
     return ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD
+
 
 def _dsv4_log_path(path: str) -> None:
     _DSV4_KERNEL_PATHS[path] = _DSV4_KERNEL_PATHS.get(path, 0) + 1
