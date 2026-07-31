@@ -69,10 +69,15 @@ def _text_of_tokens(tokenizer, rng: random.Random, n_tokens: int) -> str:
 
 
 def build_prompt(
-    tokenizer, index: int, input_tokens: int, needle_tokens: int, total: int
+    tokenizer,
+    index: int,
+    input_tokens: int,
+    needle_tokens: int,
+    total: int,
+    run_seed: int = 0,
 ) -> tuple[str, str]:
     """Return (user_message, needle_text) for request ``index``."""
-    rng = random.Random(0xD5F4 + index)
+    rng = random.Random(0xD5F4 + run_seed * 0x10001 + index)
     # No label prefix: the seeded word sequence is already unique per
     # request, and a label gets interpreted as metadata and dropped from
     # the "verbatim" reproduction.
@@ -82,7 +87,7 @@ def build_prompt(
     overhead = len(
         tokenizer.encode(framed + "\n\n" + INSTRUCTION, add_special_tokens=False)
     )
-    salt = f"document {index:03d} of {total:03d}. "
+    salt = f"run {run_seed:08x}, document {index:03d} of {total:03d}. "
     filler_budget = input_tokens - overhead - len(
         tokenizer.encode(salt, add_special_tokens=False)
     )
@@ -163,6 +168,12 @@ async def main() -> int:
     ap.add_argument("--input-tokens", type=int, default=8000)
     ap.add_argument("--needle-tokens", type=int, default=1000)
     ap.add_argument("--concurrency", type=int, default=64)
+    ap.add_argument(
+        "--run-seed",
+        type=int,
+        default=0,
+        help="changes every prompt so repeated runs cannot hit prefix cache",
+    )
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="defaults to needle-tokens + 128")
     ap.add_argument("--output-json", default=None)
@@ -174,7 +185,7 @@ async def main() -> int:
     prompts = [
         build_prompt(
             tokenizer, i, args.input_tokens, args.needle_tokens,
-            args.concurrency,
+            args.concurrency, args.run_seed,
         )
         for i in range(args.concurrency)
     ]
@@ -206,6 +217,7 @@ async def main() -> int:
 
     summary = {
         "concurrency": args.concurrency,
+        "run_seed": args.run_seed,
         "target_input_tokens": args.input_tokens,
         "target_needle_tokens": args.needle_tokens,
         "wall_s": round(wall_s, 2),
