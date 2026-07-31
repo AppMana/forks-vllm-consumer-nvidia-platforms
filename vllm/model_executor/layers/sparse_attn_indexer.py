@@ -213,6 +213,18 @@ def should_use_prefill_streaming_topk(
     return True
 
 
+def should_stream_prefill_topk_for_context(
+    dcp_world_size: int,
+    use_fp4_cache: bool,
+    context_rows: int,
+) -> bool:
+    """Use streaming only when the gathered context spans multiple slabs."""
+    return (
+        should_use_prefill_streaming_topk(dcp_world_size, use_fp4_cache)
+        and context_rows > _resolved_prefill_topk_slab_rows()
+    )
+
+
 # Centered order-preserving key of float32 -inf (bits 0xFF800000): columns
 # masked out by the logits kernel are exactly -inf; every in-range score is a
 # finite sum, so "key value-part > this" <=> "column is selectable".
@@ -867,8 +879,14 @@ def sparse_attn_indexer(
                         k_quant.view(torch.int8) if _indexer_int8 else k_quant
                     )
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-                use_streaming_topk = should_use_prefill_streaming_topk(
-                    dcp_world_size, use_fp4_cache
+                # A single slab has no memory advantage and pays the extra
+                # candidate-value write of the streaming merge interface.
+                # Keep the established one-shot kernel until the gathered
+                # context actually exceeds one slab.
+                use_streaming_topk = should_stream_prefill_topk_for_context(
+                    dcp_world_size,
+                    use_fp4_cache,
+                    k_quant_cast.shape[0],
                 )
                 if use_streaming_topk:
                     # Activation chunking: O(M x slab) streaming top-k instead

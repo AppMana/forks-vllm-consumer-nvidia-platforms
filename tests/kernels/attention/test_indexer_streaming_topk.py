@@ -262,6 +262,8 @@ def test_vllm_block_gates_streaming_and_sets_slab_rows(monkeypatch):
     )
     assert indexer_mod.should_use_prefill_streaming_topk(1, False)
     assert indexer_mod._resolved_prefill_topk_slab_rows() == 5000
+    assert not indexer_mod.should_stream_prefill_topk_for_context(1, False, 5000)
+    assert indexer_mod.should_stream_prefill_topk_for_context(1, False, 5001)
 
     m, n, topk = 128, 16384, 512
     q, k, k_scale, weights, ks, ke = _make_inputs(m, n, qk_int8=True, seed=5)
