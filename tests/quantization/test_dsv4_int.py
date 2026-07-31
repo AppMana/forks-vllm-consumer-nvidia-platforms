@@ -453,6 +453,15 @@ def test_deepseek_v4_int4_mapper_keeps_expert_scale_suffix():
     ]
 
 
+def test_dsv4_allspark_sm12x_diagnostic_switch(monkeypatch):
+    monkeypatch.delenv("VLLM_DSV4_ALLSPARK_SM12X", raising=False)
+    assert dsv4_int_module._dsv4_allspark_supported_device_capability(121)
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "0")
+    assert not dsv4_int_module._dsv4_allspark_supported_device_capability(121)
+    # The diagnostic switch is scoped to SM12x and must not alter Ampere.
+    assert dsv4_int_module._dsv4_allspark_supported_device_capability(86)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_dsv4_channel_int8_linear_method_prefers_allspark_on_ampere():
     props = torch.cuda.get_device_properties()

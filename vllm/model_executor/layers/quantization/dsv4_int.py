@@ -15,6 +15,7 @@ linear math for the smaller INT8 blocks until a W8A16 linear kernel is wired in.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -32,6 +33,14 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
 _dsv4_logger = _dsv4_init_logger(__name__)
 _DSV4_KERNEL_PATHS: dict = {}
 _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE = False
+
+
+def _dsv4_allspark_supported_device_capability(sm_version: int) -> bool:
+    if sm_version in (120, 121):
+        enabled = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X", "1")
+        if enabled.lower() in ("0", "false", "off"):
+            return False
+    return is_allspark_supported_device_capability(sm_version)
 
 def _dsv4_log_path(path: str) -> None:
     _DSV4_KERNEL_PATHS[path] = _DSV4_KERNEL_PATHS.get(path, 0) + 1
@@ -947,7 +956,7 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
             device_index = torch.cuda.current_device()
         properties = torch.cuda.get_device_properties(device_index)
         sm_version = properties.major * 10 + properties.minor
-        if not is_allspark_supported_device_capability(sm_version):
+        if not _dsv4_allspark_supported_device_capability(sm_version):
             return False
         if (
             layer.input_size_per_partition % 16 != 0

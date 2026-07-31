@@ -9,6 +9,7 @@ COPY vllm/v1/kv_cache_interface.py /tmp/vllm-overlay/v1/kv_cache_interface.py
 COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm-overlay/v1/worker/gpu/warmup.py
 COPY vllm/model_executor/warmup/kernel_warmup.py /tmp/vllm-overlay/model_executor/warmup/kernel_warmup.py
 COPY vllm/model_executor/warmup/qwen_triton_warmup.py /tmp/vllm-overlay/model_executor/warmup/qwen_triton_warmup.py
+COPY vllm/model_executor/layers/quantization/dsv4_int.py /tmp/vllm-overlay/model_executor/layers/quantization/dsv4_int.py
 
 RUN python3 - <<'PY'
 import importlib.util
@@ -25,6 +26,7 @@ for relative in (
     "v1/worker/gpu/warmup.py",
     "model_executor/warmup/kernel_warmup.py",
     "model_executor/warmup/qwen_triton_warmup.py",
+    "model_executor/layers/quantization/dsv4_int.py",
 ):
     destination = root / relative
     shutil.copy2(sources / relative, destination)
@@ -38,9 +40,11 @@ assert "alignment=specs[0].alignment" in merge
 gpu_warmup = (root / "v1/worker/gpu/warmup.py").read_text()
 kernel_warmup = (root / "model_executor/warmup/kernel_warmup.py").read_text()
 qwen_warmup = (root / "model_executor/warmup/qwen_triton_warmup.py").read_text()
+dsv4_int = (root / "model_executor/layers/quantization/dsv4_int.py").read_text()
 assert "prompt_len = min(256" in gpu_warmup
 assert "zero_kv_blocks_warmup(worker.model_runner)" in kernel_warmup
 assert "def zero_kv_blocks_warmup" in qwen_warmup
+assert "VLLM_DSV4_ALLSPARK_SM12X" in dsv4_int
 shutil.rmtree("/tmp/vllm-overlay")
 print("packed DSV4 KV-cache geometry and prefill warmup fixes installed")
 PY
