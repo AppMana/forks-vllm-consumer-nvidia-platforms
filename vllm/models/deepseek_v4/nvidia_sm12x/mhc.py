@@ -173,6 +173,7 @@ def sparkinfer_mhc_post_pre(
         sinkhorn_iters=sinkhorn_iters,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        expected_m=residual.shape[0],
         split_k=split_k,
     )
     return residual_cur, post.unsqueeze(-1), comb, y

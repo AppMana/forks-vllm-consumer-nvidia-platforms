@@ -13,13 +13,8 @@ import torch
 
 import vllm
 
-
 _ADAPTER_PATH = (
-    Path(vllm.__file__).parent
-    / "models"
-    / "deepseek_v4"
-    / "nvidia_sm12x"
-    / "mhc.py"
+    Path(vllm.__file__).parent / "models" / "deepseek_v4" / "nvidia_sm12x" / "mhc.py"
 )
 _ADAPTER_SPEC = importlib.util.spec_from_file_location(
     "dsv4_sparkinfer_mhc_adapter", _ADAPTER_PATH
@@ -126,6 +121,7 @@ def test_post_pre_preserves_vllm_mix_shapes_and_fuses_norm(monkeypatch):
     ]
     assert calls[0]["norm_weight"] is norm_weight
     assert calls[0]["split_k"] == 112
+    assert calls[0]["expected_m"] == 2
     assert "binding" not in calls[0]
 
 
@@ -133,9 +129,7 @@ def test_post_pre_preserves_vllm_mix_shapes_and_fuses_norm(monkeypatch):
     ("hidden_size", "expected_split_k"),
     [(4096, 64), (7168, 112)],
 )
-def test_sparkinfer_split_k_covers_full_hidden_dimension(
-    hidden_size, expected_split_k
-):
+def test_sparkinfer_split_k_covers_full_hidden_dimension(hidden_size, expected_split_k):
     assert adapter._sparkinfer_mhc_split_k(hidden_size, 256) == expected_split_k
 
 
@@ -346,12 +340,13 @@ def test_mtp_has_no_direct_tilelang_mhc_calls():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_compiled_post_pre_is_cuda_graph_replayable():
+@pytest.mark.parametrize("hidden", [4096, 7168])
+def test_compiled_post_pre_is_cuda_graph_replayable(hidden: int):
     pytest.importorskip("sparkinfer")
     if not adapter.current_platform.is_device_capability_family(120):
         pytest.skip("requires SM120/SM121")
 
-    tokens, hidden = 2, 7168
+    tokens = 2
     device = torch.device("cuda")
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device)
     residual = torch.randn(tokens, 4, hidden, dtype=torch.bfloat16, device=device)
