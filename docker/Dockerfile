@@ -1176,7 +1176,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             apt-get update -y && \
             apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
             uv pip install --system -r /tmp/kv_connectors.txt --no-build-isolation && \
-            apt-get purge -y ${BUILD_PKGS} && \
+            apt-get purge -y --allow-change-held-packages ${BUILD_PKGS} && \
             rm -rf /var/lib/apt/lists/* \
         ); \
     fi
@@ -1199,7 +1199,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         CUDA_HOME=/usr/local/cuda \
         uv pip install --system --no-deps --no-build-isolation --force-reinstall \
             "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}" && \
-        apt-get purge -y ${BUILD_PKGS} && \
+        apt-get purge -y --allow-change-held-packages ${BUILD_PKGS} && \
         apt-get autoremove -y && \
         rm -rf /var/lib/apt/lists/*; \
     fi
