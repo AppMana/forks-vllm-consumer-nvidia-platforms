@@ -83,6 +83,12 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 logger = init_logger(__name__)
 
 
+def _is_out_of_range_decoder_weight(name: str, num_hidden_layers: int) -> bool:
+    """Return whether a checkpoint decoder tensor is outside this model."""
+    match = re.match(r"(?:model\.)?layers\.(\d+)\.", name)
+    return match is not None and int(match.group(1)) >= num_hidden_layers
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -1400,6 +1406,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         for name, loaded_weight in weights:
+            # HF overrides are useful for reduced-model kernel profiling. The
+            # checkpoint still contains every decoder layer, so discard layers
+            # that do not exist in the reduced model before custom loading.
+            if _is_out_of_range_decoder_weight(name, len(self.layers)):
+                continue
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
