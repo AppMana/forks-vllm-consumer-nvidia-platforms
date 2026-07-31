@@ -60,15 +60,28 @@ def _modelopt_activation_gscales(
 
         weight_scale / a_gscale == weight_scale * checkpoint_input_scale
 
-    Gate and up projections share one fused FC1 activation quantizer, so use
-    the larger of their two checkpoint scales for each expert.
+    Gate and up projections share one fused FC1 activation quantizer. ModelOpt
+    emits the same input scale for both projections, so reject a malformed
+    checkpoint instead of silently replacing either value with their maximum.
     """
-    w13_scale = w13_input_scale.max(dim=-1).values.to(torch.float32)
+    if w13_input_scale.ndim != 2 or w13_input_scale.shape[1] != 2:
+        raise ValueError(
+            "w13_input_scale must have shape (num_experts, 2), got "
+            f"{tuple(w13_input_scale.shape)}"
+        )
+    if w2_input_scale.ndim != 1 or w2_input_scale.shape[0] != w13_input_scale.shape[0]:
+        raise ValueError(
+            "w2_input_scale must have shape (num_experts,), got "
+            f"{tuple(w2_input_scale.shape)}"
+        )
+    w13_scale = w13_input_scale[:, 0].to(torch.float32)
     w2_scale = w2_input_scale.to(torch.float32)
     if not torch.all(torch.isfinite(w13_scale) & (w13_scale > 0)):
         raise ValueError("w13_input_scale must be finite and positive")
     if not torch.all(torch.isfinite(w2_scale) & (w2_scale > 0)):
         raise ValueError("w2_input_scale must be finite and positive")
+    if not torch.equal(w13_input_scale[:, 0], w13_input_scale[:, 1]):
+        raise ValueError("ModelOpt gate and up input scales must match per expert")
     return torch.reciprocal(w13_scale).contiguous(), torch.reciprocal(
         w2_scale
     ).contiguous()

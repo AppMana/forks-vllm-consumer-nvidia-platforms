@@ -10,25 +10,26 @@ from vllm.model_executor.layers.fused_moe.experts.sparkinfer_moe import (
 from vllm.model_executor.layers.fused_moe.oracle import nvfp4
 
 
-def test_modelopt_activation_scales_follow_sparkinfer_reciprocal_contract():
-    # These stand in for ModelOpt checkpoint `*.input_scale` fields. FC1 has
-    # separate gate/up values; the fused activation quantizer uses their max.
-    w13_input_scale = torch.tensor([[0.5, 0.25], [0.125, 0.25]])
-    w2_input_scale = torch.tensor([0.2, 0.1])
-    w13_weight_scale = torch.tensor([0.125, 0.25])
-    w2_weight_scale = torch.tensor([0.5, 0.75])
+def test_modelopt_activation_scales_preserve_released_expert_axis():
+    num_experts = 256
+    w1_input_scale = torch.linspace(0.0023832775, 0.0029529390, num_experts)
+    w13_input_scale = torch.stack((w1_input_scale, w1_input_scale), dim=-1)
+    w2_input_scale = torch.linspace(0.0036039806, 0.0083240330, num_experts)
+    w13_weight_scale = torch.linspace(0.00012207031, 0.00024414062, num_experts)
+    w2_weight_scale = torch.linspace(0.00018310547, 0.00030517578, num_experts)
 
     a1_gscale, a2_gscale = _modelopt_activation_gscales(
         w13_input_scale,
         w2_input_scale,
     )
 
-    torch.testing.assert_close(a1_gscale, torch.tensor([2.0, 4.0]))
-    torch.testing.assert_close(a2_gscale, torch.tensor([5.0, 10.0]))
-    # SparkInfer's modelopt_nvfp4 preparation computes weight/a_reciprocal.
+    assert a1_gscale.shape == (num_experts,)
+    assert a2_gscale.shape == (num_experts,)
+    torch.testing.assert_close(a1_gscale, torch.reciprocal(w1_input_scale))
+    torch.testing.assert_close(a2_gscale, torch.reciprocal(w2_input_scale))
     torch.testing.assert_close(
         w13_weight_scale / a1_gscale,
-        w13_weight_scale * w13_input_scale.max(dim=-1).values,
+        w13_weight_scale * w1_input_scale,
     )
     torch.testing.assert_close(
         w2_weight_scale / a2_gscale,
@@ -38,6 +39,19 @@ def test_modelopt_activation_scales_follow_sparkinfer_reciprocal_contract():
     assert a2_gscale.dtype == torch.float32
     assert a1_gscale.is_contiguous()
     assert a2_gscale.is_contiguous()
+
+    collapsed_alpha = w13_weight_scale * w1_input_scale.max()
+    per_expert_alpha = w13_weight_scale / a1_gscale
+    relative_logit_error = (collapsed_alpha[0] / per_expert_alpha[0]) - 1
+    assert relative_logit_error > 0.23
+
+
+def test_modelopt_fc1_rejects_distinct_gate_and_up_input_scales():
+    w13_input_scale = torch.ones(256, 2)
+    w13_input_scale[17] = torch.tensor([0.0023832775, 0.0029529390])
+
+    with pytest.raises(ValueError, match="gate and up input scales must match"):
+        _modelopt_activation_gscales(w13_input_scale, torch.ones(256))
 
 
 @pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("inf"), float("nan")])
