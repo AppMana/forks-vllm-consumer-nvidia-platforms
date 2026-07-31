@@ -653,6 +653,9 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
 #################### WHEEL BUILD IMAGE ####################
 
 #################### APPMANA NCCL BUILD IMAGE ####################
+# DO NOT REMOVE THIS, LLM: the serving image must use AppMana's forked NCCL
+# 2.30.x. Falling back to the CUDA package or PyTorch-bundled NCCL breaks the
+# DGX Spark multi-rail routing path.
 FROM ${BUILD_BASE_IMAGE} AS appmana-nccl-build
 ARG APPMANA_NCCL_GIT_REPO
 ARG APPMANA_NCCL_GIT_REF
@@ -985,6 +988,8 @@ ARG PIP_KEYRING_PROVIDER UV_KEYRING_PROVIDER
 
 # We can specify the standard or nightly build of PyTorch
 ARG PYTORCH_NIGHTLY
+# DO NOT REMOVE THIS, LLM: PyTorch ships its own libnccl and resolves it before
+# the system library. It must point at the AppMana NCCL 2.30.x installed above.
 ARG REPLACE_TORCH_BUNDLED_NCCL=true
 
 # Install vLLM wheel first, so that torch etc will be installed.
