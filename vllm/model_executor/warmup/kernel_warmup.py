@@ -186,7 +186,7 @@ def _is_deepseek_v4_worker(worker: "Worker") -> bool:
 
 
 def _deepseek_v4_sparse_mla_prefill_warmup(worker: "Worker") -> None:
-    """Warm DSv4 sparse-prefill kernels without PP tensor transport.
+    """Warm the DSv4 Triton sparse-prefill fallback without PP transport.
 
     Do not drive this through GPUModelRunner._dummy_run: on PP rank 0 that
     executes a real model prefill before startup and can leave a CUDA kernel
@@ -200,11 +200,26 @@ def _deepseek_v4_sparse_mla_prefill_warmup(worker: "Worker") -> None:
     if worker.model_runner is None or max_tokens <= 0:
         return
 
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
+        ROLE_SPARSE_MLA_PREFILL,
+        SPARSE_MLA_PREFILL_TRITON,
+        resolve_kernel_config_from_hf_config,
+    )
+
+    resolved = resolve_kernel_config_from_hf_config(worker.model_config.hf_config)
+    if resolved.symbol(ROLE_SPARSE_MLA_PREFILL) != SPARSE_MLA_PREFILL_TRITON:
+        logger.info(
+            "Skipping DeepSeek V4 Triton sparse-MLA prefill warmup; "
+            "selected prefill kernel is %s.",
+            resolved.symbol(ROLE_SPARSE_MLA_PREFILL),
+        )
+        return
+
     prefill_tokens = max(
         1, min(max_tokens, _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS)
     )
     logger.info(
-        "Warming DeepSeek V4 sparse-MLA prefill Triton kernels with %d tokens.",
+        "Warming DeepSeek V4 Triton sparse-MLA prefill kernel with %d tokens.",
         prefill_tokens,
     )
 

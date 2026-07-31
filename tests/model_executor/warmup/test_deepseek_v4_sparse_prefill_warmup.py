@@ -39,6 +39,28 @@ def test_deepseek_v4_sparse_prefill_warmup_uses_direct_kernel_warmup(monkeypatch
     worker.model_runner._dummy_run.assert_not_called()
 
 
+def test_deepseek_v4_sparse_prefill_warmup_skips_native_flashmla(monkeypatch):
+    worker = _worker(["DeepseekV4ForCausalLM"])
+    worker.model_config.hf_config.vllm = {
+        "cache_type": "int8_ds_mla",
+        "kernels": [
+            "flash_mla.sparse_mla_decode_int8",
+            "flash_mla.sparse_mla_prefill_int8",
+        ],
+    }
+    direct_warmup = Mock()
+    monkeypatch.setattr(
+        kernel_warmup,
+        "_deepseek_v4_sparse_mla_prefill_kernel_warmup",
+        direct_warmup,
+    )
+
+    kernel_warmup._deepseek_v4_sparse_mla_prefill_warmup(worker)
+
+    direct_warmup.assert_not_called()
+    worker.model_runner._dummy_run.assert_not_called()
+
+
 def test_deepseek_v4_sparse_prefill_warmup_skips_other_models():
     worker = _worker(["LlamaForCausalLM"])
 
