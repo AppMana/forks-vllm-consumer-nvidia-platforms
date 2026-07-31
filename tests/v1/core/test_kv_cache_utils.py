@@ -2955,32 +2955,6 @@ def _c128a_only_grouped_specs() -> list[UniformTypeKVCacheSpecs]:
     return [mla_group, swa_group]
 
 
-@pytest.mark.xfail(
-    reason=(
-        "DSV4 C128A-only PP rank: KV-cache group init fails. "
-        "_get_kv_cache_groups_uniform_groups hardcodes grouped_specs[0] (the "
-        "latent-MLA group) as the tiling base and pads every sliding-window "
-        "page UP to the nearest full-MLA page (size_to_candidate uses "
-        "min(x for x in all_page_sizes if x >= ps)); it asserts "
-        "max(sm_page_sizes) <= max(all_page_sizes). On a C128A-only rank the "
-        "latent-MLA main cache is heavily compressed (compress 128, block 256 "
-        "-> storage 2 -> ~1728 B/page) while its sliding-window companion is "
-        "uncompressed (compress 1, block 64 -> 37440 B/page), so the base "
-        "group is NOT the largest and the invariant is violated. Mixed 4-5 "
-        "layer production slices always include a lighter-compression (e.g. "
-        "C4) latent layer whose page dominates, so max(all_page_sizes) stays "
-        "above the SWA page and this is latent there. A safe fix is invasive: "
-        "the tiling base must be chosen as the largest-page group (or the "
-        "full-MLA pages padded up to the SWA page), which changes downstream "
-        "layer_tuple_bytes / concurrency math and must be validated against "
-        "the mixed-slice path -- not forced blind. This is also the in-process "
-        "signature of the C128A-only bug whose mp-executor sibling surfaces as "
-        "the CompressorBackend reshape RuntimeError once a mixed partition "
-        "clears this assertion."
-    ),
-    raises=AssertionError,
-    strict=True,
-)
 def test_c128a_only_rank_kv_cache_group_init_succeeds():
     """When fixed, a C128A-only rank must produce groups with correct page
     geometry (the SWA companion tiling into aligned pages) instead of asserting.
