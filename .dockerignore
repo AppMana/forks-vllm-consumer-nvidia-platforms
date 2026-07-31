@@ -1,6 +1,7 @@
 **/__pycache__
 **/*.pyc
 **/*.so
+.git/
 .venv/
 .deps/
 .pytest_cache/
@@ -13,3 +14,4 @@ docker/
 cmake-build*/
 rust/target/
 vllm.egg-info/
+vllm/vllm-rs
