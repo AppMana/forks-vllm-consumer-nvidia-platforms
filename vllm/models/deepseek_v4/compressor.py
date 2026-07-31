@@ -187,9 +187,9 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Invalid compress ratio: {compress_ratio}")
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # Packed byte layouts need row-size alignment. Plain full-cache rows
-        # share state pages with contiguous KV pages, so padding would break
-        # page matching.
+        # This cache stores FP32 compressor state, not packed MLA KV rows.
+        # Keep the physical page aligned with the cache it overlays, but do
+        # not select that cache's packed row-size formula.
         uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
         uses_int8_ds_mla_layout = (
             vllm_config.cache_config.cache_dtype == "int8_ds_mla"
@@ -200,11 +200,9 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            cache_dtype_str=vllm_config.cache_config.cache_dtype,
             alignment=576
             if uses_fp8_ds_mla_layout
             else (528 if uses_int8_ds_mla_layout else 512),
-            model_version="deepseek_v4",
         )
 
     def forward(self): ...

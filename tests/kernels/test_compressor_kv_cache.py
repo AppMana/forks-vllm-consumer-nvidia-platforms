@@ -28,8 +28,16 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
     _launch_two_stage_sparse_attn_compressor,
 )
-from vllm.models.deepseek_v4.compressor import _get_c128_boundary
+from vllm.models.deepseek_v4.compressor import (
+    CompressorStateCache,
+    _get_c128_boundary,
+)
 from vllm.platforms import current_platform
+from vllm.v1.core.kv_cache_utils import _get_packed_kv_cache_layout
+from vllm.v1.kv_cache_interface import (
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
 
@@ -77,6 +85,64 @@ def test_get_c128_boundary(starts, query_start_loc, expected):
         query_start_loc_cpu=torch.tensor(query_start_loc),
     )
     assert _get_c128_boundary(metadata) is expected
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "alignment"),
+    [("auto", 512), ("fp8_ds_mla", 576), ("int8_ds_mla", 528)],
+)
+@pytest.mark.parametrize(
+    ("block_size", "state_dim"),
+    [(4, 2048), (8, 1024)],
+)
+def test_compressor_state_spec_uses_fp32_page_geometry(
+    cache_dtype: str,
+    alignment: int,
+    block_size: int,
+    state_dim: int,
+):
+    cache = object.__new__(CompressorStateCache)
+    cache.block_size = block_size
+    cache.state_dim = state_dim
+    cache.dtype = torch.float32
+    cache.sliding_window = block_size
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype)
+    )
+
+    spec = cache.get_kv_cache_spec(config)
+
+    assert spec.cache_dtype_str is None
+    assert spec.model_version is None
+    assert spec.real_page_size_bytes == block_size * state_dim * 4
+    assert spec.page_size_bytes >= spec.real_page_size_bytes
+    assert spec.page_size_bytes % alignment == 0
+
+
+def test_packed_compressor_state_pages_do_not_overlap():
+    cache = object.__new__(CompressorStateCache)
+    cache.block_size = 4
+    cache.state_dim = 2048
+    cache.dtype = torch.float32
+    cache.sliding_window = 8
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype="int8_ds_mla")
+    )
+    specs = {
+        name: cache.get_kv_cache_spec(config)
+        for name in ("compressor.0", "compressor.1")
+    }
+    group_spec = UniformTypeKVCacheSpecs.from_specs(specs)
+    assert group_spec is not None
+
+    stride, layers_by_offset = _get_packed_kv_cache_layout(
+        [KVCacheGroupSpec(list(specs), group_spec)]
+    )
+
+    offsets = sorted(layers_by_offset)
+    assert offsets == [0, specs["compressor.0"].page_size_bytes]
+    assert offsets[1] >= specs["compressor.0"].real_page_size_bytes
+    assert stride >= offsets[1] + specs["compressor.1"].real_page_size_bytes
 
 
 # ── Test A: DeepseekV4 Attention path ──────────────────────────────────────────────
