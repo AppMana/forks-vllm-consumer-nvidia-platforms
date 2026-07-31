@@ -434,12 +434,6 @@ class BuildPrefillChunkMetadataKernel(
         )
 
 
-# Concurrent max_model_len contexts the indexer prefill workspace is sized for.
-# Upstream's figure: 132-byte indexer rows have to fit the flashmla_sparse
-# workspace, giving (576 * 2 // 132) * 5 = 40.
-MAX_CONCURRENT_PREFILL_CONTEXTS = 40
-
-
 _BUILD_PREFILL_CHUNK_METADATA_KERNEL = BuildPrefillChunkMetadataKernel()
 
 
@@ -499,24 +493,14 @@ def get_max_prefill_buffer_size(
     workspace (132 bytes/row for the fp8/int8 layout), so the chunk planner
     (split_indexer_prefill_chunks) and the workspace reservation always agree.
 
-    Sized for MAX_CONCURRENT_PREFILL_CONTEXTS requests mid-prefill in a
-    scheduling step, each gathering at most cdiv(max_model_len,
-    compress_ratio) rows of context. A chunk only packs multiple requests
-    while it fits this budget and a single request can never exceed it;
-    additional prefill requests in a batch are planned into further chunks.
-    The budget is therefore a throughput knob, not a correctness bound.
-
-    The factor is upstream's, not the scheduler's. This once read
-    scheduler_config.max_num_partial_prefills, which no longer exists: V1
-    unified chunked prefill and dropped the partial-prefill count, so that
-    attribute raised AttributeError and took the indexer down at worker init.
-    Upstream sizes the same workspace as 40 * max_model_len, chosen so the
-    132-byte indexer rows fit inside the flashmla_sparse workspace
-    ((576 * 2 // 132) * 5 = 40); the compress_ratio divisor only ever makes
-    this smaller, so it stays within that envelope.
+    One maximum-length request must fit. Multiple concurrent prefills are
+    divided into separate chunks by split_indexer_prefill_chunks when their
+    combined gathered context would exceed this budget. This keeps the
+    workspace independent of scheduler concurrency without relying on the
+    removed max_num_partial_prefills setting.
     """
     max_model_len = vllm_config.model_config.max_model_len
-    return MAX_CONCURRENT_PREFILL_CONTEXTS * cdiv(max_model_len, compress_ratio)
+    return cdiv(max_model_len, compress_ratio)
 
 
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Prefill K-gather workspace budget: the chunk planner and every workspace
-reservation must derive from the same scheduler-bounded budget
-(max_num_partial_prefills x max_model_len), replacing the old
-`max_model_len * 40` magic sizing that reserved ~1.3 GiB/rank at 1M context.
+"""Prefill K-gather workspace budget.
+
+The chunk planner and every workspace reservation use one maximum-length
+request, replacing the old ``max_model_len * 40`` sizing.
 """
 
 from types import SimpleNamespace
@@ -31,30 +31,17 @@ HEAD_DIM = 128
 MAX_LOGITS_BYTES = 8 * 1024 * 1024
 
 
-def _config(
-    max_model_len: int, max_num_partial_prefills: int = 1
-) -> SimpleNamespace:
+def _config(max_model_len: int) -> SimpleNamespace:
     """Duck-typed VllmConfig with the fields get_max_prefill_buffer_size reads."""
-    return SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=max_model_len),
-        scheduler_config=SimpleNamespace(
-            max_num_partial_prefills=max_num_partial_prefills
-        ),
-    )
+    return SimpleNamespace(model_config=SimpleNamespace(max_model_len=max_model_len))
 
 
-def test_budget_derives_from_scheduler_prefill_bound():
+def test_budget_holds_one_maximum_length_request():
     cfg = _config(PRODUCTION_MAX_MODEL_LEN)
     assert get_max_prefill_buffer_size(cfg) == PRODUCTION_MAX_MODEL_LEN
     assert (
         get_max_prefill_buffer_size(cfg, COMPRESS_RATIO)
         == PRODUCTION_MAX_MODEL_LEN // COMPRESS_RATIO
-    )
-    # Scales with the scheduler's concurrent-partial-prefill bound.
-    cfg4 = _config(PRODUCTION_MAX_MODEL_LEN, max_num_partial_prefills=4)
-    assert (
-        get_max_prefill_buffer_size(cfg4, COMPRESS_RATIO)
-        == 4 * (PRODUCTION_MAX_MODEL_LEN // COMPRESS_RATIO)
     )
     # Rounds compressed rows up so a single max-length request always fits.
     cfg_odd = _config(163_841)
@@ -269,11 +256,11 @@ def test_workspace_arena_accounting_at_production_geometry(monkeypatch):
     The arena grows to the max ever *requested*, so this asserts on the
     requested sizes routed through a real WorkspaceManager.
     """
-    from vllm.transformers_utils.configs.dsv4.kernel_config import (
-        SPARSE_MLA_PREFILL_FLASH,
-    )
     from vllm.models.deepseek_v4.nvidia_imma.attention import (
         DeepseekV4TritonSM86Attention,
+    )
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
+        SPARSE_MLA_PREFILL_FLASH,
     )
     from vllm.v1.worker.workspace import WorkspaceManager
 
