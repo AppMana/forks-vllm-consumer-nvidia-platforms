@@ -44,7 +44,7 @@ dsv4_int = (root / "model_executor/layers/quantization/dsv4_int.py").read_text()
 assert "prompt_len = min(256" in gpu_warmup
 assert "zero_kv_blocks_warmup(worker.model_runner)" in kernel_warmup
 assert "def zero_kv_blocks_warmup" in qwen_warmup
-assert "VLLM_DSV4_ALLSPARK_SM12X" in dsv4_int
+assert "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD" in dsv4_int
 shutil.rmtree("/tmp/vllm-overlay")
 print("packed DSV4 KV-cache geometry and prefill warmup fixes installed")
 PY

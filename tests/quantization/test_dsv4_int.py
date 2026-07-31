@@ -462,6 +462,22 @@ def test_dsv4_allspark_sm12x_diagnostic_switch(monkeypatch):
     assert dsv4_int_module._dsv4_allspark_supported_device_capability(86)
 
 
+def test_dsv4_allspark_sm12x_cublas_threshold(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD", raising=False
+    )
+    assert (
+        dsv4_int_module._dsv4_allspark_cublas_m_threshold(121)
+        == dsv4_int_module.ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD
+    )
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD", "1048576")
+    assert dsv4_int_module._dsv4_allspark_cublas_m_threshold(121) == 1048576
+    assert (
+        dsv4_int_module._dsv4_allspark_cublas_m_threshold(86)
+        == dsv4_int_module.ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_dsv4_channel_int8_linear_method_prefers_allspark_on_ampere():
     props = torch.cuda.get_device_properties()

@@ -42,6 +42,19 @@ def _dsv4_allspark_supported_device_capability(sm_version: int) -> bool:
             return False
     return is_allspark_supported_device_capability(sm_version)
 
+
+def _dsv4_allspark_cublas_m_threshold(sm_version: int) -> int:
+    if sm_version in (120, 121):
+        configured = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD")
+        if configured is not None:
+            threshold = int(configured)
+            if threshold < 0:
+                raise ValueError(
+                    "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD must be non-negative"
+                )
+            return threshold
+    return ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD
+
 def _dsv4_log_path(path: str) -> None:
     _DSV4_KERNEL_PATHS[path] = _DSV4_KERNEL_PATHS.get(path, 0) + 1
     _dsv4_logger.info("DSV4KERNEL dense path=%s running_counts=%s", path, _DSV4_KERNEL_PATHS)
@@ -978,6 +991,7 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
         layer._dsv4_int_allspark_args = {
             "sm_count": num_compute_units(device_index),
             "sm_version": sm_version,
+            "cublas_m_threshold": _dsv4_allspark_cublas_m_threshold(sm_version),
         }
         return True
 
@@ -999,7 +1013,7 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
                 group_size=-1,
                 sm_count=args["sm_count"],
                 sm_version=args["sm_version"],
-                CUBLAS_M_THRESHOLD=ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD,
+                CUBLAS_M_THRESHOLD=args["cublas_m_threshold"],
                 has_zp=False,
                 n32k16_reorder=True,
             )
