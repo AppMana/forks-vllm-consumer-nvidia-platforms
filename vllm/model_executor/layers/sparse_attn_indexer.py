@@ -163,11 +163,6 @@ MXFP4_BLOCK_SIZE = 32
 # slab=16384 the transient footprint is ~231 MiB (64 MiB slab logits fp32 +
 # 144 MiB int64 candidate keys + topk temporaries) vs O(M x window) one-shot.
 INDEXER_PREFILL_TOPK_SLAB_ROWS = 16384
-# The one-shot path is already bounded by the prefill chunk planner's logits
-# budget and is substantially faster at ordinary context lengths. Streaming
-# exists for the long-context regime where retaining full-window logits becomes
-# the limiting factor.
-INDEXER_PREFILL_STREAMING_MIN_CONTEXT_TOKENS = 640 * 1024
 
 
 def _resolved_prefill_topk_slab_rows() -> int:
@@ -222,13 +217,11 @@ def should_stream_prefill_topk_for_context(
     dcp_world_size: int,
     use_fp4_cache: bool,
     context_rows: int,
-    max_seq_len: int,
 ) -> bool:
-    """Use streaming only for a multi-slab, long-context prefill."""
+    """Use streaming exactly when the gathered context needs multiple slabs."""
     return (
         should_use_prefill_streaming_topk(dcp_world_size, use_fp4_cache)
         and context_rows > _resolved_prefill_topk_slab_rows()
-        and max_seq_len > INDEXER_PREFILL_STREAMING_MIN_CONTEXT_TOKENS
     )
 
 
@@ -894,7 +887,6 @@ def sparse_attn_indexer(
                     dcp_world_size,
                     use_fp4_cache,
                     k_quant_cast.shape[0],
-                    attn_metadata_narrowed.max_seq_len,
                 )
                 if use_streaming_topk:
                     # Activation chunking: O(M x slab) streaming top-k instead
