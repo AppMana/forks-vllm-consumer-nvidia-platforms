@@ -20,11 +20,10 @@ logger = init_logger(__name__)
 
 _AUTO_WARMUP_MAX_TOKENS = 16_384
 _DEFAULT_TOKEN_SIZE_CANDIDATES = (
-    1,
-    2,
-    4,
-    8,
-    16,
+    # SparkInfer's SM121 decode planner changes partial/finalize geometry at
+    # several non-power-of-two token counts. Cover the complete decode range
+    # so an ordinary short prompt cannot select an unwarmed CuTeDSL plan.
+    *range(1, 17),
     32,
     64,
     128,

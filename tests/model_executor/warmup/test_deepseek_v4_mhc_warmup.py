@@ -7,6 +7,7 @@ import torch
 
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     _find_first_mhc_layer,
+    _select_mhc_warmup_token_sizes,
     _warmup_layer_mhc,
 )
 
@@ -81,6 +82,15 @@ class FakeMHCLayer(torch.nn.Module):
             ),
             torch.empty(residual.shape[0], self.hidden_size, dtype=residual.dtype),
         )
+
+
+def test_mhc_warmup_covers_every_decode_token_count() -> None:
+    token_sizes = _select_mhc_warmup_token_sizes(
+        max_tokens=16_384,
+        cudagraph_capture_sizes=[],
+    )
+
+    assert set(range(1, 17)).issubset(token_sizes)
 
 
 def test_mhc_warmup_exercises_fused_post_pre() -> None:
