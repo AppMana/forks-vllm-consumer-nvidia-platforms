@@ -309,7 +309,7 @@ def _mhc_pre_tilelang_fake(
     return post_mix, comb_mix, layer_input
 
 
-def mhc_pre_broadcast_tilelang(
+def _mhc_pre_broadcast_tilelang_impl(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -413,6 +413,104 @@ def mhc_pre_broadcast_tilelang(
         post_mix.unsqueeze(-1),
         comb_mix.view(num_tokens, hc_mult, hc_mult),
         layer_input,
+    )
+
+
+def _mhc_pre_broadcast_tilelang_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    fn_broadcast: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del (
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        norm_weight,
+        norm_eps,
+    )
+    assert fn_broadcast is not None
+    num_tokens, hidden_size = residual.shape
+    hc_mult = fn_broadcast.shape[0]
+    # fn_broadcast has hc_mult * 2 + hc_mult**2 rows. Recover hc_mult
+    # without inspecting tensor values so FakeTensor propagation remains pure.
+    hc_mult = int((1 + hc_mult) ** 0.5 - 1)
+    return (
+        torch.empty(
+            num_tokens,
+            hc_mult,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=residual.device,
+        ),
+        torch.empty(
+            num_tokens,
+            hc_mult,
+            1,
+            dtype=torch.float32,
+            device=residual.device,
+        ),
+        torch.empty(
+            num_tokens,
+            hc_mult,
+            hc_mult,
+            dtype=torch.float32,
+            device=residual.device,
+        ),
+        torch.empty(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=residual.device,
+        ),
+    )
+
+
+def mhc_pre_broadcast_tilelang(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    fn_broadcast: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run first-layer broadcast mHC as one opaque functional custom op."""
+    return torch.ops.vllm.mhc_pre_broadcast_tilelang(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        norm_weight,
+        norm_eps,
+        fn_broadcast,
     )
 
 
@@ -776,6 +874,12 @@ direct_register_custom_op(
     op_func=mhc_pre_tilelang,
     mutates_args=[],
     fake_impl=_mhc_pre_tilelang_fake,
+)
+direct_register_custom_op(
+    op_name="mhc_pre_broadcast_tilelang",
+    op_func=_mhc_pre_broadcast_tilelang_impl,
+    mutates_args=[],
+    fake_impl=_mhc_pre_broadcast_tilelang_fake,
 )
 direct_register_custom_op(
     op_name="mhc_post_tilelang",
