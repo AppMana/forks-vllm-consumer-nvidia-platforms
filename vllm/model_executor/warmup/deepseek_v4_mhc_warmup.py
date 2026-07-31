@@ -123,7 +123,7 @@ def _warmup_layer_mhc(
             )
 
             sparkinfer_mhc_pre_broadcast(
-                residual_slice[:, 0],
+                residual_slice[:, 0].contiguous(),
                 layer.hc_attn_fn_broadcast,
                 layer.hc_attn_scale,
                 layer.hc_attn_base,

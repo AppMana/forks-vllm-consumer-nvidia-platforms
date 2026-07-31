@@ -129,6 +129,7 @@ def test_sparkinfer_warmup_exercises_broadcast_and_fused_norm(
     broadcast_sizes = []
 
     def fake_broadcast(x, *args, **kwargs):
+        assert x.is_contiguous()
         broadcast_sizes.append(x.shape[0])
         residual = x[:, None, :].expand(-1, 2, -1).contiguous()
         return (
