@@ -27,7 +27,10 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
-from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
+from vllm.model_executor.warmup.qwen_triton_warmup import (
+    qwen_triton_warmup,
+    zero_kv_blocks_warmup,
+)
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
 )
@@ -94,6 +97,9 @@ def kernel_warmup(worker: "Worker"):
             worker.scheduler_config.max_num_batched_tokens,
         )
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+    # KVBlockZeroer is shared by generation models. Its compile key comes from
+    # the bound cache geometry, so warm it only after cache binding.
+    zero_kv_blocks_warmup(worker.model_runner)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real

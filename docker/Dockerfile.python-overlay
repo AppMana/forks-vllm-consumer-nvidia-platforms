@@ -6,6 +6,9 @@ ARG VLLM_IMAGE_TAG
 
 COPY vllm/v1/core/kv_cache_utils.py /tmp/vllm-overlay/v1/core/kv_cache_utils.py
 COPY vllm/v1/kv_cache_interface.py /tmp/vllm-overlay/v1/kv_cache_interface.py
+COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm-overlay/v1/worker/gpu/warmup.py
+COPY vllm/model_executor/warmup/kernel_warmup.py /tmp/vllm-overlay/model_executor/warmup/kernel_warmup.py
+COPY vllm/model_executor/warmup/qwen_triton_warmup.py /tmp/vllm-overlay/model_executor/warmup/qwen_triton_warmup.py
 
 RUN python3 - <<'PY'
 import importlib.util
@@ -15,9 +18,15 @@ import shutil
 spec = importlib.util.find_spec("vllm")
 assert spec is not None and spec.submodule_search_locations
 root = pathlib.Path(next(iter(spec.submodule_search_locations)))
-sources = pathlib.Path("/tmp/vllm-overlay/v1")
-for relative in ("core/kv_cache_utils.py", "kv_cache_interface.py"):
-    destination = root / "v1" / relative
+sources = pathlib.Path("/tmp/vllm-overlay")
+for relative in (
+    "v1/core/kv_cache_utils.py",
+    "v1/kv_cache_interface.py",
+    "v1/worker/gpu/warmup.py",
+    "model_executor/warmup/kernel_warmup.py",
+    "model_executor/warmup/qwen_triton_warmup.py",
+):
+    destination = root / relative
     shutil.copy2(sources / relative, destination)
 
 promote = (root / "v1/core/kv_cache_utils.py").read_text()
@@ -26,8 +35,14 @@ assert "kv_quant_mode=spec.kv_quant_mode" in promote
 assert "indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride" in promote
 assert "kv_quant_mode=specs[0].kv_quant_mode" in merge
 assert "alignment=specs[0].alignment" in merge
+gpu_warmup = (root / "v1/worker/gpu/warmup.py").read_text()
+kernel_warmup = (root / "model_executor/warmup/kernel_warmup.py").read_text()
+qwen_warmup = (root / "model_executor/warmup/qwen_triton_warmup.py").read_text()
+assert "prompt_len = min(256" in gpu_warmup
+assert "zero_kv_blocks_warmup(worker.model_runner)" in kernel_warmup
+assert "def zero_kv_blocks_warmup" in qwen_warmup
 shutil.rmtree("/tmp/vllm-overlay")
-print("packed DSV4 KV-cache geometry fix installed")
+print("packed DSV4 KV-cache geometry and prefill warmup fixes installed")
 PY
 
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT} \

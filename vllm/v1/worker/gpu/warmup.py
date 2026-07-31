@@ -590,6 +590,12 @@ def warmup_kernels(
     # length exceeds decode_query_len, preventing it from being misclassified as
     # a uniform decode batch.
     prompt_len = decode_query_len + 1
+    if _is_deepseek_v4_model_runner(model_runner) and num_spec_steps > 0:
+        # DFlash input preparation specializes on
+        # next_power_of_2(scheduled_tokens + num_query_per_req), capped at
+        # 256. Exercise the long-prefill (BLOCK_SIZE=256) compile key during
+        # startup instead of compiling it in the first real prefill.
+        prompt_len = min(256, model_runner.scheduler_config.max_num_batched_tokens)
     prompt_token_ids = list(range(prompt_len))
     # After prefill, decode generates decode_query_len tokens.
     decode_len = prompt_len + decode_query_len

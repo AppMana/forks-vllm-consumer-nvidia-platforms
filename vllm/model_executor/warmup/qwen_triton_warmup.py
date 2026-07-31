@@ -347,6 +347,29 @@ def _synchronize_device(device: torch.device) -> None:
 
 
 @torch.inference_mode()
+def zero_kv_blocks_warmup(runner: "GPUModelRunner") -> None:
+    """Warm KVBlockZeroer's exact bound-cache Triton specialization."""
+    if runner.is_pooling_model:
+        return
+
+    device = getattr(runner, "device", torch.device("cuda"))
+    zero_config = _zero_kv_warmup_config(runner)
+    warmed_zeroer = _warm_zero_kv_blocks_with_runner_zeroer(runner)
+    if zero_config is not None:
+        logger.info(
+            "Warming zero-kv kernel with N_SEGS=%d, PAGE_SIZE_EL=%d, "
+            "BLOCK_SIZE=%d.",
+            zero_config.n_segs,
+            zero_config.page_size_el,
+            zero_config.block_size,
+        )
+        _warm_zero_kv_blocks_kernel(device, zero_config)
+    elif not warmed_zeroer:
+        logger.info("Skipping zero-kv warmup: no KVBlockZeroer metadata.")
+    _synchronize_device(device)
+
+
+@torch.inference_mode()
 def qwen_triton_warmup(
     runner: "GPUModelRunner",
     model_config: object,
@@ -368,13 +391,6 @@ def qwen_triton_warmup(
 
     device = getattr(runner, "device", torch.device("cuda"))
     logger.info("Warming up Qwen Triton kernels for model_type=%s.", model_type)
-
-    zero_config = _zero_kv_warmup_config(runner)
-    warmed_zeroer = _warm_zero_kv_blocks_with_runner_zeroer(runner)
-    if zero_config is not None:
-        _warm_zero_kv_blocks_kernel(device, zero_config)
-    elif not warmed_zeroer:
-        logger.info("Skipping Qwen zero-kv warmup: no KVBlockZeroer metadata.")
 
     _warm_compute_slot_mapping_kernel(device)
     _synchronize_device(device)

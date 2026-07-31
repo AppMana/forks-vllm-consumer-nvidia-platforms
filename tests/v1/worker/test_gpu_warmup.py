@@ -207,6 +207,7 @@ def test_deepseek_v4_pp_warmup_kernels_skip_generic_execute_model(monkeypatch):
             hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
         ),
         device=torch.device("cuda", 0),
+        num_speculative_steps=0,
     )
 
     monkeypatch.setattr(
@@ -257,3 +258,30 @@ def test_non_deepseek_v4_pp_warmup_kernels_keeps_generic_execute_model(monkeypat
         0,
     ]
     assert len(sampled) == 4
+
+
+def test_deepseek_v4_spec_warmup_uses_long_prefill_compile_class(monkeypatch):
+    executed = []
+    runner = _FakeModelRunner()
+    runner.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    runner.num_speculative_steps = 5
+    runner.decode_query_len = 6
+    runner.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=8192, max_num_seqs=1
+    )
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        get_vocab_size=lambda: 1024,
+    )
+    runner.is_last_pp_rank = False
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(gpu_warmup, "warmup_long_prefill_kernels", lambda *args: None)
+
+    gpu_warmup.warmup_kernels(
+        runner,
+        lambda scheduler_output: executed.append(scheduler_output),
+        lambda _grammar_output: None,
+    )
+
+    assert executed[0].total_num_scheduled_tokens == 256

@@ -196,3 +196,42 @@ def test_deepseek_v4_fp8_ds_mla_warmup_cache_stride_matches_native_layout():
         == block_size * kernel_warmup._DEEPSEEK_V4_FP8_DS_MLA_TOKEN_DATA_BYTES
         + block_size * kernel_warmup._DEEPSEEK_V4_FP8_DS_MLA_SCALE_BYTES
     )
+
+
+def test_kernel_warmup_runs_model_agnostic_zero_kv_warmup(monkeypatch):
+    worker = _worker(["DeepseekV4ForCausalLM"])
+    worker.use_v2_model_runner = True
+    worker.vllm_config = SimpleNamespace(
+        model_config=worker.model_config,
+        kernel_config=SimpleNamespace(
+            enable_flashinfer_autotune=False,
+            enable_cutedsl_warmup=False,
+            enable_jit_warmup=False,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[]),
+    )
+    worker.get_model = lambda: torch.nn.Module()
+    worker.model_runner.is_pooling_model = False
+    worker.model_runner.attn_groups = []
+    zero_warmup = Mock()
+    monkeypatch.setattr(kernel_warmup, "zero_kv_blocks_warmup", zero_warmup)
+    monkeypatch.setattr(kernel_warmup, "qwen_triton_warmup", Mock())
+    monkeypatch.setattr(kernel_warmup, "deepseek_v4_mhc_warmup", Mock())
+    monkeypatch.setattr(
+        kernel_warmup, "flashinfer_sparse_mla_decode_autotune_warmup", Mock()
+    )
+    monkeypatch.setattr(
+        kernel_warmup, "_deepseek_v4_sparse_mla_prefill_warmup", Mock()
+    )
+    monkeypatch.setattr(
+        kernel_warmup, "_deepseek_v4_block_table_slot_mapping_warmup", Mock()
+    )
+    monkeypatch.setattr(kernel_warmup, "_deepseek_v4_marlin_moe_warmup", Mock())
+    monkeypatch.setattr(
+        "vllm.model_executor.warmup.minimax_m3_msa_warmup.minimax_m3_msa_warmup",
+        Mock(),
+    )
+
+    kernel_warmup.kernel_warmup(worker)
+
+    zero_warmup.assert_called_once_with(worker.model_runner)
