@@ -584,6 +584,23 @@ def _fp8_mqa_logits_sm12x(
 ) -> torch.Tensor:
     q_values, q_scale = q
     if q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
+        if (q_values.dtype == torch.int8) != (kv[0].dtype == torch.int8):
+            raise RuntimeError(
+                "The INT8 indexer query and contiguous K cache must be selected "
+                "together"
+            )
+        if (
+            q_values.dtype == torch.int8
+            and kv[0].dtype == torch.int8
+            and current_platform.is_device_capability_family(120)
+        ):
+            return int8_mqa_logits_sparkinfer(
+                q_values,
+                kv,
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+            )
         from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
             fp8_mqa_logits_triton,
             indexer_imma_enabled,
@@ -608,6 +625,35 @@ def _fp8_mqa_logits_sm12x(
     return _fp8_mqa_logits_torch(
         q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
     )
+
+
+def int8_mqa_logits_sparkinfer(
+    q_values: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Run the exact SM12x contiguous INT8 indexer contract in SparkInfer."""
+    from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
+        run_contiguous_logits_kernel,
+        supports_contiguous_logits_kernel,
+    )
+
+    k_values, k_scales = kv
+    contract = {
+        "q_fp8": q_values,
+        "weights": weights,
+        "k_quant": k_values,
+        "k_scale": k_scales,
+        "k_start": cu_seqlen_ks,
+        "k_end": cu_seqlen_ke,
+    }
+    if not supports_contiguous_logits_kernel(**contract):
+        raise RuntimeError(
+            "SparkInfer rejected the selected SM12x INT8 contiguous indexer contract"
+        )
+    return run_contiguous_logits_kernel(**contract)
 
 
 def fp8_fp4_mqa_logits(
