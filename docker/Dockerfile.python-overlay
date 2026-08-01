@@ -1,6 +1,7 @@
 ARG BASE_IMAGE=ghcr.io/appmana/vllm-consumer:sm86-sm121-2cb0042e1d-arm64@sha256:defd0bc7005ad1d91fb74e8e5aef47656fc09960e3478421139511e45162e325
 FROM ${BASE_IMAGE}
 
+ARG BASE_IMAGE
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_IMAGE_TAG
 
@@ -93,4 +94,4 @@ LABEL org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
       ai.vllm.build.commit="${VLLM_BUILD_COMMIT}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
-      ai.appmana.overlay.base="ghcr.io/appmana/vllm-consumer:sm86-sm121-2cb0042e1d-arm64@sha256:defd0bc7005ad1d91fb74e8e5aef47656fc09960e3478421139511e45162e325"
+      ai.appmana.overlay.base="${BASE_IMAGE}"
