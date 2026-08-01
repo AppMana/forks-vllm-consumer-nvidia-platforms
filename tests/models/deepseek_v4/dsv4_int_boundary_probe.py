@@ -3,9 +3,9 @@
 
 The probe builds a symlink-only view of a downloaded checkpoint containing the
 embedding, one decoder layer, final mHC/norm, and LM head tensors.  It then runs
-one eager prefill and serializes module-boundary tensors for comparison across
-vLLM revisions.  Checkpoint files and Hugging Face cache metadata are never
-modified.
+one prefill and serializes module-boundary tensors for comparison across vLLM
+revisions and execution modes. Checkpoint files and Hugging Face cache metadata
+are never modified.
 
 Usage::
 
@@ -99,6 +99,7 @@ def capture_boundaries(
     output: Path,
     *,
     prompt: str,
+    compiled: bool,
 ) -> None:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -119,7 +120,10 @@ def capture_boundaries(
         max_num_batched_tokens=128,
         gpu_memory_utilization=0.5,
         kv_cache_memory_bytes=1 << 30,
-        enforce_eager=True,
+        enforce_eager=not compiled,
+        compilation_config=(
+            {"cudagraph_capture_sizes": [1]} if compiled else None
+        ),
         disable_log_stats=True,
         kernel_config={
             "enable_jit_warmup": False,
@@ -180,6 +184,7 @@ def capture_boundaries(
         "prompt_token_ids": prompt_token_ids,
         "output_token_ids": list(sample.token_ids),
         "torch_version": str(torch.__version__),
+        "compiled": compiled,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(captured, output)
@@ -269,6 +274,11 @@ def main() -> int:
     capture.add_argument("checkpoint", type=Path)
     capture.add_argument("output", type=Path)
     capture.add_argument("--prompt", default="The capital of France is")
+    capture.add_argument(
+        "--compiled",
+        action="store_true",
+        help="request the optimized serving path instead of enforce-eager",
+    )
     compare = subparsers.add_parser("compare")
     compare.add_argument("left", type=Path)
     compare.add_argument("right", type=Path)
@@ -277,7 +287,12 @@ def main() -> int:
         create_boundary_view(args.source, args.target, layer=args.layer)
         return 0
     if args.command == "capture":
-        capture_boundaries(args.checkpoint, args.output, prompt=args.prompt)
+        capture_boundaries(
+            args.checkpoint,
+            args.output,
+            prompt=args.prompt,
+            compiled=args.compiled,
+        )
         return 0
     return compare_captures(args.left, args.right)
 

@@ -8,6 +8,7 @@ ARG VLLM_IMAGE_TAG
 COPY vllm/v1/core/kv_cache_utils.py /tmp/vllm-overlay/v1/core/kv_cache_utils.py
 COPY vllm/v1/kv_cache_interface.py /tmp/vllm-overlay/v1/kv_cache_interface.py
 COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm-overlay/v1/worker/gpu/warmup.py
+COPY vllm/config/vllm.py /tmp/vllm-overlay/config/vllm.py
 COPY vllm/model_executor/warmup/kernel_warmup.py /tmp/vllm-overlay/model_executor/warmup/kernel_warmup.py
 COPY vllm/model_executor/warmup/qwen_triton_warmup.py /tmp/vllm-overlay/model_executor/warmup/qwen_triton_warmup.py
 COPY vllm/model_executor/layers/fused_moe/experts/sparkinfer_moe.py /tmp/vllm-overlay/model_executor/layers/fused_moe/experts/sparkinfer_moe.py
@@ -34,6 +35,7 @@ for relative in (
     "v1/core/kv_cache_utils.py",
     "v1/kv_cache_interface.py",
     "v1/worker/gpu/warmup.py",
+    "config/vllm.py",
     "model_executor/warmup/kernel_warmup.py",
     "model_executor/warmup/qwen_triton_warmup.py",
     "model_executor/layers/fused_moe/experts/sparkinfer_moe.py",
@@ -74,6 +76,7 @@ cache_utils = (root / "models/deepseek_v4/common/ops/cache_utils.py").read_text(
 kernel_config = (
     root / "transformers_utils/configs/dsv4/kernel_config.py"
 ).read_text()
+vllm_config = (root / "config/vllm.py").read_text()
 assert "prompt_len = min(256" in gpu_warmup
 assert "zero_kv_blocks_warmup(worker.model_runner)" in kernel_warmup
 assert "def zero_kv_blocks_warmup" in qwen_warmup
@@ -86,6 +89,8 @@ assert "def classify_shards" in pp_filter
 assert "_INT8_DS_MLA_TOKEN_BYTES" in cache_utils
 assert "_INT8_DS_MLA_PAD_BYTES = 12" in cache_utils
 assert "has_int_weight_family" in kernel_config
+assert '"DSparkDraftModel"' in vllm_config
+assert "_configure_breakable_cudagraph" in vllm_config
 shutil.rmtree("/tmp/vllm-overlay")
 print("packed DSV4 KV-cache geometry and prefill warmup fixes installed")
 PY

@@ -112,6 +112,9 @@ IS_DENSE = False
 
 BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES = frozenset(
     {
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+        "DSparkDraftModel",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForCausalLM",
@@ -121,11 +124,30 @@ BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES = frozenset(
 
 
 def _should_auto_enable_breakable_cudagraph(model_config: ModelConfig) -> bool:
-    """Return whether an architecture requires the eager breakable graph path."""
+    """Return whether an architecture requires the breakable CUDA graph path."""
     return any(
         architecture in BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES
         for architecture in model_config.architectures
     )
+
+
+def _configure_breakable_cudagraph(
+    model_config: ModelConfig | None,
+    compilation_config: CompilationConfig,
+) -> tuple[bool, bool]:
+    """Apply architecture defaults while preserving an explicit env override."""
+    auto_enabled = bool(
+        model_config is not None
+        and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
+        and _should_auto_enable_breakable_cudagraph(model_config)
+    )
+    if auto_enabled:
+        os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+
+    breakable_enabled = envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+    if breakable_enabled:
+        compilation_config.mode = CompilationMode.NONE
+    return auto_enabled, breakable_enabled
 
 
 def enable_norm_fusion(cfg: "VllmConfig") -> bool:
@@ -1219,28 +1241,24 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # For model classes that do not carry @support_torch_compile, the
-        # breakable cudagraph is the supported PIECEWISE path. DeepSeek-V4 is
-        # deliberately excluded: breakable mode disables its torch.compile
-        # pipeline and regresses prefill and decode performance.
-        if (
-            self.model_config is not None
-            and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
-            and _should_auto_enable_breakable_cudagraph(self.model_config)
-        ):
-            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+        # These architectures use the breakable CUDA graph path instead of
+        # torch.compile. Keep an explicit environment setting authoritative so
+        # VLLM_USE_BREAKABLE_CUDAGRAPH=0 remains a diagnostic opt-out.
+        auto_enabled, breakable_enabled = _configure_breakable_cudagraph(
+            self.model_config,
+            self.compilation_config,
+        )
+        if auto_enabled:
             logger.info_once(
                 "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
                 "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
             )
 
-        if envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
+        if breakable_enabled:
             logger.warning_once(
                 "VLLM_USE_BREAKABLE_CUDAGRAPH is set, disabling vLLM's "
                 "torch.compile pipeline. Equivalent to -cc.mode=none."
             )
-            self.compilation_config.mode = CompilationMode.NONE
 
         if self.compilation_config.backend == "eager" or (
             self.compilation_config.mode is not None
