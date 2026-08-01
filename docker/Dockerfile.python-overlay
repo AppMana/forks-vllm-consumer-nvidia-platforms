@@ -9,7 +9,10 @@ COPY vllm/v1/kv_cache_interface.py /tmp/vllm-overlay/v1/kv_cache_interface.py
 COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm-overlay/v1/worker/gpu/warmup.py
 COPY vllm/model_executor/warmup/kernel_warmup.py /tmp/vllm-overlay/model_executor/warmup/kernel_warmup.py
 COPY vllm/model_executor/warmup/qwen_triton_warmup.py /tmp/vllm-overlay/model_executor/warmup/qwen_triton_warmup.py
+COPY vllm/model_executor/layers/fused_moe/experts/sparkinfer_moe.py /tmp/vllm-overlay/model_executor/layers/fused_moe/experts/sparkinfer_moe.py
+COPY vllm/model_executor/layers/fused_moe/oracle/nvfp4.py /tmp/vllm-overlay/model_executor/layers/fused_moe/oracle/nvfp4.py
 COPY vllm/model_executor/layers/quantization/dsv4_int.py /tmp/vllm-overlay/model_executor/layers/quantization/dsv4_int.py
+COPY vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py /tmp/vllm-overlay/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
 COPY vllm/model_executor/model_loader/default_loader.py /tmp/vllm-overlay/model_executor/model_loader/default_loader.py
 COPY vllm/model_executor/model_loader/flashpack_loader.py /tmp/vllm-overlay/model_executor/model_loader/flashpack_loader.py
 COPY vllm/model_executor/model_loader/pp_weight_filter.py /tmp/vllm-overlay/model_executor/model_loader/pp_weight_filter.py
@@ -32,7 +35,10 @@ for relative in (
     "v1/worker/gpu/warmup.py",
     "model_executor/warmup/kernel_warmup.py",
     "model_executor/warmup/qwen_triton_warmup.py",
+    "model_executor/layers/fused_moe/experts/sparkinfer_moe.py",
+    "model_executor/layers/fused_moe/oracle/nvfp4.py",
     "model_executor/layers/quantization/dsv4_int.py",
+    "model_executor/layers/quantization/utils/flashinfer_fp4_moe.py",
     "model_executor/model_loader/default_loader.py",
     "model_executor/model_loader/flashpack_loader.py",
     "model_executor/model_loader/pp_weight_filter.py",
@@ -53,6 +59,15 @@ gpu_warmup = (root / "v1/worker/gpu/warmup.py").read_text()
 kernel_warmup = (root / "model_executor/warmup/kernel_warmup.py").read_text()
 qwen_warmup = (root / "model_executor/warmup/qwen_triton_warmup.py").read_text()
 dsv4_int = (root / "model_executor/layers/quantization/dsv4_int.py").read_text()
+sparkinfer_moe = (
+    root / "model_executor/layers/fused_moe/experts/sparkinfer_moe.py"
+).read_text()
+nvfp4_oracle = (
+    root / "model_executor/layers/fused_moe/oracle/nvfp4.py"
+).read_text()
+flashinfer_fp4 = (
+    root / "model_executor/layers/quantization/utils/flashinfer_fp4_moe.py"
+).read_text()
 pp_filter = (root / "model_executor/model_loader/pp_weight_filter.py").read_text()
 cache_utils = (root / "models/deepseek_v4/common/ops/cache_utils.py").read_text()
 kernel_config = (
@@ -62,6 +77,9 @@ assert "prompt_len = min(256" in gpu_warmup
 assert "zero_kv_blocks_warmup(worker.model_runner)" in kernel_warmup
 assert "def zero_kv_blocks_warmup" in qwen_warmup
 assert "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD" in dsv4_int
+assert "input_scales_static=True" in sparkinfer_moe
+assert "require_uniform_nvfp4_expert_scale" in nvfp4_oracle
+assert "merge_nvfp4_gate_up_input_scales" in flashinfer_fp4
 assert "filter_weights_for_pp_rank" in pp_filter
 assert "INT8_DS_MLA_ENTRY_BYTES" in cache_utils
 assert "has_int_weight_family" in kernel_config
