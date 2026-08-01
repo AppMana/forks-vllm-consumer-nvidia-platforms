@@ -118,29 +118,28 @@ def test_sm120_fp8_mqa_logits_chunk_sizes_cap_large_scores():
     assert deep_gemm_utils._fp8_mqa_logits_k_chunk_size(8192, 8192, 1) == 2048
 
 
-def test_sm120_int8_paged_mqa_logits_dispatches_to_sparkinfer(
+def test_sm120_int8_paged_mqa_logits_dispatches_to_triton(
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls = {}
-    kernel_module = ModuleType("sparkinfer.attention.nsa_indexer.kernel")
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels
 
-    def fake_run_paged_logits_kernel(**kwargs):
-        calls.update(kwargs)
-        return torch.arange(384, dtype=torch.float32).reshape(2, 192)
+    def fake_paged_logits(q, kv, weights, context_lens, block_tables,
+                          max_model_len, token_count=None):
+        calls.update(
+            q=q,
+            kv=kv,
+            weights=weights,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            max_model_len=max_model_len,
+            token_count=token_count,
+        )
+        return torch.arange(260, dtype=torch.float32).reshape(2, 130)
 
-    kernel_module.run_paged_logits_kernel = fake_run_paged_logits_kernel
-    package_modules = {
-        "sparkinfer": ModuleType("sparkinfer"),
-        "sparkinfer.attention": ModuleType("sparkinfer.attention"),
-        "sparkinfer.attention.nsa_indexer": ModuleType(
-            "sparkinfer.attention.nsa_indexer"
-        ),
-        "sparkinfer.attention.nsa_indexer.kernel": kernel_module,
-    }
-    for name, module in package_modules.items():
-        if name != "sparkinfer.attention.nsa_indexer.kernel":
-            module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(
+        triton_kernels, "fp8_paged_mqa_logits_triton", fake_paged_logits
+    )
     monkeypatch.setattr(
         deep_gemm_utils.current_platform,
         "is_device_capability_family",
@@ -165,11 +164,12 @@ def test_sm120_int8_paged_mqa_logits_dispatches_to_sparkinfer(
         token_count=130,
     )
 
-    assert calls["q_fp8"].shape == (2, 64, 128)
-    assert calls["index_k_cache"] is kv_cache
-    assert calls["real_page_table"].shape == (2, 3)
-    assert calls["seqlens_per_query"].tolist() == [17, 23]
-    assert calls["page_size"] == 64
+    assert calls["q"] is q
+    assert calls["kv"] is kv_cache
+    assert calls["context_lens"] is context_lens
+    assert calls["block_tables"] is block_tables
+    assert calls["max_model_len"] == 192
+    assert calls["token_count"] == 130
     assert actual.shape == (2, 130)
 
 

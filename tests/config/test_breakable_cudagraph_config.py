@@ -5,7 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.config.compilation import CompilationMode
+from vllm.compilation.backends import wrap_with_cudagraph_if_needed
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.config.vllm import (
     _configure_breakable_cudagraph,
     _should_auto_enable_breakable_cudagraph,
@@ -54,7 +55,9 @@ def test_deepseek_v4_compile_mode_uses_breakable_cudagraph(monkeypatch):
 
     assert auto_enabled
     assert breakable_enabled
-    assert compilation_config.mode == CompilationMode.NONE
+    # Breakable graph segments protect DSV4's eager attention boundaries;
+    # they must not disable compilation of the model body around those breaks.
+    assert compilation_config.mode == CompilationMode.VLLM_COMPILE
 
 
 def test_deepseek_v4_explicit_breakable_opt_out_preserves_compile(monkeypatch):
@@ -69,3 +72,22 @@ def test_deepseek_v4_explicit_breakable_opt_out_preserves_compile(monkeypatch):
     assert not auto_enabled
     assert not breakable_enabled
     assert compilation_config.mode == CompilationMode.VLLM_COMPILE
+
+
+def test_breakable_cudagraph_does_not_nest_piecewise_wrappers(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    backend = object()
+    compilation_config = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        use_inductor_graph_partition=False,
+    )
+
+    wrapped = wrap_with_cudagraph_if_needed(
+        backend,
+        SimpleNamespace(),
+        compilation_config,
+        is_first_graph=True,
+        is_last_graph=True,
+    )
+
+    assert wrapped is backend

@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_DSV4_ALLSPARK_SM12X: bool = True
+    VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD: int | None = None
     VLLM_MHC_CUDA_BACKEND: str = "auto"
     VLLM_MHC_PRE_TRITON: bool = True
     VLLM_MHC_POST_TRITON: bool = True
@@ -750,6 +752,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
         os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+    ),
+    # DSV4 dense-kernel dispatch changes the traced graph. These controls must
+    # participate in compile-cache identity so an AllSpark artifact can never
+    # be reused by the BF16 diagnostic path, or vice versa.
+    "VLLM_DSV4_ALLSPARK_SM12X": lambda: (
+        os.environ.get("VLLM_DSV4_ALLSPARK_SM12X", "1").lower() in ("1", "true", "on")
+    ),
+    "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD": lambda: (
+        int(os.environ["VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD"])
+        if "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD" in os.environ
+        else None
     ),
     # DSV4 mHC dispatch changes the traced model graph and must participate in
     # torch.compile cache identity. Keeping these controls in the env registry

@@ -22,6 +22,7 @@ COPY vllm/model_executor/model_loader/flashpack_loader.py /tmp/vllm-overlay/mode
 COPY vllm/model_executor/model_loader/pp_weight_filter.py /tmp/vllm-overlay/model_executor/model_loader/pp_weight_filter.py
 COPY vllm/model_executor/model_loader/weight_utils.py /tmp/vllm-overlay/model_executor/model_loader/weight_utils.py
 COPY vllm/models/deepseek_v4/common/ops/cache_utils.py /tmp/vllm-overlay/models/deepseek_v4/common/ops/cache_utils.py
+COPY vllm/models/deepseek_v4/attention.py /tmp/vllm-overlay/models/deepseek_v4/attention.py
 COPY vllm/transformers_utils/configs/dsv4/kernel_config.py /tmp/vllm-overlay/transformers_utils/configs/dsv4/kernel_config.py
 COPY vllm/utils/deep_gemm.py /tmp/vllm-overlay/utils/deep_gemm.py
 
@@ -52,6 +53,7 @@ for relative in (
     "model_executor/model_loader/pp_weight_filter.py",
     "model_executor/model_loader/weight_utils.py",
     "models/deepseek_v4/common/ops/cache_utils.py",
+    "models/deepseek_v4/attention.py",
     "transformers_utils/configs/dsv4/kernel_config.py",
     "utils/deep_gemm.py",
 ):
@@ -81,6 +83,7 @@ flashinfer_fp4 = (
 ).read_text()
 pp_filter = (root / "model_executor/model_loader/pp_weight_filter.py").read_text()
 cache_utils = (root / "models/deepseek_v4/common/ops/cache_utils.py").read_text()
+attention = (root / "models/deepseek_v4/attention.py").read_text()
 kernel_config = (
     root / "transformers_utils/configs/dsv4/kernel_config.py"
 ).read_text()
@@ -98,11 +101,13 @@ assert "def should_skip_pp_weight" in pp_filter
 assert "def classify_shards" in pp_filter
 assert "_INT8_DS_MLA_TOKEN_BYTES" in cache_utils
 assert "_INT8_DS_MLA_PAD_BYTES = 12" in cache_utils
+assert "use_compilation_safe_attn_gemm_overlap" in attention
 assert "has_int_weight_family" in kernel_config
 assert '"DSparkDraftModel"' in vllm_config
 assert "_configure_breakable_cudagraph" in vllm_config
 assert "Keep contiguous prefill logits on the proven Triton implementation" in indexer
 assert "return int8_mqa_logits_sparkinfer" not in deep_gemm
+assert "run_paged_logits_kernel" not in deep_gemm
 shutil.rmtree("/tmp/vllm-overlay")
 print("packed DSV4 KV-cache geometry and prefill warmup fixes installed")
 PY

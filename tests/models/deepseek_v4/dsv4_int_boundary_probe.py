@@ -100,6 +100,7 @@ def capture_boundaries(
     *,
     prompt: str,
     compiled: bool,
+    cudagraph: bool,
 ) -> None:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -122,7 +123,13 @@ def capture_boundaries(
         kv_cache_memory_bytes=1 << 30,
         enforce_eager=not compiled,
         compilation_config=(
-            {"cudagraph_capture_sizes": [1]} if compiled else None
+            {
+                "mode": 3,
+                "cudagraph_mode": 3 if cudagraph else 0,
+                "cudagraph_capture_sizes": [1] if cudagraph else [],
+            }
+            if compiled
+            else None
         ),
         disable_log_stats=True,
         kernel_config={
@@ -185,6 +192,7 @@ def capture_boundaries(
         "output_token_ids": list(sample.token_ids),
         "torch_version": str(torch.__version__),
         "compiled": compiled,
+        "cudagraph": cudagraph,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(captured, output)
@@ -232,6 +240,12 @@ def compare_captures(left_path: Path, right_path: Path) -> int:
     ]
     first_divergence = None
     for boundary in order:
+        if boundary not in left or boundary not in right:
+            print(
+                f"{boundary} UNAVAILABLE "
+                f"left={boundary in left} right={boundary in right}"
+            )
+            continue
         left_tensors = _flatten_tensors(left[boundary], boundary)
         right_tensors = _flatten_tensors(right[boundary], boundary)
         if left_tensors.keys() != right_tensors.keys():
@@ -279,6 +293,11 @@ def main() -> int:
         action="store_true",
         help="request the optimized serving path instead of enforce-eager",
     )
+    capture.add_argument(
+        "--no-cudagraph",
+        action="store_true",
+        help="compile the model body without CUDA graph capture",
+    )
     compare = subparsers.add_parser("compare")
     compare.add_argument("left", type=Path)
     compare.add_argument("right", type=Path)
@@ -292,6 +311,7 @@ def main() -> int:
             args.output,
             prompt=args.prompt,
             compiled=args.compiled,
+            cudagraph=not args.no_cudagraph,
         )
         return 0
     return compare_captures(args.left, args.right)

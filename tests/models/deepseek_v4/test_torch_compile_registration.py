@@ -3,9 +3,14 @@
 
 import inspect
 
+import pytest
+
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.model_executor.kernels.mhc.tilelang import mhc_pre_broadcast_tilelang
-from vllm.models.deepseek_v4.attention import DeepseekV4Indexer
+from vllm.models.deepseek_v4.attention import (
+    DeepseekV4Indexer,
+    use_compilation_safe_attn_gemm_overlap,
+)
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4Model
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4Model
@@ -40,3 +45,15 @@ def test_first_layer_tilelang_mhc_is_an_opaque_custom_op():
     source = inspect.getsource(mhc_pre_broadcast_tilelang)
     assert "torch.ops.vllm.mhc_pre_broadcast_tilelang" in source
     assert "tf32_hc_prenorm_gemm" not in source
+
+
+@pytest.mark.parametrize(("is_compiling", "expected"), [(False, True), (True, False)])
+def test_attn_input_gemm_overlap_is_disabled_while_compiling(
+    monkeypatch, is_compiling: bool, expected: bool
+):
+    monkeypatch.setattr("torch.compiler.is_compiling", lambda: is_compiling)
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.attention.envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD",
+        1024,
+    )
+    assert use_compilation_safe_attn_gemm_overlap(6) is expected

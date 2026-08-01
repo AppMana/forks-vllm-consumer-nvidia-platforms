@@ -655,6 +655,10 @@ def wrap_with_cudagraph_if_needed(
     if (
         not compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
         or compilation_config.use_inductor_graph_partition
+        # Breakable CUDA graphs capture the compiled model body themselves.
+        # Wrapping each compiled partition in a normal CUDAGraphWrapper would
+        # start a nested stream capture when the outer breakable graph runs.
+        or envs.VLLM_USE_BREAKABLE_CUDAGRAPH
     ):
         return piecewise_backend
 

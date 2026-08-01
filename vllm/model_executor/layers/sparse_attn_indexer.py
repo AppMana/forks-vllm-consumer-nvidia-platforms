@@ -109,15 +109,18 @@ def _decode_logits_token_count_for_platform(
     max_model_len: int,
     is_cuda_sm120: bool,
 ) -> int:
-    """Keep GB10 on the known-safe power-of-two/full-width decode layout.
+    """Keep GB10 on a known-safe power-of-two decode layout.
 
-    The adaptive width is a useful memory optimization on Ampere, but the
-    SM12x paged indexer faults at live non-power-of-two widths even though its
-    isolated kernels pass. The production 65k configuration reserves only one
-    16,384-float row per decode request, so full width is inexpensive.
+    The SM12x paged indexer faults at live non-power-of-two widths even though
+    its isolated kernels pass. Bucket the live width up to a power of two
+    instead of scanning the full configured context on every decode layer.
+    Capture-time metadata still passes ``max_model_len`` and therefore keeps
+    the graph's full-width allocation.
     """
     if is_cuda_sm120:
-        return max_model_len
+        live_width = max(max_context_len, DECODE_LOGITS_WIDTH_ALIGNMENT)
+        power_of_two_width = 1 << (live_width - 1).bit_length()
+        return min(power_of_two_width, max_model_len)
     return _decode_logits_token_count(max_context_len, max_model_len)
 
 

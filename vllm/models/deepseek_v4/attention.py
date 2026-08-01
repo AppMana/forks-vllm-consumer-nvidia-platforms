@@ -77,6 +77,20 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def use_compilation_safe_attn_gemm_overlap(num_tokens: int) -> bool:
+    """Use auxiliary GEMM streams only outside a torch-compiled region.
+
+    Explicit stream/event orchestration inside the compiled model body can be
+    reordered across the graph break before ``attention_impl``. Keep the
+    compiled path sequential; the eager attention implementation retains its
+    own safe overlap after the break.
+    """
+    return (
+        not torch.compiler.is_compiling()
+        and num_tokens <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+    )
+
+
 @triton.jit
 def _fill_short_context_topk_indices(
     output,
@@ -468,8 +482,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.ln_events[0],
             self.ln_events[1:4],
             aux_streams,
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            enable=use_compilation_safe_attn_gemm_overlap(hidden_states.shape[0]),
         )
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights

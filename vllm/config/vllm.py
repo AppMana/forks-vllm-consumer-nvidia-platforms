@@ -145,8 +145,6 @@ def _configure_breakable_cudagraph(
         os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
 
     breakable_enabled = envs.VLLM_USE_BREAKABLE_CUDAGRAPH
-    if breakable_enabled:
-        compilation_config.mode = CompilationMode.NONE
     return auto_enabled, breakable_enabled
 
 
@@ -1241,8 +1239,9 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # These architectures use the breakable CUDA graph path instead of
-        # torch.compile. Keep an explicit environment setting authoritative so
+        # These architectures use breakable CUDA graphs around eager attention
+        # boundaries while retaining torch.compile for the surrounding model
+        # body. Keep an explicit environment setting authoritative so
         # VLLM_USE_BREAKABLE_CUDAGRAPH=0 remains a diagnostic opt-out.
         auto_enabled, breakable_enabled = _configure_breakable_cudagraph(
             self.model_config,
@@ -1255,9 +1254,9 @@ class VllmConfig:
             )
 
         if breakable_enabled:
-            logger.warning_once(
-                "VLLM_USE_BREAKABLE_CUDAGRAPH is set, disabling vLLM's "
-                "torch.compile pipeline. Equivalent to -cc.mode=none."
+            logger.info_once(
+                "VLLM_USE_BREAKABLE_CUDAGRAPH is set; eager graph-break "
+                "segments will use breakable CUDA graphs."
             )
 
         if self.compilation_config.backend == "eager" or (

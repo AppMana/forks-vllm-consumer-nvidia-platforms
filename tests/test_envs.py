@@ -46,6 +46,37 @@ def test_mhc_dispatch_is_a_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert factors["VLLM_MHC_PRE_TRITON"] is False
 
 
+def test_dsv4_dense_dispatch_is_a_compile_factor(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "0")
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD", "64")
+
+    factors = envs.compile_factors()
+
+    assert factors["VLLM_DSV4_ALLSPARK_SM12X"] is False
+    assert factors["VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD"] == 64
+
+
+def test_dsv4_dense_dispatch_changes_compile_cache_hash(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.config.utils import hash_factors
+
+    monkeypatch.delenv("VLLM_DSV4_ALLSPARK_SM12X", raising=False)
+    monkeypatch.delenv("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD", raising=False)
+    default_hash = hash_factors(envs.compile_factors())
+
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "0")
+    allspark_off_hash = hash_factors(envs.compile_factors())
+
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "1")
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD", "64")
+    threshold_hash = hash_factors(envs.compile_factors())
+
+    assert default_hash != allspark_off_hash
+    assert default_hash != threshold_hash
+    assert allspark_off_hash != threshold_hash
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

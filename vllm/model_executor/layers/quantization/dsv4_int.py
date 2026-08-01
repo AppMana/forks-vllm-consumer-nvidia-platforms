@@ -15,12 +15,12 @@ linear math for the smaller INT8 blocks until a W8A16 linear kernel is wired in.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.logger import init_logger as _dsv4_init_logger
 from vllm.transformers_utils.configs.dsv4.kernel_config import (
     DENSE_EXPERTS_INT8_ACTIVATION,
@@ -39,16 +39,15 @@ def _dsv4_allspark_supported_device_capability(sm_version: int) -> bool:
         # The native kernel is faster for small-M decode. Large-M prefill uses
         # its cuBLAS fallback at the threshold below. Keep an explicit off
         # switch for diagnostics.
-        enabled = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X", "1")
-        return enabled.lower() in ("1", "true", "on")
+        return envs.VLLM_DSV4_ALLSPARK_SM12X
     return is_allspark_supported_device_capability(sm_version)
 
 
 def _dsv4_allspark_cublas_m_threshold(sm_version: int) -> int:
     if sm_version in (120, 121):
-        configured = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD")
+        configured = envs.VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD
         if configured is not None:
-            threshold = int(configured)
+            threshold = configured
             if threshold < 0:
                 raise ValueError(
                     "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD must be non-negative"
@@ -59,7 +58,9 @@ def _dsv4_allspark_cublas_m_threshold(sm_version: int) -> int:
 
 def _dsv4_log_path(path: str) -> None:
     _DSV4_KERNEL_PATHS[path] = _DSV4_KERNEL_PATHS.get(path, 0) + 1
-    _dsv4_logger.info("DSV4KERNEL dense path=%s running_counts=%s", path, _DSV4_KERNEL_PATHS)
+    _dsv4_logger.info(
+        "DSV4KERNEL dense path=%s running_counts=%s", path, _DSV4_KERNEL_PATHS
+    )
 
 
 def _has_int4_experts_int8_dense(config_groups: dict[str, Any]) -> bool:
@@ -441,9 +442,7 @@ def requantize_fp8_to_int8_w8a16(
     abs_max = abs_max.clamp(min=torch.finfo(torch.float32).tiny)
     new_scale = abs_max / 127.0
 
-    new_scale_full = new_scale.repeat_interleave(bn, dim=0).repeat_interleave(
-        bk, dim=1
-    )
+    new_scale_full = new_scale.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
     qweight = torch.round(dequant / new_scale_full[:n, :k]).clamp(-128, 127)
     return {
         "qweight": qweight.to(torch.int8),
@@ -652,9 +651,7 @@ class Dsv4IntConfig(QuantizationConfig):
         self.kernels_explicit = resolved.explicit
         if resolved.explicit or has_int_weights:
             activate_kernel_config(resolved)
-        self.expert_input_dtype = (
-            torch.int8 if self.experimental_int8_runtime else None
-        )
+        self.expert_input_dtype = torch.int8 if self.experimental_int8_runtime else None
         linears = self.config_groups.get("linears_w8a16", {})
         weights = linears.get("weights", {})
         self.int8_weight_strategy = weights.get("strategy", "block")
@@ -1135,8 +1132,7 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         # next to the target on the last PP rank. Safe because expert e's
         # slot is only overwritten after pack_one has copied it out.
         assert first.nbytes == weight[0].nbytes, (
-            f"marlin repack changed payload size: {first.nbytes} != "
-            f"{weight[0].nbytes}"
+            f"marlin repack changed payload size: {first.nbytes} != {weight[0].nbytes}"
         )
         storage = weight.view(num_experts, -1).view(first.dtype)
         storage[0].copy_(first.view(-1))

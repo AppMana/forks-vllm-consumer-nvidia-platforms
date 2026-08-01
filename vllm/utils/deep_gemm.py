@@ -840,41 +840,11 @@ def fp8_fp4_paged_mqa_logits(
         dtype `torch.float32`.
     """
     q_values, q_scale = q
-    if (
-        q_scale is None
-        and q_values.dtype == torch.int8
-        and current_platform.is_device_capability_family(120)
-    ):
-        from sparkinfer.attention.nsa_indexer.kernel import (
-            run_paged_logits_kernel,
-        )
-
-        batch_size, next_n, num_heads, head_dim = q_values.shape
-        num_rows = batch_size * next_n
-        q_rows = q_values.reshape(num_rows, num_heads, head_dim)
-        context_rows = context_lens.reshape(num_rows)
-        page_table_rows = (
-            block_tables[:, None, :]
-            .expand(batch_size, next_n, block_tables.shape[1])
-            .reshape(num_rows, block_tables.shape[1])
-        )
-        output_width = max_model_len if token_count is None else token_count
-        page_size = kv_cache.shape[1]
-        page_table_width = (output_width + page_size - 1) // page_size
-        logits = run_paged_logits_kernel(
-            q_fp8=q_rows,
-            weights=weights,
-            index_k_cache=kv_cache,
-            real_page_table=page_table_rows[:, :page_table_width],
-            seqlens_per_query=context_rows,
-            page_size=page_size,
-        )
-        return logits[:, :output_width]
-
-    # Ampere/Ada (sm_8x) and the remaining SM12x FP8 path: DeepGEMM's
-    # paged-MQA-logits kernel is Hopper-only, so route through Triton. The
-    # SM12x INT8 path above uses SparkInfer's native IMMA kernel. q_scale is
-    # None for FP8/INT8; the FP4 path keeps the DeepGEMM implementation below.
+    # Ampere/Ada (sm_8x) and consumer Blackwell (sm_12x): DeepGEMM's paged
+    # MQA-logits kernel is Hopper-only, so route FP8/INT8 through Triton. The
+    # SparkInfer INT8 wrapper is not used here until it can accept caller-owned
+    # output and active-width buffers; its per-layer CUDA allocations regress
+    # long-context DSpark decode under unified-memory pressure.
     if q_scale is None and (
         current_platform.is_device_capability_family(80)
         or current_platform.is_device_capability_family(120)

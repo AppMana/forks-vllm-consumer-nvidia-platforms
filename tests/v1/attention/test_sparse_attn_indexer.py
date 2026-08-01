@@ -4,18 +4,18 @@
 import pytest
 import torch
 
-from vllm.utils import deep_gemm
 from vllm.model_executor.layers.quantization.dsv4_int import Dsv4IntConfig
 from vllm.model_executor.layers.sparse_attn_indexer import (
     SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH,
     SM120_SHORT_ROW_TOPK_MAX_ROWS,
     SM120_SHORT_ROW_TOPK_MAX_WIDTH,
-    _reserve_prefill_gather_workspace,
     _decode_logits_token_count_for_platform,
+    _reserve_prefill_gather_workspace,
     _should_use_sm120_short_row_topk_decode,
 )
 from vllm.models.deepseek_v4.nvidia_imma import triton_kernels as dsv4_sm86
 from vllm.transformers_utils.configs.dsv4 import kernel_config
+from vllm.utils import deep_gemm
 
 
 @pytest.mark.parametrize(
@@ -50,9 +50,15 @@ def test_sm120_short_row_topk_decode_selector(
     )
 
 
-def test_sm120_decode_logits_keep_full_power_of_two_width() -> None:
+def test_sm120_decode_logits_use_live_power_of_two_width_bucket() -> None:
     assert _decode_logits_token_count_for_platform(8211, 16384, True) == 16384
     assert _decode_logits_token_count_for_platform(10773, 16384, True) == 16384
+    # A large admission limit must not make a 64K request scan the full
+    # configured width on every C4 decode layer. 64K / 4 is exactly 16K.
+    assert _decode_logits_token_count_for_platform(16000, 62500, True) == 16384
+    assert _decode_logits_token_count_for_platform(16385, 62500, True) == 32768
+    # Capture-time metadata remains full-width so graph replay is safe.
+    assert _decode_logits_token_count_for_platform(62500, 62500, True) == 62500
     assert _decode_logits_token_count_for_platform(8211, 16384, False) == 8320
 
 
@@ -206,7 +212,9 @@ def test_mqa_logits_workspace_accepts_unaligned_workspace_views(
 
     scale_base = torch.empty((seq_len + 1, 1), device=device, dtype=torch.float32)
     scales = scale_base[1:, 0]
-    scales.copy_(torch.rand((seq_len,), device=device, dtype=torch.float32) * 0.02 + 0.001)
+    scales.copy_(
+        torch.rand((seq_len,), device=device, dtype=torch.float32) * 0.02 + 0.001
+    )
 
     weights = torch.rand((num_rows, num_heads), device=device, dtype=torch.float32)
     ks = torch.zeros((num_rows,), device=device, dtype=torch.int32)
@@ -247,7 +255,9 @@ def test_sparse_attention_bf16_accepts_unaligned_runtime_views() -> None:
         dtype=torch.bfloat16,
     )
     kv = kv_storage[1:].view(kv_rows, head_dim)
-    kv.copy_(torch.randn(kv.shape, device=device, dtype=torch.float32).to(torch.bfloat16))
+    kv.copy_(
+        torch.randn(kv.shape, device=device, dtype=torch.float32).to(torch.bfloat16)
+    )
 
     indices_storage = torch.empty(
         num_tokens * index_width + 1,
@@ -301,8 +311,10 @@ def test_paged_mqa_logits_accepts_unaligned_runtime_views() -> None:
         device=device,
         dtype=torch.uint8,
     )
-    q = q_storage[1:].view(torch.float8_e4m3fn).view(
-        batch_size, next_n, num_heads, head_dim
+    q = (
+        q_storage[1:]
+        .view(torch.float8_e4m3fn)
+        .view(batch_size, next_n, num_heads, head_dim)
     )
     q.copy_(
         torch.randn(q.shape, device=device, dtype=torch.float32)
