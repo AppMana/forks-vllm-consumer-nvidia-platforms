@@ -112,9 +112,13 @@ IS_DENSE = False
 
 BREAKABLE_CUDAGRAPH_AUTO_ENABLE_ARCHITECTURES = frozenset(
     {
-        "DeepseekV4ForCausalLM",
-        "DeepSeekV4MTPModel",
-        "DSparkDraftModel",
+        # DeepSeek V4 is deliberately absent: its attention is an opaque
+        # splitting op (torch.ops.vllm.deepseek_v4_attention), so standard
+        # piecewise CUDA graphs cover it. Breakable capture is lazy per batch
+        # descriptor and runs gc.collect() plus empty_cache() before a
+        # per-layer segmented capture; on a GB10 unified pool holding the
+        # full model that stalls decode for tens of seconds per new
+        # descriptor.
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForCausalLM",
