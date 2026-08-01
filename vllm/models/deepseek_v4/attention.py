@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -81,6 +82,31 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+# Diagnostic: serialize the attention stages and log per-stage GPU wall time.
+# Read once at import; never part of traced code (the op interior is opaque).
+_STEP_TIMING = os.environ.get("APPMANA_DSV4_STEP_TIMING", "0") == "1"
+_STEP_TIMING_STATS: dict[str, list[float]] = {}
+_STEP_TIMING_CALLS = 0
+
+
+def _step_timing_record(section: str, seconds: float) -> None:
+    bucket = _STEP_TIMING_STATS.setdefault(section, [0.0, 0.0])
+    bucket[0] += seconds
+    bucket[1] += 1.0
+
+
+def _step_timing_maybe_log() -> None:
+    global _STEP_TIMING_CALLS
+    _STEP_TIMING_CALLS += 1
+    if _STEP_TIMING_CALLS % 256 != 0:
+        return
+    parts = [
+        f"{name}={total * 1000.0 / max(count, 1.0):.2f}ms(n={int(count)})"
+        for name, (total, count) in sorted(_STEP_TIMING_STATS.items())
+    ]
+    logger.info("DSV4_STEP_TIMING %s", " ".join(parts))
+    _STEP_TIMING_STATS.clear()
 
 
 def use_compilation_safe_attn_gemm_overlap(num_tokens: int) -> bool:
@@ -520,6 +546,42 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # on the default stream so q stays on its consumer stream (forward_mqa
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
+        if _STEP_TIMING and self.indexer is not None:
+            # Serial stages with sync fences: attributes per-stage GPU wall
+            # time at the cost of losing the aux-stream overlap. Diagnostic
+            # only; guarded by APPMANA_DSV4_STEP_TIMING=1.
+            import time as _time
+
+            assert self.compressor is not None
+            torch.cuda.synchronize()
+            t0 = _time.perf_counter()
+            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            torch.cuda.synchronize()
+            t1 = _time.perf_counter()
+            self.compressor(kv_score, positions, self.rotary_emb)
+            torch.cuda.synchronize()
+            t2 = _time.perf_counter()
+            self.indexer(
+                hidden_states,
+                qr,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                self.indexer_rotary_emb,
+            )
+            torch.cuda.synchronize()
+            t3 = _time.perf_counter()
+            self.forward_mqa(q, kv, positions, out)
+            torch.cuda.synchronize()
+            t4 = _time.perf_counter()
+            _step_timing_record("wq_b_kv_insert", t1 - t0)
+            _step_timing_record("compressor", t2 - t1)
+            _step_timing_record("indexer", t3 - t2)
+            _step_timing_record("forward_mqa", t4 - t3)
+            _step_timing_maybe_log()
+            return
+
         if self.indexer is not None:
             aux_streams = self.aux_stream_list
             indexer = self.indexer
