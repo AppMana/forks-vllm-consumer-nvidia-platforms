@@ -503,13 +503,11 @@ def _write_config(
     }
     # The official DeepSeek checkpoints do not carry this fork-specific
     # runtime block. Requantized INT4/INT8 checkpoints must emit it explicitly:
-    # engine setup intentionally leaves --kv-cache-dtype=auto untouched when
-    # the block is absent, while the DSV4 attention layout requires a concrete
-    # int8_ds_mla cache type. Keep this identical to the proven production
-    # checkpoint; every symbol is validated fail-closed by kernel_config.py.
+    # the block keeps kernel selection explicit and portable across runtime
+    # versions. Keep this identical to the published checkpoint;
+    # every symbol is validated fail-closed by kernel_config.py.
     cfg["vllm"] = {
         "kernels": [
-            "flash_mla.sparse_mla_decode_fp8",
             "flash_mla.sparse_mla_decode_int8",
             "flash_mla.sparse_mla_prefill_int8",
             "vllm._custom_ops.indexer_k_quant_and_cache_int8",
@@ -520,6 +518,10 @@ def _write_config(
             (
                 "vllm.model_executor.layers.quantization.utils.marlin_utils"
                 ".marlin_act_int8_process_scales"
+            ),
+            (
+                "vllm.model_executor.layers.sparse_attn_indexer"
+                ".streaming_prefill_topk"
             ),
         ],
         "cache_type": "int8_ds_mla",

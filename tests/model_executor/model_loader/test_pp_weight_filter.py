@@ -116,18 +116,38 @@ class TestShouldSkipPpWeight:
             "model.layers.20.self_attn.q_proj.weight", local_range
         )
 
-    def test_dense_weight_never_skipped(self):
+    def test_global_weight_stage_ownership(self):
         local_range = (10, 20)
-        assert not should_skip_pp_weight("model.embed_tokens.weight", local_range)
-        assert not should_skip_pp_weight("model.norm.weight", local_range)
-        assert not should_skip_pp_weight("lm_head.weight", local_range)
-
-    def test_mtp_weight_never_skipped(self):
-        # Even though rank owning layers [10,20) doesn't own layer 0's
-        # transformer block, MTP weights aren't ".layers.N."-shaped and
-        # must pass through untouched.
-        local_range = (10, 20)
-        assert not should_skip_pp_weight("model.mtp.0.embed_tokens.weight", local_range)
+        middle = {
+            "is_first_pipeline_rank": False,
+            "is_last_pipeline_rank": False,
+        }
+        assert should_skip_pp_weight(
+            "model.embed_tokens.weight", local_range, **middle
+        )
+        assert should_skip_pp_weight("model.norm.weight", local_range, **middle)
+        assert should_skip_pp_weight("lm_head.weight", local_range, **middle)
+        assert should_skip_pp_weight(
+            "model.mtp.0.embed_tokens.weight", local_range, **middle
+        )
+        assert not should_skip_pp_weight(
+            "embed.weight",
+            local_range,
+            is_first_pipeline_rank=True,
+            is_last_pipeline_rank=False,
+        )
+        assert not should_skip_pp_weight(
+            "head.weight",
+            local_range,
+            is_first_pipeline_rank=False,
+            is_last_pipeline_rank=True,
+        )
+        assert not should_skip_pp_weight(
+            "mtp.0.norm.weight",
+            local_range,
+            is_first_pipeline_rank=False,
+            is_last_pipeline_rank=True,
+        )
 
     def test_expert_weight_layer_filtered_same_as_dense(self):
         local_range = (10, 20)
@@ -239,7 +259,13 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
         # Rank owns layers [3, 6) of 10.
         local_range = (3, 6)
         loaded = dict(
-            safetensors_weights_iterator(files, False, local_layer_range=local_range)
+            safetensors_weights_iterator(
+                files,
+                False,
+                local_layer_range=local_range,
+                is_first_pipeline_rank=False,
+                is_last_pipeline_rank=False,
+            )
         )
 
         for name in loaded:
@@ -251,10 +277,10 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
         layer_names = [n for n in loaded if parse_layer_id(n) is not None]
         assert len(layer_names) == 3 * 2
 
-        # Dense weights always present regardless of PP filtering.
-        assert "model.embed_tokens.weight" in loaded
-        assert "model.norm.weight" in loaded
-        assert "lm_head.weight" in loaded
+        # This is a middle rank: global first/last-stage tensors are not read.
+        assert "model.embed_tokens.weight" not in loaded
+        assert "model.norm.weight" not in loaded
+        assert "lm_head.weight" not in loaded
 
     def test_pp_filter_full_coverage_across_ranks(self, tmp_path):
         files, expected = self._make_synthetic_files(tmp_path, num_layers=10)
@@ -266,7 +292,11 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
             local_range = get_pp_indices(10, pp_rank, pp_size)
             loaded = dict(
                 safetensors_weights_iterator(
-                    files, False, local_layer_range=local_range
+                    files,
+                    False,
+                    local_layer_range=local_range,
+                    is_first_pipeline_rank=pp_rank == 0,
+                    is_last_pipeline_rank=pp_rank == pp_size - 1,
                 )
             )
             layer_names = {n for n in loaded if parse_layer_id(n) is not None}
@@ -278,13 +308,84 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
         }
         assert all_layer_names == expected_layer_names
 
+    def test_global_weights_are_read_only_on_owning_rank(self, tmp_path):
+        files, _ = self._make_synthetic_files(tmp_path, num_layers=4)
+        first = dict(
+            safetensors_weights_iterator(
+                files,
+                False,
+                local_layer_range=(0, 2),
+                is_first_pipeline_rank=True,
+                is_last_pipeline_rank=False,
+            )
+        )
+        last = dict(
+            safetensors_weights_iterator(
+                files,
+                False,
+                local_layer_range=(2, 4),
+                is_first_pipeline_rank=False,
+                is_last_pipeline_rank=True,
+            )
+        )
+        assert "model.embed_tokens.weight" in first
+        assert "model.norm.weight" not in first
+        assert "lm_head.weight" not in first
+        assert "model.embed_tokens.weight" not in last
+        assert "model.norm.weight" in last
+        assert "lm_head.weight" in last
+
+    def test_middle_rank_never_materializes_global_tensors(
+        self, tmp_path, monkeypatch
+    ):
+        files, _ = self._make_synthetic_files(tmp_path, num_layers=4)
+        opened = []
+        real_safe_open = weight_utils.safe_open
+
+        class RecordingSafeOpen:
+            def __init__(self, *args, **kwargs):
+                self.context = real_safe_open(*args, **kwargs)
+
+            def __enter__(self):
+                self.handle = self.context.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.context.__exit__(*args)
+
+            def keys(self):
+                return self.handle.keys()
+
+            def get_tensor(self, name):
+                opened.append(name)
+                return self.handle.get_tensor(name)
+
+        monkeypatch.setattr(weight_utils, "safe_open", RecordingSafeOpen)
+        dict(
+            safetensors_weights_iterator(
+                files,
+                False,
+                local_layer_range=(1, 3),
+                is_first_pipeline_rank=False,
+                is_last_pipeline_rank=False,
+            )
+        )
+        assert opened
+        assert all(parse_layer_id(name) in (1, 2) for name in opened)
+
     def test_tensor_values_match(self, tmp_path):
         files, _ = self._make_synthetic_files(tmp_path, num_layers=10)
         all_weights = dict(safetensors_weights_iterator(files, False))
 
         local_range = (3, 6)
         filtered = dict(
-            safetensors_weights_iterator(files, False, local_layer_range=local_range)
+            safetensors_weights_iterator(
+                files,
+                False,
+                local_layer_range=local_range,
+                is_first_pipeline_rank=False,
+                is_last_pipeline_rank=False,
+            )
         )
         for name, tensor in filtered.items():
             assert torch.equal(tensor, all_weights[name]), f"Tensor mismatch for {name}"
@@ -304,11 +405,13 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
                 False,
                 safetensors_load_strategy="pinned",
                 local_layer_range=(1, 2),
+                is_first_pipeline_rank=False,
+                is_last_pipeline_rank=False,
             )
         )
 
         assert len(pinned_names) == len(loaded)
-        assert {parse_layer_id(name) for name in loaded} == {None, 1}
+        assert {parse_layer_id(name) for name in loaded} == {1}
 
 
 class TestSafetensorsWeightsIteratorNoModelPrefix:
@@ -338,7 +441,13 @@ class TestSafetensorsWeightsIteratorNoModelPrefix:
         files, expected = self._make_synthetic_files(tmp_path, num_layers=10)
         local_range = (3, 6)
         loaded = dict(
-            safetensors_weights_iterator(files, False, local_layer_range=local_range)
+            safetensors_weights_iterator(
+                files,
+                False,
+                local_layer_range=local_range,
+                is_first_pipeline_rank=False,
+                is_last_pipeline_rank=False,
+            )
         )
 
         for name in loaded:
@@ -351,5 +460,5 @@ class TestSafetensorsWeightsIteratorNoModelPrefix:
             f"expected 6 local-layer tensors, got {len(layer_names)}: "
             f"{layer_names} -- filter is not actually skipping anything"
         )
-        assert "embed.weight" in loaded
-        assert "head.weight" in loaded
+        assert "embed.weight" not in loaded
+        assert "head.weight" not in loaded

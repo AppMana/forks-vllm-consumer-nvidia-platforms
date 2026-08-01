@@ -72,8 +72,8 @@ ROLE_SPARSE_MLA_DECODE_FP8 = "sparse_mla_decode_fp8"
 ROLE_SPARSE_MLA_DECODE_INT8 = "sparse_mla_decode_int8"
 ROLE_SPARSE_MLA_PREFILL = "sparse_mla_prefill"
 ROLE_MHC = "mhc"
-# Toggle roles: membership turns the path on; absence (in an explicit block)
-# turns it off.
+# Toggle roles: membership turns the path on. In an explicit block, absence
+# turns it off; family-aware blockless resolvers may add implied roles.
 ROLE_INDEXER_CACHE_INT8 = "indexer_cache_int8"
 ROLE_INDEXER_QUERY_INT8 = "indexer_query_int8"
 ROLE_DENSE_EXPERTS_INT8_ACTIVATION = "dense_experts_int8_activation"
@@ -180,12 +180,12 @@ _PROOF_ROLE_ORDER = (
 class ResolvedKernelConfig:
     """Validated role -> symbol assignment for one checkpoint."""
 
-    # True when a "vllm" block with a "kernels" list was present. When
-    # False (blockless), selector roles carry their documented defaults and
-    # every toggle role is off.
+    # True when a "vllm" block with a "kernels" list was present. A False
+    # value means checkpoint-family resolution supplied the blockless roles.
     explicit: bool
-    # Active role -> symbol. Selector roles are always present; toggle roles
-    # are present iff listed in an explicit block.
+    # Active role -> symbol. Selector roles are always present. Toggle roles
+    # are present when listed explicitly or implied by a blockless checkpoint
+    # family (the INT weight format implies its INT8 runtime roles).
     roles: Mapping[str, str] = field(default_factory=dict)
     # Roles whose symbol was EXPLICITLY listed in the block's kernels list
     # (as opposed to filled in by SELECTOR_ROLE_DEFAULTS). Lets arch-specific
@@ -479,6 +479,32 @@ def resolve_kernel_config_from_hf_config(
     return resolved
 
 
+def resolve_int_quant_kernel_config(
+    block: Any, *, has_int_weight_family: bool
+) -> ResolvedKernelConfig:
+    """Resolve the state available while constructing ``Dsv4IntConfig``.
+
+    Quantization config construction receives the nested quantization dict,
+    not the complete HF config or device capability. For a blockless INT
+    checkpoint the architecture-specific selector roles are resolved later by
+    ``resolve_kernel_config_from_hf_config``; the weight-format-implied INT8
+    toggle roles are already unambiguous and must not depend on call order.
+    """
+    resolved = resolve_kernel_config(block)
+    if resolved.explicit or not has_int_weight_family:
+        return resolved
+    return dataclasses.replace(
+        resolved,
+        roles={
+            **resolved.roles,
+            ROLE_INDEXER_CACHE_INT8: INDEXER_CACHE_INT8_WRITER,
+            ROLE_INDEXER_QUERY_INT8: INDEXER_QUERY_INT8_QUANT,
+            ROLE_DENSE_EXPERTS_INT8_ACTIVATION: DENSE_EXPERTS_INT8_ACTIVATION,
+        },
+        cache_type="int8_ds_mla",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Process-wide activation (set once per process; survives Ray unpickle via
 # Dsv4IntConfig.__setstate__ and model build via DeepseekV4Attention.__init__)
@@ -507,53 +533,48 @@ def active_kernel_config() -> ResolvedKernelConfig | None:
 def indexer_cache_int8_enabled() -> bool:
     """True when the indexer K cache stores symmetric INT8 instead of FP8.
 
-    On iff ``indexer_k_quant_and_cache_int8`` is listed in an explicit
-    block; no block (or no active config) means OFF.
+    Explicit blocks use membership as the toggle. Blockless INT checkpoints
+    activate it from their weight family; no active config means OFF.
     """
     config = _ACTIVE_CONFIG
-    if config is not None and config.explicit:
-        return config.has_role(ROLE_INDEXER_CACHE_INT8)
-    return False
+    return config is not None and config.has_role(ROLE_INDEXER_CACHE_INT8)
 
 
 def indexer_query_int8_enabled() -> bool:
     """True when the indexer query is quantized to symmetric INT8 so the
     logits run as s8 x s8 integer MMA.
 
-    On iff ``fused_indexer_q_rope_quant_int8`` is listed in an explicit
-    block (resolution guarantees the INT8 cache is also on); no block (or
-    no active config) means OFF.
+    Explicit blocks use membership as the toggle. Blockless INT checkpoints
+    activate it from their weight family (and resolution guarantees the INT8
+    cache is also on); no active config means OFF.
     """
     config = _ACTIVE_CONFIG
-    if config is not None and config.explicit:
-        return config.has_role(ROLE_INDEXER_QUERY_INT8)
-    return False
+    return config is not None and config.has_role(ROLE_INDEXER_QUERY_INT8)
 
 
 def dense_experts_int8_activation_enabled() -> bool:
     """True when the Marlin INT8-activation (W4A8) expert runtime is active.
 
-    On iff ``marlin_act_int8_process_scales`` is listed in an explicit
-    block; no block (or no active config) means OFF.
+    Explicit blocks use membership as the toggle. Blockless INT checkpoints
+    activate it from their weight family; no active config means OFF.
     """
     config = _ACTIVE_CONFIG
-    if config is not None and config.explicit:
-        return config.has_role(ROLE_DENSE_EXPERTS_INT8_ACTIVATION)
-    return False
+    return config is not None and config.has_role(
+        ROLE_DENSE_EXPERTS_INT8_ACTIVATION
+    )
 
 
 def indexer_streaming_topk_prefill_enabled() -> bool:
     """True when the prefill indexer runs the slab-tiled streaming top-k
     instead of materializing the full [M, N] logits.
 
-    On iff ``streaming_prefill_topk`` is listed in an explicit block; no
-    block (or no active config) means OFF -- the one-shot prefill path is
-    preserved bit-for-bit.
+    On iff ``streaming_prefill_topk`` is active in the resolved config. It is
+    not implied by a blockless checkpoint; no active config means OFF.
     """
     config = _ACTIVE_CONFIG
-    if config is not None and config.explicit:
-        return config.has_role(ROLE_INDEXER_STREAMING_TOPK_PREFILL)
-    return False
+    return config is not None and config.has_role(
+        ROLE_INDEXER_STREAMING_TOPK_PREFILL
+    )
 
 
 def indexer_prefill_topk_slab_rows_override() -> int | None:
@@ -581,7 +602,14 @@ def apply_checkpoint_config(model_config: Any, cache_config: Any) -> None:
     when the CLI left ``cache_dtype`` at ``"auto"``.
     """
     hf_config = getattr(model_config, "hf_config", None)
-    if hf_config is None or getattr(hf_config, VLLM_CONFIG_KEY, None) is None:
+    if hf_config is None:
+        return
+    architectures = getattr(hf_config, "architectures", None) or ()
+    is_deepseek_v4 = getattr(model_config, "quantization", None) in (
+        "dsv4_int",
+        "dsv4_mxfp4_int8",
+    ) or any("DeepseekV4" in architecture for architecture in architectures)
+    if not is_deepseek_v4:
         return
     resolved = resolve_kernel_config_from_hf_config(hf_config)
 
@@ -616,8 +644,8 @@ def resolved_proof_line(resolved: ResolvedKernelConfig, *, kv_cache_dtype: str) 
     parts = []
     for role in _PROOF_ROLE_ORDER:
         if role in TOGGLE_ROLES:
-            # Toggle roles carry a symbol iff listed in an explicit block;
-            # blockless resolution never activates them.
+            # Toggle roles carry a symbol iff active. Blockless INT checkpoint
+            # resolution activates the weight-format-implied INT8 roles.
             symbol = resolved.symbol(role) or "off"
         else:
             symbol = resolved.roles[role]

@@ -62,8 +62,35 @@ def _make_source_hf_cache(tmp_path, num_layers=6):
     return str(snap)
 
 
-def _stage(src_snap, dest_root, layer_range):
-    return prep.stage_shards(src_snap, str(dest_root), layer_range)
+def _stage(
+    src_snap,
+    dest_root,
+    layer_range,
+    *,
+    is_first_pipeline_rank=True,
+    is_last_pipeline_rank=True,
+):
+    return prep.stage_shards(
+        src_snap,
+        str(dest_root),
+        layer_range,
+        is_first_pipeline_rank=is_first_pipeline_rank,
+        is_last_pipeline_rank=is_last_pipeline_rank,
+    )
+
+
+def _add_global_shard(src_snap, tensor_name, shard_name, etag):
+    src_snap = os.path.abspath(src_snap)
+    blobs = os.path.join(os.path.dirname(os.path.dirname(src_snap)), "blobs")
+    with open(os.path.join(blobs, etag), "wb") as f:
+        f.write(tensor_name.encode())
+    os.symlink(f"../../blobs/{etag}", os.path.join(src_snap, shard_name))
+    index_path = os.path.join(src_snap, prep.SAFE_WEIGHTS_INDEX_NAME)
+    with open(index_path) as f:
+        index = json.load(f)
+    index["weight_map"][tensor_name] = shard_name
+    with open(index_path, "w") as f:
+        json.dump(index, f)
 
 
 def _local_repo(dest_root):
@@ -97,6 +124,47 @@ def test_owned_link_local_blob_foreign_link_source_blob(tmp_path):
             assert target.startswith(src_blobs)
     shared = os.path.realpath(os.path.join(dest, "model-shared.safetensors"))
     assert shared.startswith(os.path.realpath(local_blobs))
+
+
+def test_stage_shards_places_global_tensors_on_owning_pp_rank(tmp_path):
+    src = _make_source_hf_cache(tmp_path)
+    _add_global_shard(src, "norm.weight", "model-norm.safetensors", "norm-etag")
+    _add_global_shard(src, "head.weight", "model-head.safetensors", "head-etag")
+    _add_global_shard(src, "mtp.0.norm.weight", "model-mtp.safetensors", "mtp-etag")
+    dest_root = tmp_path / "local"
+
+    middle = _stage(
+        src,
+        dest_root,
+        (2, 4),
+        is_first_pipeline_rank=False,
+        is_last_pipeline_rank=False,
+    )
+    for shard in (
+        "model-shared.safetensors",
+        "model-norm.safetensors",
+        "model-head.safetensors",
+        "model-mtp.safetensors",
+    ):
+        assert "hf-cache" in os.path.realpath(os.path.join(middle, shard))
+
+    last = _stage(
+        src,
+        dest_root,
+        (4, 6),
+        is_first_pipeline_rank=False,
+        is_last_pipeline_rank=True,
+    )
+    assert "hf-cache" in os.path.realpath(
+        os.path.join(last, "model-shared.safetensors")
+    )
+    local_blobs = os.path.realpath(os.path.join(_local_repo(dest_root), "blobs"))
+    for shard in (
+        "model-norm.safetensors",
+        "model-head.safetensors",
+        "model-mtp.safetensors",
+    ):
+        assert os.path.realpath(os.path.join(last, shard)).startswith(local_blobs)
 
 
 def test_blob_names_match_source_etags(tmp_path):

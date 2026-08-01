@@ -168,6 +168,9 @@ def stage_shards(
     source_dir: str,
     dest_root: str,
     local_layer_range: tuple[int, int] | None,
+    *,
+    is_first_pipeline_rank: bool = True,
+    is_last_pipeline_rank: bool = True,
 ) -> str:
     from vllm.model_executor.model_loader.pp_weight_filter import classify_shards
 
@@ -177,7 +180,12 @@ def stage_shards(
         index_bytes = f.read()
     weight_map: dict[str, str] = json.loads(index_bytes)["weight_map"]
 
-    needs_copy = classify_shards(weight_map, local_layer_range)
+    needs_copy = classify_shards(
+        weight_map,
+        local_layer_range,
+        is_first_pipeline_rank=is_first_pipeline_rank,
+        is_last_pipeline_rank=is_last_pipeline_rank,
+    )
 
     repo_name, rev = _parse_source_snapshot(source_dir)
     repo_dir = _local_repo_dir(dest_root, repo_name)
@@ -310,7 +318,13 @@ def main(argv: list[str] | None = None) -> int:
     local_layer_range = _resolve_local_layer_range(
         args.source_dir, args.pp_rank, args.pp_size, args.trust_remote_code
     )
-    snap_dir = stage_shards(args.source_dir, args.dest_root, local_layer_range)
+    snap_dir = stage_shards(
+        args.source_dir,
+        args.dest_root,
+        local_layer_range,
+        is_first_pipeline_rank=args.pp_rank == 0,
+        is_last_pipeline_rank=args.pp_rank == args.pp_size - 1,
+    )
     if args.gc:
         removed = gc_dest_root(
             args.dest_root, keep_dir=snap_dir, source_dir=args.source_dir

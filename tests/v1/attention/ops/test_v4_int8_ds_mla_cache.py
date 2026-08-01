@@ -4,18 +4,19 @@
 
 import inspect
 
+import pytest
 import torch
 
 from vllm.models.deepseek_v4.attention import _resolve_dsv4_kv_cache_dtype
-from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
-    compress_norm_rope_store_triton,
-)
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     dequantize_and_gather_int8_ds_mla_cache,
     dequantize_and_gather_k_cache,
     dequantize_global_slots_int8_ds_mla_cache,
     get_int8_ds_mla_cache_views,
     quantize_and_insert_int8_ds_mla_cache,
+)
+from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
+    compress_norm_rope_store_triton,
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLABackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
@@ -422,51 +423,38 @@ def test_fused_qnorm_rope_kv_insert_dispatches_int8(monkeypatch) -> None:
     assert calls == ["int8"]
 
 
-def test_generic_gather_leaves_fp8_shaped_aux_cache_on_fp8_path(monkeypatch) -> None:
-    import vllm.models.deepseek_v4.common.ops.cache_utils as cache_utils
-
-    calls = []
-
-    def fail_int8(*args, **kwargs):
-        raise AssertionError("int8 gather must not read fp8-shaped cache")
-
-    def record_fp8(*args, **kwargs):
-        calls.append("fp8")
-
-    monkeypatch.setattr(
-        cache_utils, "dequantize_and_gather_int8_ds_mla_cache", fail_int8
-    )
-    monkeypatch.setattr(cache_utils, "_dequantize_and_gather_k_cache_torch", record_fp8)
-    monkeypatch.setattr(cache_utils, "_supports_fp8e4nv_in_triton", lambda: False)
-    # Environments whose _C provides the native sm_8x gather take that path
-    # instead of the torch fallback; force the fallback so this test observes
-    # a single deterministic fp8 route on every build.
-    monkeypatch.setattr(
-        cache_utils.torch.ops._C,
-        "deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache",
-        record_fp8,
-        raising=False,
-    )
-
-    device = _device()
+@pytest.mark.parametrize("flat", [False, True])
+def test_generic_gather_rejects_fp8_layout_for_explicit_int8_dtype(flat) -> None:
     block_size = 64
-    out = torch.empty(1, 1, 512, dtype=torch.bfloat16, device=device)
-    fp8_shaped_cache = torch.zeros(
-        2, block_size, 584, dtype=torch.uint8, device=device
-    )
-    seq_lens = torch.tensor([1], dtype=torch.int32, device=device)
-    gather_lens = torch.tensor([1], dtype=torch.int32, device=device)
-    block_table = torch.tensor([[0]], dtype=torch.int32, device=device)
+    shape = (2, block_size * 584) if flat else (2, block_size, 584)
+    fp8_shaped_cache = torch.zeros(shape, dtype=torch.uint8)
 
-    dequantize_and_gather_k_cache(
-        out,
-        fp8_shaped_cache,
-        seq_lens=seq_lens,
-        gather_lens=gather_lens,
-        block_table=block_table,
-        block_size=block_size,
-        offset=0,
-        cache_dtype="int8_ds_mla",
-    )
+    with pytest.raises(ValueError, match="528-byte INT8 cache layout"):
+        dequantize_and_gather_k_cache(
+            torch.empty(1, 1, 512, dtype=torch.bfloat16),
+            fp8_shaped_cache,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            gather_lens=torch.tensor([1], dtype=torch.int32),
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            block_size=block_size,
+            offset=0,
+            cache_dtype="int8_ds_mla",
+        )
 
-    assert calls == ["fp8"]
+
+def test_generic_gather_rejects_wrong_block_count_for_int8_layout() -> None:
+    block_size = 64
+    wrong_block_count = torch.zeros(
+        2, block_size - 1, 528, dtype=torch.uint8
+    )
+    with pytest.raises(ValueError, match="528-byte INT8 cache layout"):
+        dequantize_and_gather_k_cache(
+            torch.empty(1, 1, 512, dtype=torch.bfloat16),
+            wrong_block_count,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            gather_lens=torch.tensor([1], dtype=torch.int32),
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            block_size=block_size,
+            offset=0,
+            cache_dtype="int8_ds_mla",
+        )

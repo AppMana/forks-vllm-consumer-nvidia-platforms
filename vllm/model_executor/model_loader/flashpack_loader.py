@@ -292,18 +292,6 @@ def _import_flashpack():
     )
 
 
-def _is_first_pipeline_rank() -> bool:
-    from vllm.distributed import get_pp_group
-
-    return get_pp_group().is_first_rank
-
-
-def _is_last_pipeline_rank() -> bool:
-    from vllm.distributed import get_pp_group
-
-    return get_pp_group().is_last_rank
-
-
 def flashpack_weights_iterator(
     index: FlashPackIndex,
     parts: tuple[FlashPackPart, ...],
@@ -362,6 +350,8 @@ class FlashPackModelLoader(DefaultModelLoader):
         BaseModelLoader.__init__(self, load_config)
         self.local_expert_ids: set[int] | None = None
         self.local_layer_range: tuple[int, int] | None = None
+        self.is_first_pipeline_rank = True
+        self.is_last_pipeline_rank = True
         self.counter_before_loading_weights = 0.0
         self.counter_after_loading_weights = 0.0
         self.enable_weights_track = None
@@ -440,7 +430,12 @@ class FlashPackModelLoader(DefaultModelLoader):
 
         def should_load_weight(name: str) -> bool:
             return (
-                not should_skip_pp_weight(name, self.local_layer_range)
+                not should_skip_pp_weight(
+                    name,
+                    self.local_layer_range,
+                    is_first_pipeline_rank=self.is_first_pipeline_rank,
+                    is_last_pipeline_rank=self.is_last_pipeline_rank,
+                )
                 and not should_skip_weight(name, self.local_expert_ids)
                 and not is_pp_missing_parameter(name, model)
             )
@@ -450,10 +445,10 @@ class FlashPackModelLoader(DefaultModelLoader):
             should_load_weight,
             include_mtp=self.include_mtp,
             is_first_pipeline_stage=(
-                self.local_layer_range is None or _is_first_pipeline_rank()
+                self.local_layer_range is None or self.is_first_pipeline_rank
             ),
             is_last_pipeline_stage=(
-                self.local_layer_range is None or _is_last_pipeline_rank()
+                self.local_layer_range is None or self.is_last_pipeline_rank
             ),
         )
         if not parts:

@@ -3,9 +3,9 @@
 """Unified checkpoint-config-driven kernel configuration for AppMana DSV4.
 
 Covers the ``"vllm"`` config.json block: symbol-list resolution to roles,
-fail-closed validation, blockless defaults (selector roles get their
-documented defaults, all toggle roles off), indexer int8 independence from
-the dense runtime, cache_type defaulting, and Ray unpickle gate propagation.
+fail-closed validation, checkpoint-family-aware blockless defaults, indexer
+int8 independence from the dense runtime, cache_type defaulting, and Ray
+unpickle gate propagation.
 """
 
 import pickle
@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import vllm.model_executor.layers.quantization.dsv4_int as dsv4_int_module
 import vllm.transformers_utils.configs.dsv4.kernel_config as kernel_config
 from vllm.model_executor.layers.quantization.dsv4_int import Dsv4IntConfig
 from vllm.platforms.interface import DeviceCapability
@@ -72,7 +71,6 @@ _INT_GROUPS = {
 @pytest.fixture(autouse=True)
 def _reset_kernel_config_globals(monkeypatch):
     monkeypatch.setattr(kernel_config, "_ACTIVE_CONFIG", None)
-    monkeypatch.setattr(dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False)
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +247,7 @@ def test_defaults_when_absent():
     assert resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_TRITON
     assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_TRITON
     assert resolved.roles[ROLE_MHC] == MHC_VLLM_AUTO
-    # Blockless resolution never activates a toggle role.
+    # The raw block parser has no checkpoint family and adds no toggle role.
     assert ROLE_INDEXER_CACHE_INT8 not in resolved.roles
     assert ROLE_INDEXER_QUERY_INT8 not in resolved.roles
     assert ROLE_DENSE_EXPERTS_INT8_ACTIVATION not in resolved.roles
@@ -257,8 +255,8 @@ def test_defaults_when_absent():
     assert resolved.cache_type is None
 
 
-def test_blockless_active_config_leaves_all_toggles_off():
-    """Blockless resolution: selector defaults, every toggle gate False."""
+def test_raw_blockless_parser_leaves_all_toggles_off():
+    """The family-agnostic parser cannot infer any toggle role."""
     activate_kernel_config(resolve_kernel_config(None))
     assert not indexer_cache_int8_enabled()
     assert not indexer_query_int8_enabled()
@@ -369,9 +367,9 @@ def test_blockless_fp_falls_back_to_triton_without_flash_mla(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_blockless_dsv4_int_config_leaves_dense_and_indexer_off():
-    """Without a "vllm" block, the dense W4A8 runtime and both indexer int8
-    paths stay OFF, even on a checkpoint carrying INT4/INT8 weight groups."""
+def test_blockless_dsv4_int_config_activates_weight_implied_int_paths():
+    """INT4 expert and INT8 dense groups deterministically activate the INT
+    paths even when quant config construction happens before HF resolution."""
     from vllm.models.deepseek_v4.nvidia_imma import triton_kernels as dsv4_sm86
 
     cfg = Dsv4IntConfig.from_config(
@@ -380,14 +378,13 @@ def test_blockless_dsv4_int_config_leaves_dense_and_indexer_off():
             "config_groups": _INT_GROUPS,
         }
     )
-    assert not cfg.experimental_int8_runtime
-    assert cfg.expert_input_dtype is None
-    assert not dsv4_int_module.dsv4_int4_experts_int8_dense_active()
-    assert not indexer_cache_int8_enabled()
-    assert not indexer_query_int8_enabled()
-    assert not dense_experts_int8_activation_enabled()
-    assert not dsv4_sm86.indexer_cache_is_int8()
-    assert not dsv4_sm86.indexer_imma_enabled()
+    assert cfg.experimental_int8_runtime
+    assert cfg.expert_input_dtype is torch.int8
+    assert indexer_cache_int8_enabled()
+    assert indexer_query_int8_enabled()
+    assert dense_experts_int8_activation_enabled()
+    assert dsv4_sm86.indexer_cache_is_int8()
+    assert dsv4_sm86.indexer_imma_enabled()
 
 
 def test_vllm_block_enables_dense_runtime():
@@ -400,7 +397,6 @@ def test_vllm_block_enables_dense_runtime():
     )
     assert cfg.experimental_int8_runtime
     assert cfg.expert_input_dtype is torch.int8
-    assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
     assert dense_experts_int8_activation_enabled()
 
 
@@ -420,7 +416,6 @@ def test_vllm_block_enables_indexer_int8_without_dense_runtime():
     # Dense/W4A8 runtime stays OFF: the block did not list its symbol.
     assert not cfg.experimental_int8_runtime
     assert cfg.expert_input_dtype is None
-    assert not dsv4_int_module.dsv4_int4_experts_int8_dense_active()
     # Indexer int8 is ON, independent of the dense flag.
     assert indexer_cache_int8_enabled()
     assert indexer_query_int8_enabled()
@@ -492,14 +487,14 @@ def test_marlin_input_dtype_from_block_with_env_unset(monkeypatch):
     assert cfg.resolve_marlin_input_dtype() is torch.int8
 
 
-def test_marlin_input_dtype_env_still_works_without_block(monkeypatch):
+def test_blockless_int_weights_do_not_need_marlin_input_dtype_env(monkeypatch):
     import vllm.envs as envs
 
-    monkeypatch.setattr(envs, "VLLM_MARLIN_INPUT_DTYPE", "int8")
+    monkeypatch.setattr(envs, "VLLM_MARLIN_INPUT_DTYPE", None)
     cfg = Dsv4IntConfig.from_config(
         {"quant_method": "dsv4_int", "config_groups": _INT_GROUPS}
     )
-    assert cfg.expert_input_dtype is None
+    assert cfg.expert_input_dtype is torch.int8
     assert cfg.resolve_marlin_input_dtype() is torch.int8
 
 
@@ -537,7 +532,6 @@ def test_dsv4_int_pickle_restores_kernel_block_gates(monkeypatch):
     payload = pickle.dumps(cfg)
 
     monkeypatch.setattr(kernel_config, "_ACTIVE_CONFIG", None)
-    monkeypatch.setattr(dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False)
     assert not indexer_cache_int8_enabled()
 
     restored = pickle.loads(payload)
@@ -558,12 +552,43 @@ def test_dsv4_int_pickle_restores_dense_runtime_gate(monkeypatch):
     )
     assert cfg.experimental_int8_runtime
     payload = pickle.dumps(cfg)
-    monkeypatch.setattr(dsv4_int_module, "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE", False)
-
     restored = pickle.loads(payload)
 
     assert restored.experimental_int8_runtime
-    assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
+
+
+def test_blockless_int_activation_survives_incomplete_config_construction():
+    int_target = Dsv4IntConfig.from_config(
+        {"quant_method": "dsv4_int", "config_groups": _INT_GROUPS}
+    )
+    assert int_target.experimental_int8_runtime
+    assert indexer_cache_int8_enabled()
+    assert indexer_query_int8_enabled()
+    assert dense_experts_int8_activation_enabled()
+
+    incomplete_other = Dsv4IntConfig.from_config({"quant_method": "dsv4_int"})
+
+    assert not incomplete_other.experimental_int8_runtime
+    assert incomplete_other.expert_input_dtype is None
+    assert indexer_cache_int8_enabled()
+    assert indexer_query_int8_enabled()
+    assert dense_experts_int8_activation_enabled()
+
+
+def test_blockless_int_activation_follows_incomplete_config_construction():
+    incomplete_other = Dsv4IntConfig.from_config({"quant_method": "dsv4_int"})
+    assert not incomplete_other.experimental_int8_runtime
+    assert not indexer_cache_int8_enabled()
+    assert not indexer_query_int8_enabled()
+    assert not dense_experts_int8_activation_enabled()
+
+    int_target = Dsv4IntConfig.from_config(
+        {"quant_method": "dsv4_int", "config_groups": _INT_GROUPS}
+    )
+    assert int_target.experimental_int8_runtime
+    assert indexer_cache_int8_enabled()
+    assert indexer_query_int8_enabled()
+    assert dense_experts_int8_activation_enabled()
 
 
 # ---------------------------------------------------------------------------
@@ -594,11 +619,11 @@ def test_explicit_cli_kv_cache_dtype_wins_over_cache_type():
     assert cache_config.cache_dtype == "fp8"
 
 
-def test_apply_is_a_noop_without_block():
+def test_apply_uses_checkpoint_family_without_block():
     model_config = _fake_model_config(None)
     cache_config = SimpleNamespace(cache_dtype="auto")
     apply_checkpoint_config(model_config, cache_config)
-    assert cache_config.cache_dtype == "auto"
+    assert cache_config.cache_dtype == "int8_ds_mla"
 
 
 def test_apply_fails_closed_on_dense_symbol_with_vanilla_weights():
