@@ -81,7 +81,8 @@ assert "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD" in dsv4_int
 assert "input_scales_static=True" in sparkinfer_moe
 assert "require_uniform_nvfp4_expert_scale" in nvfp4_oracle
 assert "merge_nvfp4_gate_up_input_scales" in flashinfer_fp4
-assert "filter_weights_for_pp_rank" in pp_filter
+assert "def should_skip_pp_weight" in pp_filter
+assert "def classify_shards" in pp_filter
 assert "INT8_DS_MLA_ENTRY_BYTES" in cache_utils
 assert "has_int_weight_family" in kernel_config
 shutil.rmtree("/tmp/vllm-overlay")
