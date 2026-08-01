@@ -13,6 +13,7 @@ COPY vllm/model_executor/warmup/kernel_warmup.py /tmp/vllm-overlay/model_executo
 COPY vllm/model_executor/warmup/qwen_triton_warmup.py /tmp/vllm-overlay/model_executor/warmup/qwen_triton_warmup.py
 COPY vllm/model_executor/layers/fused_moe/experts/sparkinfer_moe.py /tmp/vllm-overlay/model_executor/layers/fused_moe/experts/sparkinfer_moe.py
 COPY vllm/model_executor/layers/fused_moe/oracle/nvfp4.py /tmp/vllm-overlay/model_executor/layers/fused_moe/oracle/nvfp4.py
+COPY vllm/model_executor/layers/sparse_attn_indexer.py /tmp/vllm-overlay/model_executor/layers/sparse_attn_indexer.py
 COPY vllm/model_executor/layers/quantization/dsv4_int.py /tmp/vllm-overlay/model_executor/layers/quantization/dsv4_int.py
 COPY vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py /tmp/vllm-overlay/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
 COPY vllm/model_executor/model_loader/default_loader.py /tmp/vllm-overlay/model_executor/model_loader/default_loader.py
@@ -21,6 +22,7 @@ COPY vllm/model_executor/model_loader/pp_weight_filter.py /tmp/vllm-overlay/mode
 COPY vllm/model_executor/model_loader/weight_utils.py /tmp/vllm-overlay/model_executor/model_loader/weight_utils.py
 COPY vllm/models/deepseek_v4/common/ops/cache_utils.py /tmp/vllm-overlay/models/deepseek_v4/common/ops/cache_utils.py
 COPY vllm/transformers_utils/configs/dsv4/kernel_config.py /tmp/vllm-overlay/transformers_utils/configs/dsv4/kernel_config.py
+COPY vllm/utils/deep_gemm.py /tmp/vllm-overlay/utils/deep_gemm.py
 
 RUN python3 - <<'PY'
 import importlib.util
@@ -40,6 +42,7 @@ for relative in (
     "model_executor/warmup/qwen_triton_warmup.py",
     "model_executor/layers/fused_moe/experts/sparkinfer_moe.py",
     "model_executor/layers/fused_moe/oracle/nvfp4.py",
+    "model_executor/layers/sparse_attn_indexer.py",
     "model_executor/layers/quantization/dsv4_int.py",
     "model_executor/layers/quantization/utils/flashinfer_fp4_moe.py",
     "model_executor/model_loader/default_loader.py",
@@ -48,6 +51,7 @@ for relative in (
     "model_executor/model_loader/weight_utils.py",
     "models/deepseek_v4/common/ops/cache_utils.py",
     "transformers_utils/configs/dsv4/kernel_config.py",
+    "utils/deep_gemm.py",
 ):
     destination = root / relative
     shutil.copy2(sources / relative, destination)
@@ -76,6 +80,8 @@ cache_utils = (root / "models/deepseek_v4/common/ops/cache_utils.py").read_text(
 kernel_config = (
     root / "transformers_utils/configs/dsv4/kernel_config.py"
 ).read_text()
+indexer = (root / "model_executor/layers/sparse_attn_indexer.py").read_text()
+deep_gemm = (root / "utils/deep_gemm.py").read_text()
 vllm_config = (root / "config/vllm.py").read_text()
 assert "prompt_len = min(256" in gpu_warmup
 assert "zero_kv_blocks_warmup(worker.model_runner)" in kernel_warmup
@@ -91,6 +97,8 @@ assert "_INT8_DS_MLA_PAD_BYTES = 12" in cache_utils
 assert "has_int_weight_family" in kernel_config
 assert '"DSparkDraftModel"' in vllm_config
 assert "_configure_breakable_cudagraph" in vllm_config
+assert "Keep contiguous prefill logits on the proven Triton implementation" in indexer
+assert "return int8_mqa_logits_sparkinfer" not in deep_gemm
 shutil.rmtree("/tmp/vllm-overlay")
 print("packed DSV4 KV-cache geometry and prefill warmup fixes installed")
 PY

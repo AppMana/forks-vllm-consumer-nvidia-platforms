@@ -284,22 +284,22 @@ def test_multi_request_row_offsets():
     _assert_sets_equal_mod_boundary_ties(out_glob, prod_glob, logits, ke, topk)
 
 
-def test_sm120_int8_streaming_selects_native_logits_per_slab(monkeypatch):
-    import vllm.model_executor.layers.sparse_attn_indexer as indexer_mod
+def test_sm120_int8_streaming_selects_triton_logits_per_slab(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels
 
     calls = []
 
-    def fake_native(q, kv, weights, k_start, k_end):
+    def fake_triton(q, kv, weights, k_start, k_end, *, qk_int8):
         del weights, k_start, k_end
+        assert qk_int8
         calls.append(kv[0].shape[0])
         scores = torch.arange(kv[0].shape[0], dtype=torch.float32, device=q.device)
         return scores.expand(q.shape[0], -1).contiguous()
 
-    monkeypatch.setattr(indexer_mod, "int8_mqa_logits_sparkinfer", fake_native)
     monkeypatch.setattr(
-        indexer_mod.current_platform,
-        "is_device_capability_family",
-        lambda family: family == 120,
+        triton_kernels,
+        "mqa_logits_workspace_triton",
+        fake_triton,
     )
     q = torch.zeros((2, HEADS, HEAD_DIM), dtype=torch.int8, device="cuda")
     k = torch.zeros((8, HEAD_DIM), dtype=torch.int8, device="cuda")

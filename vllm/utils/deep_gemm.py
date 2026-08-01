@@ -589,18 +589,6 @@ def _fp8_mqa_logits_sm12x(
                 "The INT8 indexer query and contiguous K cache must be selected "
                 "together"
             )
-        if (
-            q_values.dtype == torch.int8
-            and kv[0].dtype == torch.int8
-            and current_platform.is_device_capability_family(120)
-        ):
-            return int8_mqa_logits_sparkinfer(
-                q_values,
-                kv,
-                weights,
-                cu_seqlen_ks,
-                cu_seqlen_ke,
-            )
         from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
             fp8_mqa_logits_triton,
             indexer_imma_enabled,

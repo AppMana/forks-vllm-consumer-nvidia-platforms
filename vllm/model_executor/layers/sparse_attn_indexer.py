@@ -27,7 +27,6 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
-    int8_mqa_logits_sparkinfer,
 )
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import round_up
@@ -323,14 +322,10 @@ def _indexer_prefill_logits(
     *,
     qk_int8: bool,
 ) -> torch.Tensor:
-    if qk_int8 and current_platform.is_device_capability_family(120):
-        return int8_mqa_logits_sparkinfer(
-            q_cast,
-            kv,
-            weights,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-        )
+    # Keep contiguous prefill logits on the proven Triton implementation.
+    # SparkInfer's SM12x contiguous kernel corrupts live long-prefill launches
+    # (Xid 13, misaligned address) and is also slower at the serving shapes.
+    # Its paged decode kernel is a separate contract and remains available.
     from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         mqa_logits_workspace_triton,
     )

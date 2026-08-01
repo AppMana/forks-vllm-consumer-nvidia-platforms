@@ -229,21 +229,24 @@ def test_sm120_int8_contiguous_mqa_logits_dispatch_is_fail_closed(
     assert actual.shape == (2, 17)
 
 
-def test_sm120_int8_mqa_logits_wrapper_selects_sparkinfer(
+def test_sm120_int8_mqa_logits_wrapper_selects_triton(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels
+
     calls = {}
 
-    def fake_native(q_values, kv, weights, k_start, k_end):
+    def fake_triton(q_values, kv, weights, k_start, k_end, *, qk_int8):
         calls["args"] = (q_values, kv, weights, k_start, k_end)
+        calls["qk_int8"] = qk_int8
         return torch.empty(2, 17, dtype=torch.float32)
 
+    monkeypatch.setattr(triton_kernels, "indexer_imma_enabled", lambda: True)
     monkeypatch.setattr(
-        deep_gemm_utils.current_platform,
-        "is_device_capability_family",
-        lambda family: family == 120,
+        triton_kernels,
+        "mqa_logits_workspace_triton",
+        fake_triton,
     )
-    monkeypatch.setattr(deep_gemm_utils, "int8_mqa_logits_sparkinfer", fake_native)
     q = torch.empty(2, 64, 128, dtype=torch.int8)
     k = torch.empty(17, 128, dtype=torch.int8)
     scales = torch.empty(17, dtype=torch.float32)
@@ -262,6 +265,7 @@ def test_sm120_int8_mqa_logits_wrapper_selects_sparkinfer(
     assert called_weights is weights
     assert called_start is k_start
     assert called_end is k_end
+    assert calls["qk_int8"] is True
     assert actual.shape == (2, 17)
 
 
