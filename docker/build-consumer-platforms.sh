@@ -22,7 +22,9 @@ CONTEXT_NS="${CONTEXT_NS:-buildkit}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-remote}"
 LOCAL_PORT="${LOCAL_PORT:-11234}"
 DOCKERFILE="${DOCKERFILE:-docker/Dockerfile}"
-TARGET="${TARGET:-vllm-openai}"
+# An explicitly empty TARGET builds the Dockerfile's final stage. This is used
+# by single-stage overlay Dockerfiles.
+TARGET="${TARGET-vllm-openai}"
 BASE_IMAGE="${BASE_IMAGE:-}"
 
 # nvcc parallelism. The arm64 stages run under QEMU, so wall-clock is already
