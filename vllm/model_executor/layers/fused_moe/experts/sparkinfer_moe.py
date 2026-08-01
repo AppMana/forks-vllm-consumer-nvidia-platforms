@@ -38,6 +38,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    merge_nvfp4_gate_up_input_scales,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kNvfp4Dynamic,
@@ -64,24 +67,17 @@ def _modelopt_activation_gscales(
     emits the same input scale for both projections, so reject a malformed
     checkpoint instead of silently replacing either value with their maximum.
     """
-    if w13_input_scale.ndim != 2 or w13_input_scale.shape[1] != 2:
-        raise ValueError(
-            "w13_input_scale must have shape (num_experts, 2), got "
-            f"{tuple(w13_input_scale.shape)}"
-        )
     if w2_input_scale.ndim != 1 or w2_input_scale.shape[0] != w13_input_scale.shape[0]:
         raise ValueError(
             "w2_input_scale must have shape (num_experts,), got "
             f"{tuple(w2_input_scale.shape)}"
         )
-    w13_scale = w13_input_scale[:, 0].to(torch.float32)
+    w13_scale = merge_nvfp4_gate_up_input_scales(w13_input_scale)
     w2_scale = w2_input_scale.to(torch.float32)
     if not torch.all(torch.isfinite(w13_scale) & (w13_scale > 0)):
         raise ValueError("w13_input_scale must be finite and positive")
     if not torch.all(torch.isfinite(w2_scale) & (w2_scale > 0)):
         raise ValueError("w2_input_scale must be finite and positive")
-    if not torch.equal(w13_input_scale[:, 0], w13_input_scale[:, 1]):
-        raise ValueError("ModelOpt gate and up input scales must match per expert")
     return torch.reciprocal(w13_scale).contiguous(), torch.reciprocal(
         w2_scale
     ).contiguous()
@@ -369,6 +365,7 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
             topk_weights=topk_weights,
             topk_ids=topk_ids.to(torch.int32),
             output=output,
+            input_scales_static=True,
         )
         result = fused_moe.run(binding=binding)
         if result.data_ptr() != output.data_ptr():

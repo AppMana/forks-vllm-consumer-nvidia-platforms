@@ -24,8 +24,45 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 __all__ = [
+    "merge_nvfp4_gate_up_input_scales",
     "reorder_w1w3_to_w3w1",
+    "require_uniform_nvfp4_expert_scale",
 ]
+
+
+def merge_nvfp4_gate_up_input_scales(scale: torch.Tensor) -> torch.Tensor:
+    """Return one input scale per expert without collapsing experts."""
+    if scale.ndim != 2 or scale.shape[1] != 2:
+        raise ValueError(
+            "NVFP4 gate/up input scale must have shape (num_experts, 2), got "
+            f"{tuple(scale.shape)}"
+        )
+    scale = scale.to(torch.float32)
+    if not torch.all(torch.isfinite(scale) & (scale > 0)):
+        raise ValueError("NVFP4 gate/up input scale must be finite and positive")
+    if not torch.equal(scale[:, 0], scale[:, 1]):
+        raise ValueError("NVFP4 gate and up input scales must match per expert")
+    return scale[:, 0].contiguous()
+
+
+def require_uniform_nvfp4_expert_scale(
+    scale: torch.Tensor,
+    *,
+    num_local_experts: int,
+    name: str,
+) -> torch.Tensor:
+    """Fail closed when a backend cannot represent per-expert input scales."""
+    if scale.ndim != 1:
+        raise ValueError(f"{name} must have shape (num_experts,), got {scale.shape}")
+    scale = scale.to(torch.float32)
+    if not torch.all(torch.isfinite(scale) & (scale > 0)):
+        raise ValueError(f"{name} must be finite and positive")
+    if not torch.equal(scale, scale[:1].expand_as(scale)):
+        raise ValueError(
+            f"{name} differs across experts, but this NVFP4 backend only supports "
+            "one activation scale"
+        )
+    return scale[:1].expand(num_local_experts).contiguous()
 
 
 def reorder_w1w3_to_w3w1(
@@ -107,10 +144,19 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
     """
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
-    # Global scaling factors (same as other FlashInfer backends).
+    # This backend quantizes the shared activation once and therefore cannot
+    # represent route-specific expert scales.
     num_experts = w13.shape[0]
-    a13_scale = a13_scale.max().to(torch.float32).repeat(num_experts)
-    a2_scale = a2_scale.max().to(torch.float32).repeat(num_experts)
+    a13_scale = require_uniform_nvfp4_expert_scale(
+        merge_nvfp4_gate_up_input_scales(a13_scale),
+        num_local_experts=num_experts,
+        name="a13_scale",
+    )
+    a2_scale = require_uniform_nvfp4_expert_scale(
+        a2_scale,
+        num_local_experts=num_experts,
+        name="a2_scale",
+    )
 
     half = w13.shape[1] // 2
     w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1)
@@ -335,13 +381,21 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
     ):
         w13, w13_scale = reorder_w1w3_to_w3w1(w13, w13_scale)
 
+    a13_scale = merge_nvfp4_gate_up_input_scales(a13_scale)
+
     # For some FI kernels, the input scales are shared by all experts.
     if is_global_sf_supported_for_nvfp4_backend(backend):
         num_experts = w13.shape[0]
-        a13_scale = a13_scale.max().to(torch.float32).repeat(num_experts)
-        a2_scale = a2_scale.max().to(torch.float32).repeat(num_experts)
-    else:
-        a13_scale = a13_scale.max(dim=1).values.to(torch.float32)
+        a13_scale = require_uniform_nvfp4_expert_scale(
+            a13_scale,
+            num_local_experts=num_experts,
+            name="a13_scale",
+        )
+        a2_scale = require_uniform_nvfp4_expert_scale(
+            a2_scale,
+            num_local_experts=num_experts,
+            name="a2_scale",
+        )
 
     # Shuffle weights and scales for FI TRTLLM NVFP4 MoE kernels.
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
