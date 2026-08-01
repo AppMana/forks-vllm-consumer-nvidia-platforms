@@ -21,6 +21,9 @@ REF="${REF:-appmana/vllm-consumer-nvidia-platforms}"
 CONTEXT_NS="${CONTEXT_NS:-buildkit}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-remote}"
 LOCAL_PORT="${LOCAL_PORT:-11234}"
+DOCKERFILE="${DOCKERFILE:-docker/Dockerfile}"
+TARGET="${TARGET:-vllm-openai}"
+BASE_IMAGE="${BASE_IMAGE:-}"
 
 # nvcc parallelism. The arm64 stages run under QEMU, so wall-clock is already
 # poor; oversubscribing turns it into OOM. Raise only with headroom measured on
@@ -78,6 +81,24 @@ sleep 5
 
 echo "building $IMAGE for $PLATFORM from $REF at $resolved_commit"
 
+build_options=(
+    --opt "context=${REPO_URL}#${resolved_commit}"
+    --opt "filename=$DOCKERFILE"
+    --opt "platform=$PLATFORM"
+    --opt build-arg:BUILDKIT_CONTEXT_KEEP_GIT_DIR=1
+    --opt "build-arg:max_jobs=$MAX_JOBS"
+    --opt "build-arg:nvcc_threads=$NVCC_THREADS"
+    --opt "build-arg:VLLM_BUILD_COMMIT=$resolved_commit"
+    --opt "build-arg:VLLM_VERSION_OVERRIDE=$wheel_version"
+    --opt build-arg:RUN_WHEEL_CHECK=false
+)
+if [ -n "$TARGET" ]; then
+    build_options+=(--opt "target=$TARGET")
+fi
+if [ -n "$BASE_IMAGE" ]; then
+    build_options+=(--opt "build-arg:BASE_IMAGE=$BASE_IMAGE")
+fi
+
 # BUILDKIT_CONTEXT_KEEP_GIT_DIR: a git context strips .git by default, but the
 # Dockerfile bind-mounts it for tools/check_repo.sh, which otherwise fails with
 # 'failed to calculate checksum of ref ...: "/.git": not found'.
@@ -89,16 +110,7 @@ exec buildctl \
     --tlsservername buildkitd \
     build \
     --frontend dockerfile.v0 \
-    --opt "context=${REPO_URL}#${resolved_commit}" \
-    --opt filename=docker/Dockerfile \
-    --opt target=vllm-openai \
-    --opt "platform=$PLATFORM" \
-    --opt build-arg:BUILDKIT_CONTEXT_KEEP_GIT_DIR=1 \
-    --opt "build-arg:max_jobs=$MAX_JOBS" \
-    --opt "build-arg:nvcc_threads=$NVCC_THREADS" \
-    --opt "build-arg:VLLM_BUILD_COMMIT=$resolved_commit" \
-    --opt "build-arg:VLLM_VERSION_OVERRIDE=$wheel_version" \
-    --opt build-arg:RUN_WHEEL_CHECK=false \
+    "${build_options[@]}" \
     --secret "id=GIT_AUTH_TOKEN,src=$workdir/ghtoken" \
     --output "type=image,name=$IMAGE,push=true" \
     --progress plain
