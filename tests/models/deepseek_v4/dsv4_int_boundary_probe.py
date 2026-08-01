@@ -119,13 +119,17 @@ def capture_boundaries(
         max_model_len=128,
         max_num_seqs=1,
         max_num_batched_tokens=128,
-        gpu_memory_utilization=0.5,
-        kv_cache_memory_bytes=1 << 30,
+        # Probes co-schedule with live serving on the unified-memory GB10s;
+        # the ceiling must fit in whatever the serving ranks leave free.
+        gpu_memory_utilization=float(os.environ.get("DSV4_PROBE_GMU", "0.5")),
+        kv_cache_memory_bytes=int(os.environ.get("DSV4_PROBE_KV_BYTES", 1 << 30)),
         enforce_eager=not compiled,
         compilation_config=(
             {
                 "mode": 3,
-                "cudagraph_mode": 3 if cudagraph else 0,
+                # FULL_AND_PIECEWISE is spelled (FULL, PIECEWISE); plain FULL
+                # or the legacy integer alias 3 are rejected by validation.
+                "cudagraph_mode": (2, 1) if cudagraph else 0,
                 "cudagraph_capture_sizes": [1] if cudagraph else [],
             }
             if compiled
@@ -216,9 +220,18 @@ def _flatten_tensors(value: Any, prefix: str = "") -> dict[str, torch.Tensor]:
     return {}
 
 
-def compare_captures(left_path: Path, right_path: Path) -> int:
+def compare_captures(
+    left_path: Path, right_path: Path, *, max_abs_tol: float = 0.0
+) -> int:
     left = torch.load(left_path, map_location="cpu", weights_only=True)
     right = torch.load(right_path, map_location="cpu", weights_only=True)
+    left_tokens = left.get("metadata", {}).get("output_token_ids")
+    right_tokens = right.get("metadata", {}).get("output_token_ids")
+    tokens_equal = left_tokens == right_tokens
+    print(
+        f"output_tokens {'GREEN' if tokens_equal else 'RED'} "
+        f"left={left_tokens} right={right_tokens}"
+    )
     order = [
         "embedding",
         "layer0_mhc_pre",
@@ -266,15 +279,19 @@ def compare_captures(left_path: Path, right_path: Path) -> int:
             delta = (a.float() - b.float()).abs()
             max_abs = delta.max().item() if delta.numel() else 0.0
             mean_abs = delta.mean().item() if delta.numel() else 0.0
+            # Bitwise parity is unreachable between eager and inductor by
+            # construction (fusion and reduction reordering in the traceable
+            # glue); the gate is token equality plus a logits tolerance.
+            within = exact or (max_abs_tol > 0.0 and max_abs <= max_abs_tol)
             print(
-                f"{name} {'GREEN' if exact else 'RED'} exact={exact} "
+                f"{name} {'GREEN' if within else 'RED'} exact={exact} "
                 f"max_abs={max_abs:.9g} mean_abs={mean_abs:.9g}"
             )
-            boundary_equal &= exact
+            boundary_equal &= within
         if not boundary_equal and first_divergence is None:
             first_divergence = boundary
     print(f"first_divergence={first_divergence or 'none'}")
-    return int(first_divergence is not None)
+    return int(first_divergence is not None or not tokens_equal)
 
 
 def main() -> int:
@@ -301,6 +318,13 @@ def main() -> int:
     compare = subparsers.add_parser("compare")
     compare.add_argument("left", type=Path)
     compare.add_argument("right", type=Path)
+    compare.add_argument(
+        "--max-abs-tol",
+        type=float,
+        default=0.0,
+        help="treat a boundary as GREEN when its max abs delta is at or "
+        "below this tolerance (0 requires bitwise equality)",
+    )
     args = parser.parse_args()
     if args.command == "view":
         create_boundary_view(args.source, args.target, layer=args.layer)
@@ -314,7 +338,7 @@ def main() -> int:
             cudagraph=not args.no_cudagraph,
         )
         return 0
-    return compare_captures(args.left, args.right)
+    return compare_captures(args.left, args.right, max_abs_tol=args.max_abs_tol)
 
 
 if __name__ == "__main__":

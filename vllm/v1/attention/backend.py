@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from typing_extensions import deprecated
 
+import vllm.envs as envs
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic64Sym,
     kFp8Dynamic128Sym,
@@ -691,9 +692,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         # flashinfer_mla_sparse up to 1024) so query lengths their decode
         # kernels served correctly were re-routed to prefill, and it skipped
         # the decode_context_parallel guard above.
-        import os as _os
-
-        if _os.environ.get("APPMANA_DSPARK_SPEC_AS_PREFILL") == "1":
+        if envs.APPMANA_DSPARK_SPEC_AS_PREFILL:
             hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
             architectures = getattr(hf_config, "architectures", None) or ()
             if any(

@@ -65,8 +65,12 @@ if TYPE_CHECKING:
     VLLM_MHC_PRE_TRITON: bool = True
     VLLM_MHC_POST_TRITON: bool = True
     VLLM_MHC_HEAD_TRITON: bool = True
-    VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE: bool = True
+    VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE: bool = False
     VLLM_MHC_TORCH_FALLBACK_SYNC_MODE: str = "stream"
+    APPMANA_DSPARK_SPEC_AS_PREFILL: bool = False
+    APPMANA_DSPARK_SYNC_DEBUG: bool = False
+    APPMANA_DSPARK_PROF: bool = False
+    APPMANA_DSPARK_PROF_LOG_EVERY: int = 50
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -772,11 +776,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MHC_PRE_TRITON": lambda: os.environ.get("VLLM_MHC_PRE_TRITON", "1") != "0",
     "VLLM_MHC_POST_TRITON": lambda: os.environ.get("VLLM_MHC_POST_TRITON", "1") != "0",
     "VLLM_MHC_HEAD_TRITON": lambda: os.environ.get("VLLM_MHC_HEAD_TRITON", "1") != "0",
+    # Default off: a hard synchronization is a fault-localization diagnostic
+    # and must not serialize normal fallback execution. The registry default
+    # must match the consumer in vllm/model_executor/layers/mhc.py or the
+    # compile factor records a value the code never uses.
     "VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE": lambda: (
-        os.environ.get("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1") != "0"
+        os.environ.get("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "0") != "0"
     ),
     "VLLM_MHC_TORCH_FALLBACK_SYNC_MODE": lambda: os.environ.get(
         "VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", "stream"
+    ),
+    # DSpark speculative-decode controls change attention-metadata
+    # construction and drafter control flow, so they must participate in
+    # compile-cache identity like the mHC and AllSpark controls above.
+    "APPMANA_DSPARK_SPEC_AS_PREFILL": lambda: (
+        os.environ.get("APPMANA_DSPARK_SPEC_AS_PREFILL", "0") == "1"
+    ),
+    "APPMANA_DSPARK_SYNC_DEBUG": lambda: (
+        os.environ.get("APPMANA_DSPARK_SYNC_DEBUG", "0") == "1"
+    ),
+    "APPMANA_DSPARK_PROF": lambda: (os.environ.get("APPMANA_DSPARK_PROF", "0") == "1"),
+    "APPMANA_DSPARK_PROF_LOG_EVERY": lambda: int(
+        os.environ.get("APPMANA_DSPARK_PROF_LOG_EVERY", "50")
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').
@@ -2187,6 +2208,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        # Logging cadence only; does not affect traced code.
+        "APPMANA_DSPARK_PROF_LOG_EVERY",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",

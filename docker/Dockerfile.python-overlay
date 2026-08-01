@@ -25,6 +25,13 @@ COPY vllm/models/deepseek_v4/common/ops/cache_utils.py /tmp/vllm-overlay/models/
 COPY vllm/models/deepseek_v4/attention.py /tmp/vllm-overlay/models/deepseek_v4/attention.py
 COPY vllm/transformers_utils/configs/dsv4/kernel_config.py /tmp/vllm-overlay/transformers_utils/configs/dsv4/kernel_config.py
 COPY vllm/utils/deep_gemm.py /tmp/vllm-overlay/utils/deep_gemm.py
+COPY vllm/envs.py /tmp/vllm-overlay/envs.py
+COPY vllm/compilation/backends.py /tmp/vllm-overlay/compilation/backends.py
+COPY vllm/model_executor/layers/mhc.py /tmp/vllm-overlay/model_executor/layers/mhc.py
+COPY vllm/v1/attention/backend.py /tmp/vllm-overlay/v1/attention/backend.py
+COPY vllm/v1/attention/backends/mla/sparse_swa.py /tmp/vllm-overlay/v1/attention/backends/mla/sparse_swa.py
+COPY vllm/v1/worker/gpu/model_runner.py /tmp/vllm-overlay/v1/worker/gpu/model_runner.py
+COPY vllm/v1/worker/gpu/spec_decode/dflash/speculator.py /tmp/vllm-overlay/v1/worker/gpu/spec_decode/dflash/speculator.py
 
 RUN python3 - <<'PY'
 import importlib.util
@@ -56,6 +63,13 @@ for relative in (
     "models/deepseek_v4/attention.py",
     "transformers_utils/configs/dsv4/kernel_config.py",
     "utils/deep_gemm.py",
+    "envs.py",
+    "compilation/backends.py",
+    "model_executor/layers/mhc.py",
+    "v1/attention/backend.py",
+    "v1/attention/backends/mla/sparse_swa.py",
+    "v1/worker/gpu/model_runner.py",
+    "v1/worker/gpu/spec_decode/dflash/speculator.py",
 ):
     destination = root / relative
     shutil.copy2(sources / relative, destination)
@@ -102,6 +116,22 @@ assert "def classify_shards" in pp_filter
 assert "_INT8_DS_MLA_TOKEN_BYTES" in cache_utils
 assert "_INT8_DS_MLA_PAD_BYTES = 12" in cache_utils
 assert "use_compilation_safe_attn_gemm_overlap" in attention
+assert "torch.ops.vllm.deepseek_v4_attention" in attention
+envs_py = (root / "envs.py").read_text()
+compile_backends = (root / "compilation/backends.py").read_text()
+mhc = (root / "model_executor/layers/mhc.py").read_text()
+attn_backend = (root / "v1/attention/backend.py").read_text()
+sparse_swa = (root / "v1/attention/backends/mla/sparse_swa.py").read_text()
+model_runner = (root / "v1/worker/gpu/model_runner.py").read_text()
+speculator = (root / "v1/worker/gpu/spec_decode/dflash/speculator.py").read_text()
+assert "VLLM_DSV4_ALLSPARK_SM12X" in envs_py
+assert "APPMANA_DSPARK_SPEC_AS_PREFILL" in envs_py
+assert "or envs.VLLM_USE_BREAKABLE_CUDAGRAPH" in compile_backends
+assert "envs.VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE" in mhc
+assert "envs.APPMANA_DSPARK_SPEC_AS_PREFILL" in attn_backend
+assert "envs.APPMANA_DSPARK_SPEC_AS_PREFILL" in sparse_swa
+assert "envs.APPMANA_DSPARK_SYNC_DEBUG" in model_runner
+assert "envs.APPMANA_DSPARK_PROF" in speculator
 assert "has_int_weight_family" in kernel_config
 assert '"DSparkDraftModel"' in vllm_config
 assert "_configure_breakable_cudagraph" in vllm_config

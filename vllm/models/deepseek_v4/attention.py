@@ -33,6 +33,12 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -224,9 +230,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # block in the checkpoint config.json) before any consumer (indexer,
         # compressor, backend dispatch) reads the kernel gates. Runs in every
         # worker process at model build; idempotent by value.
-        activate_kernel_config(
-            resolve_kernel_config_from_hf_config(config)
-        )
+        activate_kernel_config(resolve_kernel_config_from_hf_config(config))
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
@@ -410,10 +414,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
         )
 
-        # attention_impl is wrapped with @eager_break_during_capture: this is
-        # where the breakable cudagraph capture breaks (the attention op runs
-        # eagerly between captured graph segments).
-        self.attention_impl(
+        # The metadata-dependent attention stack must stay opaque to
+        # torch.compile: it reads live forward-context state (attention
+        # metadata, KV caches, shared top-k buffers) that Dynamo would
+        # otherwise bake in at trace time, and the traced body is reused
+        # for every batch with all guards dropped. The custom op executes
+        # this Python at runtime; under breakable CUDA graph capture it is
+        # also where the capture breaks.
+        torch.ops.vllm.deepseek_v4_attention(
             hidden_states,
             qr,
             kv,
@@ -422,6 +430,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer_weights,
             positions,
             o_padded,
+            _encode_layer_name(self.prefix),
         )
         o = o_padded[:, : self.n_local_heads, :]
 
@@ -487,7 +496,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
-    @eager_break_during_capture
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -792,9 +800,7 @@ class DeepseekV4Indexer(nn.Module):
         self._indexer_use_cutedsl = has_cutedsl()
         self._indexer_is_xpu = current_platform.is_xpu()
         self._indexer_fp8_dtype = current_platform.fp8_dtype()
-        self._indexer_supports_fp8e4nv_in_triton = (
-            _supports_fp8e4nv_in_triton()
-        )
+        self._indexer_supports_fp8e4nv_in_triton = _supports_fp8e4nv_in_triton()
         logger.info_once(
             "Lightning Indexer: cache_payload=%s query=%s",
             _indexer_cache_fmt,
@@ -934,9 +940,7 @@ class DeepseekV4Indexer(nn.Module):
                 use_cutedsl=self._indexer_use_cutedsl,
                 is_xpu=self._indexer_is_xpu,
                 fp8_dtype=self._indexer_fp8_dtype,
-                supports_fp8e4nv_in_triton=(
-                    self._indexer_supports_fp8e4nv_in_triton
-                ),
+                supports_fp8e4nv_in_triton=(self._indexer_supports_fp8e4nv_in_triton),
             )
 
         # compressor returns None and writes K to the indexer KV cache; the
@@ -949,3 +953,55 @@ class DeepseekV4Indexer(nn.Module):
             self.aux_stream,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)
+
+
+@eager_break_during_capture
+def deepseek_v4_attention(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    kv_score: torch.Tensor | None,
+    indexer_kv_score: torch.Tensor | None,
+    indexer_weights: torch.Tensor | None,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """Opaque DSV4 attention: q up-projection, indexer, compressor, KV-cache
+    insert, and sparse MLA. Everything behind this op reads forward-context
+    state (attention metadata, KV caches, the shared top-k indices buffer)
+    at runtime, so it must never be traced into the compiled model body."""
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer.attention_impl(
+        hidden_states,
+        qr,
+        kv,
+        kv_score,
+        indexer_kv_score,
+        indexer_weights,
+        positions,
+        out,
+    )
+
+
+def deepseek_v4_attention_fake(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    kv_score: torch.Tensor | None,
+    indexer_kv_score: torch.Tensor | None,
+    indexer_weights: torch.Tensor | None,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_attention",
+    op_func=deepseek_v4_attention,
+    mutates_args=["out"],
+    fake_impl=deepseek_v4_attention_fake,
+)

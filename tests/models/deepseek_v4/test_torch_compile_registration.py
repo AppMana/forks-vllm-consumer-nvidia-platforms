@@ -4,10 +4,13 @@
 import inspect
 
 import pytest
+import torch
 
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+from vllm.config.compilation import CompilationConfig
 from vllm.model_executor.kernels.mhc.tilelang import mhc_pre_broadcast_tilelang
 from vllm.models.deepseek_v4.attention import (
+    DeepseekV4Attention,
     DeepseekV4Indexer,
     use_compilation_safe_attn_gemm_overlap,
 )
@@ -22,6 +25,25 @@ def test_deepseek_v4_models_register_for_torch_compile():
     assert TorchCompileWithNoGuardsWrapper in DeepseekV4Model.__bases__
     assert TorchCompileWithNoGuardsWrapper in DeepSeekV4MTP.__bases__
     assert TorchCompileWithNoGuardsWrapper in DSparkDeepseekV4Model.__bases__
+
+
+def test_deepseek_v4_attention_is_an_opaque_custom_op():
+    # The attention stack reads forward-context state (attention metadata,
+    # KV caches, the shared top-k buffer) at runtime. Traced into the
+    # guard-free compiled body, those reads constant-fold: the profile-run
+    # trace has no metadata, so attention became out.zero_() forever.
+    op = torch.ops.vllm.deepseek_v4_attention
+    schema = op.default._schema
+    out_arg = next(a for a in schema.arguments if a.name == "out")
+    assert out_arg.alias_info is not None and out_arg.alias_info.is_write
+
+    source = inspect.getsource(DeepseekV4Attention.forward)
+    assert "torch.ops.vllm.deepseek_v4_attention" in source
+    assert "self.attention_impl" not in source
+
+
+def test_deepseek_v4_attention_is_a_splitting_op():
+    assert "vllm::deepseek_v4_attention" in CompilationConfig._attention_ops
 
 
 def test_compressor_forward_has_no_runtime_platform_dispatch():

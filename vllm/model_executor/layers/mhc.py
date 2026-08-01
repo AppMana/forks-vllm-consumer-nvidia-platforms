@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 # this import will also register the custom ops
+import vllm.envs as envs
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.logger import init_logger
@@ -191,7 +192,8 @@ def _mhc_torch_fallback_synchronize() -> bool:
     # A hard stream/device synchronization is useful for localizing an
     # asynchronous kernel fault, but it serializes the request path. Keep the
     # diagnostic available without imposing it on normal fallback execution.
-    return os.getenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "0") != "0"
+    # Read through vllm.envs so the compile factor and the runtime agree.
+    return envs.VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE
 
 
 def _synchronize_mhc_torch_fallback() -> None:

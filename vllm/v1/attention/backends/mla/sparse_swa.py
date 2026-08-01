@@ -5,6 +5,7 @@ from typing import ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
@@ -435,9 +436,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # See backend._init_reorder_batch_threshold: route multi-token verify
         # to the prefill (causal multi-query) path to bypass the s_q-templated
         # sparse decode kernel that collapses the first post-prefill verify.
-        import os as _os
-
-        if _os.environ.get("APPMANA_DSPARK_SPEC_AS_PREFILL") == "1":
+        if envs.APPMANA_DSPARK_SPEC_AS_PREFILL:
             self.decode_threshold = 1
         self.reorder_batch_threshold = None
 
