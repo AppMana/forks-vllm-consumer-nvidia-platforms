@@ -56,17 +56,28 @@ if ! [[ "$resolved_commit" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 wheel_version="${VLLM_VERSION_OVERRIDE:-0.0.0+consumer.${resolved_commit:0:10}}"
 
-# buildkitd requires mTLS; the client keypair lives in the cluster.
-kubectl --context "$KUBE_CONTEXT" get secret buildkit-client-tls -n "$CONTEXT_NS" -o json \
-  | python3 -c "
+# Use mTLS when the BuildKit deployment publishes a client certificate. A
+# cluster-local BuildKit can instead rely on the authenticated Kubernetes
+# port-forward and does not need a second secret.
+tls_options=()
+if kubectl --context "$KUBE_CONTEXT" get secret buildkit-client-tls \
+    -n "$CONTEXT_NS" -o json > "$workdir/buildkit-client-tls.json" 2>/dev/null; then
+  python3 -c "
 import base64, json, pathlib, sys
-data = json.load(sys.stdin)['data']
+data = json.load(open('$workdir/buildkit-client-tls.json'))['data']
 out = pathlib.Path('$workdir')
 for name, value in data.items():
     path = out / name
     path.write_bytes(base64.b64decode(value))
     path.chmod(0o600)
 "
+  tls_options=(
+      --tlscacert "$workdir/ca.crt"
+      --tlscert "$workdir/tls.crt"
+      --tlskey "$workdir/tls.key"
+      --tlsservername buildkitd
+  )
+fi
 
 # GIT_AUTH_TOKEN authenticates the private git context. The token must not carry
 # a trailing newline: `gh auth token` emits one and it corrupts the auth header,
@@ -105,10 +116,7 @@ fi
 # 'failed to calculate checksum of ref ...: "/.git": not found'.
 exec buildctl \
     --addr "tcp://127.0.0.1:$LOCAL_PORT" \
-    --tlscacert "$workdir/ca.crt" \
-    --tlscert "$workdir/tls.crt" \
-    --tlskey "$workdir/tls.key" \
-    --tlsservername buildkitd \
+    "${tls_options[@]}" \
     build \
     --frontend dockerfile.v0 \
     "${build_options[@]}" \
