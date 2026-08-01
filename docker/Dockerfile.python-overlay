@@ -6,6 +6,7 @@ ARG VLLM_BUILD_COMMIT
 ARG VLLM_IMAGE_TAG
 
 COPY vllm/v1/core/kv_cache_utils.py /tmp/vllm-overlay/v1/core/kv_cache_utils.py
+COPY vllm/v1/core/sched/scheduler.py /tmp/vllm-overlay/v1/core/sched/scheduler.py
 COPY vllm/v1/kv_cache_interface.py /tmp/vllm-overlay/v1/kv_cache_interface.py
 COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm-overlay/v1/worker/gpu/warmup.py
 COPY vllm/config/vllm.py /tmp/vllm-overlay/config/vllm.py
@@ -35,6 +36,7 @@ root = pathlib.Path(next(iter(spec.submodule_search_locations)))
 sources = pathlib.Path("/tmp/vllm-overlay")
 for relative in (
     "v1/core/kv_cache_utils.py",
+    "v1/core/sched/scheduler.py",
     "v1/kv_cache_interface.py",
     "v1/worker/gpu/warmup.py",
     "config/vllm.py",
@@ -57,9 +59,11 @@ for relative in (
     shutil.copy2(sources / relative, destination)
 
 promote = (root / "v1/core/kv_cache_utils.py").read_text()
+scheduler = (root / "v1/core/sched/scheduler.py").read_text()
 merge = (root / "v1/kv_cache_interface.py").read_text()
 assert "kv_quant_mode=spec.kv_quant_mode" in promote
 assert "indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride" in promote
+assert "and request.num_in_flight_tokens > 0" in scheduler
 assert "kv_quant_mode=specs[0].kv_quant_mode" in merge
 assert "alignment=specs[0].alignment" in merge
 gpu_warmup = (root / "v1/worker/gpu/warmup.py").read_text()
