@@ -447,9 +447,9 @@ def test_deepseek_v4_int4_mapper_keeps_expert_scale_suffix():
     ]
 
 
-def test_dsv4_allspark_sm12x_diagnostic_switch(monkeypatch):
+def test_dsv4_allspark_sm12x_default_and_diagnostic_switch(monkeypatch):
     monkeypatch.delenv("VLLM_DSV4_ALLSPARK_SM12X", raising=False)
-    assert not dsv4_int_module._dsv4_allspark_supported_device_capability(121)
+    assert dsv4_int_module._dsv4_allspark_supported_device_capability(121)
     monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "1")
     assert dsv4_int_module._dsv4_allspark_supported_device_capability(121)
     monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "0")

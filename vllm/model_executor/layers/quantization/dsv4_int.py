@@ -36,12 +36,10 @@ _DSV4_KERNEL_PATHS: dict = {}
 
 def _dsv4_allspark_supported_device_capability(sm_version: int) -> bool:
     if sm_version in (120, 121):
-        # The Ampere kernel compiles for SM12x, but its large-M fallback
-        # dequantizes the complete weight on every call. More importantly, a
-        # real layer-0 checkpoint probe first diverges at these projections and
-        # returns bit-exact logits when SM12x AllSpark is disabled. Keep the
-        # experimental path opt-in until its real-weight contract is fixed.
-        enabled = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X", "0")
+        # The native kernel is faster for small-M decode. Large-M prefill uses
+        # its cuBLAS fallback at the threshold below. Keep an explicit off
+        # switch for diagnostics.
+        enabled = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X", "1")
         return enabled.lower() in ("1", "true", "on")
     return is_allspark_supported_device_capability(sm_version)
 
