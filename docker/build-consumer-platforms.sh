@@ -89,6 +89,7 @@ build_options=(
     --opt "build-arg:max_jobs=$MAX_JOBS"
     --opt "build-arg:nvcc_threads=$NVCC_THREADS"
     --opt "build-arg:VLLM_BUILD_COMMIT=$resolved_commit"
+    --opt "build-arg:VLLM_IMAGE_TAG=$IMAGE"
     --opt "build-arg:VLLM_VERSION_OVERRIDE=$wheel_version"
     --opt build-arg:RUN_WHEEL_CHECK=false
 )
