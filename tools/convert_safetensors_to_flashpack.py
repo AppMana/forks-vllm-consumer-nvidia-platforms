@@ -20,6 +20,13 @@ Conversion is resumable: finished part records are checkpointed in
 ``.flashpack-convert-state.json`` inside the destination and reused when
 the recorded size still matches the file on disk.
 
+``--low-memory`` bounds peak resident memory to roughly one tensor
+instead of one shard: source tensors are materialized one at a time
+through ``safetensors.safe_open`` on every packing pass, and
+verification compares FlashPack's lazy CPU mmap views against
+per-tensor reloads. This trades extra read passes over each shard for
+a footprint small enough to run beside a serving deployment.
+
 Usage:
     python convert_safetensors_to_flashpack.py \
         --source-dir /hf-cache/.../snapshots/<rev> \
@@ -106,7 +113,40 @@ def _classify_stage(names: list[str]) -> str:
     return "any"
 
 
-def _verify_part(path: str, tensors: dict) -> None:
+def _read_safetensors_header(path: str) -> dict:
+    import struct
+
+    with open(path, "rb") as file:
+        (header_size,) = struct.unpack("<Q", file.read(8))
+        header = json.loads(file.read(header_size))
+    header.pop("__metadata__", None)
+    return header
+
+
+class _LazyShardTensors:
+    """Read-through view of a safetensors shard for ``pack_to_file``.
+
+    Every ``[]`` access loads that one tensor from disk, so the packing
+    passes hold at most a single tensor resident at a time.
+    """
+
+    def __init__(self, path: str):
+        from safetensors import safe_open
+
+        self._handle = safe_open(path, framework="pt", device="cpu")
+        self._names = list(self._handle.keys())
+
+    def keys(self) -> list[str]:
+        return list(self._names)
+
+    def __getitem__(self, name: str):
+        return self._handle.get_tensor(name)
+
+
+def _verify_part(path: str, tensors) -> None:
+    """Compare every packed tensor against *tensors* (a dict or a
+    ``_LazyShardTensors``). On CPU the packed side is a lazy mmap view,
+    so peak memory follows the source side's access pattern."""
     import torch
     from flashpack.deserialization import (
         get_flashpack_file_metadata,
@@ -129,8 +169,9 @@ def _verify_part(path: str, tensors: dict) -> None:
         if not torch.equal(tensor, source):
             raise ValueError(f"Round-trip payload mismatch for {name!r}")
         seen.add(name)
-    if seen != set(tensors):
-        raise ValueError(f"Round-trip lost tensors: {sorted(set(tensors) - seen)}")
+    expected = set(tensors.keys())
+    if seen != expected:
+        raise ValueError(f"Round-trip lost tensors: {sorted(expected - seen)}")
 
 
 def _load_state(dest_dir: str) -> dict:
@@ -155,6 +196,7 @@ def convert(
     revision: str,
     *,
     verify: bool,
+    low_memory: bool = False,
 ) -> None:
     from flashpack import pack_to_file
     from safetensors.torch import load_file
@@ -189,25 +231,35 @@ def convert(
             )
         else:
             start = time.perf_counter()
-            tensors = load_file(os.path.join(source_dir, shard_filename))
-            if set(tensors) != expected_names:
+            shard_path = os.path.join(source_dir, shard_filename)
+            shapes = {
+                name: record["shape"]
+                for name, record in _read_safetensors_header(shard_path).items()
+            }
+            if set(shapes) != expected_names:
                 raise ValueError(
                     f"Shard {shard_filename!r} tensors disagree with "
                     f"{SAFE_WEIGHTS_INDEX_NAME}"
                 )
-            empty = sorted(n for n, t in tensors.items() if t.numel() == 0)
+            empty = sorted(n for n, s in shapes.items() if 0 in s)
             if empty:
                 raise ValueError(
                     f"Shard {shard_filename!r} has zero-element tensors "
                     f"(unrepresentable in a FlashPack footer): {empty}"
                 )
-            scalars = sorted(n for n, t in tensors.items() if t.dim() == 0)
+            scalars = sorted(n for n, s in shapes.items() if s == [])
             if scalars:
                 raise ValueError(
                     f"Shard {shard_filename!r} has 0-dim tensors, which "
                     f"FlashPack deserializes with shape (1,): {scalars}"
                 )
-            pack_to_file(tensors, part_path, target_dtype=None)
+            if low_memory:
+                tensors = _LazyShardTensors(shard_path)
+                name_order = tensors.keys()
+            else:
+                tensors = load_file(shard_path)
+                name_order = None
+            pack_to_file(tensors, part_path, target_dtype=None, name_order=name_order)
             # pack_to_file writes through mkstemp, which leaves 0600.
             os.chmod(part_path, 0o644)
             if verify:
@@ -294,6 +346,12 @@ def main() -> int:
         help="Re-read each packed part and compare every tensor "
         "against the source shard",
     )
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help="Materialize one tensor at a time instead of one shard; "
+        "slower (extra read passes) but safe next to a live deployment",
+    )
     args = parser.parse_args()
 
     source_dir = os.path.abspath(args.source_dir)
@@ -309,7 +367,14 @@ def main() -> int:
             "not an HF cache snapshot path"
         )
 
-    convert(source_dir, dest_dir, repo_id, revision, verify=args.verify)
+    convert(
+        source_dir,
+        dest_dir,
+        repo_id,
+        revision,
+        verify=args.verify,
+        low_memory=args.low_memory,
+    )
     return 0
 
 
