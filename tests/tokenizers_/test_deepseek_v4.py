@@ -211,8 +211,21 @@ def test_deepseek_v4_renders_parsed_history_tool_arguments():
     assert 'parameter name="arguments"' not in prompt
 
 
-@pytest.mark.parametrize("reasoning_effort", ["minimal", "low", "medium", "high"])
-def test_deepseek_v4_accepts_openai_reasoning_effort_values(reasoning_effort):
+@pytest.mark.parametrize(
+    ("reasoning_effort", "expect_preamble"),
+    [
+        # DeepSeek-V4-Flash-0731 gave "high" its own preamble (the text that
+        # used to be "max"-only), so the low tier is now the ONLY one that
+        # renders a bare thinking prompt.
+        ("minimal", False),
+        ("low", False),
+        ("medium", True),
+        ("high", True),
+    ],
+)
+def test_deepseek_v4_accepts_openai_reasoning_effort_values(
+    reasoning_effort, expect_preamble
+):
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
@@ -221,7 +234,7 @@ def test_deepseek_v4_accepts_openai_reasoning_effort_values(reasoning_effort):
     )
 
     assert prompt.endswith("<｜Assistant｜><think>")
-    assert "Reasoning Effort: Absolute maximum" not in prompt
+    assert ("Reasoning Effort: Absolute maximum" in prompt) is expect_preamble
 
 
 def test_deepseek_v4_none_reasoning_effort_disables_thinking():
@@ -238,14 +251,19 @@ def test_deepseek_v4_none_reasoning_effort_disables_thinking():
 @pytest.mark.parametrize(
     ("reasoning_effort", "expected_mode", "expected_effort"),
     [
+        # The OpenAI API's levels collapse onto DeepSeek's three in order.
+        # Before 0731 the encoding only honoured "max", so everything below it
+        # could safely be lumped into "high"; now "high" carries real weight
+        # and each tier has to land on its own level.
         ("none", "chat", None),
-        ("minimal", "thinking", "high"),
-        ("low", "thinking", "high"),
+        ("minimal", "thinking", "low"),
+        ("low", "thinking", "low"),
         ("medium", "thinking", "high"),
         ("high", "thinking", "high"),
         ("xhigh", "thinking", "max"),
         ("max", "thinking", "max"),
-        ("unexpected", "thinking", "high"),
+        # Unrecognized levels degrade to the default rather than escalating.
+        ("unexpected", "thinking", "low"),
     ],
 )
 def test_deepseek_v4_maps_compatible_thinking_reasoning_effort_values(
@@ -276,30 +294,25 @@ def test_deepseek_v4_maps_compatible_thinking_reasoning_effort_values(
     assert captured_kwargs[-1]["reasoning_effort"] == expected_effort
 
 
-def test_deepseek_v4_preserves_reference_max_reasoning_effort():
+@pytest.mark.parametrize("reasoning_effort", ["max", "xhigh"])
+def test_deepseek_v4_preserves_reference_max_reasoning_effort(reasoning_effort):
+    """The top tier renders 0731's "Beyond maximum" preamble.
+
+    Pre-0731 this text did not exist and "max" rendered "Absolute maximum" --
+    which 0731 demoted to the "high" tier. Asserting on the distinguishing
+    opening line is what separates the two.
+    """
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
         enable_thinking=True,
-        reasoning_effort="max",
+        reasoning_effort=reasoning_effort,
     )
 
     assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"
     )
-
-
-def test_deepseek_v4_maps_xhigh_to_reference_max_reasoning_effort():
-    prompt = _tokenizer().apply_chat_template(
-        [{"role": "user", "content": "Hello"}],
-        tokenize=False,
-        enable_thinking=True,
-        reasoning_effort="xhigh",
-    )
-
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
-    )
+    assert "Absolute maximum" not in prompt
 
 
 @pytest.mark.parametrize(
