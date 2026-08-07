@@ -80,6 +80,13 @@ _PRESERVE_DTYPE_NAMES = {
 }
 _FP8_WEIGHT_DTYPE_NAMES = {"torch.float8_e4m3fn", "F8_E4M3"}
 _FP8_SCALE_DTYPE_NAMES = {"torch.float8_e8m0fnu", "F8_E8M0"}
+# The MXFP4 routed-expert container: two 4-bit values per byte, carried as I8.
+# Any other dtype under an expert weight name is a container we do not know how
+# to unpack, and unpacking it as nibbles anyway yields plausible-looking
+# garbage, so it must classify as unknown.
+_MXFP4_PACKED_WEIGHT_DTYPE_NAMES = {"torch.int8", "I8"}
+# Its E8M0 group-scale companion, either typed or as the raw exponent byte.
+_MXFP4_SCALE_DTYPE_NAMES = _FP8_SCALE_DTYPE_NAMES | {"torch.uint8", "U8"}
 
 
 @dataclass(frozen=True)
@@ -119,9 +126,13 @@ def classify_tensor(name: str, dtype: str) -> tuple[str, str]:
         # weight_scale/weight_scale_2/input_scale companions.
         if dtype in _NVFP4_PACKED_WEIGHT_DTYPE_NAMES:
             return "routed_expert_nvfp4_weight", "preserve"
-        return "routed_expert_mxfp4_weight", "quantize_asym_int4_awq_candidate"
+        if dtype in _MXFP4_PACKED_WEIGHT_DTYPE_NAMES:
+            return "routed_expert_mxfp4_weight", "quantize_asym_int4_awq_candidate"
+        return "unknown", "manual_review"
     if _ROUTED_EXPERT_SCALE_RE.search(name):
-        return "routed_expert_mxfp4_scale", "quantize_asym_int4_awq_candidate"
+        if dtype in _MXFP4_SCALE_DTYPE_NAMES:
+            return "routed_expert_mxfp4_scale", "quantize_asym_int4_awq_candidate"
+        return "unknown", "manual_review"
     # These fp8-parent checks must run BEFORE the blanket preserve-dtype
     # check below, and are name-gated on the fp8-parent substring lists so
     # they cannot misclassify unrelated passthrough tensors (norms, biases).
@@ -192,13 +203,57 @@ def _iter_safetensors(
                 )
 
 
-def audit_checkpoint(checkpoint: Path) -> dict[str, object]:
-    cfg_path = checkpoint / "config.json"
-    num_mtp_layers = 0
-    if cfg_path.exists():
-        cfg = json.loads(cfg_path.read_text())
-        num_mtp_layers = int(cfg.get("num_nextn_predict_layers", 0) or 0)
+_MTP_STAGE_RE = re.compile(r"^mtp\.(\d+)\.")
+# Materialized by the converter from the backbone's own ``embed.weight`` /
+# ``head.weight``, so a source that lacks the per-stage copies is not missing
+# anything as long as it carries the backbone tensor to copy from.
+_MTP_SHARED_TENSORS = {
+    "emb.tok_emb.weight": "embed.weight",
+    "head.weight": "head.weight",
+}
+# Final norm, HCHead parameters and (DSpark) Markov head. DSpark carries these
+# on its LAST stage, vanilla single-stage Flash MTP on mtp.0 -- the same rule.
+_MTP_FINAL_STAGE_TENSORS = (
+    "norm.weight",
+    "hc_head_fn",
+    "hc_head_base",
+    "hc_head_scale",
+)
 
+
+def mtp_stage_ids(tensor_names: Iterable[str]) -> list[int]:
+    """MTP/DSpark stage indices actually present, ignoring config.json.
+
+    ``num_nextn_predict_layers`` is not a stage count for DSpark checkpoints:
+    0731 ships all three stages while still declaring 1.
+    """
+    return sorted(
+        {
+            int(match.group(1))
+            for name in tensor_names
+            if (match := _MTP_STAGE_RE.match(name))
+        }
+    )
+
+
+def _missing_mtp_tensors(tensor_names: set[str]) -> list[str]:
+    stages = mtp_stage_ids(tensor_names)
+    if not stages:
+        return []
+    missing: list[str] = []
+    for stage in stages:
+        for suffix, backbone_source in _MTP_SHARED_TENSORS.items():
+            name = f"mtp.{stage}.{suffix}"
+            if name not in tensor_names and backbone_source not in tensor_names:
+                missing.append(name)
+    for suffix in _MTP_FINAL_STAGE_TENSORS:
+        name = f"mtp.{stages[-1]}.{suffix}"
+        if name not in tensor_names:
+            missing.append(name)
+    return missing
+
+
+def audit_checkpoint(checkpoint: Path) -> dict[str, object]:
     records: list[TensorRecord] = []
     tensor_names: set[str] = set()
     for name, shard_path, dtype, shape in _iter_safetensors(checkpoint):
@@ -224,27 +279,14 @@ def audit_checkpoint(checkpoint: Path) -> dict[str, object]:
         and r.action != "preserve"
         and r.scale_name not in tensor_names
     ]
-    missing_mtp_tensors: list[str] = []
-    if num_mtp_layers > 0 and any(name.startswith("mtp.") for name in tensor_names):
-        for idx in range(num_mtp_layers):
-            for suffix in (
-                "emb.tok_emb.weight",
-                "head.weight",
-                "norm.weight",
-                "hc_head_fn",
-                "hc_head_base",
-                "hc_head_scale",
-            ):
-                name = f"mtp.{idx}.{suffix}"
-                if name not in tensor_names:
-                    missing_mtp_tensors.append(name)
     summary = {
         "total_tensors": len(records),
         "by_role": dict(collections.Counter(r.role for r in records)),
         "by_action": dict(collections.Counter(r.action for r in records)),
         "by_dtype": dict(collections.Counter(r.dtype for r in records)),
+        "mtp_stages": mtp_stage_ids(tensor_names),
         "missing_scales": missing_scales,
-        "missing_mtp_tensors": missing_mtp_tensors,
+        "missing_mtp_tensors": _missing_mtp_tensors(tensor_names),
         "unknown_tensors": [r.name for r in records if r.role == "unknown"],
     }
     return {

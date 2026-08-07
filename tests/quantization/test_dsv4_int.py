@@ -11,7 +11,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from tools.ampere.dsv4_checkpoint_audit import classify_tensor, matched_scale_name
-from tools.ampere.dsv4_requant_checkpoint import convert_checkpoint, splice_mtp
+from tools.ampere.dsv4_requant_checkpoint import convert_checkpoint
 import vllm.model_executor.layers.quantization.dsv4_int as dsv4_int_module
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
 from vllm.model_executor.layers.linear import LinearBase
@@ -30,7 +30,6 @@ from vllm.model_executor.layers.quantization.dsv4_int import (
     dequantize_int8_w8a16,
     dequantize_uint4_asym_w4a16,
     quantize_fp32_to_uint4_asym_w4a16,
-    requantize_fp8_block_to_int4_w4a16,
     requantize_fp8_to_allspark_uint8_w8a16,
     requantize_fp8_to_int8_w8a16,
     requantize_mxfp4_to_int4_w4a16,
@@ -261,75 +260,13 @@ def test_mxfp4_to_int4_mse_scale_mode_beats_absmax7():
 
 
 @pytest.mark.skipif(
-    not hasattr(torch, "float8_e4m3fn"),
-    reason="requires torch float8 dtypes",
-)
-def test_fp8_block_to_int4_requant_roundtrip_matches_fp8_block_dequant():
-    """The Flash-Base routed-expert source path: full-width F8_E4M3 weight +
-    classic FP32 128x128-tile scale (NOT packed MXFP4 + E8M0), requantized to
-    the same on-disk INT4 W4A16 group-32 convention as the MXFP4 path."""
-    torch.manual_seed(3)
-    n = 64
-    k = 256
-    source = (torch.randn(n, k) * 0.5).clamp(-4, 4)
-    weight_fp8 = source.to(torch.float8_e4m3fn)
-    scale_fp32 = torch.rand(1, 2) * 0.05 + 0.01  # gn=1 (n<128), gk=2 (k=256)
-
-    fp8_truth = weight_fp8.to(torch.float32) * scale_fp32.repeat_interleave(
-        128, 0
-    ).repeat_interleave(128, 1)[:n, :k]
-
-    result = requantize_fp8_block_to_int4_w4a16(weight_fp8, scale_fp32)
-    assert result["qweight_packed"].shape == (n, k // 2)
-    assert result["scales"].shape == (n, k // 32)
-    dequant = dequantize_int4_w4a16(
-        result["qweight_packed"], result["scales"], group_size=32
-    )
-    assert _snr_db(fp8_truth, dequant) > 20.0
-
-
-@pytest.mark.skipif(
-    not hasattr(torch, "float8_e4m3fn"),
-    reason="requires torch float8 dtypes",
-)
-def test_fp8_block_to_int4_mse_scale_mode_beats_absmax7():
-    """Re-verify (do not assume) that the MSE scale search still helps on
-    fp8-block source, whose noise characteristics differ from the MXFP4
-    source the search was originally tuned against (fp8-block: finer 3-bit
-    e4m3 mantissa per value, coarser 128-wide scale tile vs MXFP4's 32-wide
-    groups)."""
-    torch.manual_seed(4)
-    n = 64
-    k = 1024
-    source = (torch.randn(n, k) * 0.6).clamp(-4, 4)
-    weight_fp8 = source.to(torch.float8_e4m3fn)
-    scale_fp32 = torch.rand(1, 8) * 0.05 + 0.01
-
-    fp8_truth = weight_fp8.to(torch.float32) * scale_fp32.repeat_interleave(
-        128, 0
-    ).repeat_interleave(128, 1)[:n, :k]
-
-    snrs = {}
-    for mode in ("absmax7", "mse"):
-        result = requantize_fp8_block_to_int4_w4a16(
-            weight_fp8, scale_fp32, scale_mode=mode
-        )
-        dequant = dequantize_int4_w4a16(
-            result["qweight_packed"], result["scales"], group_size=32
-        )
-        snrs[mode] = _snr_db(fp8_truth, dequant)
-
-    assert snrs["mse"] > snrs["absmax7"], snrs
-
-
-@pytest.mark.skipif(
     not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
     reason="requires torch float8 dtypes",
 )
 def test_fp8_to_int8_requant_accepts_classic_fp32_block_scale():
-    """Flash-Base's dense/attention FP8 linears carry a classic FP32 tile
-    scale, not Flash's MX-style UE8M0 byte. Both must dequantize to the same
-    physical value and both must be accepted by the same requant helper."""
+    """A block scale may be stored as the MX-style UE8M0 byte or as a classic
+    FP32 tile value. Both must dequantize to the same physical value and both
+    must be accepted by the same requant helper."""
     torch.manual_seed(5)
     n = 256
     k = 256
@@ -941,33 +878,20 @@ def test_checkpoint_audit_classifies_deepseek_v4_precision_roles():
         matched_scale_name("layers.0.attn.wq_a.weight")
         == "layers.0.attn.wq_a.scale"
     )
-    # Flash-Base source: routed experts are full-width F8_E4M3 + classic
-    # FP32 tile scale, distinct from Flash's packed I8 MXFP4 + F8_E8M0.
-    assert classify_tensor("layers.2.ffn.experts.0.w1.weight", "F8_E4M3") == (
-        "routed_expert_fp8_block_weight",
-        "quantize_int4_w4a16_candidate",
-    )
-    assert classify_tensor("layers.2.ffn.experts.0.w1.scale", "F32") == (
-        "routed_expert_fp8_block_scale",
-        "quantize_int4_w4a16_candidate",
-    )
     assert classify_tensor("layers.2.ffn.experts.0.w1.scale", "F8_E8M0") == (
         "routed_expert_mxfp4_scale",
         "quantize_asym_int4_awq_candidate",
     )
-    # Flash-Base's dense/attention FP8 linears use the same classic FP32
-    # scale as its routed experts, not Flash's MX-style UE8M0 byte.
-    assert classify_tensor("layers.2.attn.wq_a.scale", "F32") == (
-        "dense_fp8_scale",
-        "quantize_int8_w8a16_candidate",
+    # A routed-expert container we cannot unpack must not be mistaken for the
+    # packed I8 MXFP4 one: unpacking those bytes as nibbles yields
+    # plausible-looking garbage rather than an error.
+    assert classify_tensor("layers.2.ffn.experts.0.w1.weight", "F8_E4M3") == (
+        "unknown",
+        "manual_review",
     )
-    assert classify_tensor("layers.2.attn.indexer.wq_b.scale", "F32") == (
-        "indexer_qk_fp8_scale",
-        "measure_recall_then_quantize",
-    )
-    assert classify_tensor("mtp.0.h_proj.scale", "F32") == (
-        "mtp_fp8_scale",
-        "quantize_int8_w8a16_candidate",
+    assert classify_tensor("layers.2.ffn.experts.0.w1.scale", "F32") == (
+        "unknown",
+        "manual_review",
     )
 
 
@@ -1030,11 +954,13 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
     cfg = json.loads((dst / "config.json").read_text())
     assert cfg["expert_dtype"] == "int4"
     assert cfg["quantization_config"]["quant_method"] == "dsv4_int"
+    # The default scale mode is recorded in the checkpoint, so a served
+    # checkpoint always says how its expert scales were derived.
     assert (
         cfg["quantization_config"]["config_groups"]["experts_w4a16"]["weights"][
             "scale_mode"
         ]
-        == "absmax7"
+        == "mse"
     )
     assert cfg["num_hidden_layers"] == 2
     assert cfg["vllm"] == {
@@ -1161,92 +1087,14 @@ def test_requant_checkpoint_can_preserve_mxfp4_experts_with_int8_dense(tmp_path)
     not hasattr(torch, "float8_e4m3fn"),
     reason="requires torch float8 dtypes",
 )
-def test_requant_checkpoint_converts_flash_base_fp8_block_source(tmp_path):
-    """End-to-end pipeline smoke test for the Flash-Base source convention:
-    routed experts are full-width F8_E4M3 + classic FP32 tile scale (not
-    packed MXFP4 + E8M0), and dense/attention FP8 linears also carry a
-    classic FP32 tile scale instead of Flash's MX-style UE8M0 byte. Both must
-    land in the SAME on-disk INT4/INT8 target convention our runtime kernels
-    expect, indistinguishable from a Flash-sourced conversion."""
-    src = tmp_path / "src"
-    dst = tmp_path / "dst"
-    src.mkdir()
-
-    shard_name = "model-00001-of-00001.safetensors"
-    expert_fp8 = torch.randn(4, 64).clamp(-2, 2).to(torch.float8_e4m3fn)
-    expert_scale_fp32 = torch.full((1, 1), 0.05, dtype=torch.float32)
-    attn_fp8 = torch.randn(130, 129).clamp(-2, 2).to(torch.float8_e4m3fn)
-    attn_scale_fp32 = torch.full((2, 2), 0.05, dtype=torch.float32)
-    wo_a_fp8 = torch.randn(64, 64).clamp(-2, 2).to(torch.float8_e4m3fn)
-    wo_a_scale_fp32 = torch.full((1, 1), 0.05, dtype=torch.float32)
-    tensors = {
-        "layers.0.ffn.experts.0.w1.weight": expert_fp8,
-        "layers.0.ffn.experts.0.w1.scale": expert_scale_fp32,
-        "layers.42.attn.wq_a.weight": attn_fp8,
-        "layers.42.attn.wq_a.scale": attn_scale_fp32,
-        "layers.42.attn.wo_a.weight": wo_a_fp8,
-        "layers.42.attn.wo_a.scale": wo_a_scale_fp32,
-        "layers.42.attn.attn_sink": torch.ones(4, dtype=torch.bfloat16),
-    }
-    save_file(tensors, str(src / shard_name))
-    (src / "config.json").write_text(
-        json.dumps(
-            {
-                "architectures": ["DeepseekV4ForCausalLM"],
-                "num_hidden_layers": 2,
-                "expert_dtype": "fp8_block",
-            }
-        )
-    )
-    (src / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": "0"},
-                "weight_map": {name: shard_name for name in tensors},
-            }
-        )
-    )
-
-    convert_checkpoint(
-        src,
-        dst,
-        device="cpu",
-        out_scale_dtype=torch.bfloat16,
-        overwrite=False,
-        layer_remap=None,
-    )
-
-    cfg = json.loads((dst / "config.json").read_text())
-    assert cfg["expert_dtype"] == "int4"
-    assert cfg["quantization_config"]["quant_method"] == "dsv4_int"
-
-    with safe_open(dst / shard_name, framework="pt", device="cpu") as handle:
-        keys = set(handle.keys())
-        # remapped from layer 42 -> layer 1 (only layers 0 and 42 present, 2
-        # declared hidden layers -> auto layer-remap collapses them to 0,1)
-        assert "layers.1.attn.wq_a.weight" in keys
-        assert handle.get_tensor("layers.0.ffn.experts.0.w1.weight").dtype is torch.int8
-        assert handle.get_tensor("layers.0.ffn.experts.0.w1.weight").shape == (4, 32)
-        assert (
-            handle.get_tensor("layers.0.ffn.experts.0.w1.scale").dtype
-            is torch.bfloat16
-        )
-        assert handle.get_tensor("layers.0.ffn.experts.0.w1.scale").shape == (4, 2)
-        assert handle.get_tensor("layers.1.attn.wq_a.weight").dtype is torch.int8
-        assert handle.get_tensor("layers.1.attn.wq_a.scale").dtype is torch.bfloat16
-        # wo_a: dequantized straight to BF16, no scale companion emitted
-        assert handle.get_tensor("layers.1.attn.wo_a.weight").dtype is torch.bfloat16
-        assert "layers.1.attn.wo_a.scale" not in keys
-
-
-@pytest.mark.skipif(
-    not hasattr(torch, "float8_e4m3fn"),
-    reason="requires torch float8 dtypes",
-)
-def test_requant_checkpoint_rejects_mxfp4_passthrough_for_fp8_block_experts(tmp_path):
-    """--expert-format mxfp4 has no meaning for Flash-Base's fp8-block routed
-    experts (there is no native MXFP4 on-disk form to preserve byte-for-byte)
-    and must fail loudly instead of silently requantizing anyway."""
+@pytest.mark.parametrize("expert_format", ["int4", "mxfp4"])
+def test_requant_checkpoint_rejects_unrecognized_expert_container(
+    tmp_path, expert_format
+):
+    """A routed-expert weight that is not the packed I8 MXFP4 container has no
+    conversion: unpacking those bytes as INT4 nibbles produces
+    plausible-looking garbage, and preserving them byte-for-byte produces a
+    checkpoint the Marlin kernels cannot read. Fail on the tensor instead."""
     src = tmp_path / "src"
     dst = tmp_path / "dst"
     src.mkdir()
@@ -1256,7 +1104,9 @@ def test_requant_checkpoint_rejects_mxfp4_passthrough_for_fp8_block_experts(tmp_
         "layers.0.ffn.experts.0.w1.weight": torch.randn(4, 64)
         .clamp(-2, 2)
         .to(torch.float8_e4m3fn),
-        "layers.0.ffn.experts.0.w1.scale": torch.full((1, 1), 0.05, dtype=torch.float32),
+        "layers.0.ffn.experts.0.w1.scale": torch.full(
+            (1, 1), 0.05, dtype=torch.float32
+        ),
     }
     save_file(tensors, str(src / shard_name))
     (src / "config.json").write_text(
@@ -1271,7 +1121,7 @@ def test_requant_checkpoint_rejects_mxfp4_passthrough_for_fp8_block_experts(tmp_
         )
     )
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="unknown tensor"):
         convert_checkpoint(
             src,
             dst,
@@ -1279,161 +1129,7 @@ def test_requant_checkpoint_rejects_mxfp4_passthrough_for_fp8_block_experts(tmp_
             out_scale_dtype=torch.bfloat16,
             overwrite=False,
             layer_remap=None,
-            expert_format="mxfp4",
-        )
-
-
-@pytest.mark.skipif(
-    not hasattr(torch, "float8_e4m3fn"),
-    reason="requires torch float8 dtypes",
-)
-def test_splice_mtp_replaces_backbone_mtp_with_dspark_three_stages(tmp_path):
-    """The DSpark splice: mtp.0 is RESTRUCTURED (replaces whatever mtp.0 the
-    backbone source natively carries), mtp.1 AND mtp.2 are ADDED (three
-    DeepSpec draft stages total -- corrected from an earlier 2-stage
-    assumption after diffing the real DSpark index this session). All three
-    stages requantize to the same on-disk convention as the backbone."""
-    backbone_src = tmp_path / "backbone_src"
-    dst = tmp_path / "dst"
-    mtp_src = tmp_path / "mtp_src"
-    backbone_src.mkdir()
-    mtp_src.mkdir()
-
-    backbone_shard = "model-00001-of-00001.safetensors"
-    backbone_tensors = {
-        "layers.0.attn.wq_a.weight": torch.randn(130, 129)
-        .clamp(-2, 2)
-        .to(torch.float8_e4m3fn),
-        "layers.0.attn.wq_a.scale": torch.full((2, 2), 0.05, dtype=torch.float32),
-        # Backbone's OWN native mtp.0 (Base-sourced) must be dropped, not
-        # merged, once a --mtp-src splice is requested.
-        "mtp.0.enorm.weight": torch.ones(8, dtype=torch.bfloat16),
-    }
-    save_file(backbone_tensors, str(backbone_src / backbone_shard))
-    (backbone_src / "config.json").write_text(
-        json.dumps({"architectures": ["DeepseekV4ForCausalLM"], "num_hidden_layers": 1})
-    )
-    (backbone_src / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": "0"},
-                "weight_map": {name: backbone_shard for name in backbone_tensors},
-            }
-        )
-    )
-
-    convert_checkpoint(
-        backbone_src,
-        dst,
-        device="cpu",
-        out_scale_dtype=torch.bfloat16,
-        overwrite=False,
-        layer_remap=None,
-        drop_mtp=True,
-    )
-    assert not [
-        n
-        for n in json.loads((dst / "model.safetensors.index.json").read_text())[
-            "weight_map"
-        ]
-        if n.startswith("mtp.")
-    ]
-
-    mtp_shard = "model-00001-of-00001.safetensors"
-    mtp_tensors: dict[str, torch.Tensor] = {}
-    for stage in (0, 1, 2):
-        mtp_tensors[f"mtp.{stage}.attn.wq_a.weight"] = (
-            torch.randn(64, 64).clamp(-2, 2).to(torch.float8_e4m3fn)
-        )
-        mtp_tensors[f"mtp.{stage}.attn.wq_a.scale"] = torch.full(
-            (1, 1), 0.05, dtype=torch.float32
-        )
-        mtp_tensors[f"mtp.{stage}.ffn.experts.0.w1.weight"] = (
-            torch.randn(4, 64).clamp(-2, 2).to(torch.float8_e4m3fn)
-        )
-        mtp_tensors[f"mtp.{stage}.ffn.experts.0.w1.scale"] = torch.full(
-            (1, 1), 0.05, dtype=torch.float32
-        )
-        mtp_tensors[f"mtp.{stage}.main_norm.weight"] = torch.ones(
-            8, dtype=torch.bfloat16
-        )
-    # non-mtp tensor in the same source shard must NOT be pulled in
-    mtp_tensors["layers.0.attn.wq_a.weight"] = (
-        torch.randn(130, 129).clamp(-2, 2).to(torch.float8_e4m3fn)
-    )
-    mtp_tensors["layers.0.attn.wq_a.scale"] = torch.full(
-        (2, 2), 0.05, dtype=torch.float32
-    )
-    save_file(mtp_tensors, str(mtp_src / mtp_shard))
-    (mtp_src / "config.json").write_text(
-        json.dumps(
-            {
-                "architectures": ["DeepseekV4ForCausalLM"],
-                "num_hidden_layers": 1,
-                "dspark_block_size": 5,
-                "dspark_markov_rank": 256,
-                "dspark_noise_token_id": 128799,
-                "dspark_target_layer_ids": [40, 41, 42],
-            }
-        )
-    )
-    (mtp_src / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": "0"},
-                "weight_map": {name: mtp_shard for name in mtp_tensors},
-            }
-        )
-    )
-
-    totals = splice_mtp(
-        dst,
-        mtp_src,
-        device="cpu",
-        out_scale_dtype=torch.bfloat16,
-        dense_int8_strategy="block",
-    )
-    assert totals["int4_from_fp8_block"] == 3  # one expert weight per stage
-    assert totals["int8"] == 3  # one attn linear per stage
-    assert totals["preserve"] == 3  # main_norm per stage
-
-    index = json.loads((dst / "model.safetensors.index.json").read_text())
-    weight_map = index["weight_map"]
-    for stage in (0, 1, 2):
-        assert f"mtp.{stage}.attn.wq_a.weight" in weight_map
-        assert f"mtp.{stage}.ffn.experts.0.w1.weight" in weight_map
-        assert f"mtp.{stage}.main_norm.weight" in weight_map
-    # the non-mtp tensor from mtp_src's shard must not have leaked in
-    assert not [n for n in weight_map if n == "layers.1.attn.wq_a.weight"]
-    non_mtp_backbone_tensors = [
-        n for n in weight_map if not n.startswith("mtp.") and "attn.wq_a" in n
-    ]
-    # weight + scale for the original backbone's single attn.wq_a only
-    assert len(non_mtp_backbone_tensors) == 2
-
-    dst_shards = {p.name for p in dst.glob("*.safetensors")}
-    with safe_open(
-        dst / weight_map["mtp.1.ffn.experts.0.w1.weight"], framework="pt", device="cpu"
-    ) as handle:
-        assert handle.get_tensor("mtp.1.ffn.experts.0.w1.weight").dtype is torch.int8
-        assert (
-            handle.get_tensor("mtp.1.ffn.experts.0.w1.scale").dtype is torch.bfloat16
-        )
-
-    cfg = json.loads((dst / "config.json").read_text())
-    assert cfg["num_nextn_predict_layers"] == 3
-    assert cfg["dspark_target_layer_ids"] == [40, 41, 42]
-    assert cfg["dspark_block_size"] == 5
-
-    # re-splicing without a fresh drop_mtp backbone must fail loudly instead
-    # of silently duplicating/orphaning tensors
-    with pytest.raises(ValueError, match="already carries"):
-        splice_mtp(
-            dst,
-            mtp_src,
-            device="cpu",
-            out_scale_dtype=torch.bfloat16,
-            dense_int8_strategy="block",
+            expert_format=expert_format,
         )
 
 
