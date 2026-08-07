@@ -199,7 +199,9 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def _validate_part_file(path: str, part: FlashPackPart) -> None:
+def _validate_part_file(
+    path: str, part: FlashPackPart, *, verify_sha256: bool = True
+) -> None:
     try:
         size = os.path.getsize(path)
     except FileNotFoundError as exc:
@@ -208,6 +210,8 @@ def _validate_part_file(path: str, part: FlashPackPart) -> None:
         raise ValueError(
             f"FlashPack part {part.filename!r} has size {size}, expected {part.size}"
         )
+    if not verify_sha256:
+        return
     actual_sha256 = _sha256_file(path)
     if actual_sha256 != part.sha256:
         raise ValueError(
@@ -292,18 +296,6 @@ def _import_flashpack():
     )
 
 
-def _is_first_pipeline_rank() -> bool:
-    from vllm.distributed import get_pp_group
-
-    return get_pp_group().is_first_rank
-
-
-def _is_last_pipeline_rank() -> bool:
-    from vllm.distributed import get_pp_group
-
-    return get_pp_group().is_last_rank
-
-
 def flashpack_weights_iterator(
     index: FlashPackIndex,
     parts: tuple[FlashPackPart, ...],
@@ -311,6 +303,7 @@ def flashpack_weights_iterator(
     should_load_weight: Callable[[str], bool],
     *,
     device: torch.device,
+    verify_sha256: bool = True,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield local weights while retaining at most one part's storage."""
     (
@@ -326,12 +319,15 @@ def flashpack_weights_iterator(
         path = resolve_part(part.filename)
 
         # Footer validation happens before checksum streaming and payload
-        # transfer. The checksum then authenticates both footer and payload.
+        # transfer. With verify_sha256, the checksum then authenticates both
+        # footer and payload; without it only the size and footer names are
+        # checked. The sha pass re-reads every byte of the checkpoint, which
+        # doubles load IO on pools too small to page-cache it.
         metadata = get_flashpack_file_metadata(path)
         _validate_footer_tensor_names(
             metadata, names_by_part[part.filename], part.filename
         )
-        _validate_part_file(path, part)
+        _validate_part_file(path, part, verify_sha256=verify_sha256)
 
         storage, metadata = read_flashpack_file(
             path,
@@ -362,6 +358,8 @@ class FlashPackModelLoader(DefaultModelLoader):
         BaseModelLoader.__init__(self, load_config)
         self.local_expert_ids: set[int] | None = None
         self.local_layer_range: tuple[int, int] | None = None
+        self.is_first_pipeline_rank = True
+        self.is_last_pipeline_rank = True
         self.counter_before_loading_weights = 0.0
         self.counter_after_loading_weights = 0.0
         self.enable_weights_track = None
@@ -369,7 +367,12 @@ class FlashPackModelLoader(DefaultModelLoader):
         extra_config = load_config.model_loader_extra_config
         if not isinstance(extra_config, dict):
             raise ValueError("FlashPack model_loader_extra_config must be a dict")
-        allowed_keys = {"include_mtp", "manifest_filename", "enable_weights_track"}
+        allowed_keys = {
+            "include_mtp",
+            "manifest_filename",
+            "enable_weights_track",
+            "verify_sha256",
+        }
         unexpected_keys = set(extra_config) - allowed_keys
         if unexpected_keys:
             raise ValueError(
@@ -382,6 +385,10 @@ class FlashPackModelLoader(DefaultModelLoader):
         self.enable_weights_track = extra_config.get("enable_weights_track")
         if self.enable_weights_track not in (None, True, False):
             raise ValueError("FlashPack enable_weights_track must be a bool")
+        verify_sha256 = extra_config.get("verify_sha256", True)
+        if not isinstance(verify_sha256, bool):
+            raise ValueError("FlashPack verify_sha256 must be a bool")
+        self.verify_sha256 = verify_sha256
 
         manifest_filename = extra_config.get("manifest_filename", FLASHPACK_INDEX_NAME)
         self.manifest_filename = _require_nonempty_string(
@@ -440,7 +447,12 @@ class FlashPackModelLoader(DefaultModelLoader):
 
         def should_load_weight(name: str) -> bool:
             return (
-                not should_skip_pp_weight(name, self.local_layer_range)
+                not should_skip_pp_weight(
+                    name,
+                    self.local_layer_range,
+                    is_first_pipeline_rank=self.is_first_pipeline_rank,
+                    is_last_pipeline_rank=self.is_last_pipeline_rank,
+                )
                 and not should_skip_weight(name, self.local_expert_ids)
                 and not is_pp_missing_parameter(name, model)
             )
@@ -450,10 +462,10 @@ class FlashPackModelLoader(DefaultModelLoader):
             should_load_weight,
             include_mtp=self.include_mtp,
             is_first_pipeline_stage=(
-                self.local_layer_range is None or _is_first_pipeline_rank()
+                self.local_layer_range is None or self.is_first_pipeline_rank
             ),
             is_last_pipeline_stage=(
-                self.local_layer_range is None or _is_last_pipeline_rank()
+                self.local_layer_range is None or self.is_last_pipeline_rank
             ),
         )
         if not parts:
@@ -477,4 +489,5 @@ class FlashPackModelLoader(DefaultModelLoader):
             lambda filename: self._resolve_file(model_config, filename),
             should_load_weight,
             device=device,
+            verify_sha256=self.verify_sha256,
         )

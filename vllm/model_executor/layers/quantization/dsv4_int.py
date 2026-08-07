@@ -15,39 +15,39 @@ linear math for the smaller INT8 blocks until a W8A16 linear kernel is wired in.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.logger import init_logger as _dsv4_init_logger
 from vllm.transformers_utils.configs.dsv4.kernel_config import (
     DENSE_EXPERTS_INT8_ACTIVATION,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
     VLLM_CONFIG_KEY,
     activate_kernel_config,
-    resolve_kernel_config,
+    resolve_int_quant_kernel_config,
 )
 
 _dsv4_logger = _dsv4_init_logger(__name__)
 _DSV4_KERNEL_PATHS: dict = {}
-_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE = False
 
 
 def _dsv4_allspark_supported_device_capability(sm_version: int) -> bool:
     if sm_version in (120, 121):
-        enabled = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X", "1")
-        if enabled.lower() in ("0", "false", "off"):
-            return False
+        # The native kernel is faster for small-M decode. Large-M prefill uses
+        # its cuBLAS fallback at the threshold below. Keep an explicit off
+        # switch for diagnostics.
+        return envs.VLLM_DSV4_ALLSPARK_SM12X
     return is_allspark_supported_device_capability(sm_version)
 
 
 def _dsv4_allspark_cublas_m_threshold(sm_version: int) -> int:
     if sm_version in (120, 121):
-        configured = os.environ.get("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD")
+        configured = envs.VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD
         if configured is not None:
-            threshold = int(configured)
+            threshold = configured
             if threshold < 0:
                 raise ValueError(
                     "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD must be non-negative"
@@ -55,13 +55,12 @@ def _dsv4_allspark_cublas_m_threshold(sm_version: int) -> int:
             return threshold
     return ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD
 
+
 def _dsv4_log_path(path: str) -> None:
     _DSV4_KERNEL_PATHS[path] = _DSV4_KERNEL_PATHS.get(path, 0) + 1
-    _dsv4_logger.info("DSV4KERNEL dense path=%s running_counts=%s", path, _DSV4_KERNEL_PATHS)
-
-
-def dsv4_int4_experts_int8_dense_active() -> bool:
-    return _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE
+    _dsv4_logger.info(
+        "DSV4KERNEL dense path=%s running_counts=%s", path, _DSV4_KERNEL_PATHS
+    )
 
 
 def _has_int4_experts_int8_dense(config_groups: dict[str, Any]) -> bool:
@@ -76,11 +75,6 @@ def _has_int4_experts_int8_dense(config_groups: dict[str, Any]) -> bool:
         and linear_weights.get("type") == "int"
     )
 
-
-def _mark_dsv4_int4_experts_int8_dense_active(active: bool) -> None:
-    global _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE
-    if active:
-        _DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE = True
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention import Attention
@@ -448,9 +442,7 @@ def requantize_fp8_to_int8_w8a16(
     abs_max = abs_max.clamp(min=torch.finfo(torch.float32).tiny)
     new_scale = abs_max / 127.0
 
-    new_scale_full = new_scale.repeat_interleave(bn, dim=0).repeat_interleave(
-        bk, dim=1
-    )
+    new_scale_full = new_scale.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
     qweight = torch.round(dequant / new_scale_full[:n, :k]).clamp(-128, 127)
     return {
         "qweight": qweight.to(torch.int8),
@@ -644,29 +636,22 @@ class Dsv4IntConfig(QuantizationConfig):
         # here fails closed at startup and, together with __setstate__,
         # propagates the kernel gates into Ray workers on unpickle.
         self.vllm = vllm
-        resolved = resolve_kernel_config(vllm)
-        if resolved.explicit:
-            dense_listed = resolved.has_role(ROLE_DENSE_EXPERTS_INT8_ACTIVATION)
-            if dense_listed and not _has_int4_experts_int8_dense(
-                self.config_groups
-            ):
-                raise ValueError(
-                    f"{DENSE_EXPERTS_INT8_ACTIVATION!r} "
-                    f"({ROLE_DENSE_EXPERTS_INT8_ACTIVATION}) is listed in "
-                    f'"{VLLM_CONFIG_KEY}.kernels" but the checkpoint does '
-                    "not carry INT4 experts + INT8 dense weight groups"
-                )
-            self.experimental_int8_runtime = dense_listed
-        else:
-            self.experimental_int8_runtime = False
+        has_int_weights = _has_int4_experts_int8_dense(self.config_groups)
+        resolved = resolve_int_quant_kernel_config(
+            vllm, has_int_weight_family=has_int_weights
+        )
+        dense_enabled = resolved.has_role(ROLE_DENSE_EXPERTS_INT8_ACTIVATION)
+        if resolved.explicit and dense_enabled and not has_int_weights:
+            raise ValueError(
+                f"{DENSE_EXPERTS_INT8_ACTIVATION!r} "
+                f"({ROLE_DENSE_EXPERTS_INT8_ACTIVATION}) requires a checkpoint "
+                "with INT4 experts and INT8 dense weight groups"
+            )
+        self.experimental_int8_runtime = dense_enabled
         self.kernels_explicit = resolved.explicit
-        _mark_dsv4_int4_experts_int8_dense_active(
-            self.experimental_int8_runtime
-        )
-        activate_kernel_config(resolved)
-        self.expert_input_dtype = (
-            torch.int8 if self.experimental_int8_runtime else None
-        )
+        if resolved.explicit or has_int_weights:
+            activate_kernel_config(resolved)
+        self.expert_input_dtype = torch.int8 if self.experimental_int8_runtime else None
         linears = self.config_groups.get("linears_w8a16", {})
         weights = linears.get("weights", {})
         self.int8_weight_strategy = weights.get("strategy", "block")
@@ -684,14 +669,15 @@ class Dsv4IntConfig(QuantizationConfig):
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
-        _mark_dsv4_int4_experts_int8_dense_active(
-            self.experimental_int8_runtime
-        )
         # Re-activate the unified kernel config in Ray workers (the module
         # global does not travel with the pickle).
-        activate_kernel_config(
-            resolve_kernel_config(getattr(self, "vllm", None))
+        has_int_weights = _has_int4_experts_int8_dense(self.config_groups)
+        resolved = resolve_int_quant_kernel_config(
+            getattr(self, "vllm", None),
+            has_int_weight_family=has_int_weights,
         )
+        if resolved.explicit or has_int_weights:
+            activate_kernel_config(resolved)
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -734,8 +720,10 @@ class Dsv4IntConfig(QuantizationConfig):
         Precedence: ``vllm`` kernel block > ``VLLM_MARLIN_INPUT_DTYPE``
         env > default (None = W4A16). An explicit ``vllm.kernels`` list is
         authoritative: listing ``marlin_act_int8_process_scales`` selects the
-        INT8 integer-MMA activation path, omitting it selects W4A16 even when
-        the upstream env is set. Without a block, the upstream env applies.
+        INT8 integer-MMA activation path, while omitting it selects W4A16 even
+        when the upstream env is set. Without a block, INT4/INT8 checkpoint
+        groups imply INT8 activations; incomplete configs fall back to the
+        upstream environment setting.
         """
         if getattr(self, "kernels_explicit", False):
             return self.expert_input_dtype
@@ -1144,8 +1132,7 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         # next to the target on the last PP rank. Safe because expert e's
         # slot is only overwritten after pack_one has copied it out.
         assert first.nbytes == weight[0].nbytes, (
-            f"marlin repack changed payload size: {first.nbytes} != "
-            f"{weight[0].nbytes}"
+            f"marlin repack changed payload size: {first.nbytes} != {weight[0].nbytes}"
         )
         storage = weight.view(num_experts, -1).view(first.dtype)
         storage[0].copy_(first.view(-1))

@@ -1236,12 +1236,12 @@ assert callable(flash_mla.sparse_mla_decode_int8); \
 assert callable(flash_mla.sparse_mla_prefill_int8); \
 print('flash_mla 2.0.0 native INT8 decode/prefill importable')"
 
-# sparkinfer supplies the sm12x (GB10) kernels used by the shared image's
-# FP8/NVFP4 paths. The int4-int8 checkpoint selects flash_mla instead.
+# sparkinfer supplies SM12x kernels for FP8/NVFP4 and the native INT8
+# sparse-indexer decode and prefill paths used by the int4-int8 checkpoint.
 # Install order matters -- it pins nvidia-cutlass-dsl, which quack must not
 # drag backwards; requirements/cuda.txt already pins 4.6.0 for both.
 ARG SPARKINFER_REPO=https://github.com/AppMana/forks-sparkinfer
-ARG SPARKINFER_REF=7811b848c16a90841c7c0c852125d31ec4504f99
+ARG SPARKINFER_REF=78cc92eaad3bf0378d199c44621bbaee75d0cb47
 # uv shells out to git for a `git+` requirement, and this stage has no git.
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt \

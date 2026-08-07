@@ -24,8 +24,6 @@ from copy import deepcopy
 from typing import Any, NamedTuple
 
 import numpy as np
-import os
-
 import torch
 import torch.nn as nn
 
@@ -1171,12 +1169,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
-        import os as _os4
-
-        if (
-            _os4.environ.get("APPMANA_DSPARK_SYNC_DEBUG") == "1"
-            and sample_hidden_states.shape[0] > 1
-        ):
+        if envs.APPMANA_DSPARK_SYNC_DEBUG and sample_hidden_states.shape[0] > 1:
             _shv = sample_hidden_states.float()
             _hsv = hidden_states.float()
             logger.warning(
@@ -1268,7 +1261,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # sample_tokens(), before propose()'s return value is broadcast.
             valid = idx_mapping >= 0
             if bool(valid.any()):
-                self.req_states.draft_tokens[idx_mapping[valid]] = proposed_tokens[valid]
+                self.req_states.draft_tokens[idx_mapping[valid]] = proposed_tokens[
+                    valid
+                ]
 
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu

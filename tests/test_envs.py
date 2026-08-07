@@ -46,6 +46,65 @@ def test_mhc_dispatch_is_a_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert factors["VLLM_MHC_PRE_TRITON"] is False
 
 
+def test_dsv4_dense_dispatch_is_a_compile_factor(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "0")
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD", "64")
+
+    factors = envs.compile_factors()
+
+    assert factors["VLLM_DSV4_ALLSPARK_SM12X"] is False
+    assert factors["VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD"] == 64
+
+
+def test_dsv4_dense_dispatch_changes_compile_cache_hash(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.config.utils import hash_factors
+
+    monkeypatch.delenv("VLLM_DSV4_ALLSPARK_SM12X", raising=False)
+    monkeypatch.delenv("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD", raising=False)
+    default_hash = hash_factors(envs.compile_factors())
+
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "0")
+    allspark_off_hash = hash_factors(envs.compile_factors())
+
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "1")
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD", "64")
+    threshold_hash = hash_factors(envs.compile_factors())
+
+    assert default_hash != allspark_off_hash
+    assert default_hash != threshold_hash
+    assert allspark_off_hash != threshold_hash
+
+
+def test_dspark_spec_controls_are_compile_factors(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("APPMANA_DSPARK_SPEC_AS_PREFILL", "1")
+    monkeypatch.setenv("APPMANA_DSPARK_SYNC_DEBUG", "1")
+    monkeypatch.setenv("APPMANA_DSPARK_PROF", "1")
+
+    factors = envs.compile_factors()
+
+    assert factors["APPMANA_DSPARK_SPEC_AS_PREFILL"] is True
+    assert factors["APPMANA_DSPARK_SYNC_DEBUG"] is True
+    assert factors["APPMANA_DSPARK_PROF"] is True
+    # Logging cadence only; never part of compile-cache identity.
+    assert "APPMANA_DSPARK_PROF_LOG_EVERY" not in factors
+
+
+def test_mhc_torch_fallback_synchronize_default_matches_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.mhc import _mhc_torch_fallback_synchronize
+
+    monkeypatch.delenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", raising=False)
+    assert envs.VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE is False
+    assert _mhc_torch_fallback_synchronize() is False
+
+    monkeypatch.setenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1")
+    assert envs.VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE is True
+    assert _mhc_torch_fallback_synchronize() is True
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

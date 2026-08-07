@@ -128,6 +128,8 @@ def test_zero_layer_rank_loads_sharded_checkpoint(monkeypatch, tmp_path):
         files,
         use_tqdm_on_load=False,
         local_layer_range=(NUM_LAYERS, NUM_LAYERS),
+        is_first_pipeline_rank=False,
+        is_last_pipeline_rank=True,
     )
     loader = AutoWeightsLoader(parent, skip_substrs=["mtp."])
     loaded = loader.load_weights(
@@ -157,12 +159,13 @@ def test_zero_layer_iterator_yields_no_backbone(tmp_path):
             files,
             use_tqdm_on_load=False,
             local_layer_range=(NUM_LAYERS, NUM_LAYERS),
+            is_first_pipeline_rank=False,
+            is_last_pipeline_rank=True,
         )
     ]
     assert names == sorted(names)  # safetensors key order within the shard
     assert all(not n.startswith("layers.") for n in names)
     assert set(names) == {
-        "embed.weight",
         "norm.weight",
         "head.weight",
         "mtp.0.norm.weight",

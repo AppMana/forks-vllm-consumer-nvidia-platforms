@@ -363,12 +363,14 @@ class DeepSeekV4MTP(nn.Module):
                 num_experts=self.config.n_routed_experts,
             )
 
-        # FP8 experts register ``..._weight_scale_inv`` (block_quant) while
-        # FP4/MXFP4 experts register ``..._weight_scale``. Choose the suffix
-        # for the rename below based on the model's expert dtype.
+        # fp4 AND int4 experts register ".weight_scale"; only block-fp8
+        # experts use ".weight_scale_inv" (mirrors dspark.py and the target
+        # model's weights mapper). With int4 treated as fp8 here, loading the
+        # dsv4_int (W4A16 Marlin) MTP weights looked up w13_weight_scale_inv
+        # params the draft's quantized MoE never registers.
         expert_scale_suffix = (
             ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+            if getattr(self.config, "expert_dtype", "fp4") in ("fp4", "int4")
             else ".weight_scale_inv"
         )
 

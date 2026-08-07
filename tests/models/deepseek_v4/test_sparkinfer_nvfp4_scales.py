@@ -1,43 +1,155 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import sys
+import types
+from pathlib import Path
+
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.sparkinfer_moe import (
+    SparkInferExperts,
     _modelopt_activation_gscales,
 )
 from vllm.model_executor.layers.fused_moe.oracle import nvfp4
+from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    merge_nvfp4_gate_up_input_scales,
+    require_uniform_nvfp4_expert_scale,
+)
+
+_SCALE_FIXTURE = Path(__file__).parent / "fixtures" / "nvfp4_layer0_input_scales.json"
+_NVFP4_VALUES = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
 
 
-def test_modelopt_activation_scales_follow_sparkinfer_reciprocal_contract():
-    # These stand in for ModelOpt checkpoint `*.input_scale` fields. FC1 has
-    # separate gate/up values; the fused activation quantizer uses their max.
-    w13_input_scale = torch.tensor([[0.5, 0.25], [0.125, 0.25]])
-    w2_input_scale = torch.tensor([0.2, 0.1])
-    w13_weight_scale = torch.tensor([0.125, 0.25])
-    w2_weight_scale = torch.tensor([0.5, 0.75])
+def _load_released_scales() -> tuple[torch.Tensor, torch.Tensor]:
+    payload = json.loads(_SCALE_FIXTURE.read_text())
+    assert payload["revision"] == "e3cd60e7de98e9867116860d522499a728de1cf9"
+    assert payload["num_experts"] == 256
+    w1 = torch.tensor(payload["w1_input_scale"], dtype=torch.float32)
+    w2 = torch.tensor(payload["w2_input_scale"], dtype=torch.float32)
+    w3 = torch.tensor(payload["w3_input_scale"], dtype=torch.float32)
+    torch.testing.assert_close(w1, w3, rtol=0, atol=0)
+    return torch.stack((w1, w3), dim=-1), w2
+
+
+def _torch_nvfp4_quant_dequant(
+    x: torch.Tensor, checkpoint_scale: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize Torch NVFP4 blocks using ModelOpt's per-expert scale."""
+    x_f32 = x.float().reshape(x.shape[0], -1, 16)
+    global_scale = checkpoint_scale.reciprocal().reshape(-1, 1)
+    block_scale = (x_f32.abs().amax(dim=-1) * global_scale / 6.0).clamp(
+        max=torch.finfo(torch.float8_e4m3fn).max
+    )
+    block_scale = block_scale.to(torch.float8_e4m3fn).float()
+    dequant_scale = block_scale / global_scale
+    normalized = x_f32 / dequant_scale.unsqueeze(-1).clamp(min=1e-30)
+    sign = normalized.sign()
+    magnitude = normalized.abs().unsqueeze(-1)
+    fp4 = _NVFP4_VALUES[(magnitude - _NVFP4_VALUES).abs().argmin(dim=-1)] * sign
+    return (fp4 * dequant_scale.unsqueeze(-1)).reshape_as(x).to(torch.bfloat16)
+
+
+def test_modelopt_activation_scales_preserve_released_expert_axis():
+    w13_input_scale, w2_input_scale = _load_released_scales()
 
     a1_gscale, a2_gscale = _modelopt_activation_gscales(
         w13_input_scale,
         w2_input_scale,
     )
 
-    torch.testing.assert_close(a1_gscale, torch.tensor([2.0, 4.0]))
-    torch.testing.assert_close(a2_gscale, torch.tensor([5.0, 10.0]))
-    # SparkInfer's modelopt_nvfp4 preparation computes weight/a_reciprocal.
-    torch.testing.assert_close(
-        w13_weight_scale / a1_gscale,
-        w13_weight_scale * w13_input_scale.max(dim=-1).values,
-    )
-    torch.testing.assert_close(
-        w2_weight_scale / a2_gscale,
-        w2_weight_scale * w2_input_scale,
-    )
+    assert a1_gscale.shape == (256,)
+    assert a2_gscale.shape == (256,)
+    torch.testing.assert_close(a1_gscale, torch.reciprocal(w13_input_scale[:, 0]))
+    torch.testing.assert_close(a2_gscale, torch.reciprocal(w2_input_scale))
     assert a1_gscale.dtype == torch.float32
     assert a2_gscale.dtype == torch.float32
     assert a1_gscale.is_contiguous()
     assert a2_gscale.is_contiguous()
+
+    ramp = torch.linspace(-1.0, 1.0, 32).repeat(256, 1)
+    calibrated_amax = w2_input_scale[:, None] * (448.0 * 6.0)
+    hidden_states = (ramp * calibrated_amax * 0.91).to(torch.bfloat16)
+    reference = _torch_nvfp4_quant_dequant(hidden_states, w2_input_scale)
+    collapsed = _torch_nvfp4_quant_dequant(
+        hidden_states,
+        w2_input_scale.max().expand_as(w2_input_scale),
+    )
+    mismatch = torch.nonzero(reference != collapsed)
+    assert mismatch.numel() > 0
+    assert tuple(mismatch[0].tolist()) == (0, 0)
+
+
+def test_modelopt_fc1_rejects_distinct_gate_and_up_input_scales():
+    w13_input_scale = torch.ones(256, 2)
+    w13_input_scale[17] = torch.tensor([0.0023832775, 0.0029529390])
+
+    with pytest.raises(ValueError, match="gate and up input scales must match"):
+        _modelopt_activation_gscales(w13_input_scale, torch.ones(256))
+
+
+def test_shared_scale_backends_reject_released_expert_axis():
+    w13_input_scale, w2_input_scale = _load_released_scales()
+
+    torch.testing.assert_close(
+        merge_nvfp4_gate_up_input_scales(w13_input_scale),
+        w13_input_scale[:, 0],
+    )
+    with pytest.raises(ValueError, match="differs across experts"):
+        require_uniform_nvfp4_expert_scale(
+            w2_input_scale,
+            num_local_experts=256,
+            name="a2_scale",
+        )
+
+
+def test_sparkinfer_marks_checkpoint_activation_scales_static(monkeypatch):
+    captured = {}
+    fused_moe = types.ModuleType("sparkinfer.moe.fused_moe")
+
+    def bind(plan, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    fused_moe.bind = bind
+    fused_moe.run = lambda *, binding: captured["output"]
+    moe_module = types.ModuleType("sparkinfer.moe")
+    moe_module.fused_moe = fused_moe
+    package = types.ModuleType("sparkinfer")
+    package.moe = moe_module
+    monkeypatch.setitem(sys.modules, "sparkinfer", package)
+    monkeypatch.setitem(sys.modules, "sparkinfer.moe", moe_module)
+
+    experts = object.__new__(SparkInferExperts)
+    experts._experts = object()
+    experts._weight_plan = object()
+    experts._get_plan_scratch = lambda num_tokens, device: (object(), torch.empty(1))
+    hidden_states = torch.zeros(2, 16, dtype=torch.bfloat16)
+    output = torch.empty_like(hidden_states)
+    experts.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=torch.empty(0),
+        w2=torch.empty(0),
+        topk_weights=torch.ones(2, 1),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+        activation=MoEActivation.SILU,
+        global_num_experts=256,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=None,
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert captured["input_scales_static"] is True
 
 
 @pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("inf"), float("nan")])

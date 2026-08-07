@@ -28,12 +28,27 @@ import regex as re
 # start-of-string case.
 _LAYER_ID_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
+_FIRST_STAGE_PREFIXES = (
+    "embed.",
+    "embed_tokens.",
+    "model.embed.",
+    "model.embed_tokens.",
+)
+_LAST_STAGE_PREFIXES = (
+    "head.",
+    "lm_head.",
+    "norm.",
+    "model.norm.",
+    "hc_head",
+    "model.hc_head",
+    "mtp.",
+    "model.mtp.",
+)
+
 
 def parse_layer_id(weight_name: str) -> int | None:
     """Return the hidden-layer index embedded in *weight_name*, or ``None``
-    if the weight is not associated with a specific numbered layer (e.g.
-    embedding, final norm, lm_head -- these are always dense/shared and must
-    never be skipped)."""
+    if the weight is not associated with a specific numbered layer."""
     m = _LAYER_ID_RE.search(weight_name)
     return int(m.group(1)) if m else None
 
@@ -41,28 +56,40 @@ def parse_layer_id(weight_name: str) -> int | None:
 def should_skip_pp_weight(
     weight_name: str,
     local_layer_range: tuple[int, int] | None,
+    *,
+    is_first_pipeline_rank: bool = True,
+    is_last_pipeline_rank: bool = True,
 ) -> bool:
     """Return ``True`` if *weight_name* is a per-layer weight whose layer
     index falls outside this rank's local ``[start, end)`` layer range and
     should be skipped during loading.
 
     ``local_layer_range`` is ``None`` when pipeline parallelism is not
-    active (pp_size <= 1), in which case nothing is ever skipped.
+    active (pp_size <= 1), in which case nothing is ever skipped. Under PP,
+    standard global tensors are kept only on their owning first or last rank.
     """
     if local_layer_range is None:
         return False
     lid = parse_layer_id(weight_name)
-    if lid is None:
-        # Not a per-layer weight (embedding / final norm / lm_head / etc.)
-        # -> always local, never skip.
-        return False
-    start, end = local_layer_range
-    return not (start <= lid < end)
+    if lid is not None:
+        start, end = local_layer_range
+        return not (start <= lid < end)
+    if weight_name.startswith(_FIRST_STAGE_PREFIXES):
+        return not is_first_pipeline_rank
+    if weight_name.startswith(_LAST_STAGE_PREFIXES):
+        return not is_last_pipeline_rank
+    # Unknown shared/global tensors stay visible on every rank. This is the
+    # conservative fallback for model-specific parameters whose ownership is
+    # not encoded by the standard checkpoint names above.
+    return False
 
 
 def classify_shards(
     weight_map: dict[str, str],
     local_layer_range: tuple[int, int] | None,
+    *,
+    is_first_pipeline_rank: bool = True,
+    is_last_pipeline_rank: bool = True,
 ) -> dict[str, bool]:
     """Given a safetensors index's ``weight_map`` (tensor name -> shard
     filename), return ``{shard_filename: needs_real_copy}`` for staging a
@@ -76,6 +103,11 @@ def classify_shards(
     fetched with ``get_tensor()`` -- which never happens for skipped names."""
     result: dict[str, bool] = {}
     for weight_name, shard_filename in weight_map.items():
-        needs_copy = not should_skip_pp_weight(weight_name, local_layer_range)
+        needs_copy = not should_skip_pp_weight(
+            weight_name,
+            local_layer_range,
+            is_first_pipeline_rank=is_first_pipeline_rank,
+            is_last_pipeline_rank=is_last_pipeline_rank,
+        )
         result[shard_filename] = result.get(shard_filename, False) or needs_copy
     return result

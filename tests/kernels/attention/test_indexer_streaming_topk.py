@@ -26,11 +26,10 @@ if not current_platform.is_cuda() or capability is None or capability.major < 8:
     )
 
 from vllm.model_executor.layers.sparse_attn_indexer import (  # noqa: E402
+    _fp32_sort_keys_into,
+    _indexer_prefill_logits,
     oneshot_prefill_topk_reference,
     streaming_prefill_topk,
-)
-from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (  # noqa: E402
-    mqa_logits_workspace_triton,
 )
 
 HEADS = 64
@@ -62,6 +61,54 @@ def _make_inputs(m, n, *, qk_int8, seed=0, ctx_start=None, device="cuda"):
     return q, k, k_scale, weights, ks, ke
 
 
+def _torch_int8_mqa_logits(q, k, k_scale, weights, ks, ke):
+    """Known-correct eager form of the INT8 indexer logits equation."""
+    scores = torch.einsum("mhd,nd->mhn", q.float(), k.float())
+    logits = (torch.relu(scores * k_scale[None, None, :]) * weights[:, :, None]).sum(
+        dim=1
+    )
+    columns = torch.arange(k.shape[0], device=q.device)
+    valid = (columns[None, :] >= ks[:, None]) & (columns[None, :] < ke[:, None])
+    return logits.masked_fill(~valid, -torch.inf)
+
+
+def test_int8_logits_and_streaming_topk_match_torch_eager():
+    """Prove both the modified logits path and streamed selection against eager."""
+    m, n, topk = 4, 4097, 512
+    q, k, k_scale, weights, ks, ke = _make_inputs(
+        m, n, qk_int8=True, seed=17, ctx_start=n - m
+    )
+
+    eager_logits = _torch_int8_mqa_logits(q, k, k_scale, weights, ks, ke)
+    native_logits = _indexer_prefill_logits(
+        q, (k, k_scale), weights, ks, ke, qk_int8=True
+    )
+    torch.testing.assert_close(native_logits, eager_logits, rtol=2e-5, atol=2e-3)
+
+    eager_keys = torch.empty((m, n), dtype=torch.int64, device="cuda")
+    _fp32_sort_keys_into(eager_logits, 0, eager_keys)
+    eager_top_keys = torch.topk(
+        eager_keys, topk, dim=1, largest=True, sorted=True
+    ).values
+    eager_indices = ((1 << 32) - 1 - (eager_top_keys & 0xFFFFFFFF)).to(
+        torch.int32
+    ) - ks[:, None]
+
+    actual = torch.empty(m, topk, dtype=torch.int32, device="cuda")
+    streaming_prefill_topk(
+        q,
+        (k, k_scale),
+        weights,
+        ks,
+        ke,
+        actual,
+        topk,
+        slab_rows=2048,
+        qk_int8=True,
+    )
+    _assert_sets_equal_mod_boundary_ties(actual, eager_indices, eager_logits, ke, topk)
+
+
 @pytest.mark.parametrize("qk_int8", [True, False])
 @pytest.mark.parametrize("slab_rows", [4096, 16384, 8191])
 def test_streaming_matches_oneshot_scores(qk_int8, slab_rows):
@@ -84,9 +131,7 @@ def test_streaming_matches_oneshot_scores(qk_int8, slab_rows):
         slab_rows=slab_rows,
         qk_int8=qk_int8,
     )
-    logits = mqa_logits_workspace_triton(
-        q, (k, k_scale), weights, ks, ke, qk_int8=qk_int8
-    )
+    logits = _indexer_prefill_logits(q, (k, k_scale), weights, ks, ke, qk_int8=qk_int8)
     _assert_sets_equal_mod_boundary_ties(out, ref, logits, ke, topk)
 
 
@@ -121,9 +166,7 @@ def test_streaming_matches_production_kernel_set(qk_int8):
     m, n, topk = 256, 32768, 2048
     q, k, k_scale, weights, ks, ke = _make_inputs(m, n, qk_int8=qk_int8, seed=1)
 
-    logits = mqa_logits_workspace_triton(
-        q, (k, k_scale), weights, ks, ke, qk_int8=qk_int8
-    )
+    logits = _indexer_prefill_logits(q, (k, k_scale), weights, ks, ke, qk_int8=qk_int8)
     prod = torch.full((m, topk), -1, dtype=torch.int32, device="cuda")
     ops.top_k_per_row_prefill(
         logits, ks, ke, prod, m, logits.stride(0), logits.stride(1), topk
@@ -172,9 +215,7 @@ def test_streaming_ties_preserve_score_multiset():
             slab_rows=slab,
             qk_int8=True,
         )
-        logits = mqa_logits_workspace_triton(
-            q, (k, k_scale), weights, ks, ke, qk_int8=True
-        )
+        logits = _indexer_prefill_logits(q, (k, k_scale), weights, ks, ke, qk_int8=True)
         _assert_sets_equal_mod_boundary_ties(out, ref, logits, ke, topk)
 
 
@@ -195,7 +236,7 @@ def test_short_rows_pad_minus_one():
     streaming_prefill_topk(
         q, (k, k_scale), weights, ks, ke, out, topk, slab_rows=4096, qk_int8=True
     )
-    logits = mqa_logits_workspace_triton(q, (k, k_scale), weights, ks, ke, qk_int8=True)
+    logits = _indexer_prefill_logits(q, (k, k_scale), weights, ks, ke, qk_int8=True)
     _assert_sets_equal_mod_boundary_ties(out, ref, logits, ke, topk)
     assert (out[0] == -1).all()
     ke_cpu = ke.cpu()
@@ -232,7 +273,7 @@ def test_multi_request_row_offsets():
 
     # Set-compare against the production kernel too. Its indices are local;
     # re-localize both against ks=0 for the helper by adding row starts back.
-    logits = mqa_logits_workspace_triton(q, (k, k_scale), weights, ks, ke, qk_int8=True)
+    logits = _indexer_prefill_logits(q, (k, k_scale), weights, ks, ke, qk_int8=True)
     prod = torch.full((m, topk), -1, dtype=torch.int32, device="cuda")
     ops.top_k_per_row_prefill(
         logits, ks, ke, prod, m, logits.stride(0), logits.stride(1), topk
@@ -241,6 +282,49 @@ def test_multi_request_row_offsets():
     out_glob = torch.where(out >= 0, out + ks_col, out)
     prod_glob = torch.where(prod >= 0, prod + ks_col, prod)
     _assert_sets_equal_mod_boundary_ties(out_glob, prod_glob, logits, ke, topk)
+
+
+def test_sm120_int8_streaming_selects_triton_logits_per_slab(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels
+
+    calls = []
+
+    def fake_triton(q, kv, weights, k_start, k_end, *, qk_int8):
+        del weights, k_start, k_end
+        assert qk_int8
+        calls.append(kv[0].shape[0])
+        scores = torch.arange(kv[0].shape[0], dtype=torch.float32, device=q.device)
+        return scores.expand(q.shape[0], -1).contiguous()
+
+    monkeypatch.setattr(
+        triton_kernels,
+        "mqa_logits_workspace_triton",
+        fake_triton,
+    )
+    q = torch.zeros((2, HEADS, HEAD_DIM), dtype=torch.int8, device="cuda")
+    k = torch.zeros((8, HEAD_DIM), dtype=torch.int8, device="cuda")
+    scales = torch.ones(8, dtype=torch.float32, device="cuda")
+    weights = torch.ones((2, HEADS), dtype=torch.float32, device="cuda")
+    k_start = torch.zeros(2, dtype=torch.int32, device="cuda")
+    k_end = torch.full((2,), 8, dtype=torch.int32, device="cuda")
+    out = torch.empty((2, 2), dtype=torch.int32, device="cuda")
+
+    streaming_prefill_topk(
+        q,
+        (k, scales),
+        weights,
+        k_start,
+        k_end,
+        out,
+        2,
+        slab_rows=4,
+        qk_int8=True,
+    )
+
+    assert calls == [4, 4]
+    assert torch.equal(
+        out, torch.tensor([[3, 7], [3, 7]], dtype=torch.int32, device="cuda")
+    )
 
 
 def test_vllm_block_gates_streaming_and_sets_slab_rows(monkeypatch):
@@ -263,16 +347,8 @@ def test_vllm_block_gates_streaming_and_sets_slab_rows(monkeypatch):
     )
     assert indexer_mod.should_use_prefill_streaming_topk(1, False)
     assert indexer_mod._resolved_prefill_topk_slab_rows() == 5000
-    min_context = indexer_mod.INDEXER_PREFILL_STREAMING_MIN_CONTEXT_TOKENS
-    assert not indexer_mod.should_stream_prefill_topk_for_context(
-        1, False, 5000, min_context + 1
-    )
-    assert not indexer_mod.should_stream_prefill_topk_for_context(
-        1, False, 5001, min_context
-    )
-    assert indexer_mod.should_stream_prefill_topk_for_context(
-        1, False, 5001, min_context + 1
-    )
+    assert not indexer_mod.should_stream_prefill_topk_for_context(1, False, 5000)
+    assert indexer_mod.should_stream_prefill_topk_for_context(1, False, 5001)
 
     m, n, topk = 128, 16384, 512
     q, k, k_scale, weights, ks, ke = _make_inputs(m, n, qk_int8=True, seed=5)
@@ -282,5 +358,5 @@ def test_vllm_block_gates_streaming_and_sets_slab_rows(monkeypatch):
     # No explicit slab_rows: the config-block value (5000, unaligned) is used.
     out = torch.empty(m, topk, dtype=torch.int32, device="cuda")
     streaming_prefill_topk(q, (k, k_scale), weights, ks, ke, out, topk, qk_int8=True)
-    logits = mqa_logits_workspace_triton(q, (k, k_scale), weights, ks, ke, qk_int8=True)
+    logits = _indexer_prefill_logits(q, (k, k_scale), weights, ks, ke, qk_int8=True)
     _assert_sets_equal_mod_boundary_ties(out, ref, logits, ke, topk)

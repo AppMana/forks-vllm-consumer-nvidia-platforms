@@ -75,6 +75,8 @@ class DefaultModelLoader(BaseModelLoader):
         super().__init__(load_config)
         self.local_expert_ids: set[int] | None = None
         self.local_layer_range: tuple[int, int] | None = None
+        self.is_first_pipeline_rank = True
+        self.is_last_pipeline_rank = True
 
         extra_config = load_config.model_loader_extra_config
         if not isinstance(extra_config, dict):
@@ -297,6 +299,8 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
                         local_layer_range=self.local_layer_range,
+                        is_first_pipeline_rank=self.is_first_pipeline_rank,
+                        is_last_pipeline_rank=self.is_last_pipeline_rank,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -443,6 +447,11 @@ class DefaultModelLoader(BaseModelLoader):
 
         start, end = model_config.get_layers_start_end_indices(parallel_config)
         self.local_layer_range = (start, end)
+        from vllm.distributed import get_pp_group
+
+        pp_group = get_pp_group()
+        self.is_first_pipeline_rank = pp_group.is_first_rank
+        self.is_last_pipeline_rank = pp_group.is_last_rank
         logger.info_once(
             "PP weight filter: pp_size=%d, loading layers [%d, %d) of %d",
             parallel_config.pipeline_parallel_size,

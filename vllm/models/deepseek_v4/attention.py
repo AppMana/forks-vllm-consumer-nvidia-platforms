@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -33,6 +34,12 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -75,6 +82,45 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+# Diagnostic: serialize the attention stages and log per-stage GPU wall time.
+# Read once at import; never part of traced code (the op interior is opaque).
+_STEP_TIMING = os.environ.get("APPMANA_DSV4_STEP_TIMING", "0") == "1"
+_STEP_TIMING_STATS: dict[str, list[float]] = {}
+_STEP_TIMING_CALLS = 0
+
+
+def _step_timing_record(section: str, seconds: float) -> None:
+    bucket = _STEP_TIMING_STATS.setdefault(section, [0.0, 0.0])
+    bucket[0] += seconds
+    bucket[1] += 1.0
+
+
+def _step_timing_maybe_log() -> None:
+    global _STEP_TIMING_CALLS
+    _STEP_TIMING_CALLS += 1
+    if _STEP_TIMING_CALLS % 256 != 0:
+        return
+    parts = [
+        f"{name}={total * 1000.0 / max(count, 1.0):.2f}ms(n={int(count)})"
+        for name, (total, count) in sorted(_STEP_TIMING_STATS.items())
+    ]
+    logger.info("DSV4_STEP_TIMING %s", " ".join(parts))
+    _STEP_TIMING_STATS.clear()
+
+
+def use_compilation_safe_attn_gemm_overlap(num_tokens: int) -> bool:
+    """Use auxiliary GEMM streams only outside a torch-compiled region.
+
+    Explicit stream/event orchestration inside the compiled model body can be
+    reordered across the graph break before ``attention_impl``. Keep the
+    compiled path sequential; the eager attention implementation retains its
+    own safe overlap after the break.
+    """
+    return (
+        not torch.compiler.is_compiling()
+        and num_tokens <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+    )
 
 
 @triton.jit
@@ -210,9 +256,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # block in the checkpoint config.json) before any consumer (indexer,
         # compressor, backend dispatch) reads the kernel gates. Runs in every
         # worker process at model build; idempotent by value.
-        activate_kernel_config(
-            resolve_kernel_config_from_hf_config(config)
-        )
+        activate_kernel_config(resolve_kernel_config_from_hf_config(config))
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
@@ -396,10 +440,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
         )
 
-        # attention_impl is wrapped with @eager_break_during_capture: this is
-        # where the breakable cudagraph capture breaks (the attention op runs
-        # eagerly between captured graph segments).
-        self.attention_impl(
+        # The metadata-dependent attention stack must stay opaque to
+        # torch.compile: it reads live forward-context state (attention
+        # metadata, KV caches, shared top-k buffers) that Dynamo would
+        # otherwise bake in at trace time, and the traced body is reused
+        # for every batch with all guards dropped. The custom op executes
+        # this Python at runtime; under breakable CUDA graph capture it is
+        # also where the capture breaks.
+        torch.ops.vllm.deepseek_v4_attention(
             hidden_states,
             qr,
             kv,
@@ -408,6 +456,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer_weights,
             positions,
             o_padded,
+            _encode_layer_name(self.prefix),
         )
         o = o_padded[:, : self.n_local_heads, :]
 
@@ -468,13 +517,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.ln_events[0],
             self.ln_events[1:4],
             aux_streams,
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            enable=use_compilation_safe_attn_gemm_overlap(hidden_states.shape[0]),
         )
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
-    @eager_break_during_capture
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -499,6 +546,42 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # on the default stream so q stays on its consumer stream (forward_mqa
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
+        if _STEP_TIMING and self.indexer is not None:
+            # Serial stages with sync fences: attributes per-stage GPU wall
+            # time at the cost of losing the aux-stream overlap. Diagnostic
+            # only; guarded by APPMANA_DSV4_STEP_TIMING=1.
+            import time as _time
+
+            assert self.compressor is not None
+            torch.cuda.synchronize()
+            t0 = _time.perf_counter()
+            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            torch.cuda.synchronize()
+            t1 = _time.perf_counter()
+            self.compressor(kv_score, positions, self.rotary_emb)
+            torch.cuda.synchronize()
+            t2 = _time.perf_counter()
+            self.indexer(
+                hidden_states,
+                qr,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                self.indexer_rotary_emb,
+            )
+            torch.cuda.synchronize()
+            t3 = _time.perf_counter()
+            self.forward_mqa(q, kv, positions, out)
+            torch.cuda.synchronize()
+            t4 = _time.perf_counter()
+            _step_timing_record("wq_b_kv_insert", t1 - t0)
+            _step_timing_record("compressor", t2 - t1)
+            _step_timing_record("indexer", t3 - t2)
+            _step_timing_record("forward_mqa", t4 - t3)
+            _step_timing_maybe_log()
+            return
+
         if self.indexer is not None:
             aux_streams = self.aux_stream_list
             indexer = self.indexer
@@ -779,9 +862,7 @@ class DeepseekV4Indexer(nn.Module):
         self._indexer_use_cutedsl = has_cutedsl()
         self._indexer_is_xpu = current_platform.is_xpu()
         self._indexer_fp8_dtype = current_platform.fp8_dtype()
-        self._indexer_supports_fp8e4nv_in_triton = (
-            _supports_fp8e4nv_in_triton()
-        )
+        self._indexer_supports_fp8e4nv_in_triton = _supports_fp8e4nv_in_triton()
         logger.info_once(
             "Lightning Indexer: cache_payload=%s query=%s",
             _indexer_cache_fmt,
@@ -921,9 +1002,7 @@ class DeepseekV4Indexer(nn.Module):
                 use_cutedsl=self._indexer_use_cutedsl,
                 is_xpu=self._indexer_is_xpu,
                 fp8_dtype=self._indexer_fp8_dtype,
-                supports_fp8e4nv_in_triton=(
-                    self._indexer_supports_fp8e4nv_in_triton
-                ),
+                supports_fp8e4nv_in_triton=(self._indexer_supports_fp8e4nv_in_triton),
             )
 
         # compressor returns None and writes K to the indexer KV cache; the
@@ -936,3 +1015,55 @@ class DeepseekV4Indexer(nn.Module):
             self.aux_stream,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)
+
+
+@eager_break_during_capture
+def deepseek_v4_attention(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    kv_score: torch.Tensor | None,
+    indexer_kv_score: torch.Tensor | None,
+    indexer_weights: torch.Tensor | None,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """Opaque DSV4 attention: q up-projection, indexer, compressor, KV-cache
+    insert, and sparse MLA. Everything behind this op reads forward-context
+    state (attention metadata, KV caches, the shared top-k indices buffer)
+    at runtime, so it must never be traced into the compiled model body."""
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer.attention_impl(
+        hidden_states,
+        qr,
+        kv,
+        kv_score,
+        indexer_kv_score,
+        indexer_weights,
+        positions,
+        out,
+    )
+
+
+def deepseek_v4_attention_fake(
+    hidden_states: torch.Tensor,
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    kv_score: torch.Tensor | None,
+    indexer_kv_score: torch.Tensor | None,
+    indexer_weights: torch.Tensor | None,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_attention",
+    op_func=deepseek_v4_attention,
+    mutates_args=["out"],
+    fake_impl=deepseek_v4_attention_fake,
+)

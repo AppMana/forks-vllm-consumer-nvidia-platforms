@@ -103,14 +103,9 @@ def test_dsv4_int_quantization_config_registered():
     assert hybrid_cfg.int8_weight_strategy == "channel"
 
 
-def test_dsv4_int_top_level_vllm_block_enables_runtime(monkeypatch):
+def test_dsv4_int_top_level_vllm_block_enables_runtime():
     """get_quant_config copies the top-level "vllm" block alongside the
     quantization_config, so the block enables the dense W4A8 runtime."""
-    monkeypatch.setattr(
-        dsv4_int_module,
-        "_DSV4_INT4_EXPERTS_INT8_DENSE_ACTIVE",
-        False,
-    )
     quantization_config = {
         "quant_method": "dsv4_int",
         "config_groups": {
@@ -144,7 +139,6 @@ def test_dsv4_int_top_level_vllm_block_enables_runtime(monkeypatch):
     cfg = get_quant_config(model_config, SimpleNamespace())
 
     assert cfg.experimental_int8_runtime
-    assert dsv4_int_module.dsv4_int4_experts_int8_dense_active()
 
 
 def test_deepseek_v4_nvidia_scale_fmt_defaults_for_dsv4_int():
@@ -453,8 +447,10 @@ def test_deepseek_v4_int4_mapper_keeps_expert_scale_suffix():
     ]
 
 
-def test_dsv4_allspark_sm12x_diagnostic_switch(monkeypatch):
+def test_dsv4_allspark_sm12x_default_and_diagnostic_switch(monkeypatch):
     monkeypatch.delenv("VLLM_DSV4_ALLSPARK_SM12X", raising=False)
+    assert dsv4_int_module._dsv4_allspark_supported_device_capability(121)
+    monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "1")
     assert dsv4_int_module._dsv4_allspark_supported_device_capability(121)
     monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "0")
     assert not dsv4_int_module._dsv4_allspark_supported_device_capability(121)
@@ -479,11 +475,15 @@ def test_dsv4_allspark_sm12x_cublas_threshold(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_dsv4_channel_int8_linear_method_prefers_allspark_on_ampere():
+def test_dsv4_channel_int8_linear_method_prefers_allspark_on_supported_device(
+    monkeypatch,
+):
     props = torch.cuda.get_device_properties()
     sm_version = props.major * 10 + props.minor
     if not (80 <= sm_version <= 89 or sm_version in (120, 121)):
         pytest.skip("AllSpark W8A16 channel path is unsupported on this GPU")
+    if sm_version in (120, 121):
+        monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "1")
 
     torch.manual_seed(14)
     m = 12
@@ -546,7 +546,7 @@ def test_dsv4_channel_int8_linear_method_prefers_allspark_on_ampere():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_allspark_channel_int8_linear_method_matches_dequant_reference():
+def test_allspark_channel_int8_linear_method_matches_dequant_reference(monkeypatch):
     if not hasattr(torch.ops, "_C") or not hasattr(
         torch.ops._C, "allspark_w8a16_gemm"
     ):
@@ -555,6 +555,8 @@ def test_allspark_channel_int8_linear_method_matches_dequant_reference():
     sm_version = props.major * 10 + props.minor
     if not (80 <= sm_version <= 89 or sm_version in (120, 121)):
         pytest.skip("AllSpark W8A16 path is unsupported on this GPU")
+    if sm_version in (120, 121):
+        monkeypatch.setenv("VLLM_DSV4_ALLSPARK_SM12X", "1")
 
     torch.manual_seed(12)
     m = 12
@@ -1037,7 +1039,6 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
     assert cfg["num_hidden_layers"] == 2
     assert cfg["vllm"] == {
         "kernels": [
-            "flash_mla.sparse_mla_decode_fp8",
             "flash_mla.sparse_mla_decode_int8",
             "flash_mla.sparse_mla_prefill_int8",
             "vllm._custom_ops.indexer_k_quant_and_cache_int8",
@@ -1048,6 +1049,10 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
             (
                 "vllm.model_executor.layers.quantization.utils.marlin_utils"
                 ".marlin_act_int8_process_scales"
+            ),
+            (
+                "vllm.model_executor.layers.sparse_attn_indexer"
+                ".streaming_prefill_topk"
             ),
         ],
         "cache_type": "int8_ds_mla",
@@ -1527,6 +1532,7 @@ def test_int4_moe_marlin_repack_smoke():
     assert repacked.is_cuda
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_int4_moe_marlin_repack_reuses_source_storage():
     """The repack must not allocate a second full-size tensor: the DSpark
     draft loads next to the target on the last PP rank, where a duplicated

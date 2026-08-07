@@ -109,15 +109,18 @@ def _decode_logits_token_count_for_platform(
     max_model_len: int,
     is_cuda_sm120: bool,
 ) -> int:
-    """Keep GB10 on the known-safe power-of-two/full-width decode layout.
+    """Keep GB10 on a known-safe power-of-two decode layout.
 
-    The adaptive width is a useful memory optimization on Ampere, but the
-    SM12x paged indexer faults at live non-power-of-two widths even though its
-    isolated kernels pass. The production 65k configuration reserves only one
-    16,384-float row per decode request, so full width is inexpensive.
+    The SM12x paged indexer faults at live non-power-of-two widths even though
+    its isolated kernels pass. Bucket the live width up to a power of two
+    instead of scanning the full configured context on every decode layer.
+    Capture-time metadata still passes ``max_model_len`` and therefore keeps
+    the graph's full-width allocation.
     """
     if is_cuda_sm120:
-        return max_model_len
+        live_width = max(max_context_len, DECODE_LOGITS_WIDTH_ALIGNMENT)
+        power_of_two_width = 1 << (live_width - 1).bit_length()
+        return min(power_of_two_width, max_model_len)
     return _decode_logits_token_count(max_context_len, max_model_len)
 
 
@@ -163,11 +166,6 @@ MXFP4_BLOCK_SIZE = 32
 # slab=16384 the transient footprint is ~231 MiB (64 MiB slab logits fp32 +
 # 144 MiB int64 candidate keys + topk temporaries) vs O(M x window) one-shot.
 INDEXER_PREFILL_TOPK_SLAB_ROWS = 16384
-# The one-shot path is already bounded by the prefill chunk planner's logits
-# budget and is substantially faster at ordinary context lengths. Streaming
-# exists for the long-context regime where retaining full-window logits becomes
-# the limiting factor.
-INDEXER_PREFILL_STREAMING_MIN_CONTEXT_TOKENS = 640 * 1024
 
 
 def _resolved_prefill_topk_slab_rows() -> int:
@@ -222,13 +220,11 @@ def should_stream_prefill_topk_for_context(
     dcp_world_size: int,
     use_fp4_cache: bool,
     context_rows: int,
-    max_seq_len: int,
 ) -> bool:
-    """Use streaming only for a multi-slab, long-context prefill."""
+    """Use streaming exactly when the gathered context needs multiple slabs."""
     return (
         should_use_prefill_streaming_topk(dcp_world_size, use_fp4_cache)
         and context_rows > _resolved_prefill_topk_slab_rows()
-        and max_seq_len > INDEXER_PREFILL_STREAMING_MIN_CONTEXT_TOKENS
     )
 
 
@@ -304,19 +300,47 @@ def oneshot_prefill_topk_reference(
     """One-shot reference: full [M, N] logits, single top-k over the same
     unique-key total order as the streaming path. Returns [M, topk] int32
     request-LOCAL indices (column - cu_seqlen_ks), -1 padded."""
-    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
-        mqa_logits_workspace_triton,
-    )
-
     m = q_cast.shape[0]
     n = kv[0].shape[0]
-    logits = mqa_logits_workspace_triton(
-        q_cast, kv, weights, cu_seqlen_ks, cu_seqlen_ke, qk_int8=qk_int8
+    logits = _indexer_prefill_logits(
+        q_cast,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        qk_int8=qk_int8,
     )
     keys = torch.empty((m, n), dtype=torch.int64, device=q_cast.device)
     _fp32_sort_keys_into(logits, 0, keys)
     top_keys, _ = torch.topk(keys, topk_tokens, dim=1, largest=True, sorted=True)
     return _decode_topk_keys(top_keys, cu_seqlen_ks)
+
+
+def _indexer_prefill_logits(
+    q_cast: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    *,
+    qk_int8: bool,
+) -> torch.Tensor:
+    # Keep contiguous prefill logits on the proven Triton implementation.
+    # SparkInfer's SM12x contiguous kernel corrupts live long-prefill launches
+    # (Xid 13, misaligned address) and is also slower at the serving shapes.
+    # Its paged decode kernel is a separate contract and remains available.
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
+        mqa_logits_workspace_triton,
+    )
+
+    return mqa_logits_workspace_triton(
+        q_cast,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        qk_int8=qk_int8,
+    )
 
 
 def _decode_topk_keys(
@@ -351,7 +375,6 @@ def streaming_prefill_topk(
     """
     from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         indexer_imma_enabled,
-        mqa_logits_workspace_triton,
     )
 
     k_values, k_scales = kv
@@ -387,7 +410,7 @@ def streaming_prefill_topk(
         s = n1 - n0
         ks_local = torch.clamp(ks32 - n0, 0, s)
         ke_local = torch.clamp(ke32 - n0, 0, s)
-        slab_logits = mqa_logits_workspace_triton(
+        slab_logits = _indexer_prefill_logits(
             q_cast,
             (k_values[n0:n1], k_scales[n0:n1]),
             weights,
@@ -894,7 +917,6 @@ def sparse_attn_indexer(
                     dcp_world_size,
                     use_fp4_cache,
                     k_quant_cast.shape[0],
-                    attn_metadata_narrowed.max_seq_len,
                 )
                 if use_streaming_topk:
                     # Activation chunking: O(M x slab) streaming top-k instead

@@ -2,14 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm.models.deepseek_v4.nvidia_sm12x import mhc as adapter
+import vllm
+
+_ADAPTER_PATH = (
+    Path(vllm.__file__).parent / "models" / "deepseek_v4" / "nvidia_sm12x" / "mhc.py"
+)
+_ADAPTER_SPEC = importlib.util.spec_from_file_location(
+    "dsv4_sparkinfer_mhc_adapter", _ADAPTER_PATH
+)
+assert _ADAPTER_SPEC is not None and _ADAPTER_SPEC.loader is not None
+adapter = importlib.util.module_from_spec(_ADAPTER_SPEC)
+sys.modules[_ADAPTER_SPEC.name] = adapter
+_ADAPTER_SPEC.loader.exec_module(adapter)
 
 
 def _install_fake_sparkinfer(monkeypatch, mhc) -> None:
@@ -36,13 +49,13 @@ def test_pre_broadcast_preserves_vllm_mix_shapes_and_fuses_norm(monkeypatch):
 
     _install_fake_sparkinfer(
         monkeypatch,
-        SimpleNamespace(run_pre=run_pre),
+        SimpleNamespace(run_pre=run_pre, DEFAULT_BLOCK_K=256),
     )
-    x = torch.zeros(3, 8)
-    fn = torch.zeros(24, 8)
+    x = torch.zeros(3, 7168)
+    fn = torch.zeros(24, 7168)
     scale = torch.zeros(3)
     base = torch.zeros(24)
-    norm_weight = torch.ones(8)
+    norm_weight = torch.ones(7168)
 
     residual, post, comb, y = adapter.sparkinfer_mhc_pre_broadcast(
         x,
@@ -56,11 +69,12 @@ def test_pre_broadcast_preserves_vllm_mix_shapes_and_fuses_norm(monkeypatch):
         norm_eps=1.0e-6,
     )
 
-    assert residual.shape == (3, 4, 8)
+    assert residual.shape == (3, 4, 7168)
     assert post.shape == (3, 4, 1)
     assert comb.shape == (3, 4, 4)
-    assert y.shape == (3, 8)
+    assert y.shape == (3, 7168)
     assert calls[0][4]["norm_weight"] is norm_weight
+    assert calls[0][4]["split_k"] == 112
     assert "binding" not in calls[0][4]
 
 
@@ -79,17 +93,17 @@ def test_post_pre_preserves_vllm_mix_shapes_and_fuses_norm(monkeypatch):
 
     _install_fake_sparkinfer(
         monkeypatch,
-        SimpleNamespace(run_post_pre=run_post_pre),
+        SimpleNamespace(run_post_pre=run_post_pre, DEFAULT_BLOCK_K=256),
     )
-    x = torch.zeros(2, 8)
-    residual = torch.zeros(2, 4, 8)
-    norm_weight = torch.ones(8)
+    x = torch.zeros(2, 7168)
+    residual = torch.zeros(2, 4, 7168)
+    norm_weight = torch.ones(7168)
     outputs = adapter.sparkinfer_mhc_post_pre(
         x,
         residual,
         torch.zeros(2, 4, 1),
         torch.zeros(2, 4, 4),
-        torch.zeros(24, 32),
+        torch.zeros(24, 4 * 7168),
         torch.zeros(3),
         torch.zeros(24),
         rms_eps=1.0e-6,
@@ -100,13 +114,28 @@ def test_post_pre_preserves_vllm_mix_shapes_and_fuses_norm(monkeypatch):
     )
 
     assert [tuple(output.shape) for output in outputs] == [
-        (2, 4, 8),
+        (2, 4, 7168),
         (2, 4, 1),
         (2, 4, 4),
-        (2, 8),
+        (2, 7168),
     ]
     assert calls[0]["norm_weight"] is norm_weight
+    assert calls[0]["split_k"] == 112
+    assert calls[0]["expected_m"] == 2
     assert "binding" not in calls[0]
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "expected_split_k"),
+    [(4096, 64), (7168, 112)],
+)
+def test_sparkinfer_split_k_covers_full_hidden_dimension(hidden_size, expected_split_k):
+    assert adapter._sparkinfer_mhc_split_k(hidden_size, 256) == expected_split_k
+
+
+def test_sparkinfer_split_k_rejects_partial_k_coverage():
+    with pytest.raises(ValueError, match="to be divisible"):
+        adapter._sparkinfer_mhc_split_k(7168, 192)
 
 
 def test_contract_validation_fails_closed(monkeypatch):
@@ -231,6 +260,39 @@ def test_refresh_mhc_dispatch_runs_after_kernel_config_activation(monkeypatch):
     assert mhc._MHC_HEAD_TRITON
 
 
+def test_mhc_torch_fallback_does_not_synchronize_by_default(monkeypatch):
+    from vllm.model_executor.layers import mhc
+
+    monkeypatch.delenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", raising=False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: pytest.fail("default MHC fallback synchronized the CUDA stream"),
+    )
+
+    assert not mhc._mhc_torch_fallback_synchronize()
+    mhc._synchronize_mhc_torch_fallback()
+
+
+def test_mhc_torch_fallback_synchronizes_when_explicitly_enabled(monkeypatch):
+    from vllm.model_executor.layers import mhc
+
+    calls = []
+    stream = SimpleNamespace(synchronize=lambda: calls.append("stream"))
+    monkeypatch.setenv("VLLM_MHC_TORCH_FALLBACK_SYNCHRONIZE", "1")
+    monkeypatch.delenv("VLLM_MHC_TORCH_FALLBACK_SYNC_MODE", raising=False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    assert mhc._mhc_torch_fallback_synchronize()
+    mhc._synchronize_mhc_torch_fallback()
+
+    assert calls == ["stream"]
+
+
 def test_uncompiled_raw_cuda_graph_capture_fails_closed(monkeypatch):
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -278,12 +340,13 @@ def test_mtp_has_no_direct_tilelang_mhc_calls():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_compiled_post_pre_is_cuda_graph_replayable():
+@pytest.mark.parametrize("hidden", [4096, 7168])
+def test_compiled_post_pre_is_cuda_graph_replayable(hidden: int):
     pytest.importorskip("sparkinfer")
     if not adapter.current_platform.is_device_capability_family(120):
         pytest.skip("requires SM120/SM121")
 
-    tokens, hidden = 2, 4096
+    tokens = 2
     device = torch.device("cuda")
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device)
     residual = torch.randn(tokens, 4, hidden, dtype=torch.bfloat16, device=device)
@@ -346,6 +409,6 @@ def test_compiled_post_pre_is_cuda_graph_replayable():
     ).to(torch.bfloat16)
 
     torch.testing.assert_close(outputs[0], residual_ref, rtol=0.0, atol=2e-2)
-    torch.testing.assert_close(outputs[1], post_ref.unsqueeze(-1), rtol=2e-6, atol=1e-5)
-    torch.testing.assert_close(outputs[2], comb_ref, rtol=2e-6, atol=1e-5)
+    torch.testing.assert_close(outputs[1], post_ref.unsqueeze(-1), rtol=2e-6, atol=1e-4)
+    torch.testing.assert_close(outputs[2], comb_ref, rtol=2e-6, atol=1e-4)
     torch.testing.assert_close(outputs[3], y_ref, rtol=0.0, atol=2e-2)

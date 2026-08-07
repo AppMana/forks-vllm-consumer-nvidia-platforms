@@ -251,8 +251,9 @@ def test_sm86_int8_dispatch_supports_native_and_triton_fqns() -> None:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 8,
-    reason="flash_mla sparse-MLA kernels require Ampere (sm_8x)",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability(0) not in ((8, 6), (12, 1)),
+    reason="INT8 flash_mla sparse-MLA kernels require sm_86 or sm_121",
 )
 def test_flash_mla_int8_native_matches_triton_on_vllm_528B_views() -> None:
     """Numeric parity on the EXACT artifacts vLLM hands the kernels: a paged

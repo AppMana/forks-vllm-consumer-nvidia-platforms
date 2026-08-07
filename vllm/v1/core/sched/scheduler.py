@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -491,6 +490,7 @@ class Scheduler(SchedulerInterface):
 
             if (
                 request.num_output_placeholders > 0
+                and request.num_in_flight_tokens > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
                 # Since output placeholders are also included in the computed tokens
                 # count, we subtract (num_output_placeholders - 1) to remove any draft
@@ -499,9 +499,11 @@ class Scheduler(SchedulerInterface):
                 and request.num_computed_tokens + 2 - request.num_output_placeholders
                 >= request.num_prompt_tokens + request.max_tokens
             ):
-                # Async scheduling: Avoid scheduling an extra step when we are sure that
-                # the previous step has reached request.max_tokens. We don't schedule
-                # partial draft tokens since this prevents uniform decode optimizations.
+                # Async scheduling: Avoid scheduling an extra step while the previous
+                # step that can reach request.max_tokens is still in flight. A model
+                # runner can return no sampled token for the final prefill frame. In
+                # that case the placeholder remains, but once the frame has drained we
+                # must schedule a recovery decode instead of wedging the request.
                 req_index += 1
                 continue
 

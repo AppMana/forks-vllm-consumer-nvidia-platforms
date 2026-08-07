@@ -65,6 +65,55 @@ def test_stop_by_max_tokens(max_tokens: int):
     assert total_num_scheduled_tokens == expected_total_num_scheduled_tokens
 
 
+def test_empty_final_prefill_output_does_not_wedge_max_tokens_guard():
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=5,
+        speculative_method="ngram_gpu",
+    )
+    request = create_requests(num_requests=1, max_tokens=1)[0]
+    scheduler.add_request(request)
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens[request.request_id] == (
+        request.num_prompt_tokens
+    )
+    assert request.num_output_placeholders == 1
+
+    # The output placeholder prevents a redundant step while the final
+    # prefill output is still in flight.
+    assert not scheduler.schedule().num_scheduled_tokens
+
+    # A model runner may return no sampled token for this frame. Once the
+    # frame has drained, the placeholder must not suppress every future step.
+    empty_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(prefill, empty_output)
+    assert request.num_in_flight_tokens == 0
+
+    recovery = scheduler.schedule()
+    assert recovery.num_scheduled_tokens[request.request_id] == (
+        1 + scheduler.num_spec_tokens
+    )
+    recovered_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[123]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(recovery, recovered_output)
+    assert scheduler.get_num_unfinished_requests() == 0
+    assert list(request.output_token_ids) == [123]
+
+
 def test_abort():
     scheduler = create_scheduler(async_scheduling=True)
     requests = create_requests(num_requests=10, max_tokens=20)

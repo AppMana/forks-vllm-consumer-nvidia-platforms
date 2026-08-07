@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from collections.abc import Mapping
 from typing import Any
 
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -28,14 +28,14 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
-_SYNC_DEBUG = bool(int(os.environ.get("APPMANA_DSPARK_SYNC_DEBUG", "0")))
+_SYNC_DEBUG = envs.APPMANA_DSPARK_SYNC_DEBUG
 
 # Env-gated per-phase timing of propose() (APPMANA_DSPARK_PROF=1). CUDA events
 # bracket each phase; sums are drained and logged every _PROF_LOG_EVERY propose
 # calls (one synchronize per drain). Phases also emit NVTX ranges so an nsys
 # capture shows the same segmentation alongside the MTP dense layers.
-_PROF = bool(int(os.environ.get("APPMANA_DSPARK_PROF", "0")))
-_PROF_LOG_EVERY = int(os.environ.get("APPMANA_DSPARK_PROF_LOG_EVERY", "50"))
+_PROF = envs.APPMANA_DSPARK_PROF
+_PROF_LOG_EVERY = envs.APPMANA_DSPARK_PROF_LOG_EVERY
 
 
 class _ProposePhaseProfiler:

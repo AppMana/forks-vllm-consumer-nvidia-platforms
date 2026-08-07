@@ -867,6 +867,8 @@ def safetensors_weights_iterator(
     local_expert_ids: set[int] | None = None,
     local_layer_range: tuple[int, int] | None = None,
     *,
+    is_first_pipeline_rank: bool = True,
+    is_last_pipeline_rank: bool = True,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -966,7 +968,12 @@ def safetensors_weights_iterator(
             for name, param in state_dict.items():
                 if not should_skip_weight(
                     name, local_expert_ids
-                ) and not should_skip_pp_weight(name, local_layer_range):
+                ) and not should_skip_pp_weight(
+                    name,
+                    local_layer_range,
+                    is_first_pipeline_rank=is_first_pipeline_rank,
+                    is_last_pipeline_rank=is_last_pipeline_rank,
+                ):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -985,7 +992,12 @@ def safetensors_weights_iterator(
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(
                         name, local_expert_ids
-                    ) or should_skip_pp_weight(name, local_layer_range):
+                    ) or should_skip_pp_weight(
+                        name,
+                        local_layer_range,
+                        is_first_pipeline_rank=is_first_pipeline_rank,
+                        is_last_pipeline_rank=is_last_pipeline_rank,
+                    ):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -1005,7 +1017,12 @@ def safetensors_weights_iterator(
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(
                         name, local_expert_ids
-                    ) or should_skip_pp_weight(name, local_layer_range):
+                    ) or should_skip_pp_weight(
+                        name,
+                        local_layer_range,
+                        is_first_pipeline_rank=is_first_pipeline_rank,
+                        is_last_pipeline_rank=is_last_pipeline_rank,
+                    ):
                         continue
                     param = f.get_tensor(name)
                     if safetensors_load_strategy == "pinned":

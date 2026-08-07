@@ -19,9 +19,11 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    merge_nvfp4_gate_up_input_scales,
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
     reorder_w1w3_to_w3w1,
+    require_uniform_nvfp4_expert_scale,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     prepare_nvfp4_moe_layer_for_marlin,
@@ -451,23 +453,19 @@ def convert_to_nvfp4_moe_kernel_format(
                 f" a13_scale={a13_scale}, a2_scale={a2_scale}"
             )
 
-        if torch.unique(a13_scale).numel() != 1 or torch.unique(a2_scale).numel() != 1:
-            logger.warning_once(
-                "In NVFP4 linear, the activation global scale for inputs are different"
-                " for MOE w13 (gate_up_proj) layer or MOE w2 (down_proj). Using"
-                " a13_scale = a13_scale.max() and a2_scale = a2_scale.max()."
-            )
-
-        # 1. We take the max following e.g. quantization/utils/flashinfer_fp4_moe.py.
-        # 2. moe_kernel_quantize_input -> ref_nvfp4_quant_dequant
-        # use the inverse scale directly (large global scale).
-        # NOTE: Before this point, `a13_scale` and `a2_scale` are such that:
-        # `FP8_MAX = activation[expert_id].abs().max() * global_scale[expert_id]`,
-        # and `global_scale[expert_id]` are small (~1e-4).
-        # Taking the largest global scale likely results in overflowing the FP8 range
-        # for other experts - other selection strategies may be used.
-        a13_scale = 1.0 / a13_scale.max().to(torch.float32)
-        a2_scale = 1.0 / a2_scale.max().to(torch.float32)
+        num_experts = w13.shape[0]
+        a13_scale = require_uniform_nvfp4_expert_scale(
+            merge_nvfp4_gate_up_input_scales(a13_scale),
+            num_local_experts=num_experts,
+            name="a13_scale",
+        )
+        a2_scale = require_uniform_nvfp4_expert_scale(
+            a2_scale,
+            num_local_experts=num_experts,
+            name="a2_scale",
+        )
+        a13_scale = a13_scale[:1].reciprocal()
+        a2_scale = a2_scale[:1].reciprocal()
     elif nvfp4_backend == NvFp4MoeBackend.SPARKINFER:
         # vLLM loads fused FC1 in [w1 gate; w3 up] order. SparkInfer's
         # micro/dynamic kernels consume [up; gate], so normalize both weights

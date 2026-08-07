@@ -584,6 +584,11 @@ def _fp8_mqa_logits_sm12x(
 ) -> torch.Tensor:
     q_values, q_scale = q
     if q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
+        if (q_values.dtype == torch.int8) != (kv[0].dtype == torch.int8):
+            raise RuntimeError(
+                "The INT8 indexer query and contiguous K cache must be selected "
+                "together"
+            )
         from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
             fp8_mqa_logits_triton,
             indexer_imma_enabled,
@@ -608,6 +613,35 @@ def _fp8_mqa_logits_sm12x(
     return _fp8_mqa_logits_torch(
         q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
     )
+
+
+def int8_mqa_logits_sparkinfer(
+    q_values: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Run the exact SM12x contiguous INT8 indexer contract in SparkInfer."""
+    from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
+        run_contiguous_logits_kernel,
+        supports_contiguous_logits_kernel,
+    )
+
+    k_values, k_scales = kv
+    contract = {
+        "q_fp8": q_values,
+        "weights": weights,
+        "k_quant": k_values,
+        "k_scale": k_scales,
+        "k_start": cu_seqlen_ks,
+        "k_end": cu_seqlen_ke,
+    }
+    if not supports_contiguous_logits_kernel(**contract):
+        raise RuntimeError(
+            "SparkInfer rejected the selected SM12x INT8 contiguous indexer contract"
+        )
+    return run_contiguous_logits_kernel(**contract)
 
 
 def fp8_fp4_mqa_logits(
@@ -805,12 +839,12 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, token_count or max_model_len],
         dtype `torch.float32`.
     """
-    # Ampere/Ada (sm_8x) and SM12x: DeepGEMM's paged-MQA-logits kernel is
-    # Hopper-only, so route the FP8/INT8 indexer logits through the portable
-    # Triton kernel (FP8 inputs upcast to bf16; INT8 K-cache + s8 query handled
-    # inside via indexer_cache_is_int8()/q.dtype). q_scale is None for the
-    # FP8/INT8 indexer path; the FP4 path keeps the DeepGEMM impl below.
     q_values, q_scale = q
+    # Ampere/Ada (sm_8x) and consumer Blackwell (sm_12x): DeepGEMM's paged
+    # MQA-logits kernel is Hopper-only, so route FP8/INT8 through Triton. The
+    # SparkInfer INT8 wrapper is not used here until it can accept caller-owned
+    # output and active-width buffers; its per-layer CUDA allocations regress
+    # long-context DSpark decode under unified-memory pressure.
     if q_scale is None and (
         current_platform.is_device_capability_family(80)
         or current_platform.is_device_capability_family(120)

@@ -3,7 +3,8 @@
 """Unit tests for the sparse MLA backends and utilities."""
 
 import math
-from types import MethodType, SimpleNamespace
+import sys
+from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -35,6 +36,10 @@ if not current_platform.is_cuda():
         allow_module_level=True,
     )
 
+from vllm.models.deepseek_v4.common.ops import (
+    combine_topk_swa_indices,
+    compute_global_topk_indices_and_lens,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseTRTLLMBackend,
@@ -57,10 +62,6 @@ from vllm.v1.attention.backends.utils import (
     split_prefill_chunks,
 )
 from vllm.v1.attention.ops import flashmla
-from vllm.models.deepseek_v4.common.ops import (
-    combine_topk_swa_indices,
-    compute_global_topk_indices_and_lens,
-)
 
 SPARSE_BACKEND_BATCH_SPECS = {
     name: BATCH_SPECS[name]
@@ -115,6 +116,171 @@ def test_sm120_fp8_mqa_logits_chunk_sizes_cap_large_scores():
     assert deep_gemm_utils._fp8_mqa_logits_head_chunk_size(8192, 8192, 32) == 1
     assert deep_gemm_utils._fp8_mqa_logits_k_chunk_size(128, 128, 8) == 128
     assert deep_gemm_utils._fp8_mqa_logits_k_chunk_size(8192, 8192, 1) == 2048
+
+
+def test_sm120_int8_paged_mqa_logits_dispatches_to_triton(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = {}
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels
+
+    def fake_paged_logits(q, kv, weights, context_lens, block_tables,
+                          max_model_len, token_count=None):
+        calls.update(
+            q=q,
+            kv=kv,
+            weights=weights,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            max_model_len=max_model_len,
+            token_count=token_count,
+        )
+        return torch.arange(260, dtype=torch.float32).reshape(2, 130)
+
+    monkeypatch.setattr(
+        triton_kernels, "fp8_paged_mqa_logits_triton", fake_paged_logits
+    )
+    monkeypatch.setattr(
+        deep_gemm_utils.current_platform,
+        "is_device_capability_family",
+        lambda family: family == 120,
+    )
+
+    q = torch.empty(2, 1, 64, 128, dtype=torch.int8)
+    kv_cache = torch.empty(4, 64, 1, 132, dtype=torch.uint8)
+    weights = torch.empty(2, 64, dtype=torch.float32)
+    context_lens = torch.tensor([[17], [23]], dtype=torch.int32)
+    block_tables = torch.tensor([[3, 2, 1], [0, 1, 2]], dtype=torch.int32)
+
+    actual = deep_gemm_utils.fp8_fp4_paged_mqa_logits(
+        (q, None),
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata=torch.empty(0, dtype=torch.int32),
+        max_model_len=192,
+        clean_logits=False,
+        token_count=130,
+    )
+
+    assert calls["q"] is q
+    assert calls["kv"] is kv_cache
+    assert calls["context_lens"] is context_lens
+    assert calls["block_tables"] is block_tables
+    assert calls["max_model_len"] == 192
+    assert calls["token_count"] == 130
+    assert actual.shape == (2, 130)
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_sm120_int8_contiguous_mqa_logits_dispatch_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    supported: bool,
+):
+    calls = {}
+    kernel_module = ModuleType("sparkinfer.attention.nsa_indexer.contiguous_kernel")
+
+    def fake_supports(**kwargs):
+        calls["supports"] = kwargs
+        return supported
+
+    def fake_run(**kwargs):
+        calls["run"] = kwargs
+        return torch.arange(34, dtype=torch.float32).reshape(2, 17)
+
+    kernel_module.supports_contiguous_logits_kernel = fake_supports
+    kernel_module.run_contiguous_logits_kernel = fake_run
+    package_modules = {
+        "sparkinfer": ModuleType("sparkinfer"),
+        "sparkinfer.attention": ModuleType("sparkinfer.attention"),
+        "sparkinfer.attention.nsa_indexer": ModuleType(
+            "sparkinfer.attention.nsa_indexer"
+        ),
+        "sparkinfer.attention.nsa_indexer.contiguous_kernel": kernel_module,
+    }
+    for name, module in package_modules.items():
+        if name != "sparkinfer.attention.nsa_indexer.contiguous_kernel":
+            module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+    q = torch.empty(2, 64, 128, dtype=torch.int8)
+    k = torch.empty(17, 128, dtype=torch.int8)
+    scales = torch.empty(17, dtype=torch.float32)
+    weights = torch.empty(2, 64, dtype=torch.float32)
+    k_start = torch.zeros(2, dtype=torch.int32)
+    k_end = torch.full((2,), 17, dtype=torch.int32)
+
+    if not supported:
+        with pytest.raises(RuntimeError, match="rejected.*INT8 contiguous"):
+            deep_gemm_utils.int8_mqa_logits_sparkinfer(
+                q, (k, scales), weights, k_start, k_end
+            )
+        assert "run" not in calls
+        return
+
+    actual = deep_gemm_utils.int8_mqa_logits_sparkinfer(
+        q, (k, scales), weights, k_start, k_end
+    )
+    assert calls["supports"] == calls["run"]
+    assert calls["run"]["q_fp8"] is q
+    assert calls["run"]["k_quant"] is k
+    assert calls["run"]["k_scale"] is scales
+    assert actual.shape == (2, 17)
+
+
+def test_sm120_int8_mqa_logits_wrapper_selects_triton(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.models.deepseek_v4.nvidia_imma import triton_kernels
+
+    calls = {}
+
+    def fake_triton(q_values, kv, weights, k_start, k_end, *, qk_int8):
+        calls["args"] = (q_values, kv, weights, k_start, k_end)
+        calls["qk_int8"] = qk_int8
+        return torch.empty(2, 17, dtype=torch.float32)
+
+    monkeypatch.setattr(triton_kernels, "indexer_imma_enabled", lambda: True)
+    monkeypatch.setattr(
+        triton_kernels,
+        "mqa_logits_workspace_triton",
+        fake_triton,
+    )
+    q = torch.empty(2, 64, 128, dtype=torch.int8)
+    k = torch.empty(17, 128, dtype=torch.int8)
+    scales = torch.empty(17, dtype=torch.float32)
+    weights = torch.empty(2, 64, dtype=torch.float32)
+    k_start = torch.zeros(2, dtype=torch.int32)
+    k_end = torch.full((2,), 17, dtype=torch.int32)
+
+    actual = deep_gemm_utils._fp8_mqa_logits_sm12x(
+        (q, None), (k, scales), weights, k_start, k_end, clean_logits=False
+    )
+
+    called_q, called_kv, called_weights, called_start, called_end = calls["args"]
+    assert called_q is q
+    assert called_kv[0] is k
+    assert called_kv[1] is scales
+    assert called_weights is weights
+    assert called_start is k_start
+    assert called_end is k_end
+    assert calls["qk_int8"] is True
+    assert actual.shape == (2, 17)
+
+
+def test_mqa_logits_wrapper_rejects_mixed_int8_contract():
+    q = torch.empty(2, 64, 128, dtype=torch.int8)
+    k = torch.empty(17, 128, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(17, dtype=torch.float32)
+    weights = torch.empty(2, 64, dtype=torch.float32)
+    k_start = torch.zeros(2, dtype=torch.int32)
+    k_end = torch.full((2,), 17, dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="query and contiguous K cache"):
+        deep_gemm_utils._fp8_mqa_logits_sm12x(
+            (q, None), (k, scales), weights, k_start, k_end, clean_logits=False
+        )
 
 
 @pytest.mark.skipif(
