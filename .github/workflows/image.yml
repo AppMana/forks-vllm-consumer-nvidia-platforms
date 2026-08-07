@@ -1,0 +1,125 @@
+name: image
+
+# Builds the consumer-NVIDIA-platform image (sm_86 + sm_121) from source and
+# pushes it to GHCR. This is docker/build-consumer-platforms.sh as a workflow.
+#
+# Runs on the self-hosted GB10 runners because they are the only ones that can
+# do it: they are native arm64, so nvcc runs at full speed instead of under the
+# binfmt emulation the script needs, and they have the memory. GitHub's hosted
+# arm64 runners OOM under nvcc, which is why they are an explicit opt-in for
+# experiments rather than the default.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Where to build. github-arm64 is known to OOM under nvcc.
+        type: choice
+        default: gb10-self-hosted
+        options: [gb10-self-hosted, github-arm64]
+      platform:
+        type: choice
+        default: linux/arm64
+        options: [linux/arm64, linux/amd64]
+      max_jobs:
+        description: nvcc parallelism. Raise only with measured headroom.
+        type: string
+        default: "8"
+      nvcc_threads:
+        type: string
+        default: "2"
+      push:
+        type: boolean
+        default: true
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/appmana/vllm-consumer
+
+jobs:
+  build:
+    runs-on: ${{ (inputs.runner == 'github-arm64') && 'ubuntu-24.04-arm' || fromJSON('["self-hosted","Linux","ARM64","cuda-gb10-128gb"]') }}
+    timeout-minutes: 600
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # The Dockerfile bind-mounts .git for tools/check_repo.sh, so the history
+      # has to be here, not just the tree.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: meta
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          arch="$(echo '${{ inputs.platform }}' | cut -d/ -f2)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "tag=sm86-sm121-${commit:0:10}-${arch}" >> "$GITHUB_OUTPUT"
+          echo "wheel_version=0.0.0+consumer.${commit:0:10}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: vllm-openai
+          platforms: ${{ inputs.platform }}
+          push: ${{ inputs.push != false }}
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            BUILDKIT_CONTEXT_KEEP_GIT_DIR=1
+            max_jobs=${{ inputs.max_jobs }}
+            nvcc_threads=${{ inputs.nvcc_threads }}
+            VLLM_BUILD_COMMIT=${{ steps.meta.outputs.commit }}
+            VLLM_VERSION_OVERRIDE=${{ steps.meta.outputs.wheel_version }}
+            RUN_WHEEL_CHECK=false
+
+      # The -arm64 suffix is a claim, not evidence: a single-manifest base has
+      # produced a mislabelled image before.
+      - if: ${{ inputs.push != false }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect \
+            "${{ env.IMAGE }}@${{ steps.build.outputs.digest }}" \
+            --format '{{json .}}' > manifest.json
+          python3 - <<'PY'
+          import json, os
+          m = json.load(open("manifest.json")).get("manifest", {})
+          entries = m.get("manifests", [m])
+          arches = {
+              f"{e.get('platform',{}).get('os')}/{e.get('platform',{}).get('architecture')}"
+              for e in entries
+          }
+          real = {a for a in arches if not a.startswith("unknown")}
+          want = {os.environ["WANT"]}
+          assert real == want, f"expected {want}, got {sorted(arches)}"
+          print(f"verified: {sorted(real)}")
+          PY
+        env:
+          WANT: ${{ inputs.platform }}
+
+      - if: ${{ inputs.push != false }}
+        run: |
+          {
+            echo "### image"
+            echo
+            echo '```'
+            echo "${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "built on \`${{ runner.name }}\` (${{ runner.arch }}), platform \`${{ inputs.platform }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
