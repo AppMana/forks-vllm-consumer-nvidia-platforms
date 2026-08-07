@@ -48,14 +48,12 @@ try:
     # a bare spark workspace without a vLLM install.
     from vllm.model_executor.layers.quantization.dsv4_int import (  # noqa: E402
         dequantize_fp8_block_to_bf16,
-        requantize_fp8_block_to_int4_w4a16,
         requantize_fp8_to_allspark_uint8_w8a16,
         requantize_fp8_to_int8_w8a16,
         requantize_mxfp4_to_int4_w4a16,
     )
 except ImportError:  # pragma: no cover - bare-workspace nvfp4 runs
     dequantize_fp8_block_to_bf16 = None
-    requantize_fp8_block_to_int4_w4a16 = None
     requantize_fp8_to_allspark_uint8_w8a16 = None
     requantize_fp8_to_int8_w8a16 = None
     requantize_mxfp4_to_int4_w4a16 = None
@@ -91,6 +89,32 @@ def _remap_tensor_name(name: str, layer_remap: dict[int, int] | None) -> str | N
 
 _EXPERT_NAME_RE = re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.")
 _GATE_NAME_RE = re.compile(r"^layers\.\d+\.ffn\.gate\.(weight|bias)$")
+_MTP_STAGE_RE = re.compile(r"^mtp\.(\d+)\.")
+
+
+def _mtp_stage_ids(checkpoint: Path) -> list[int]:
+    """MTP/DSpark stage indices actually present in a checkpoint's tensors.
+
+    ``config.json``'s ``num_nextn_predict_layers`` is NOT a reliable stage
+    count for DSpark checkpoints: deepseek-ai/DeepSeek-V4-Flash-0731 ships the
+    full 3-stage DSpark subtree (``mtp.0``/``mtp.1``/``mtp.2``, matching its
+    3-entry ``dspark_target_layer_ids``) while still declaring
+    ``num_nextn_predict_layers: 1`` like vanilla Flash. Counting real tensor
+    prefixes is the only thing that distinguishes a vanilla single-stage MTP
+    from a DSpark graft, so every stage-count decision in this tool reads
+    from here.
+    """
+    names: list[str] = []
+    index_path = checkpoint / "model.safetensors.index.json"
+    if index_path.exists():
+        names = list(json.loads(index_path.read_text())["weight_map"])
+    else:
+        for shard in sorted(checkpoint.glob("*.safetensors")):
+            with safe_open(shard, framework="pt", device="cpu") as handle:
+                names.extend(handle.keys())
+    return sorted(
+        {int(match.group(1)) for name in names if (match := _MTP_STAGE_RE.match(name))}
+    )
 
 
 def _is_wo_a_scale(name: str) -> bool:
@@ -233,18 +257,35 @@ def _ensure_mtp_shared_tensors(dst: Path) -> None:
     ``shared_head.head``.
     """
 
-    cfg = json.loads((dst / "config.json").read_text())
-    num_mtp_layers = int(cfg.get("num_nextn_predict_layers", 0) or 0)
-    if num_mtp_layers <= 0:
+    stage_ids = _mtp_stage_ids(dst)
+    if not stage_ids:
         return
+
+    cfg_path = dst / "config.json"
+    cfg = json.loads(cfg_path.read_text())
+    declared = int(cfg.get("num_nextn_predict_layers", 0) or 0)
+    # A config declaring no MTP means the shared embed/head aliases are not
+    # wanted, even if stray mtp.* tensors are present. Only override the
+    # declaration when the checkpoint carries a DSpark subtree it understates
+    # (0731 ships 3 stages while declaring 1).
+    if declared <= 0 and len(stage_ids) <= 1:
+        return
+    # Reconcile the declared stage count with the stages actually present.
+    # A DSpark-bearing source (0731, or a --mtp-src graft) carries 3 stages
+    # while still declaring 1; leaving the declaration at 1 would strand
+    # mtp.1/mtp.2 without the embed/head aliases materialized below, and
+    # vllm/config/speculative.py sizes the draft model off this field.
+    if int(cfg.get("num_nextn_predict_layers", 0) or 0) != len(stage_ids):
+        _log(
+            f"num_nextn_predict_layers: "
+            f"{cfg.get('num_nextn_predict_layers')} -> {len(stage_ids)} "
+            f"(stages present: {stage_ids})"
+        )
+        cfg["num_nextn_predict_layers"] = len(stage_ids)
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
 
     index = _load_index_or_build(dst)
     weight_map = dict(index["weight_map"])
-    mtp_prefixes = {
-        name.split(".", 2)[1] for name in weight_map if name.startswith("mtp.")
-    }
-    if not mtp_prefixes:
-        return
 
     embed_name = _find_required_tensor(
         weight_map,
@@ -256,7 +297,7 @@ def _ensure_mtp_shared_tensors(dst: Path) -> None:
     )
 
     additions: dict[str, torch.Tensor] = {}
-    for mtp_idx in range(num_mtp_layers):
+    for mtp_idx in stage_ids:
         embed_alias = f"mtp.{mtp_idx}.emb.tok_emb.weight"
         head_alias = f"mtp.{mtp_idx}.head.weight"
         if embed_alias not in weight_map:
@@ -483,8 +524,18 @@ def _write_config(
                     "*.ffn.shared_experts.w1",
                     "*.ffn.shared_experts.w2",
                     "*.ffn.shared_experts.w3",
+                    # Vanilla Flash MTP output-head projections.
                     "mtp.*.e_proj",
                     "mtp.*.h_proj",
+                    # DSpark's restructured mtp.0 output projection, which
+                    # replaces e_proj/h_proj for the stage that feeds the next
+                    # draft stage instead of emitting its own next-token
+                    # distribution. Same fp8-block source convention, so it
+                    # lands in the same channelwise INT8 as the rest.
+                    # (mtp.1/mtp.2 are full decoder layers; their attention,
+                    # shared-expert and routed-expert tensors are already
+                    # covered by the '*.attn.*' / '*.ffn.*' globs above.)
+                    "mtp.*.main_proj",
                 ],
             },
         },
@@ -503,9 +554,20 @@ def _write_config(
     }
     # The official DeepSeek checkpoints do not carry this fork-specific
     # runtime block. Requantized INT4/INT8 checkpoints must emit it explicitly:
-    # the block keeps kernel selection explicit and portable across runtime
-    # versions. Keep this identical to the published checkpoint;
-    # every symbol is validated fail-closed by kernel_config.py.
+    # engine setup intentionally leaves --kv-cache-dtype=auto untouched when
+    # the block is absent, while the DSV4 attention layout requires a concrete
+    # int8_ds_mla cache type. Keep this identical to the proven production
+    # checkpoint; every symbol is validated fail-closed by kernel_config.py.
+    # This list must stay byte-identical to the block on the SERVING revision
+    # of appmana/deepseek-v4-int4-int8. Two of these roles are *toggle* roles
+    # (see kernel_config.py): when an explicit block is present, a role whose
+    # symbol is unlisted is OFF, not defaulted. Dropping
+    # ``streaming_prefill_topk`` here would silently turn the long-context
+    # streaming indexer path off on every rebuilt revision while the
+    # checkpoint still looked correct -- so kernel selection is preserved
+    # explicitly rather than reconstructed. ``sparse_mla_decode_fp8`` is
+    # deliberately absent: this checkpoint's cache is int8_ds_mla, and the
+    # fp8 decode selector falls back to its documented default.
     cfg["vllm"] = {
         "kernels": [
             "flash_mla.sparse_mla_decode_int8",
@@ -519,10 +581,7 @@ def _write_config(
                 "vllm.model_executor.layers.quantization.utils.marlin_utils"
                 ".marlin_act_int8_process_scales"
             ),
-            (
-                "vllm.model_executor.layers.sparse_attn_indexer"
-                ".streaming_prefill_topk"
-            ),
+            "vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk",
         ],
         "cache_type": "int8_ds_mla",
     }
@@ -588,7 +647,6 @@ def convert_shard(
         "int8": 0,
         "wo_a_bf16": 0,
         "preserve": 0,
-        "int4_from_fp8_block": 0,
     }
     paired_scales: set[str | None] = set()
     if not passthrough:
@@ -596,10 +654,7 @@ def convert_shard(
             matched_scale_name(name)
             for name, role in roles.items()
             if role
-            in (
-                "routed_expert_mxfp4_weight",
-                "routed_expert_fp8_block_weight",
-            )
+            in ("routed_expert_mxfp4_weight",)
             or role in _FP8_WEIGHT_ROLES
         }
         paired_scales.discard(None)
@@ -641,31 +696,6 @@ def convert_shard(
                     out[out_name] = converted["qweight_packed"].cpu()
                     out[out_scale_name] = converted["scales"].cpu()
                     counts["int4"] += 1
-            elif role == "routed_expert_fp8_block_weight":
-                # deepseek-ai/DeepSeek-V4-Flash-Base source: full-width
-                # F8_E4M3 weight + classic FP32 128x128-tile scale (not
-                # packed MXFP4), requantized straight to the same INT4
-                # W4A16 group-32 on-disk convention as the MXFP4 path above.
-                if expert_format == "mxfp4":
-                    raise NotImplementedError(
-                        f"{name}: fp8-block routed experts (Flash-Base source) "
-                        "have no native MXFP4 on-disk form to preserve; "
-                        "--expert-format mxfp4 only applies to MXFP4-sourced "
-                        "(Flash) checkpoints"
-                    )
-                scale_name = matched_scale_name(name)
-                assert scale_name is not None
-                out_scale_name = _remap_tensor_name(scale_name, layer_remap)
-                assert out_scale_name is not None
-                converted = requantize_fp8_block_to_int4_w4a16(
-                    handle.get_tensor(name),
-                    handle.get_tensor(scale_name),
-                    scale_mode="mse",
-                    out_scale_dtype=out_scale_dtype,
-                )
-                out[out_name] = converted["qweight_packed"].cpu()
-                out[out_scale_name] = converted["scales"].cpu()
-                counts["int4_from_fp8_block"] += 1
             elif role in _FP8_WEIGHT_ROLES:
                 scale_name = matched_scale_name(name)
                 assert scale_name is not None
@@ -726,7 +756,7 @@ def splice_mtp(
     splice it into ``dst``'s safetensors index.
 
     ``mtp_src`` is deepseek-ai/DeepSeek-V4-Flash-DSpark: its ``mtp.0`` is a
-    RESTRUCTURED replacement for whatever mtp.0 the backbone source (Base)
+    RESTRUCTURED replacement for whatever mtp.0 the backbone source
     natively carries (DSpark rewires mtp.0's output head to feed mtp.1
     instead of producing a standalone next-token distribution), and its
     ``mtp.1``/``mtp.2`` are ADDED stages (three DeepSpec draft stages total,
@@ -770,8 +800,7 @@ def splice_mtp(
             "int8": 0,
             "wo_a_bf16": 0,
             "preserve": 0,
-            "int4_from_fp8_block": 0,
-        }
+            }
         merged: dict[str, torch.Tensor] = {}
         for shard_idx, (shard, names) in enumerate(sorted(by_shard.items())):
             name_set = set(names)
@@ -829,7 +858,6 @@ def splice_mtp(
         f"mtp splice done: stages={stage_ids} "
         f"int4={totals['int4']} int8={totals['int8']} "
         f"wo_a_bf16={totals['wo_a_bf16']} preserve={totals['preserve']} "
-        f"int4_from_fp8_block={totals['int4_from_fp8_block']} "
         f"-> {out_shard_name}"
     )
     return totals
@@ -845,7 +873,7 @@ def convert_checkpoint(
     layer_remap: dict[int, int] | None,
     dense_int8_strategy: str = "block",
     expert_format: str = "int4",
-    expert_int4_scale_mode: str = "absmax7",
+    expert_int4_scale_mode: str = "mse",
     num_output_shards: int | None = None,
     keep_experts: int | None = None,
     drop_mtp: bool = False,
@@ -891,7 +919,6 @@ def convert_checkpoint(
         "int8": 0,
         "wo_a_bf16": 0,
         "preserve": 0,
-        "int4_from_fp8_block": 0,
     }
     _log(f"converting {len(shards)} shards from {src} to {dst}")
     for shard in shards:
@@ -913,8 +940,7 @@ def convert_checkpoint(
         _log(
             f"{shard.name}: int4={counts['int4']} mxfp4={counts['mxfp4']} "
             f"int8={counts['int8']} wo_a_bf16={counts['wo_a_bf16']} "
-            f"preserve={counts['preserve']} "
-            f"int4_from_fp8_block={counts['int4_from_fp8_block']}"
+            f"preserve={counts['preserve']}"
         )
 
     _copy_metadata(src, dst)
@@ -942,8 +968,7 @@ def convert_checkpoint(
     _log(
         f"done: int4={totals['int4']} mxfp4={totals['mxfp4']} "
         f"int8={totals['int8']} wo_a_bf16={totals['wo_a_bf16']} "
-        f"preserve={totals['preserve']} "
-        f"int4_from_fp8_block={totals['int4_from_fp8_block']}"
+        f"preserve={totals['preserve']}"
     )
 
 
@@ -974,8 +999,13 @@ def main() -> int:
     parser.add_argument(
         "--expert-int4-scale-mode",
         choices=("absmax7", "absmax8", "mse"),
-        default="absmax7",
-        help="Scale selection for MXFP4 routed experts converted to signed INT4.",
+        default="mse",
+        help="Scale selection for MXFP4 routed experts converted to signed INT4. "
+        "mse runs a per-group scale search and is the default: it measures "
+        "+4.2 to +8.7 dB reconstruction SNR over absmax7 on real 0731 expert "
+        "tensors, for build time only (same on-disk layout, same kernels, no "
+        "inference cost). absmax7 divides by the group max, which forces "
+        "MXFP4's 0.5 and 1.0 levels onto the same INT4 code.",
     )
     parser.add_argument(
         "--num-output-shards",
@@ -1026,6 +1056,26 @@ def main() -> int:
         layer_remap = {i: i for i in range(args.keep_layers)}
 
     out_scale_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.scale_dtype]
+
+    # A source that already carries a multi-stage MTP subtree IS a DSpark
+    # checkpoint (deepseek-ai/DeepSeek-V4-Flash-0731 ships mtp.0/1/2 natively,
+    # unlike vanilla Flash's single mtp.0). Grafting DSpark's mtp over it would
+    # replace those native, co-trained stages with ones lifted from a different
+    # release -- strictly worse than converting what the source already has.
+    # Detect and skip rather than fail, so the same command line works against
+    # both a pre-0731 (graft required) and a 0731+ (graft redundant) source.
+    mtp_src = args.mtp_src
+    if mtp_src is not None:
+        src_stages = _mtp_stage_ids(args.src.resolve())
+        if len(src_stages) > 1:
+            _log(
+                f"--mtp-src IGNORED: {args.src} already carries a multi-stage "
+                f"MTP subtree (stages {src_stages}), i.e. DSpark is native to "
+                f"this checkpoint; converting it in place instead of grafting "
+                f"from {mtp_src}"
+            )
+            mtp_src = None
+
     convert_checkpoint(
         args.src.resolve(),
         args.dst.resolve(),
@@ -1036,14 +1086,14 @@ def main() -> int:
         dense_int8_strategy=args.dense_int8_strategy,
         expert_format=args.expert_format,
         expert_int4_scale_mode=args.expert_int4_scale_mode,
-        num_output_shards=None if args.mtp_src is not None else args.num_output_shards,
+        num_output_shards=None if mtp_src is not None else args.num_output_shards,
         keep_experts=args.keep_experts,
-        drop_mtp=args.drop_mtp or args.mtp_src is not None,
+        drop_mtp=args.drop_mtp or mtp_src is not None,
     )
-    if args.mtp_src is not None:
+    if mtp_src is not None:
         splice_mtp(
             args.dst.resolve(),
-            args.mtp_src.resolve(),
+            mtp_src.resolve(),
             device=args.device,
             out_scale_dtype=out_scale_dtype,
             dense_int8_strategy=args.dense_int8_strategy,
