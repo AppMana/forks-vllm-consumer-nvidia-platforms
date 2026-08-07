@@ -256,6 +256,17 @@ def requantize_mxfp4_to_int4_w4a16(
     else:
         raise ValueError(f"unsupported MXFP4->INT4 scale mode: {scale_mode}")
 
+    # Quantize against the scale that will actually be STORED, not the float32
+    # one it was computed in. ``scales`` is emitted as ``out_scale_dtype``
+    # (bf16: 8 mantissa bits), so rounding the codes against full-precision
+    # float32 optimizes them for a scale the kernel never sees -- every group
+    # then dequantizes with a slightly different scale than the one its codes
+    # were chosen for. The mse branch already rounds its candidates through
+    # out_scale_dtype before scoring them; absmax7/absmax8 did not.
+    new_scale = new_scale.to(out_scale_dtype).to(torch.float32)
+    # bf16 rounding can flush a tiny scale to zero; clamp in the STORED dtype.
+    new_scale = new_scale.clamp(min=torch.finfo(out_scale_dtype).tiny)
+
     int4_signed = torch.round(grouped / new_scale.unsqueeze(-1)).clamp(-8, 7)
     unsigned = (int4_signed + 8).to(torch.uint8)
     packed = _pack_int4_pairs(unsigned.reshape(*fp4.shape)).view(torch.int8)
