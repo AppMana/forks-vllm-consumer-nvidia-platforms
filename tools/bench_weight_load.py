@@ -426,6 +426,14 @@ def cmd_flashpack(args) -> None:
             # so unlike the safetensors path there is no consumer-side H2D to
             # time; the comparison point is bytes-on-GPU either way.
             nbytes += tensor.numel() * tensor.element_size()
+            if args.touch:
+                # A CPU-target FlashPack read returns lazy mmap views unless
+                # FLASHPACK_CPU_PARALLEL_READ=1, so counting bytes would time
+                # nothing. Cloning forces materialisation; both variants pay
+                # the same one memcpy, so the difference is the fault cost.
+                t1 = time.perf_counter()
+                tensor.view(torch.uint8).clone()
+                consume_time += time.perf_counter() - t1
             del tensor
             n += 1
         if dev.type == "cuda":
@@ -632,6 +640,7 @@ def main() -> None:
     sp.add_argument("--device", default="cuda:0")
     sp.add_argument("--verify-sha256", action="store_true")
     sp.add_argument("--include-mtp", action="store_true")
+    sp.add_argument("--touch", action="store_true")
     sp.set_defaults(func=cmd_flashpack)
 
     sp = sub.add_parser("engine")
