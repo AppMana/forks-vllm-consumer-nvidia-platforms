@@ -1,0 +1,59 @@
+ARG BASE_IMAGE=ghcr.io/appmana/vllm-consumer:sm86-sm121-3ebdf5cac9-arm64@sha256:921b7b919663c8cab5c8fdd463db857deb57d7d9eef8fc1df8abffd6f3b98f68
+FROM ${BASE_IMAGE}
+
+ARG VLLM_BUILD_COMMIT
+ARG VLLM_IMAGE_TAG
+
+COPY vllm/v1/core/kv_cache_utils.py /tmp/vllm-overlay/v1/core/kv_cache_utils.py
+COPY vllm/v1/kv_cache_interface.py /tmp/vllm-overlay/v1/kv_cache_interface.py
+COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm-overlay/v1/worker/gpu/warmup.py
+COPY vllm/model_executor/warmup/kernel_warmup.py /tmp/vllm-overlay/model_executor/warmup/kernel_warmup.py
+COPY vllm/model_executor/warmup/qwen_triton_warmup.py /tmp/vllm-overlay/model_executor/warmup/qwen_triton_warmup.py
+COPY vllm/model_executor/layers/quantization/dsv4_int.py /tmp/vllm-overlay/model_executor/layers/quantization/dsv4_int.py
+COPY vllm/entrypoints/openai/chat_completion/protocol.py /tmp/vllm-overlay/entrypoints/openai/chat_completion/protocol.py
+COPY vllm/entrypoints/openai/engine/protocol.py /tmp/vllm-overlay/entrypoints/openai/engine/protocol.py
+
+RUN python3 - <<'PY'
+import importlib.util
+import pathlib
+import shutil
+
+# Each entry is (path relative to the vllm package, marker that must survive
+# the copy). The marker is the point: a COPY that lands in the wrong place, or
+# a base image whose vllm lives somewhere unexpected, otherwise produces an
+# image that looks built and behaves exactly like the base.
+OVERLAY = (
+    ("v1/core/kv_cache_utils.py", "kv_quant_mode=spec.kv_quant_mode"),
+    ("v1/core/kv_cache_utils.py", "indexes_kv_by_block_stride=spec.indexes_kv_by_block_stride"),
+    ("v1/kv_cache_interface.py", "kv_quant_mode=specs[0].kv_quant_mode"),
+    ("v1/kv_cache_interface.py", "alignment=specs[0].alignment"),
+    ("v1/worker/gpu/warmup.py", "prompt_len = min(256"),
+    ("model_executor/warmup/kernel_warmup.py", "zero_kv_blocks_warmup(worker.model_runner)"),
+    ("model_executor/warmup/qwen_triton_warmup.py", "def zero_kv_blocks_warmup"),
+    ("model_executor/layers/quantization/dsv4_int.py", "VLLM_DSV4_ALLSPARK_SM12X_CUBLAS_M_THRESHOLD"),
+    ("entrypoints/openai/chat_completion/protocol.py", 'data["reasoning_content"] = data["reasoning"]'),
+    ("entrypoints/openai/engine/protocol.py", 'data["reasoning_content"] = data["reasoning"]'),
+)
+
+spec = importlib.util.find_spec("vllm")
+assert spec is not None and spec.submodule_search_locations
+root = pathlib.Path(next(iter(spec.submodule_search_locations)))
+sources = pathlib.Path("/tmp/vllm-overlay")
+
+for relative in dict.fromkeys(relative for relative, _ in OVERLAY):
+    shutil.copy2(sources / relative, root / relative)
+
+for relative, marker in OVERLAY:
+    assert marker in (root / relative).read_text(), f"{relative}: {marker}"
+
+shutil.rmtree("/tmp/vllm-overlay")
+print(f"overlay installed: {len(dict.fromkeys(r for r, _ in OVERLAY))} files, {len(OVERLAY)} assertions")
+PY
+
+ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT} \
+    VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG}
+LABEL org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
+      ai.vllm.build.commit="${VLLM_BUILD_COMMIT}" \
+      ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
+      ai.appmana.overlay.base="${BASE_IMAGE}"

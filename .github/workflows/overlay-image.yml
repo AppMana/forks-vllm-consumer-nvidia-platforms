@@ -1,0 +1,113 @@
+name: overlay image
+
+on:
+  push:
+    branches: [appmana/vllm-consumer-nvidia-platforms]
+    paths:
+      - docker/Dockerfile.overlay
+      - .github/workflows/overlay-image.yml
+      - vllm/v1/core/kv_cache_utils.py
+      - vllm/v1/kv_cache_interface.py
+      - vllm/v1/worker/gpu/warmup.py
+      - vllm/model_executor/warmup/kernel_warmup.py
+      - vllm/model_executor/warmup/qwen_triton_warmup.py
+      - vllm/model_executor/layers/quantization/dsv4_int.py
+      - vllm/entrypoints/openai/chat_completion/protocol.py
+      - vllm/entrypoints/openai/engine/protocol.py
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Where to build. gb10 is self-hosted ON THE GPU NODES that serve DSV4.
+        type: choice
+        default: github-arm64
+        options: [github-arm64, gb10-self-hosted]
+      base_image:
+        description: Base to overlay onto (pin by digest).
+        type: string
+        default: ghcr.io/appmana/vllm-consumer:sm86-sm121-3ebdf5cac9-arm64@sha256:921b7b919663c8cab5c8fdd463db857deb57d7d9eef8fc1df8abffd6f3b98f68
+      push:
+        description: Push to ghcr, or build only.
+        type: boolean
+        default: true
+
+concurrency:
+  group: overlay-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/appmana/vllm-consumer
+  DEFAULT_BASE: ghcr.io/appmana/vllm-consumer:sm86-sm121-3ebdf5cac9-arm64@sha256:921b7b919663c8cab5c8fdd463db857deb57d7d9eef8fc1df8abffd6f3b98f68
+
+jobs:
+  build:
+    # ubuntu-24.04-arm is GitHub's native arm64 hosted runner, so the overlay
+    # builds without qemu. The self-hosted alternative is the GB10 boxes, which
+    # are the same nodes that serve the model: opt in deliberately.
+    runs-on: ${{ (inputs.runner == 'gb10-self-hosted') && fromJSON('["self-hosted","Linux","ARM64","cuda-gb10-128gb"]') || 'ubuntu-24.04-arm' }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          set -euo pipefail
+          echo "tag=sm86-sm121-$(git rev-parse --short=10 HEAD)-arm64" >> "$GITHUB_OUTPUT"
+          echo "base=${{ inputs.base_image || env.DEFAULT_BASE }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.overlay
+          platforms: linux/arm64
+          push: ${{ inputs.push != false }}
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            BASE_IMAGE=${{ steps.meta.outputs.base }}
+            VLLM_BUILD_COMMIT=${{ github.sha }}
+            VLLM_IMAGE_TAG=${{ steps.meta.outputs.tag }}
+
+      # A tag ending in -arm64 is a claim, not evidence. A single-manifest base
+      # has previously produced an image labelled arm64 that was not.
+      - if: ${{ inputs.push != false }}
+        run: |
+          set -euo pipefail
+          ref="${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          docker buildx imagetools inspect "$ref" --format '{{json .}}' > manifest.json
+          python3 - <<'PY'
+          import json
+          m = json.load(open("manifest.json"))
+          manifest = m.get("manifest", {})
+          entries = manifest.get("manifests", [manifest])
+          arches = {
+              f"{e.get('platform',{}).get('os')}/{e.get('platform',{}).get('architecture')}"
+              for e in entries
+          }
+          real = {a for a in arches if not a.startswith("unknown")}
+          assert real == {"linux/arm64"}, f"expected only linux/arm64, got {sorted(arches)}"
+          print(f"verified: {sorted(real)}")
+          PY
+
+      - if: ${{ inputs.push != false }}
+        run: |
+          {
+            echo "### overlay image"
+            echo
+            echo '```'
+            echo "${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "base: \`${{ steps.meta.outputs.base }}\`"
+            echo "built on: \`${{ runner.name }}\` (${{ runner.arch }})"
+          } >> "$GITHUB_STEP_SUMMARY"
