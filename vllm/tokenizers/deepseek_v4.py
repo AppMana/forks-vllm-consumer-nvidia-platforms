@@ -7,9 +7,30 @@ from transformers import TokenizersBackend
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 
-from .deepseek_v4_encoding import encode_messages
+from .deepseek_v4_encoding import DEFAULT_REASONING_EFFORT, encode_messages
 from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
+
+# The OpenAI API exposes seven reasoning-effort levels; DeepSeek V4's encoding
+# has three ("low"/"high"/"max", where "low" emits no prefix at all). This is
+# the order-preserving collapse of one onto the other.
+#
+# Getting this wrong is silent: before DeepSeek-V4-Flash-0731 the encoding only
+# emitted a prefix for "max", so mapping everything non-max onto "high" was a
+# harmless no-op. From 0731 on, "high" emits the text that "max" used to, so
+# that same mapping would escalate every minimal/low/medium request to a heavy
+# "Absolute maximum" reasoning prefix without any error surfacing.
+#
+# "none" is handled separately by the caller: it selects chat mode outright
+# rather than a thinking-mode effort level.
+_OPENAI_TO_DSV4_REASONING_EFFORT = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
 
 
 def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
@@ -49,10 +70,10 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             elif reasoning_effort == "none":
                 thinking_mode = "chat"
                 reasoning_effort = None
-            elif reasoning_effort in ("max", "xhigh"):
-                reasoning_effort = "max"
             else:
-                reasoning_effort = "high"
+                reasoning_effort = _OPENAI_TO_DSV4_REASONING_EFFORT.get(
+                    reasoning_effort, DEFAULT_REASONING_EFFORT
+                )
 
             encode_config = dict(
                 thinking_mode=thinking_mode,

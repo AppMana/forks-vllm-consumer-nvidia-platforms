@@ -130,6 +130,15 @@ The examples use the LWS-provided `LWS_GROUP_SIZE`, `LWS_WORKER_INDEX`, and
 `LWS_LEADER_ADDRESS` values. Provide the `dsv4-cache` PVC, the `huggingface`
 Secret, and optional network settings in the `dsv4-network` ConfigMap.
 
+vLLM assigns the runtime ranks. With Ray,
+`VLLM_RAY_WORKER_IP_ORDER` provides the ordered node IPs. vLLM sorts the
+placement-group bundles by that list, assigns global ranks, and derives
+`pp_rank = rank // tensor_parallel_size` and
+`tp_rank = rank % tensor_parallel_size`. Do not set a PP rank on individual
+pods. The deployment layer can inject the ordered list from its topology
+assignment. Rank-local staging maps the pod IP to the same list before Ray
+starts, so staged shards match the rank vLLM assigns.
+
 ## Benchmarks
 
 ### RTX 30xx

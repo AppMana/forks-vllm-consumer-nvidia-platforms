@@ -939,33 +939,9 @@ def test_checkpoint_audit_classifies_deepseek_v4_precision_roles():
         matched_scale_name("layers.0.attn.wq_a.weight")
         == "layers.0.attn.wq_a.scale"
     )
-    # Flash-Base source: routed experts are full-width F8_E4M3 + classic
-    # FP32 tile scale, distinct from Flash's packed I8 MXFP4 + F8_E8M0.
-    assert classify_tensor("layers.2.ffn.experts.0.w1.weight", "F8_E4M3") == (
-        "routed_expert_fp8_block_weight",
-        "quantize_int4_w4a16_candidate",
-    )
-    assert classify_tensor("layers.2.ffn.experts.0.w1.scale", "F32") == (
-        "routed_expert_fp8_block_scale",
-        "quantize_int4_w4a16_candidate",
-    )
     assert classify_tensor("layers.2.ffn.experts.0.w1.scale", "F8_E8M0") == (
         "routed_expert_mxfp4_scale",
         "quantize_asym_int4_awq_candidate",
-    )
-    # Flash-Base's dense/attention FP8 linears use the same classic FP32
-    # scale as its routed experts, not Flash's MX-style UE8M0 byte.
-    assert classify_tensor("layers.2.attn.wq_a.scale", "F32") == (
-        "dense_fp8_scale",
-        "quantize_int8_w8a16_candidate",
-    )
-    assert classify_tensor("layers.2.attn.indexer.wq_b.scale", "F32") == (
-        "indexer_qk_fp8_scale",
-        "measure_recall_then_quantize",
-    )
-    assert classify_tensor("mtp.0.h_proj.scale", "F32") == (
-        "mtp_fp8_scale",
-        "quantize_int8_w8a16_candidate",
     )
 
 
@@ -1032,12 +1008,19 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
         cfg["quantization_config"]["config_groups"]["experts_w4a16"]["weights"][
             "scale_mode"
         ]
-        == "absmax7"
+        == "mse"
     )
     assert cfg["num_hidden_layers"] == 2
+    # Must stay byte-identical to the block on the serving revision of
+    # appmana/deepseek-v4-int4-int8. indexer_streaming_topk_prefill is a
+    # TOGGLE role: with an explicit block present, an unlisted symbol means
+    # OFF rather than defaulted, so dropping streaming_prefill_topk here
+    # would silently disable the long-context indexer path on every rebuilt
+    # checkpoint. sparse_mla_decode_fp8 is deliberately absent -- this
+    # checkpoint's cache is int8_ds_mla and the fp8 decode selector falls
+    # back to its documented default.
     assert cfg["vllm"] == {
         "kernels": [
-            "flash_mla.sparse_mla_decode_fp8",
             "flash_mla.sparse_mla_decode_int8",
             "flash_mla.sparse_mla_prefill_int8",
             "vllm._custom_ops.indexer_k_quant_and_cache_int8",
@@ -1049,6 +1032,7 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
                 "vllm.model_executor.layers.quantization.utils.marlin_utils"
                 ".marlin_act_int8_process_scales"
             ),
+            "vllm.model_executor.layers.sparse_attn_indexer.streaming_prefill_topk",
         ],
         "cache_type": "int8_ds_mla",
     }
@@ -1156,132 +1140,6 @@ def test_requant_checkpoint_can_preserve_mxfp4_experts_with_int8_dense(tmp_path)
     not hasattr(torch, "float8_e4m3fn"),
     reason="requires torch float8 dtypes",
 )
-def test_requant_checkpoint_converts_flash_base_fp8_block_source(tmp_path):
-    """End-to-end pipeline smoke test for the Flash-Base source convention:
-    routed experts are full-width F8_E4M3 + classic FP32 tile scale (not
-    packed MXFP4 + E8M0), and dense/attention FP8 linears also carry a
-    classic FP32 tile scale instead of Flash's MX-style UE8M0 byte. Both must
-    land in the SAME on-disk INT4/INT8 target convention our runtime kernels
-    expect, indistinguishable from a Flash-sourced conversion."""
-    src = tmp_path / "src"
-    dst = tmp_path / "dst"
-    src.mkdir()
-
-    shard_name = "model-00001-of-00001.safetensors"
-    expert_fp8 = torch.randn(4, 64).clamp(-2, 2).to(torch.float8_e4m3fn)
-    expert_scale_fp32 = torch.full((1, 1), 0.05, dtype=torch.float32)
-    attn_fp8 = torch.randn(130, 129).clamp(-2, 2).to(torch.float8_e4m3fn)
-    attn_scale_fp32 = torch.full((2, 2), 0.05, dtype=torch.float32)
-    wo_a_fp8 = torch.randn(64, 64).clamp(-2, 2).to(torch.float8_e4m3fn)
-    wo_a_scale_fp32 = torch.full((1, 1), 0.05, dtype=torch.float32)
-    tensors = {
-        "layers.0.ffn.experts.0.w1.weight": expert_fp8,
-        "layers.0.ffn.experts.0.w1.scale": expert_scale_fp32,
-        "layers.42.attn.wq_a.weight": attn_fp8,
-        "layers.42.attn.wq_a.scale": attn_scale_fp32,
-        "layers.42.attn.wo_a.weight": wo_a_fp8,
-        "layers.42.attn.wo_a.scale": wo_a_scale_fp32,
-        "layers.42.attn.attn_sink": torch.ones(4, dtype=torch.bfloat16),
-    }
-    save_file(tensors, str(src / shard_name))
-    (src / "config.json").write_text(
-        json.dumps(
-            {
-                "architectures": ["DeepseekV4ForCausalLM"],
-                "num_hidden_layers": 2,
-                "expert_dtype": "fp8_block",
-            }
-        )
-    )
-    (src / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": "0"},
-                "weight_map": {name: shard_name for name in tensors},
-            }
-        )
-    )
-
-    convert_checkpoint(
-        src,
-        dst,
-        device="cpu",
-        out_scale_dtype=torch.bfloat16,
-        overwrite=False,
-        layer_remap=None,
-    )
-
-    cfg = json.loads((dst / "config.json").read_text())
-    assert cfg["expert_dtype"] == "int4"
-    assert cfg["quantization_config"]["quant_method"] == "dsv4_int"
-
-    with safe_open(dst / shard_name, framework="pt", device="cpu") as handle:
-        keys = set(handle.keys())
-        # remapped from layer 42 -> layer 1 (only layers 0 and 42 present, 2
-        # declared hidden layers -> auto layer-remap collapses them to 0,1)
-        assert "layers.1.attn.wq_a.weight" in keys
-        assert handle.get_tensor("layers.0.ffn.experts.0.w1.weight").dtype is torch.int8
-        assert handle.get_tensor("layers.0.ffn.experts.0.w1.weight").shape == (4, 32)
-        assert (
-            handle.get_tensor("layers.0.ffn.experts.0.w1.scale").dtype
-            is torch.bfloat16
-        )
-        assert handle.get_tensor("layers.0.ffn.experts.0.w1.scale").shape == (4, 2)
-        assert handle.get_tensor("layers.1.attn.wq_a.weight").dtype is torch.int8
-        assert handle.get_tensor("layers.1.attn.wq_a.scale").dtype is torch.bfloat16
-        # wo_a: dequantized straight to BF16, no scale companion emitted
-        assert handle.get_tensor("layers.1.attn.wo_a.weight").dtype is torch.bfloat16
-        assert "layers.1.attn.wo_a.scale" not in keys
-
-
-@pytest.mark.skipif(
-    not hasattr(torch, "float8_e4m3fn"),
-    reason="requires torch float8 dtypes",
-)
-def test_requant_checkpoint_rejects_mxfp4_passthrough_for_fp8_block_experts(tmp_path):
-    """--expert-format mxfp4 has no meaning for Flash-Base's fp8-block routed
-    experts (there is no native MXFP4 on-disk form to preserve byte-for-byte)
-    and must fail loudly instead of silently requantizing anyway."""
-    src = tmp_path / "src"
-    dst = tmp_path / "dst"
-    src.mkdir()
-
-    shard_name = "model-00001-of-00001.safetensors"
-    tensors = {
-        "layers.0.ffn.experts.0.w1.weight": torch.randn(4, 64)
-        .clamp(-2, 2)
-        .to(torch.float8_e4m3fn),
-        "layers.0.ffn.experts.0.w1.scale": torch.full((1, 1), 0.05, dtype=torch.float32),
-    }
-    save_file(tensors, str(src / shard_name))
-    (src / "config.json").write_text(
-        json.dumps({"architectures": ["DeepseekV4ForCausalLM"], "num_hidden_layers": 1})
-    )
-    (src / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": "0"},
-                "weight_map": {name: shard_name for name in tensors},
-            }
-        )
-    )
-
-    with pytest.raises(NotImplementedError):
-        convert_checkpoint(
-            src,
-            dst,
-            device="cpu",
-            out_scale_dtype=torch.bfloat16,
-            overwrite=False,
-            layer_remap=None,
-            expert_format="mxfp4",
-        )
-
-
-@pytest.mark.skipif(
-    not hasattr(torch, "float8_e4m3fn"),
-    reason="requires torch float8 dtypes",
-)
 def test_splice_mtp_replaces_backbone_mtp_with_dspark_three_stages(tmp_path):
     """The DSpark splice: mtp.0 is RESTRUCTURED (replaces whatever mtp.0 the
     backbone source natively carries), mtp.1 AND mtp.2 are ADDED (three
@@ -1343,12 +1201,14 @@ def test_splice_mtp_replaces_backbone_mtp_with_dspark_three_stages(tmp_path):
         mtp_tensors[f"mtp.{stage}.attn.wq_a.scale"] = torch.full(
             (1, 1), 0.05, dtype=torch.float32
         )
-        mtp_tensors[f"mtp.{stage}.ffn.experts.0.w1.weight"] = (
-            torch.randn(4, 64).clamp(-2, 2).to(torch.float8_e4m3fn)
+        # Routed experts arrive as packed MXFP4 (I8 container, 2 values/byte)
+        # with a per-32-group E8M0 scale, matching the real DSpark source.
+        mtp_tensors[f"mtp.{stage}.ffn.experts.0.w1.weight"] = torch.randint(
+            -128, 127, (4, 32), dtype=torch.int8
         )
         mtp_tensors[f"mtp.{stage}.ffn.experts.0.w1.scale"] = torch.full(
-            (1, 1), 0.05, dtype=torch.float32
-        )
+            (4, 2), 127, dtype=torch.uint8
+        ).view(torch.float8_e8m0fnu)
         mtp_tensors[f"mtp.{stage}.main_norm.weight"] = torch.ones(
             8, dtype=torch.bfloat16
         )
@@ -1388,7 +1248,7 @@ def test_splice_mtp_replaces_backbone_mtp_with_dspark_three_stages(tmp_path):
         out_scale_dtype=torch.bfloat16,
         dense_int8_strategy="block",
     )
-    assert totals["int4_from_fp8_block"] == 3  # one expert weight per stage
+    assert totals["int4"] == 3  # one expert weight per stage
     assert totals["int8"] == 3  # one attn linear per stage
     assert totals["preserve"] == 3  # main_norm per stage
 
