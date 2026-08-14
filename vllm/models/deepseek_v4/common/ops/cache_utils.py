@@ -14,6 +14,7 @@ preparation.
   window indices for sparse prefill.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,8 +29,11 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     is_triton_aligned,
 )
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import next_power_of_2
+
+logger = init_logger(__name__)
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
@@ -158,6 +162,8 @@ def quantize_and_insert_int8_ds_mla_cache(
         "num_tokens_insert",
         "cache_block_size",
         "block_stride",
+        "num_slots",
+        "num_positions",
     ],
     do_not_specialize_on_alignment=[
         "q_ptr",
@@ -167,6 +173,7 @@ def quantize_and_insert_int8_ds_mla_cache(
         "slot_mapping_ptr",
         "positions_ptr",
         "cos_sin_ptr",
+        "guard_counter_ptr",
     ],
 )
 def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
@@ -177,10 +184,13 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
     slot_mapping_ptr,
     positions_ptr,
     cos_sin_ptr,
+    guard_counter_ptr,
     num_tokens_full,
     num_tokens_insert,
     cache_block_size,
     block_stride,
+    num_slots,
+    num_positions,
     eps,
     num_heads: tl.constexpr,
     num_heads_padded: tl.constexpr,
@@ -223,6 +233,13 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
         slot_idx = tl.load(slot_mapping_ptr + token)
         if slot_idx < 0:
             return
+        if slot_idx >= num_slots:
+            # A slot beyond the paged cache is corrupt scheduler state; a
+            # store through it is the illegal memory access this kernel has
+            # been dying with in production. Count it and drop the write --
+            # one stale cache row is recoverable, a dead engine is not.
+            tl.atomic_add(guard_counter_ptr, 1)
+            return
         x = tl.load(kv_ptr + token * head_dim + offs).to(tl.float32)
     else:
         x = tl.load(
@@ -245,6 +262,13 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
     cs_idx = tl.maximum(rope_pair_local, 0)
 
     pos = tl.load(positions_ptr + token)
+    # Reading the cos/sin table at a corrupt position faults just like a
+    # corrupt slot. Clamp to a valid row (the RoPE values are wrong for this
+    # token, the addresses are not) and count it. Mask-style rather than a
+    # divergent reassignment, which trips Triton's type merge.
+    pos_oob = (pos < 0) | (pos >= num_positions)
+    tl.atomic_add(guard_counter_ptr + 1, 1, mask=pos_oob)
+    pos = tl.where(pos_oob, tl.zeros_like(pos), pos)
     cs_base = cos_sin_ptr + pos * rope_dim
     cos_v = tl.load(cs_base + cs_idx, mask=is_rope_pair, other=1.0)
     sin_v = tl.load(cs_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0)
@@ -276,6 +300,37 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
     else:
         out_row = q_out_ptr + (token * num_heads_padded + slot) * head_dim
         tl.store(out_row + offs, x.to(tl.bfloat16))
+
+
+# One [oob_slots, oob_positions] int32 pair per device. Created at the first
+# insert call, which happens during warmup -- before any CUDA graph capture,
+# so the captured graphs replay against a stable address. The guards in the
+# kernel accumulate here at zero steady-state cost; reading it back costs a
+# sync and is therefore gated behind VLLM_DSV4_INSERT_GUARD_REPORT=1.
+_INSERT_GUARD_COUNTERS: dict[torch.device, torch.Tensor] = {}
+_INSERT_GUARD_REPORT = os.environ.get("VLLM_DSV4_INSERT_GUARD_REPORT") == "1"
+
+
+def _insert_guard_counter(device: torch.device) -> torch.Tensor:
+    # Normalize: torch.device("cuda") and torch.device("cuda", 0) must key the
+    # same counter, or a caller and the kernel can end up on different ones.
+    if device.index is None and device.type == "cuda":
+        device = torch.device("cuda", torch.cuda.current_device())
+    counter = _INSERT_GUARD_COUNTERS.get(device)
+    if counter is None:
+        counter = torch.zeros(2, dtype=torch.int32, device=device)
+        _INSERT_GUARD_COUNTERS[device] = counter
+    return counter
+
+
+def int8_ds_mla_insert_guard_counts() -> dict[str, int]:
+    """Guard trips so far on every device this process has inserted on."""
+    out: dict[str, int] = {"oob_slots": 0, "oob_positions": 0}
+    for counter in _INSERT_GUARD_COUNTERS.values():
+        host = counter.cpu()
+        out["oob_slots"] += int(host[0])
+        out["oob_positions"] += int(host[1])
+    return out
 
 
 def fused_qnorm_rope_kv_int8_ds_mla_insert(
@@ -325,6 +380,7 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
     q_out = q.new_empty(num_tokens_full, num_heads_padded, head_dim)
     if num_tokens_full == 0:
         return q_out
+    guard_counter = _insert_guard_counter(q.device)
     _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel[
         (num_tokens_full, num_heads_padded + 1)
     ](
@@ -335,10 +391,13 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
         slot_mapping,
         positions,
         cos_sin_cache,
+        guard_counter,
         num_tokens_full,
         num_tokens_insert,
         block_size,
         flat_cache.stride(0),
+        flat_cache.shape[0] * block_size,
+        cos_sin_cache.shape[0],
         eps,
         num_heads=num_heads,
         num_heads_padded=num_heads_padded,
@@ -346,6 +405,18 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
         rope_dim=64,
         token_stride=_INT8_DS_MLA_TOKEN_BYTES,
     )
+    if _INSERT_GUARD_REPORT and not torch.cuda.is_current_stream_capturing():
+        host = guard_counter.cpu()
+        if int(host[0]) or int(host[1]):
+            logger.warning(
+                "int8_ds_mla insert guard tripped: oob_slots=%d oob_positions=%d "
+                "(num_slots=%d num_positions=%d num_tokens_insert=%d)",
+                int(host[0]),
+                int(host[1]),
+                flat_cache.shape[0] * block_size,
+                cos_sin_cache.shape[0],
+                num_tokens_insert,
+            )
     return q_out
 
 

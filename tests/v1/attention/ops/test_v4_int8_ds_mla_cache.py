@@ -458,3 +458,57 @@ def test_generic_gather_rejects_wrong_block_count_for_int8_layout() -> None:
             offset=0,
             cache_dtype="int8_ds_mla",
         )
+
+
+def test_fused_qnorm_rope_kv_int8_insert_guards_oob_slot_and_position() -> None:
+    """A slot beyond the paged cache or a position beyond the cos/sin table is
+    corrupt scheduler state; before the guards, the store/load through it was
+    an illegal memory access that killed the engine (the production EOS-tail
+    crash signature). The kernel must survive both, count each trip, and leave
+    every in-bounds token's row correct."""
+    device = _device()
+    if device.type != "cuda":
+        return
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        _insert_guard_counter,
+        fused_qnorm_rope_kv_int8_ds_mla_insert,
+    )
+
+    block_size = 4
+    k_cache = torch.zeros(3, block_size, 528, dtype=torch.uint8, device=device)
+    num_slots = 3 * block_size
+
+    torch.manual_seed(0)
+    num_tokens = 4
+    q = torch.randn(num_tokens, 2, 512, dtype=torch.bfloat16, device=device)
+    kv = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device=device)
+    cos_sin = torch.randn(16, 64, dtype=torch.float32, device=device)
+    # Token 1: slot far past the cache. Token 2: position far past the table.
+    positions = torch.tensor([0, 3, 1 << 40, 5], dtype=torch.int64, device=device)
+    slot_mapping = torch.tensor(
+        [0, num_slots + (1 << 30), 2, 3], dtype=torch.int64, device=device
+    )
+
+    counter = _insert_guard_counter(device)
+    before = counter.cpu().clone()
+    q_out = fused_qnorm_rope_kv_int8_ds_mla_insert(
+        q, kv, k_cache, slot_mapping, positions, cos_sin, 2, 1e-6, block_size
+    )
+    torch.cuda.synchronize()
+
+    delta = counter.cpu() - before
+    assert int(delta[0]) == 1, f"expected 1 oob-slot trip, got {int(delta[0])}"
+    # The position guard runs in every (token, slot) program that reads the
+    # position: padded_heads Q lanes plus the KV lane.
+    assert int(delta[1]) == 3, f"expected 3 oob-position trips, got {int(delta[1])}"
+    assert q_out.shape == (num_tokens, 2, 512)
+    assert not q_out.isnan().any()
+
+    # In-bounds tokens landed; the poisoned slot's write was dropped, so no
+    # other row moved. Rows 0, 2, 3 written; row 1's target does not exist.
+    rows_i8, scales = get_int8_ds_mla_cache_views(k_cache, block_size)
+    written = {0, 2, 3}
+    for slot in range(num_slots):
+        b, p = divmod(slot, block_size)
+        row_used = bool(rows_i8[b, p].any() or scales[b, p] != 0)
+        assert row_used == (slot in written), f"slot {slot}: used={row_used}"
