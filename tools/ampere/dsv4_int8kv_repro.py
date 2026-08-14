@@ -155,6 +155,22 @@ def main() -> int:
         "length-capped ones are known not to trigger it.",
     )
     parser.add_argument(
+        "--prefix-caching",
+        action="store_true",
+        help="Enable prefix caching (production default). The crashing "
+        "request in the production dump was consuming a prefix-cache hit "
+        "(num_common_prefix_blocks=[1,...]) from the EOS-finished request "
+        "before it; every request through the chat template shares a prefix.",
+    )
+    parser.add_argument(
+        "--shared-prefix-tokens",
+        type=int,
+        default=0,
+        help="First N prompt tokens identical across rounds, modelling the "
+        "shared chat-template prefix that makes consecutive requests hit "
+        "each other's cached blocks.",
+    )
+    parser.add_argument(
         "--eos-finish",
         action="store_true",
         help="Alternate rounds: one request whose sampler may only emit the "
@@ -211,7 +227,7 @@ def main() -> int:
         max_num_batched_tokens=args.max_num_batched_tokens,
         enable_chunked_prefill=True,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
-        enable_prefix_caching=False,
+        enable_prefix_caching=args.prefix_caching,
         **kwargs,
     )
 
@@ -231,10 +247,13 @@ def main() -> int:
     for round_idx in range(args.rounds):
         # Fresh token ids per round: identical prompts would be served from the
         # prefix cache and never allocate a recycled block.
+        shared = prompts[0]["prompt_token_ids"][: args.shared_prefix_tokens]
         round_prompts = [
             {
-                "prompt_token_ids": [
-                    random.randint(10, 20000) for _ in range(args.prompt_tokens)
+                "prompt_token_ids": shared
+                + [
+                    random.randint(10, 20000)
+                    for _ in range(args.prompt_tokens - len(shared))
                 ]
             }
             for _ in range(args.num_prompts)
