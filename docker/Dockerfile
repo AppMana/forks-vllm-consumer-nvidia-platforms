@@ -870,7 +870,6 @@ RUN --mount=type=cache,target=/var/cache/apt \
 # (HPC-X's segfaults in nccl_p2p_ib_pci_path) cannot handle that; routing
 # lives in the forked NCCL's internal NET/IB path. HCA lists and the rest of
 # the NCCL env are owned by the tb-chain webhook, never baked here.
-ENV NCCL_NET_PLUGIN=none
 
 # Install uv for faster pip installs
 RUN python3 -m pip install uv
