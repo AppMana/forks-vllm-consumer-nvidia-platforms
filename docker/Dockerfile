@@ -52,12 +52,18 @@ ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 ARG APPMANA_NCCL_GIT_REF=22355b63ea9ffd869e208e4f6d381e6f31b471d9
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
-# 0.2.20 is the proven pairing with kernel 0.2.37: provider 0.2.37 hangs the
-# NCCL communicator-init all-reduce on the TB chain (raw RC verbs are fine,
-# ibv_rc_pingpong passes) -- root-cause before bumping again.
-ARG USB4_RDMA_PROVIDER_VERSION=0.2.20
-# release tag carrying the provider deb (tag scheme decoupled from provider version)
-ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v0.2.20
+# 0.2.70 is the first provider that serves BOTH host engines: libusb4_rdma for
+# the legacy thunderbolt_ibverbs module (private verb ABI -- the container
+# version must match the host kernel module exactly, see
+# forks-thunderbolt drivers/thunderbolt_ibverbs/docs/provider_version_matching.md)
+# and libtbrxe for tbrxe.ko (stock rxe uverbs ABI under the private USB4 driver
+# id; stock librxe can never bind it, so a < 0.2.70 provider leaves tbrxe hosts
+# with no userspace at all). Keep this moving with the fleet's dkms
+# PACKAGE_VERSION.
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.70
+# The provider deb rides the forks-thunderbolt tbfix release tags (v2.39+),
+# no longer a provider-versioned tag.
+ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v2.39
 
 # OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
 # Python bootstrap. Set to "manylinux" alongside a manylinux build base such
@@ -851,9 +857,20 @@ RUN --mount=type=cache,target=/var/cache/apt \
             /tmp/usb4-rdma-provider.deb; \
         dpkg-query -W -f='${Package} ${Version}\n' usb4-rdma-provider; \
         test -e "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libibverbs/libusb4_rdma-rdmav34.so"; \
+        test -e "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libibverbs/libtbrxe-rdmav34.so"; \
+        test -e /etc/libibverbs.d/usb4_rdma.driver; \
+        test -e /etc/libibverbs.d/tbrxe.driver; \
+        mkdir -p /etc/appmana; \
+        dpkg-query -W -f='${Version}' usb4-rdma-provider > /etc/appmana/usb4-rdma-provider-version; \
         rm -f /tmp/usb4-rdma-provider.deb; \
         rm -rf /var/lib/apt/lists/*; \
     fi
+
+# The usb4_rdma / tbrxe HCAs have no PCI parent. External NCCL net plugins
+# (HPC-X's segfaults in nccl_p2p_ib_pci_path) cannot handle that; routing
+# lives in the forked NCCL's internal NET/IB path. HCA lists and the rest of
+# the NCCL env are owned by the tb-chain webhook, never baked here.
+ENV NCCL_NET_PLUGIN=none
 
 # Install uv for faster pip installs
 RUN python3 -m pip install uv
@@ -1151,6 +1168,8 @@ ARG VLLM_IMAGE_TAG
 ARG VLLM_SOURCE_REPO=https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms
 ARG APPMANA_NCCL_GIT_REPO
 ARG APPMANA_NCCL_GIT_REF
+ARG USB4_RDMA_PROVIDER_VERSION
+ARG APPMANA_THUNDERBOLT_RELEASE_TAG
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1382,7 +1401,9 @@ LABEL org.opencontainers.image.source="${VLLM_SOURCE_REPO}" \
       ai.appmana.lmcache.ref="${LMCACHE_GIT_REF}" \
       ai.appmana.flashmla.spec="${FLASHMLA_SPEC} from ${FLASHMLA_INDEX_URL}" \
       ai.appmana.nccl.repo="${APPMANA_NCCL_GIT_REPO}" \
-      ai.appmana.nccl.ref="${APPMANA_NCCL_GIT_REF}"
+      ai.appmana.nccl.ref="${APPMANA_NCCL_GIT_REF}" \
+      ai.appmana.usb4_rdma.provider="${USB4_RDMA_PROVIDER_VERSION}" \
+      ai.appmana.usb4_rdma.release_tag="${APPMANA_THUNDERBOLT_RELEASE_TAG}"
 
 # define sagemaker first, so it is not default from `docker build`
 FROM vllm-openai-base AS vllm-sagemaker

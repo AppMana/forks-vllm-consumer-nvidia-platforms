@@ -32,10 +32,10 @@
       "default": "true"
     },
     "USB4_RDMA_PROVIDER_VERSION": {
-      "default": "0.2.20"
+      "default": "0.2.70"
     },
     "APPMANA_THUNDERBOLT_RELEASE_TAG": {
-      "default": "v0.2.20"
+      "default": "v2.39"
     },
     "BUILD_OS": {
       "default": "ubuntu"
