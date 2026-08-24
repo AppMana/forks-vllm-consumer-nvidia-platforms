@@ -60,10 +60,10 @@ ARG INSTALL_USB4_RDMA_PROVIDER=true
 # id; stock librxe can never bind it, so a < 0.2.70 provider leaves tbrxe hosts
 # with no userspace at all). Keep this moving with the fleet's dkms
 # PACKAGE_VERSION.
-ARG USB4_RDMA_PROVIDER_VERSION=0.2.70
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.72
 # The provider deb rides the forks-thunderbolt tbfix release tags (v2.39+),
 # no longer a provider-versioned tag.
-ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v2.39
+ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v2.43
 
 # OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
 # Python bootstrap. Set to "manylinux" alongside a manylinux build base such
