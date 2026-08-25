@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import queue
+import threading
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import vllm.v1.worker.gpu.warmup as gpu_warmup
@@ -285,3 +288,297 @@ def test_deepseek_v4_spec_warmup_uses_long_prefill_compile_class(monkeypatch):
     )
 
     assert executed[0].total_num_scheduled_tokens == 256
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-parallel collective symmetry of the warmup sequences.
+#
+# Field evidence (12-rank PP DeepSeek V4 + DSpark, num_speculative_tokens=7):
+# the server never became ready, all GPUs idle at 0%, and SIGUSR2 dumps showed
+#   rank 0  warmup.py run_spec_verify_warmup -> gpu_worker.py:1116
+#           isend_tensor_dict -> send_object -> torch.distributed.send BLOCKED
+#   rank 11 warmup.py run_spec_verify_warmup -> gpu_worker.py:1080
+#           irecv_tensor_dict -> recv_object -> torch.distributed.recv BLOCKED
+#   rank 1  not in the warmup at all, back in worker_busy_loop's dequeue
+# i.e. the two end ranks were mid-sequence while a middle rank had already
+# left it. The harness below models exactly the transfer rule
+# GPUWorker.execute_model implements, and the blocking metadata rendezvous
+# both isend_tensor_dict and irecv_tensor_dict perform, so that any
+# divergence in per-rank transfer counts shows up as a bounded failure
+# instead of a hung test.
+# ---------------------------------------------------------------------------
+
+_PP_TIMEOUT = 5.0
+
+
+class _PPStranded(RuntimeError):
+    """A rank blocked in a rendezvous no peer will ever match."""
+
+
+class _PPLinks:
+    """One rendezvous channel per pipeline hop `rank -> rank + 1`.
+
+    Mirrors parallel_state.send_object/recv_object (parallel_state.py:852 and
+    :872): the metadata handshake blocks on BOTH sides until it is matched,
+    which is why an unmatched send wedges the sender just as an unmatched
+    recv wedges the receiver.
+    """
+
+    def __init__(self, pp_size: int):
+        self.pp_size = pp_size
+        self.hops = [queue.Queue() for _ in range(pp_size - 1)]
+        self.sends = [0] * pp_size
+        self.recvs = [0] * pp_size
+        self.stranded: list[tuple[int, str]] = []
+
+    def send(self, rank: int) -> None:
+        ack = threading.Event()
+        self.sends[rank] += 1
+        self.hops[rank].put(ack)
+        if not ack.wait(_PP_TIMEOUT):
+            self.stranded.append((rank, "send"))
+            raise _PPStranded(f"rank {rank} blocked in send")
+
+    def recv(self, rank: int) -> None:
+        try:
+            ack = self.hops[rank - 1].get(timeout=_PP_TIMEOUT)
+        except queue.Empty:
+            self.stranded.append((rank, "recv"))
+            raise _PPStranded(f"rank {rank} blocked in recv") from None
+        self.recvs[rank] += 1
+        ack.set()
+
+    @property
+    def unmatched(self) -> int:
+        return sum(hop.qsize() for hop in self.hops)
+
+    def assert_balanced(self) -> None:
+        """Every hop must have as many recvs on its far side as sends on its
+        near side, and nothing left in flight."""
+        assert self.stranded == [], (
+            f"ranks blocked on peers that walked away: {self.stranded}"
+        )
+        for hop in range(self.pp_size - 1):
+            assert self.sends[hop] == self.recvs[hop + 1], (
+                f"hop {hop}->{hop + 1}: {self.sends[hop]} sends vs "
+                f"{self.recvs[hop + 1]} recvs"
+            )
+        assert self.sends[self.pp_size - 1] == 0
+        assert self.recvs[0] == 0
+        assert self.unmatched == 0
+
+
+class _FakeAllReduce:
+    """Barrier-backed MIN all-reduce across the simulated ranks."""
+
+    def __init__(self, pp_size: int):
+        self.barrier = threading.Barrier(pp_size, timeout=_PP_TIMEOUT)
+        self.slots = [0] * pp_size
+        self.rounds = 0
+
+    def __call__(self, tensor, op=None, group=None):
+        idx = self.barrier.wait()
+        self.slots[idx] = int(tensor.item())
+        self.barrier.wait()
+        tensor.fill_(min(self.slots))
+        if idx == 0:
+            self.rounds += 1
+        self.barrier.wait()
+
+
+def _spec_runner(rank: int, pp_size: int, **overrides):
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        num_speculative_steps=7,
+        kv_connector=_FakeKVConnector(),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=128,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
+            ],
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
+    )
+    for key, value in overrides.items():
+        setattr(runner, key, value)
+    return runner
+
+
+def _pp_execute_model(rank: int, pp_size: int, links: _PPLinks):
+    """The transfer rule GPUWorker.execute_model implements.
+
+    `forward_pass = scheduler_output.total_num_scheduled_tokens > 0`
+    (gpu_worker.py:1036) gates the irecv (gpu_worker.py:1071); a zero-token
+    batch also returns from GPUModelRunner.execute_model before producing
+    IntermediateTensors (gpu/model_runner.py:1289-1292), so the isend at
+    gpu_worker.py:1116 is never reached either.
+    """
+
+    def execute_model(scheduler_output):
+        if scheduler_output.total_num_scheduled_tokens <= 0:
+            return None
+        if rank != 0:
+            links.recv(rank)
+        if rank != pp_size - 1:
+            links.send(rank)
+        return None
+
+    return execute_model
+
+
+def _run_ranks(monkeypatch, pp_size, runners, target=gpu_warmup.run_spec_verify_warmup):
+    """Drive `target` on every simulated rank concurrently."""
+    links = _PPLinks(pp_size)
+    all_reduce = _FakeAllReduce(pp_size)
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        gpu_warmup, "get_pp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+
+    results: list[object] = [None] * pp_size
+    errors: list[BaseException | None] = [None] * pp_size
+
+    def run(rank: int) -> None:
+        try:
+            results[rank] = target(
+                runners[rank],
+                _pp_execute_model(rank, pp_size, links),
+                lambda _grammar_output: None,
+            )
+        except BaseException as exc:  # noqa: BLE001 - recorded, asserted on
+            errors[rank] = exc
+
+    threads = [
+        threading.Thread(target=run, args=(rank,), daemon=True)
+        for rank in range(pp_size)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=4 * _PP_TIMEOUT)
+    assert not any(thread.is_alive() for thread in threads), (
+        "a simulated rank never finished; the warmup can wedge a PP rank"
+    )
+    return links, all_reduce, results, errors
+
+
+def test_spec_verify_warmup_transfers_match_on_every_rank(monkeypatch):
+    """Healthy 12-rank pipeline: identical transfer counts, warmup preserved."""
+    pp_size = 12
+    runners = [_spec_runner(rank, pp_size) for rank in range(pp_size)]
+
+    links, _all_reduce, results, errors = _run_ranks(monkeypatch, pp_size, runners)
+
+    assert errors == [None] * pp_size
+    links.assert_balanced()
+    assert results == [True] * pp_size
+    # Three batches carry scheduled tokens (prefill, first verify, steady
+    # verify). The pp_size empty drain batches and the cleanup batch must add
+    # nothing at all, on any rank.
+    assert links.sends == [3] * (pp_size - 1) + [0]
+    assert links.recvs == [0] + [3] * (pp_size - 1)
+    assert links.unmatched == 0
+
+
+def test_spec_verify_warmup_is_skipped_on_all_ranks_when_one_rank_declines(
+    monkeypatch,
+):
+    """Regression: the reproduced 2026-08-24 deadlock.
+
+    One middle rank's LOCAL gate fails (its own kv_cache_config cannot
+    supply the warmup blocks). Before the collective agreement it returned
+    False on its own while every other rank walked into the pipeline, which
+    is precisely the captured failure: rank 0 blocked in send_object, rank
+    11 blocked in recv_object, the middle rank already back in the worker
+    busy loop.
+    """
+    pp_size = 12
+    runners = [_spec_runner(rank, pp_size) for rank in range(pp_size)]
+    runners[5].kv_cache_config = SimpleNamespace(
+        num_blocks=1,
+        kv_cache_groups=runners[5].kv_cache_config.kv_cache_groups,
+    )
+
+    links, _all_reduce, results, errors = _run_ranks(monkeypatch, pp_size, runners)
+
+    assert errors == [None] * pp_size
+    links.assert_balanced()
+    # Uniform decision: all ranks skip, nobody transfers anything.
+    assert results == [False] * pp_size
+    assert links.sends == [0] * pp_size
+    assert links.recvs == [0] * pp_size
+    assert links.unmatched == 0
+
+
+def test_zero_layer_tail_rank_participates_identically(monkeypatch):
+    """The draft/MTP tail rank owns no target layers.
+
+    An attention-free worker gets num_blocks=1 with zero cache groups
+    (kv_cache_utils.py:1365-1372), so its block requirement is zero. It must
+    reach the same decision as every other rank and post exactly the same
+    transfers for its position in the pipeline.
+    """
+    pp_size = 12
+    runners = [_spec_runner(rank, pp_size) for rank in range(pp_size)]
+    runners[pp_size - 1].kv_cache_config = SimpleNamespace(
+        num_blocks=1, kv_cache_groups=[]
+    )
+
+    links, _all_reduce, results, errors = _run_ranks(monkeypatch, pp_size, runners)
+
+    assert errors == [None] * pp_size
+    links.assert_balanced()
+    assert results == [True] * pp_size
+    assert links.recvs[pp_size - 1] == 3
+    assert links.sends[pp_size - 1] == 0
+    assert links.recvs == [0] + [3] * (pp_size - 1)
+    assert links.unmatched == 0
+
+
+def test_spec_verify_warmup_uniformly_skipped_without_speculation(monkeypatch):
+    """num_speculative_steps is config-uniform: every rank returns together,
+    and the collective must NOT be entered (a rank that returned before it
+    would hang the ranks that reached it)."""
+    pp_size = 12
+    runners = [
+        _spec_runner(rank, pp_size, num_speculative_steps=0) for rank in range(pp_size)
+    ]
+
+    links, all_reduce, results, errors = _run_ranks(monkeypatch, pp_size, runners)
+
+    assert errors == [None] * pp_size
+    links.assert_balanced()
+    assert results == [False] * pp_size
+    assert links.sends == [0] * pp_size
+    assert links.recvs == [0] * pp_size
+    assert all_reduce.rounds == 0
+
+
+def test_pp_coupled_sequence_fails_fast_rather_than_stranding_peers(monkeypatch):
+    """A failure after the first transfer cannot unwind quietly: returning to
+    the worker busy loop leaves peers in an unmatched rendezvous forever."""
+    exits: list[int] = []
+    monkeypatch.setattr(gpu_warmup.os, "_exit", lambda code: exits.append(code))
+
+    runner = _spec_runner(0, 12)
+
+    def _boom():
+        raise RuntimeError("kernel blew up mid-sequence")
+
+    gpu_warmup.run_pp_coupled(runner, "test sequence", _boom)
+
+    assert exits == [1]
+
+
+def test_pp_coupled_sequence_reraises_without_pipeline_parallel(monkeypatch):
+    exits: list[int] = []
+    monkeypatch.setattr(gpu_warmup.os, "_exit", lambda code: exits.append(code))
+    runner = _spec_runner(0, 1)
+
+    def _boom():
+        raise RuntimeError("kernel blew up mid-sequence")
+
+    with pytest.raises(RuntimeError):
+        gpu_warmup.run_pp_coupled(runner, "test sequence", _boom)
+    assert exits == []

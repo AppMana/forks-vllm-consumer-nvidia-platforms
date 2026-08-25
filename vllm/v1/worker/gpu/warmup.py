@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import sys
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
@@ -9,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.attention.backends.mla.indexer import (
@@ -28,6 +31,93 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
+def _pp_size(model_runner: GPUModelRunner) -> int:
+    return int(
+        getattr(
+            getattr(model_runner, "parallel_config", None),
+            "pipeline_parallel_size",
+            1,
+        )
+        or 1
+    )
+
+
+def pp_ranks_all_agree(model_runner: GPUModelRunner, local_ok: bool, what: str) -> bool:
+    """Reduce a per-rank decision to one answer shared by every PP rank.
+
+    Every warmup step that goes through `worker_execute_model` is
+    collectively coupled. For a batch with scheduled tokens,
+    `GPUWorker.execute_model` posts an UNBOUNDED, BLOCKING metadata
+    rendezvous on both sides of each pipeline hop:
+    `isend_tensor_dict` -> `send_object` -> `torch.distributed.send` and
+    `irecv_tensor_dict` -> `recv_object` -> `torch.distributed.recv`
+    (parallel_state.py:1062/852 and 1160/872). "isend" is a misnomer: only
+    the payload tensors are async, the metadata handshake is not.
+
+    So a rank that decides on its own to skip a warmup sequence does not
+    just lose the warmup, it strands its neighbours forever. Any gate that
+    reads RANK-LOCAL state (KV block counts, per-rank projected cache
+    groups, anything sized from this rank's own memory) must therefore be
+    reduced here, so all ranks either run the sequence or all skip it.
+
+    Gates computed from configuration that is identical in every worker
+    process do not need this and must not use it: a rank returning on such
+    a gate is guaranteed to have every peer return with it, and routing it
+    through a collective would itself be a place to hang. For the same
+    reason, everything a caller evaluates before reaching this call must be
+    plain attribute reads and arithmetic over state that already exists --
+    a rank that raises on the way here strands the ranks that arrived.
+    """
+    if _pp_size(model_runner) <= 1 or not torch.distributed.is_initialized():
+        return local_ok
+
+    flag = torch.tensor([1 if local_ok else 0], dtype=torch.int32, device="cpu")
+    torch.distributed.all_reduce(
+        flag, op=torch.distributed.ReduceOp.MIN, group=get_pp_group().cpu_group
+    )
+    agreed = bool(flag.item())
+    if local_ok and not agreed:
+        logger.info(
+            "Skipping %s on every PP rank because at least one rank cannot run "
+            "it. The warmup only pays off if all ranks participate; a partial "
+            "run deadlocks the pipeline.",
+            what,
+        )
+    return agreed
+
+
+def run_pp_coupled(
+    model_runner: GPUModelRunner, what: str, body: Callable[[], None]
+) -> None:
+    """Run a PP-coupled warmup sequence, failing fast instead of hanging.
+
+    Once the first transfer of the sequence has been posted, this rank owes
+    its neighbours an exact number of matching transfers. Unwinding the
+    stack (which under the multiproc executor just returns the worker to
+    `worker_busy_loop`'s dequeue, multiproc_executor.py:1021-1039) leaves
+    them parked in a rendezvous nothing will ever match, and the engine
+    leader blocks reading rank 0's response before it ever sees the
+    failure -- the deployment wedges with no error anywhere. Dying is the
+    only way to release a blocked peer: it drops the transport and the
+    executor's worker monitor fails the engine promptly. Mirrors the same
+    reasoning already applied in multiproc_executor.py:1040-1065.
+    """
+    try:
+        body()
+    except BaseException:
+        if _pp_size(model_runner) <= 1:
+            raise
+        logger.exception(
+            "%s failed after PP transfers were already posted. Peer ranks are "
+            "blocked in an unbounded send/recv rendezvous this rank can no "
+            "longer match; exiting so they fail fast instead of deadlocking.",
+            what,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+
+
 def _is_deepseek_v4_model_runner(model_runner: GPUModelRunner) -> bool:
     model_config = getattr(model_runner, "model_config", None)
     hf_config = getattr(model_config, "hf_config", None)
@@ -45,6 +135,11 @@ def run_mixed_prefill_decode_warmup(
     req_id_prefix: str = "_v2_mixed_warmup",
 ) -> bool:
     """Run a V2 mixed prefill+decode step through normal scheduler inputs."""
+    # Config-uniform gates: is_pooling_model comes from
+    # model_config.runner_type and max_num_reqs from
+    # scheduler_config.max_num_seqs, both identical in every worker process,
+    # and num_tokens is derived from scheduler_config by the caller. Every
+    # rank returns here or no rank does, so no agreement round is needed.
     if model_runner.is_pooling_model or model_runner.max_num_reqs < 2 or num_tokens < 3:
         return False
 
@@ -74,13 +169,20 @@ def run_mixed_prefill_decode_warmup(
         cdiv(prefill_len, block_size) for block_size in group_block_sizes
     ]
     required_blocks = sum(decode_block_counts) + sum(prefill_block_counts)
-    if model_runner.kv_cache_config.num_blocks <= required_blocks:
+    # RANK-LOCAL gate: kv_cache_config is this rank's own config (its
+    # projected cache groups, its block budget). Deciding alone here would
+    # strand every other rank in the pipeline, so agree first.
+    has_blocks = model_runner.kv_cache_config.num_blocks > required_blocks
+    if not has_blocks:
         logger.warning(
             "Skipping V2 mixed prefill+decode warmup because only %d KV blocks "
             "are available for %d required warmup blocks.",
             model_runner.kv_cache_config.num_blocks,
             required_blocks,
         )
+    if not pp_ranks_all_agree(
+        model_runner, has_blocks, "V2 mixed prefill+decode warmup"
+    ):
         return False
 
     next_block_id = 1
@@ -148,8 +250,8 @@ def run_mixed_prefill_decode_warmup(
     cleanup_output.finished_req_ids = {decode_req_id, prefill_req_id}
 
     context = mixed_step_context or nullcontext()
-    model_runner.kv_connector.set_disabled(True)
-    try:
+
+    def _sequence() -> None:
         worker_execute_model(decode_prefill_output)
         worker_sample_tokens(None)
         with context:
@@ -159,15 +261,16 @@ def run_mixed_prefill_decode_warmup(
         # Async PP defers sampled-token postprocessing by one pipeline depth.
         # Drain those slots before finishing the synthetic requests so the
         # deferred post_update path is JIT-warmed while request state is valid.
-        pp_size = getattr(
-            getattr(model_runner, "parallel_config", None),
-            "pipeline_parallel_size",
-            1,
-        )
-        for _ in range(max(0, pp_size)):
+        # These batches carry zero scheduled tokens, so they post no PP
+        # transfers on any rank (see run_spec_verify_warmup).
+        for _ in range(max(0, _pp_size(model_runner))):
             worker_execute_model(SchedulerOutput.make_empty())
 
         worker_execute_model(cleanup_output)
+
+    model_runner.kv_connector.set_disabled(True)
+    try:
+        run_pp_coupled(model_runner, "V2 mixed prefill+decode warmup", _sequence)
     finally:
         model_runner.kv_connector.set_disabled(False)
     return True
@@ -195,7 +298,17 @@ def run_spec_verify_warmup(
     distinct kernel specializations. State bookkeeping for the synthetic
     request only needs to be internally consistent enough to reach the
     kernels; the request is finished and its blocks dropped afterwards.
+
+    Participation is a COLLECTIVE decision. Every non-empty batch below is a
+    matched PP send/recv rendezvous, so this either runs on all PP ranks or
+    on none: config-uniform gates return outright, rank-local ones go
+    through `pp_ranks_all_agree` first.
     """
+    # Config-uniform gate. num_speculative_steps is assigned straight from
+    # vllm_config.num_speculative_tokens (gpu/model_runner.py:209) and
+    # is_pooling_model from model_config.runner_type (gpu/model_runner.py:240);
+    # both are identical in every worker process, so a return here is taken
+    # by every rank simultaneously and cannot strand a peer.
     num_spec = model_runner.num_speculative_steps
     if num_spec <= 0 or model_runner.is_pooling_model:
         return False
@@ -216,13 +329,21 @@ def run_spec_verify_warmup(
     block_deltas = [
         full - prefill for full, prefill in zip(full_block_counts, prefill_block_counts)
     ]
-    if model_runner.kv_cache_config.num_blocks <= sum(full_block_counts):
+    # RANK-LOCAL gate: both the block budget and the projected cache groups
+    # this sum is taken over belong to THIS rank (a tail rank owning no
+    # target layers can even have zero groups, hence a zero requirement).
+    # Returning on it alone is what deadlocks the pipeline: the ranks that
+    # kept going park in `send_object`/`recv_object` waiting for a peer that
+    # already walked away. Agree across the PP group before acting on it.
+    has_blocks = model_runner.kv_cache_config.num_blocks > sum(full_block_counts)
+    if not has_blocks:
         logger.warning(
             "Skipping V2 spec verify warmup: only %d KV blocks available for "
             "%d required warmup blocks.",
             model_runner.kv_cache_config.num_blocks,
             sum(full_block_counts),
         )
+    if not pp_ranks_all_agree(model_runner, has_blocks, "V2 spec verify warmup"):
         return False
 
     next_block_id = 1
@@ -285,12 +406,12 @@ def run_spec_verify_warmup(
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = {req_id}
 
-    pp_size = getattr(
-        getattr(model_runner, "parallel_config", None), "pipeline_parallel_size", 1
-    )
+    pp_size = _pp_size(model_runner)
 
-    model_runner.kv_connector.set_disabled(True)
-    try:
+    def _sequence() -> None:
+        # Three batches with scheduled tokens: each is exactly one PP
+        # transfer per hop, identical in count on every rank (a recv on
+        # every non-first rank, a send on every non-last rank).
         worker_execute_model(prefill_output)
         worker_sample_tokens(None)
         worker_execute_model(first_verify)
@@ -300,9 +421,24 @@ def run_spec_verify_warmup(
         # Async PP defers sampled-token postprocessing by one pipeline depth.
         # Drain those slots so the deferred post_update path is JIT-warmed
         # while the synthetic request's state is still valid.
+        #
+        # These carry zero scheduled tokens, and so does the cleanup batch
+        # below. A zero-token batch posts NO PP transfer on ANY rank:
+        # gpu_worker.execute_model computes
+        # `forward_pass = total_num_scheduled_tokens > 0` (gpu_worker.py:1036)
+        # and guards the irecv on it (gpu_worker.py:1071), while
+        # GPUModelRunner.execute_model returns the connector's empty output
+        # before producing IntermediateTensors (gpu/model_runner.py:1289-1292)
+        # so the isend at gpu_worker.py:1116 is never reached. The drain is
+        # therefore collectively symmetric on first, middle and last ranks
+        # alike, and stays inside the agreed sequence.
         for _ in range(max(0, pp_size)):
             worker_execute_model(SchedulerOutput.make_empty())
         worker_execute_model(cleanup_output)
+
+    model_runner.kv_connector.set_disabled(True)
+    try:
+        run_pp_coupled(model_runner, "V2 spec verify warmup", _sequence)
     finally:
         model_runner.kv_connector.set_disabled(False)
     logger.info(
