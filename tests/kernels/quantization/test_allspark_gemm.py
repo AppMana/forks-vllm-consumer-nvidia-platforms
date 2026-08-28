@@ -134,7 +134,7 @@ def test_gptq_allspark_gemm_ampere(mnk_factors, group_size, has_zp, dtype):
 def test_native_allspark_splitk_makes_progress_and_matches_reference():
     device = torch.device("cuda")
     properties = torch.cuda.get_device_properties(device)
-    m, n, k = 1024, 1536, 4096
+    m, n, k = 1024, 384, 4096
 
     generator = torch.Generator().manual_seed(42)
     weight = torch.randint(
