@@ -51,6 +51,9 @@ assert "RAY_NSYS_PROFILE_CONFIG" in (root / "v1/executor/ray_utils.py").read_tex
 assert "token_sizes = sorted({16, max_tokens})" in (
     root / "v1/worker/gpu/warmup.py"
 ).read_text()
+assert "steady_verify.total_num_scheduled_tokens = 1 + num_spec" in (
+    root / "v1/worker/gpu/warmup.py"
+).read_text()
 assert "gpu_model_runner: target_forward" in (
     root / "v1/worker/gpu/model_runner.py"
 ).read_text()
