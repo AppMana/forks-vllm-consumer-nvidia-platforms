@@ -211,11 +211,15 @@ class DefaultModelLoader(BaseModelLoader):
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
-            if len(hf_weights_files) > 0:
+            matched_files = glob.glob(os.path.join(hf_folder, pattern))
+            hf_weights_files.extend(
+                path for path in matched_files if path not in hf_weights_files
+            )
+            if matched_files:
                 if pattern.endswith(".safetensors"):
                     use_safetensors = True
-                break
+                if allow_patterns_overrides is None:
+                    break
 
         if use_safetensors:
             # For models like Mistral-7B-Instruct-v0.3

@@ -465,13 +465,6 @@ def warmup_long_prefill_kernels(
         warmup_prefill_chunk_metadata_kernel(device, compress_ratio=4)
         warmup_block_table_slot_mapping_kernel(model_runner, device)
 
-    if _is_deepseek_v4_model_runner(model_runner):
-        logger.info(
-            "Skipping DeepSeek V4 full-model long-prefill warmup; direct sparse "
-            "MLA prefill warmups cover the Triton specializations."
-        )
-        return
-
     max_tokens = model_runner.scheduler_config.max_num_batched_tokens
     token_sizes = sorted({16, max_tokens})
     warmed_sizes: list[int] = []

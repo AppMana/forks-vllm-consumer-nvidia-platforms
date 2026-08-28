@@ -104,6 +104,9 @@ def test_versions_json_matches_the_dockerfile() -> None:
         ("torch_cuda_arch_list", "TORCH_CUDA_ARCH_LIST"),
         ("max_jobs", "MAX_JOBS"),
         ("nvcc_threads", "NVCC_THREADS"),
+        ("APPMANA_NCCL_GIT_REF", "APPMANA_NCCL_GIT_REF"),
+        ("USB4_RDMA_PROVIDER_VERSION", "USB4_RDMA_PROVIDER_VERSION"),
+        ("APPMANA_THUNDERBOLT_RELEASE_TAG", "APPMANA_THUNDERBOLT_RELEASE_TAG"),
     ):
         defaults = dockerfile_arg_defaults(arg_name)
         if not defaults:

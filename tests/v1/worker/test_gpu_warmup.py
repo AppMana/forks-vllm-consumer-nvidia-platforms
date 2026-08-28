@@ -90,13 +90,13 @@ def test_mixed_prefill_decode_warmup_drains_async_pp_slots():
     }
 
 
-def test_deepseek_v4_long_prefill_warmup_skips_full_model_batch(monkeypatch):
-    executed = []
+def test_deepseek_v4_long_prefill_warmup_runs_production_shapes(monkeypatch):
+    mixed_sizes = []
     metadata_warmup = []
     runner = SimpleNamespace(
         is_pooling_model=False,
         device=torch.device("cuda", 0),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=1024),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
         ),
@@ -109,19 +109,26 @@ def test_deepseek_v4_long_prefill_warmup_skips_full_model_batch(monkeypatch):
             (device, compress_ratio)
         ),
     )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_mixed_prefill_decode_warmup",
+        lambda _runner, _execute, _sample, num_tokens, **_kwargs: (
+            mixed_sizes.append(num_tokens) or True
+        ),
+    )
 
     gpu_warmup.warmup_long_prefill_kernels(
         runner,
-        lambda scheduler_output: executed.append(scheduler_output),
+        lambda _scheduler_output: None,
         lambda _grammar_output: None,
     )
 
     assert metadata_warmup == [(torch.device("cuda", 0), 4)]
-    assert executed == []
+    assert mixed_sizes == [16, 1024]
 
 
 def test_deepseek_v4_long_prefill_warmup_directly_warms_slot_mapping(monkeypatch):
-    executed = []
+    mixed_sizes = []
     metadata_warmup = []
     block_table = _FakeMultiGroupBlockTable()
     runner = SimpleNamespace(
@@ -142,15 +149,22 @@ def test_deepseek_v4_long_prefill_warmup_directly_warms_slot_mapping(monkeypatch
         ),
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_mixed_prefill_decode_warmup",
+        lambda _runner, _execute, _sample, num_tokens, **_kwargs: (
+            mixed_sizes.append(num_tokens) or True
+        ),
+    )
 
     gpu_warmup.warmup_long_prefill_kernels(
         runner,
-        lambda scheduler_output: executed.append(scheduler_output),
+        lambda _scheduler_output: None,
         lambda _grammar_output: None,
     )
 
     assert metadata_warmup == [(torch.device("cpu"), 4)]
-    assert executed == []
+    assert mixed_sizes == [16]
     assert block_table.calls == [
         ("add_row", ([1],), 0),
         ("commit_block_table", 1),
@@ -199,8 +213,8 @@ def test_block_table_warmup_clamps_to_table_capacity(monkeypatch):
     assert block_table.calls[2] == ("compute_slot_mapping", 1, (0, 64), 64)
 
 
-def test_deepseek_v4_pp_warmup_kernels_skip_generic_execute_model(monkeypatch):
-    executed = []
+def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch):
+    mixed_sizes = []
     metadata_warmup = []
     runner = SimpleNamespace(
         is_pooling_model=False,
@@ -221,14 +235,21 @@ def test_deepseek_v4_pp_warmup_kernels_skip_generic_execute_model(monkeypatch):
         ),
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_mixed_prefill_decode_warmup",
+        lambda _runner, _execute, _sample, num_tokens, **_kwargs: (
+            mixed_sizes.append(num_tokens) or True
+        ),
+    )
 
     gpu_warmup.warmup_kernels(
         runner,
-        lambda scheduler_output: executed.append(scheduler_output),
+        lambda _scheduler_output: None,
         lambda _grammar_output: None,
     )
 
-    assert executed == []
+    assert mixed_sizes == [16]
     assert metadata_warmup == [(torch.device("cuda", 0), 4)]
 
 

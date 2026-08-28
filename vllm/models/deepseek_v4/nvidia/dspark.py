@@ -9,7 +9,7 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
-import glob
+import json
 import os
 from collections.abc import Iterable
 
@@ -62,6 +62,69 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+
+
+def _remap_dspark_checkpoint_name(name: str) -> str | None:
+    m = re.match(r"mtp\.(\d+)\.(.*)", name)
+    if m is None:
+        return None
+    stage = int(m.group(1))
+    rest = m.group(2)
+    if rest.startswith("confidence_head."):
+        return None
+    if rest == "emb.tok_emb.weight":
+        return "model.embed_tokens.weight" if stage == 0 else None
+    if rest == "head.weight":
+        return None
+    head_prefixes = (
+        "norm.",
+        "hc_head_fn",
+        "hc_head_base",
+        "hc_head_scale",
+        "markov_head.",
+    )
+    if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
+        head_prefixes
+    ):
+        return f"model.{rest}"
+    return f"model.layers.{stage}.{rest}"
+
+
+def _indexed_dspark_weight_files(model_path: str) -> list[str] | None:
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return None
+
+    with open(index_path) as f:
+        index = json.load(f)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise ValueError(f"Invalid safetensors index: {index_path}")
+
+    files = sorted(
+        {
+            shard
+            for name, shard in weight_map.items()
+            if isinstance(name, str)
+            and isinstance(shard, str)
+            and _remap_dspark_checkpoint_name(name) is not None
+        }
+    )
+    if not files:
+        raise ValueError(
+            f"No loadable DSpark weights in safetensors index: {index_path}"
+        )
+
+    missing = [
+        shard
+        for shard in files
+        if not os.path.isfile(os.path.join(model_path, shard))
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"DSpark weight shards referenced by the index are missing: {missing}"
+        )
+    return files
 
 
 @support_torch_compile
@@ -393,21 +456,13 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        # The draft loads from the SAME checkpoint dir as the target
-        # (self-drafting), whose default weight iterator walks every shard —
-        # rereading the whole multi-hundred-GB checkpoint to pick out the
-        # mtp.* subtree. On GB10 unified memory (cache under pressure after
-        # the target load + KV allocation) that turned an ~11G draft load
-        # into a 30+ minute crawl that outlived the executor's 30-minute
-        # gloo barrier. The graft tool (dsv4_requant_checkpoint --mtp-src)
-        # always emits the DSpark subtree + materialized shared embed/head
-        # as dedicated model-mtp-*.safetensors shards; when they exist,
-        # restrict the loader to exactly those files.
+        # Select shards from the index because native and grafted checkpoints
+        # place the same MTP tensors in different files.
         _model_path = self.draft_model_config.model
-        if os.path.isdir(_model_path) and glob.glob(
-            os.path.join(_model_path, "model-mtp-*.safetensors")
-        ):
-            self.allow_patterns_overrides = ["model-mtp-*.safetensors"]
+        if os.path.isdir(_model_path):
+            indexed_files = _indexed_dspark_weight_files(_model_path)
+            if indexed_files is not None:
+                self.allow_patterns_overrides = indexed_files
         self.quant_config = vllm_config.quant_config
         self.pad_shared_expert = (
             getattr(self.quant_config, "weight_block_size", None) is not None
@@ -647,38 +702,4 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
 
         Returns None for non-mtp weights (owned by the target model).
         """
-        m = re.match(r"mtp\.(\d+)\.(.*)", name)
-        if m is None:
-            return None
-        stage = int(m.group(1))
-        rest = m.group(2)
-        # The confidence head is not wired into inference yet; drop its weights.
-        if rest.startswith("confidence_head."):
-            return None
-        # Rebuilt Base+DSpark grafts ship per-stage emb.tok_emb/head copies
-        # that are byte-identical to the target's embed/head (verified against
-        # appmana/deepseek-v4-int4-int8). The draft has ONE model-level
-        # VocabParallelEmbedding, which under PP>1 is deliberately NOT aliased
-        # from the target (target embed lives on the first rank, draft on the
-        # last -- see dspark/utils.py), so it must load from the checkpoint:
-        # take stage 0's copy, drop the redundant ones. lm_head IS aliased
-        # from the target on the same last rank under any PP, so all head
-        # copies are dropped.
-        if rest == "emb.tok_emb.weight":
-            return "model.embed_tokens.weight" if stage == 0 else None
-        if rest == "head.weight":
-            return None
-        # Head-stack params live at model level (mtp.last), context combiner at
-        # model level (mtp.0); everything else is a per-layer decoder block.
-        head_prefixes = (
-            "norm.",
-            "hc_head_fn",
-            "hc_head_base",
-            "hc_head_scale",
-            "markov_head.",
-        )
-        if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
-            head_prefixes
-        ):
-            return f"model.{rest}"
-        return f"model.layers.{stage}.{rest}"
+        return _remap_dspark_checkpoint_name(name)

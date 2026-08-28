@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
 import pytest
 from torch import nn
 
@@ -88,3 +90,31 @@ def test_default_loader_hf_still_falls_back_to_pt(tmp_path):
     )
     assert use_safetensors is False
     assert any(f.endswith("model.pt") for f in files)
+
+
+def test_default_loader_collects_every_explicit_override(tmp_path):
+    shard_names = ["draft-0.safetensors", "draft-1.safetensors"]
+    for shard_name in shard_names:
+        (tmp_path / shard_name).touch()
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "mtp.0.weight": shard_names[0],
+                    "mtp.1.weight": shard_names[1],
+                }
+            }
+        )
+    )
+
+    loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    _, files, use_safetensors = loader._prepare_weights(
+        str(tmp_path),
+        None,
+        None,
+        fall_back_to_pt=False,
+        allow_patterns_overrides=shard_names,
+    )
+
+    assert use_safetensors is True
+    assert [path.rsplit("/", 1)[-1] for path in files] == shard_names
