@@ -759,7 +759,14 @@ size_t allspark_qgemm_w8a16_perc_n32k16_ampere_workspace_size(
   int k_slice =
       (k / n_slice) % 32 == 0 ? k / n_slice : k / n_slice / 32 * 32 + 32;
   grid_z = (k + k_slice - 1) / k_slice;
-  bool enable_fuse = float(grid_x * grid_y) / sm_count >= 0.5 ? 1 : 0;
+  // The fused reduction serializes split-K blocks with a device-side ticket
+  // (red_count == blockIdx.z). CUDA does not guarantee block residency in z
+  // order, so a later partition can occupy the machine while waiting for an
+  // earlier partition that has not been scheduled yet. Keep the direct fused
+  // store for a single K partition only; the existing separate reduction is
+  // the progress-safe path when the launch actually splits K.
+  bool enable_fuse =
+      grid_z == 1 && float(grid_x * grid_y) / sm_count >= 0.5;
 
   size_t ws_size;
   if (enable_fuse) {

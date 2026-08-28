@@ -125,3 +125,57 @@ def test_gptq_allspark_gemm_ampere(mnk_factors, group_size, has_zp, dtype):
     max_diff = compute_max_diff(output, output_ref)
 
     assert max_diff < 0.04
+
+
+@pytest.mark.skipif(
+    not is_gptq_allspark_supported(),
+    reason="AllSpark W8A16 kernel is not supported on this GPU type.",
+)
+def test_native_allspark_splitk_makes_progress_and_matches_reference():
+    device = torch.device("cuda")
+    properties = torch.cuda.get_device_properties(device)
+    m, n, k = 1024, 1536, 4096
+
+    generator = torch.Generator().manual_seed(42)
+    weight = torch.randint(
+        0,
+        256,
+        (k, n),
+        dtype=torch.uint8,
+        generator=generator,
+    ).to(device)
+    scales = (
+        torch.rand((1, n), dtype=torch.float32, generator=generator) * 0.01
+    ).to(dtype=torch.bfloat16, device=device)
+    packed_weight, packed_scales, _ = ops.allspark_repack_weight(
+        weight,
+        scales,
+        None,
+        False,
+    )
+    activation = torch.randn(
+        (m, k), dtype=torch.float32, generator=generator
+    ).to(dtype=torch.bfloat16, device=device)
+
+    for _ in range(256):
+        output = ops.allspark_w8a16_gemm(
+            activation,
+            packed_weight,
+            packed_scales,
+            None,
+            n,
+            -1,
+            num_compute_units(device.index),
+            properties.major * 10 + properties.minor,
+            1024,
+            False,
+            True,
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all()
+
+    reference_weight = (weight.float() - 128.0) * scales.float()
+    reference = activation.float() @ reference_weight
+    error = output.float() - reference
+    snr_db = 10 * torch.log10(reference.square().mean() / error.square().mean())
+    assert float(snr_db) > 45.0
