@@ -41,7 +41,8 @@ for relative in runtime_files:
 loader = (root / runtime_files[0]).read_text()
 draft = (root / runtime_files[1]).read_text()
 assert "matched_files" in loader
-assert "_indexed_dspark_weight_files" in draft
+assert "_indexed_dspark_weight_manifest" in draft
+assert "missing_checkpoint_names" in draft
 assert "RAY_NSYS_PROFILE_CONFIG" in (root / "v1/executor/ray_utils.py").read_text()
 assert "token_sizes = sorted({16, max_tokens})" in (
     root / "v1/worker/gpu/warmup.py"
