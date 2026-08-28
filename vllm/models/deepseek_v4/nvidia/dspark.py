@@ -90,7 +90,11 @@ def _remap_dspark_checkpoint_name(name: str) -> str | None:
     return f"model.layers.{stage}.{rest}"
 
 
-def _indexed_dspark_weight_files(model_path: str) -> list[str] | None:
+def _indexed_dspark_weight_manifest(
+    model_path: str,
+    *,
+    require_routed_experts: bool,
+) -> tuple[list[str], set[str]] | None:
     index_path = os.path.join(model_path, "model.safetensors.index.json")
     if not os.path.isfile(index_path):
         return None
@@ -101,30 +105,34 @@ def _indexed_dspark_weight_files(model_path: str) -> list[str] | None:
     if not isinstance(weight_map, dict):
         raise ValueError(f"Invalid safetensors index: {index_path}")
 
-    files = sorted(
-        {
-            shard
-            for name, shard in weight_map.items()
-            if isinstance(name, str)
-            and isinstance(shard, str)
-            and _remap_dspark_checkpoint_name(name) is not None
-        }
-    )
-    if not files:
+    files: set[str] = set()
+    required_names: set[str] = set()
+    for name, shard in weight_map.items():
+        if not isinstance(name, str) or not isinstance(shard, str):
+            continue
+        mapped = _remap_dspark_checkpoint_name(name)
+        if mapped is None:
+            continue
+        files.add(shard)
+        if require_routed_experts or ".experts." not in mapped:
+            required_names.add(name)
+
+    sorted_files = sorted(files)
+    if not sorted_files:
         raise ValueError(
             f"No loadable DSpark weights in safetensors index: {index_path}"
         )
 
     missing = [
         shard
-        for shard in files
+        for shard in sorted_files
         if not os.path.isfile(os.path.join(model_path, shard))
     ]
     if missing:
         raise FileNotFoundError(
             f"DSpark weight shards referenced by the index are missing: {missing}"
         )
-    return files
+    return sorted_files, required_names
 
 
 @support_torch_compile
@@ -460,13 +468,36 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
             getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) == 1
             and not self.has_own_embed_tokens
         )
+        self._expected_dspark_checkpoint_names: set[str] | None = None
+        parallel_config = vllm_config.parallel_config
+        ep_size = (
+            getattr(parallel_config, "data_parallel_size", 1)
+            * getattr(parallel_config, "prefill_context_parallel_size", 1)
+            * getattr(parallel_config, "tensor_parallel_size", 1)
+        )
+        ep_filter_can_hide_sources = (
+            getattr(parallel_config, "enable_expert_parallel", False)
+            and getattr(parallel_config, "enable_ep_weight_filter", False)
+            and not getattr(parallel_config, "enable_eplb", False)
+            and ep_size > 1
+        )
+        # Only multi-rank EP filtering can legitimately hide indexed routed
+        # experts from the iterator. EP=1 must account for every source tensor.
+        self._requires_all_expert_checkpoint_names = not ep_filter_can_hide_sources
         # Select shards from the index because native and grafted checkpoints
         # place the same MTP tensors in different files.
         _model_path = self.draft_model_config.model
         if os.path.isdir(_model_path):
-            indexed_files = _indexed_dspark_weight_files(_model_path)
-            if indexed_files is not None:
+            manifest = _indexed_dspark_weight_manifest(
+                _model_path,
+                require_routed_experts=self._requires_all_expert_checkpoint_names,
+            )
+            if manifest is not None:
+                indexed_files, expected_names = manifest
+                if self._shares_target_embed_tokens:
+                    expected_names.discard("mtp.0.emb.tok_emb.weight")
                 self.allow_patterns_overrides = indexed_files
+                self._expected_dspark_checkpoint_names = expected_names
         self.quant_config = vllm_config.quant_config
         self.pad_shared_expert = (
             getattr(self.quant_config, "weight_block_size", None) is not None
@@ -616,6 +647,7 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        seen_checkpoint_names: set[str] = set()
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -624,9 +656,11 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         head_end = n_local_head * (tp_rank + 1)
 
         for name, loaded_weight in weights:
+            checkpoint_name = name
             mapped = self._remap_dspark_name(name)
             if mapped is None:
                 continue
+            seen_checkpoint_names.add(checkpoint_name)
             name = mapped
 
             # ``.scale`` -> per-method scale suffix.
@@ -696,12 +730,25 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
-        self._validate_loaded_parameters(loaded_params)
+        self._validate_loaded_parameters(loaded_params, seen_checkpoint_names)
         self._finalize_moe()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
-    def _validate_loaded_parameters(self, loaded_params: set[str]) -> None:
+    def _validate_loaded_parameters(
+        self,
+        loaded_params: set[str],
+        seen_checkpoint_names: set[str],
+    ) -> None:
+        expected_names = self._expected_dspark_checkpoint_names
+        if expected_names is not None:
+            missing_checkpoint_names = sorted(expected_names - seen_checkpoint_names)
+            if missing_checkpoint_names:
+                raise ValueError(
+                    "DSpark checkpoint source tensors were not provided by the "
+                    f"weight iterator: {missing_checkpoint_names}"
+                )
+
         required = {name for name, _ in self.named_parameters()}
         if not self.has_own_lm_head:
             required = {

@@ -61,7 +61,7 @@ def test_remap_dspark_name(name: str, expected: str | None) -> None:
 
 
 @pytest.mark.parametrize(
-    ("weight_map", "expected"),
+    ("weight_map", "expected_files", "expected_names"),
     [
         (
             {
@@ -78,6 +78,11 @@ def test_remap_dspark_name(name: str, expected: str | None) -> None:
                 "model-00048-of-00048.safetensors",
                 "model-mtp-shared.safetensors",
             ],
+            {
+                "mtp.0.attn.wq_a.weight",
+                "mtp.1.attn.wq_a.weight",
+                "mtp.2.attn.wq_a.weight",
+            },
         ),
         (
             {
@@ -86,11 +91,28 @@ def test_remap_dspark_name(name: str, expected: str | None) -> None:
                 "mtp.0.emb.tok_emb.weight": "model-mtp-shared.safetensors",
             },
             ["model-mtp-dspark.safetensors", "model-mtp-shared.safetensors"],
+            {"mtp.0.attn.wq_a.weight", "mtp.2.norm.weight"},
+        ),
+        (
+            {
+                "mtp.0.ffn.experts.7.w1.weight": "model-mtp-experts.safetensors",
+                "mtp.0.ffn.shared_experts.w1.weight": "model-mtp-shared.safetensors",
+                "mtp.0.confidence_head.proj.weight": "model-mtp-confidence.safetensors",
+            },
+            ["model-mtp-experts.safetensors", "model-mtp-shared.safetensors"],
+            {
+                "mtp.0.ffn.experts.7.w1.weight",
+                "mtp.0.ffn.shared_experts.w1.weight",
+            },
         ),
     ],
 )
 def test_dspark_selects_every_indexed_loadable_shard(
-    tmp_path, monkeypatch, weight_map: dict[str, str], expected: list[str]
+    tmp_path,
+    monkeypatch,
+    weight_map: dict[str, str],
+    expected_files: list[str],
+    expected_names: set[str],
 ) -> None:
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": weight_map})
@@ -117,7 +139,28 @@ def test_dspark_selects_every_indexed_loadable_shard(
 
     model = DSparkDeepseekV4ForCausalLM(vllm_config=vllm_config)
 
-    assert model.allow_patterns_overrides == expected
+    assert model.allow_patterns_overrides == expected_files
+    assert model._expected_dspark_checkpoint_names == expected_names
+
+
+def test_dspark_manifest_defers_routed_experts_when_ep_filter_can_hide_them(
+    tmp_path,
+) -> None:
+    weight_map = {
+        "mtp.0.ffn.experts.7.w1.weight": "model-mtp.safetensors",
+        "mtp.0.ffn.shared_experts.w1.weight": "model-mtp.safetensors",
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    (tmp_path / "model-mtp.safetensors").touch()
+
+    manifest = dspark._indexed_dspark_weight_manifest(
+        str(tmp_path), require_routed_experts=False
+    )
+
+    assert manifest is not None
+    assert manifest[1] == {"mtp.0.ffn.shared_experts.w1.weight"}
 
 
 def _make_weight_loading_model(
@@ -126,6 +169,7 @@ def _make_weight_loading_model(
     owns_layers: bool = True,
     include_embed: bool = False,
     shares_target_embed: bool = False,
+    expected_checkpoint_names: set[str] | None = None,
 ) -> DSparkDeepseekV4ForCausalLM:
     monkeypatch.setattr(
         dspark,
@@ -160,6 +204,7 @@ def _make_weight_loading_model(
     model.quant_config = SimpleNamespace(weight_block_size=None)
     model.pad_shared_expert = False
     model._shares_target_embed_tokens = shares_target_embed
+    model._expected_dspark_checkpoint_names = expected_checkpoint_names
     return model
 
 
@@ -196,6 +241,47 @@ def test_dspark_requires_pp_local_embedding_when_it_cannot_be_aliased(
 
     with pytest.raises(ValueError, match="model.embed_tokens.weight"):
         model.load_weights([("mtp.0.main_norm.weight", torch.ones(1))])
+
+
+def test_dspark_rejects_missing_source_component_of_loaded_parameter(
+    monkeypatch,
+) -> None:
+    model = _make_weight_loading_model(
+        monkeypatch,
+        expected_checkpoint_names={
+            "mtp.0.main_norm.weight",
+            "mtp.1.main_norm.weight",
+        },
+    )
+
+    with pytest.raises(ValueError, match="mtp.1.main_norm.weight"):
+        model.load_weights([("mtp.0.main_norm.weight", torch.ones(1))])
+
+
+def test_dspark_ep1_rejects_only_the_missing_expert_source_component(
+    monkeypatch,
+) -> None:
+    present = "mtp.0.ffn.experts.7.w1.weight"
+    missing = "mtp.0.ffn.experts.7.w3.weight"
+    model = _make_weight_loading_model(
+        monkeypatch,
+        expected_checkpoint_names={
+            "mtp.0.main_norm.weight",
+            present,
+            missing,
+        },
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        model.load_weights(
+            [
+                ("mtp.0.main_norm.weight", torch.ones(1)),
+                (present, torch.ones(1)),
+            ]
+        )
+
+    assert present not in str(exc_info.value)
+    assert missing in str(exc_info.value)
 
 
 def test_dspark_skips_completeness_check_on_non_owning_pp_rank(monkeypatch) -> None:
