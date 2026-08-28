@@ -13,6 +13,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 from torch import nn
 
 from vllm.models.deepseek_v4.nvidia import dspark
@@ -117,3 +118,92 @@ def test_dspark_selects_every_indexed_loadable_shard(
     model = DSparkDeepseekV4ForCausalLM(vllm_config=vllm_config)
 
     assert model.allow_patterns_overrides == expected
+
+
+def _make_weight_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    owns_layers: bool = True,
+    include_embed: bool = False,
+    shares_target_embed: bool = False,
+) -> DSparkDeepseekV4ForCausalLM:
+    monkeypatch.setattr(
+        dspark,
+        "fused_moe_make_expert_params_mapping",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_rank", lambda: 0)
+
+    model = DSparkDeepseekV4ForCausalLM.__new__(DSparkDeepseekV4ForCausalLM)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+    model.model._owns_dspark_layers = owns_layers
+    model.model.layers = [
+        SimpleNamespace(
+            ffn=SimpleNamespace(
+                use_mega_moe=False,
+                finalize_mega_moe_weights=lambda: None,
+            )
+        )
+    ]
+    model.model.main_norm = nn.Module()
+    model.model.main_norm.weight = nn.Parameter(torch.empty(1))
+    if include_embed:
+        model.model.embed_tokens = nn.Embedding(1, 1)
+    model.lm_head = nn.Linear(1, 1, bias=False)
+    model.config = SimpleNamespace(
+        n_routed_experts=0,
+        num_attention_heads=1,
+        expert_dtype="int4",
+    )
+    model.quant_config = SimpleNamespace(weight_block_size=None)
+    model.pad_shared_expert = False
+    model._shares_target_embed_tokens = shares_target_embed
+    return model
+
+
+def test_dspark_rejects_missing_owned_checkpoint_parameter(monkeypatch) -> None:
+    model = _make_weight_loading_model(monkeypatch)
+
+    with pytest.raises(ValueError, match="model.main_norm.weight"):
+        model.load_weights([])
+
+
+def test_dspark_allows_target_aliases_and_unsupported_confidence_head(
+    monkeypatch,
+) -> None:
+    model = _make_weight_loading_model(
+        monkeypatch, include_embed=True, shares_target_embed=True
+    )
+
+    loaded = model.load_weights(
+        [
+            ("mtp.0.main_norm.weight", torch.ones(1)),
+            ("mtp.0.confidence_head.proj.weight", torch.ones(1)),
+        ]
+    )
+
+    assert loaded == {"model.main_norm.weight"}
+
+
+def test_dspark_requires_pp_local_embedding_when_it_cannot_be_aliased(
+    monkeypatch,
+) -> None:
+    model = _make_weight_loading_model(
+        monkeypatch, include_embed=True, shares_target_embed=False
+    )
+
+    with pytest.raises(ValueError, match="model.embed_tokens.weight"):
+        model.load_weights([("mtp.0.main_norm.weight", torch.ones(1))])
+
+
+def test_dspark_skips_completeness_check_on_non_owning_pp_rank(monkeypatch) -> None:
+    model = _make_weight_loading_model(
+        monkeypatch,
+        owns_layers=False,
+        include_embed=True,
+        shares_target_embed=False,
+    )
+
+    assert model.load_weights([]) == set()

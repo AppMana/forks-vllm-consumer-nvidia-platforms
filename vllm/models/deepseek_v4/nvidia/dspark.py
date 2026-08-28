@@ -456,6 +456,10 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
+        self._shares_target_embed_tokens = (
+            getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) == 1
+            and not self.has_own_embed_tokens
+        )
         # Select shards from the index because native and grafted checkpoints
         # place the same MTP tensors in different files.
         _model_path = self.draft_model_config.model
@@ -570,9 +574,12 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
 
-        Non-mtp weights (embed/head/main layers) belong to the target model and
-        are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
+        Non-MTP and unsupported confidence-head weights are skipped. The target
+        always supplies ``lm_head``; it also supplies ``embed_tokens`` for PP=1.
         """
+        if not self.model._owns_dspark_layers:
+            return set()
+
         first_layer = self.model.layers[0]
         use_mega_moe = first_layer.ffn.use_mega_moe
         if use_mega_moe:
@@ -689,9 +696,33 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        self._validate_loaded_parameters(loaded_params)
         self._finalize_moe()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
+
+    def _validate_loaded_parameters(self, loaded_params: set[str]) -> None:
+        required = {name for name, _ in self.named_parameters()}
+        if not self.has_own_lm_head:
+            required = {
+                name
+                for name in required
+                if name != "lm_head" and not name.startswith("lm_head.")
+            }
+        if self._shares_target_embed_tokens:
+            required = {
+                name
+                for name in required
+                if name != "model.embed_tokens"
+                and not name.startswith("model.embed_tokens.")
+            }
+
+        missing = sorted(required - loaded_params)
+        if missing:
+            raise ValueError(
+                "DSpark checkpoint did not initialize owned draft parameters: "
+                f"{missing}"
+            )
 
     def _finalize_moe(self) -> None:
         for layer in self.model.layers:
