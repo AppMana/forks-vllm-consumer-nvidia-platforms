@@ -46,6 +46,7 @@ logger = init_logger(__name__)
 
 _INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS: set[tuple[int, bool]] = set()
 _INDEXER_PREFILL_GATHER_KERNEL_WARMUPS: set[tuple[int, bool]] = set()
+_INDEXER_PREFILL_TOPK_KERNEL_WARMUPS: set[int] = set()
 
 SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH = 4096
 # GB10's DSV4 C4 indexer is at most 65,536 compressed rows for the planned
@@ -390,6 +391,51 @@ def warmup_indexer_prefill_logits_kernel(
     )
     torch.accelerator.synchronize()
     _INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS.add(key)
+
+
+def warmup_indexer_prefill_topk_kernel(device: torch.device) -> None:
+    """Load the native prefill top-k CUDA function before live PP traffic.
+
+    The logits warmup above only launches the Triton producer.  The native
+    consumer is a separate CUDA module/function and can otherwise pay its
+    first-load cost in a live pipeline step, stalling one rank while its peers
+    are already waiting on the corresponding handoff.
+    """
+    if device.type != "cuda":
+        return
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    if device_index in _INDEXER_PREFILL_TOPK_KERNEL_WARMUPS:
+        return
+
+    num_rows = 1
+    topk_tokens = 512
+    context_rows = topk_tokens + 1
+    logits = torch.zeros(
+        (num_rows, context_rows), dtype=torch.float32, device=device
+    )
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    row_ends = torch.full(
+        (num_rows,), context_rows, dtype=torch.int32, device=device
+    )
+    topk_indices = torch.empty(
+        (num_rows, topk_tokens), dtype=torch.int32, device=device
+    )
+
+    ops.top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        topk_indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
+    )
+    torch.accelerator.synchronize()
+    _INDEXER_PREFILL_TOPK_KERNEL_WARMUPS.add(device_index)
 
 
 def warmup_indexer_prefill_gather_kernel(

@@ -413,6 +413,11 @@ def test_long_prefill_warmup_loads_native_gather_boundary_specializations(
     )
     monkeypatch.setattr(
         gpu_warmup,
+        "warmup_indexer_prefill_topk_kernel",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
         "warmup_block_table_slot_mapping_kernel",
         lambda _runner, _device: False,
     )
@@ -712,6 +717,16 @@ def test_long_prefill_warmup_invokes_indexer_logits_warmup(
     )
     monkeypatch.setattr(
         gpu_warmup,
+        "warmup_indexer_prefill_gather_kernel",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_indexer_prefill_topk_kernel",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
         "run_mixed_prefill_decode_warmup",
         lambda *_args, **_kwargs: False,
     )
@@ -723,3 +738,98 @@ def test_long_prefill_warmup_invokes_indexer_logits_warmup(
     )
 
     assert calls == [torch.device("cuda")]
+
+
+def test_long_prefill_warmup_exercises_native_prefill_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    synchronize_calls = 0
+    real_topk = ops.top_k_per_row_prefill
+    real_synchronize = torch.accelerator.synchronize
+
+    def record_real_topk(*args):
+        calls.append(args)
+        return real_topk(*args)
+
+    def record_real_synchronize() -> None:
+        nonlocal synchronize_calls
+        synchronize_calls += 1
+        real_synchronize()
+
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        max_num_reqs=32,
+        device=torch.device("cuda"),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=12),
+        kv_connector=_FakeKVConnector(),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))
+            ],
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=1024),
+        input_batch=None,
+    )
+    monkeypatch.setattr(ops, "top_k_per_row_prefill", record_real_topk)
+    monkeypatch.setattr(torch.accelerator, "synchronize", record_real_synchronize)
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_prefill_chunk_metadata_kernel",
+        lambda _device, *, compress_ratio: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_indexer_prefill_gather_kernel",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_indexer_prefill_logits_kernel",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_block_table_slot_mapping_kernel",
+        lambda _runner, _device: False,
+    )
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "_INDEXER_PREFILL_TOPK_KERNEL_WARMUPS",
+        set(),
+        raising=False,
+    )
+    outputs = []
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_pp_coupled",
+        lambda _runner, _what, body: body(),
+    )
+
+    gpu_warmup.warmup_long_prefill_kernels(
+        runner,
+        outputs.append,
+        lambda _grammar: None,
+    )
+    gpu_warmup.warmup_long_prefill_kernels(
+        runner,
+        lambda _output: None,
+        lambda _grammar: None,
+    )
+
+    assert len(calls) == 1
+    assert synchronize_calls == 1
+    logits, row_starts, row_ends, output, num_rows, _, _, topk = calls[0]
+    mixed_prefill_rows = [
+        scheduled_output.num_scheduled_tokens[request.req_id] // 4
+        for scheduled_output in outputs
+        for request in scheduled_output.scheduled_new_reqs
+        if request.req_id.endswith("_prefill_")
+    ]
+    assert max(mixed_prefill_rows) == 255
+    assert num_rows == logits.shape[0]
+    assert output.shape == (num_rows, topk)
+    assert row_starts.min().item() == 0
+    assert row_ends.max().item() > topk
+    assert logits.shape[1] >= row_ends.max().item()

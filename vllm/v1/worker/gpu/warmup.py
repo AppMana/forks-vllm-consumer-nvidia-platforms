@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.sparse_attn_indexer import (
     warmup_indexer_prefill_gather_kernel,
     warmup_indexer_prefill_logits_kernel,
+    warmup_indexer_prefill_topk_kernel,
 )
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
@@ -488,6 +489,7 @@ def warmup_long_prefill_kernels(
         warmup_prefill_chunk_metadata_kernel(device, compress_ratio=4)
         warmup_indexer_prefill_gather_kernel(device)
         warmup_indexer_prefill_logits_kernel(device)
+        warmup_indexer_prefill_topk_kernel(device)
         warmup_block_table_slot_mapping_kernel(model_runner, device)
 
     max_tokens = model_runner.scheduler_config.max_num_batched_tokens
