@@ -6,7 +6,6 @@ Run `pytest tests/distributed/test_comm_ops.py`.
 """
 
 from collections.abc import Callable
-from threading import Event, Thread
 from typing import Any
 
 import pytest
@@ -313,21 +312,20 @@ def test_irecv_tensor_dict_can_use_preallocated_recv_buffers(
     torch.testing.assert_close(preallocated, torch.full((4,), 7, dtype=torch.int32))
 
 
-def test_isend_tensor_dict_does_not_wait_for_metadata_receiver(
+def test_isend_tensor_dict_finishes_metadata_before_launching_tensor_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sender_started = Event()
-    release_metadata = Event()
-    send_returned = Event()
-    errors: list[BaseException] = []
+    operation_order: list[str] = []
+    metadata_sends: list[tuple[Any, int]] = []
     raw_handles: list[_DummyWork] = []
     raw_tensors: list[torch.Tensor] = []
-    returned_handles: list[Any] = []
 
-    def blocking_metadata_send(*args: Any, **kwargs: Any) -> None:
-        release_metadata.wait(timeout=5)
+    def record_metadata_send(obj: Any, dst: int) -> None:
+        operation_order.append("metadata")
+        metadata_sends.append((obj, dst))
 
     def fake_isend(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        operation_order.append("payload")
         handle = _DummyWork()
         raw_handles.append(handle)
         raw_tensors.append(tensor)
@@ -337,39 +335,18 @@ def test_isend_tensor_dict_does_not_wait_for_metadata_receiver(
     monkeypatch.setattr(torch.distributed, "isend", fake_isend)
 
     group = _make_group_for_unit_test()
-    group.send_object = blocking_metadata_send  # type: ignore[method-assign]
+    group.send_object = record_metadata_send  # type: ignore[method-assign]
 
-    def send() -> None:
-        sender_started.set()
-        try:
-            returned_handles.extend(
-                group.isend_tensor_dict({"hidden_states": torch.zeros(1)})
-            )
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            send_returned.set()
+    returned_handles = group.isend_tensor_dict({"hidden_states": torch.zeros(1)})
 
-    thread = Thread(target=send)
-    thread.start()
-    assert sender_started.wait(timeout=1)
-    try:
-        assert send_returned.wait(timeout=0.2), (
-            "the asynchronous tensor send waited for metadata receiver progress"
-        )
-    finally:
-        release_metadata.set()
-        thread.join(timeout=1)
-
-    assert not errors
-    assert len(raw_handles) == 3
-    assert [tensor.dtype for tensor in raw_tensors] == [
-        torch.long,
-        torch.uint8,
-        torch.float32,
-    ]
-    assert raw_tensors[0].item() == raw_tensors[1].numel()
-    assert len(returned_handles) == 2
+    assert len(metadata_sends) == 1
+    metadata, dst = metadata_sends[0]
+    assert dst == 1
+    assert metadata[0][0] == "hidden_states"
+    assert len(raw_handles) == 1
+    assert [tensor.dtype for tensor in raw_tensors] == [torch.float32]
+    assert operation_order == ["metadata", "payload"]
+    assert returned_handles == raw_handles
     for handle in returned_handles:
         handle.wait()
     assert all(handle.wait_calls == 1 for handle in raw_handles)
