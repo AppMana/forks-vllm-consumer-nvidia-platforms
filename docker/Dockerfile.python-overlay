@@ -6,6 +6,7 @@ ARG VLLM_BUILD_COMMIT
 ARG VLLM_IMAGE_TAG
 
 COPY vllm/model_executor/model_loader/default_loader.py /tmp/vllm-overlay/model_executor/model_loader/default_loader.py
+COPY vllm/model_executor/layers/quantization/dsv4_int.py /tmp/vllm-overlay/model_executor/layers/quantization/dsv4_int.py
 COPY vllm/models/deepseek_v4/nvidia/dspark.py /tmp/vllm-overlay/models/deepseek_v4/nvidia/dspark.py
 COPY vllm/v1/executor/ray_executor.py /tmp/vllm-overlay/v1/executor/ray_executor.py
 COPY vllm/v1/executor/ray_executor_v2.py /tmp/vllm-overlay/v1/executor/ray_executor_v2.py
@@ -25,6 +26,7 @@ assert spec is not None and spec.submodule_search_locations
 root = pathlib.Path(next(iter(spec.submodule_search_locations)))
 sources = pathlib.Path("/tmp/vllm-overlay")
 runtime_files = (
+    "model_executor/layers/quantization/dsv4_int.py",
     "model_executor/model_loader/default_loader.py",
     "models/deepseek_v4/nvidia/dspark.py",
     "v1/executor/ray_executor.py",
@@ -38,9 +40,11 @@ runtime_files = (
 for relative in runtime_files:
     shutil.copy2(sources / relative, root / relative)
 
-loader = (root / runtime_files[0]).read_text()
-draft = (root / runtime_files[1]).read_text()
+quant = (root / runtime_files[0]).read_text()
+loader = (root / runtime_files[1]).read_text()
+draft = (root / runtime_files[2]).read_text()
 assert "matched_files" in loader
+assert "is_checkpoint_optional" in quant
 assert "_indexed_dspark_weight_manifest" in draft
 assert "missing_checkpoint_names" in draft
 assert "RAY_NSYS_PROFILE_CONFIG" in (root / "v1/executor/ray_utils.py").read_text()

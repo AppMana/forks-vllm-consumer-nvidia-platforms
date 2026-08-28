@@ -38,6 +38,7 @@ PYTHON_OVERLAY_DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile.python-overlay"
 REQUIRED_ARCHES = ("8.6", "12.1a")
 REQUIRED_SPARKINFER_REF = "78cc92eaad3bf0378d199c44621bbaee75d0cb47"
 RUNTIME_OVERLAY_FILES = (
+    "vllm/model_executor/layers/quantization/dsv4_int.py",
     "vllm/model_executor/model_loader/default_loader.py",
     "vllm/models/deepseek_v4/nvidia/dspark.py",
     "vllm/v1/executor/ray_executor.py",
