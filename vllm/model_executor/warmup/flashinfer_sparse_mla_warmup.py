@@ -14,7 +14,10 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import autotune as flashinfer_autotune
 from vllm.utils.flashinfer import has_flashinfer
-from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
+from vllm.v1.worker.gpu.warmup import (
+    pp_ranks_all_agree,
+    run_mixed_prefill_decode_warmup,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2GPUModelRunner
@@ -72,21 +75,29 @@ def _run_flashinfer_sparse_mla_decode_autotune(
     """Autotune FlashInfer's SM120 sparse-MLA decode path."""
     runner = worker.model_runner
     log_label = _flashinfer_sparse_mla_decode_label(runner, allowed_backends)
-    if log_label is None:
-        return False
-    if worker.vllm_config.kernel_config.enable_flashinfer_autotune is not True:
-        return False
-    if not has_flashinfer() or not current_platform.is_device_capability_family(120):
-        return False
+    local_ok = (
+        log_label is not None
+        and worker.vllm_config.kernel_config.enable_flashinfer_autotune is True
+        and has_flashinfer()
+        and current_platform.is_device_capability_family(120)
+    )
+    AutoTuner = None
+    if local_ok:
+        try:
+            from flashinfer.autotuner import AutoTuner
+        except ImportError:
+            logger.warning(
+                "Skipping FlashInfer SM120 sparse MLA decode autotune because "
+                "FlashInfer autotuner is unavailable."
+            )
+            local_ok = False
 
-    try:
-        from flashinfer.autotuner import AutoTuner
-    except ImportError:
-        logger.warning(
-            "Skipping FlashInfer SM120 sparse MLA decode autotune because "
-            "FlashInfer autotuner is unavailable."
-        )
+    if not pp_ranks_all_agree(
+        runner, local_ok, "FlashInfer SM120 sparse MLA decode autotune"
+    ):
         return False
+    assert log_label is not None
+    assert AutoTuner is not None
 
     from vllm.distributed.parallel_state import get_world_group
 

@@ -3,11 +3,13 @@
 
 import queue
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import vllm.model_executor.warmup.flashinfer_sparse_mla_warmup as sparse_mla_warmup
 import vllm.v1.worker.gpu.warmup as gpu_warmup
 
 
@@ -606,6 +608,93 @@ def test_spec_verify_warmup_is_skipped_on_all_ranks_when_one_rank_declines(
     assert links.sends == [0] * pp_size
     assert links.recvs == [0] * pp_size
     assert links.unmatched == 0
+
+
+def test_sparse_mla_autotune_rank_local_backend_gate_keeps_pp_sequence_aligned(
+    monkeypatch,
+    tmp_path,
+):
+    """A local backend gate cannot skip a collectively coupled PP warmup."""
+    pp_size = 12
+
+    class Backend:
+        def __init__(self, name):
+            self.name = name
+
+        def get_name(self):
+            return self.name
+
+    runners = []
+    for rank in range(pp_size):
+        runner = _spec_runner(
+            rank,
+            pp_size,
+            max_num_reqs=6,
+            vllm_config=SimpleNamespace(use_v2_model_runner=True),
+        )
+        runner.attn_groups = (
+            [[SimpleNamespace(backend=Backend("FLASHINFER_MLA_SPARSE_SM120"))]]
+            if rank < 4
+            else []
+        )
+        runners.append(runner)
+
+    world = SimpleNamespace(
+        rank_in_group=1,
+        rank=1,
+        broadcast_object=lambda obj, src: None,
+        barrier=lambda: None,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_world_group", lambda: world
+    )
+    monkeypatch.setattr(sparse_mla_warmup, "has_flashinfer", lambda: True)
+    monkeypatch.setattr(
+        sparse_mla_warmup,
+        "resolve_flashinfer_autotune_file",
+        lambda _runner: tmp_path / "autotune-cache",
+    )
+    monkeypatch.setattr(
+        sparse_mla_warmup,
+        "flashinfer_autotune",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        sparse_mla_warmup.current_platform,
+        "is_device_capability_family",
+        lambda _capability: True,
+    )
+    monkeypatch.setattr(
+        gpu_warmup, "run_pp_coupled", lambda _runner, _what, body: body()
+    )
+
+    def run_autotune(runner, execute_model, sample_tokens):
+        worker = SimpleNamespace(
+            model_runner=runner,
+            execute_model=execute_model,
+            sample_tokens=sample_tokens,
+            vllm_config=SimpleNamespace(
+                kernel_config=SimpleNamespace(enable_flashinfer_autotune=True)
+            ),
+        )
+        return sparse_mla_warmup._run_flashinfer_sparse_mla_decode_autotune(
+            worker,
+            16,
+            frozenset({"FLASHINFER_MLA_SPARSE_SM120"}),
+        )
+
+    links, _all_reduce, results, errors = _run_ranks(
+        monkeypatch,
+        pp_size,
+        runners,
+        target=run_autotune,
+    )
+
+    links.assert_balanced()
+    assert errors == [None] * pp_size
+    assert results == [False] * pp_size
+    assert links.sends == [0] * pp_size
+    assert links.recvs == [0] * pp_size
 
 
 def test_zero_layer_tail_rank_participates_identically(monkeypatch):
