@@ -31,11 +31,17 @@ VERSIONS_JSON = REPO_ROOT / "docker" / "versions.json"
 BAKE_HCL = REPO_ROOT / "docker" / "docker-bake.hcl"
 CMAKE_LISTS = REPO_ROOT / "CMakeLists.txt"
 CMAKE_UTILS = REPO_ROOT / "cmake" / "utils.cmake"
+PYTHON_OVERLAY_DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile.python-overlay"
 
 # The architectures this branch exists to serve: sm_86 (Ampere consumer) and
 # sm_121a (GB10 / DGX Spark).
 REQUIRED_ARCHES = ("8.6", "12.1a")
 REQUIRED_SPARKINFER_REF = "78cc92eaad3bf0378d199c44621bbaee75d0cb47"
+RUNTIME_OVERLAY_FILES = (
+    "vllm/model_executor/model_loader/default_loader.py",
+    "vllm/models/deepseek_v4/nvidia/dspark.py",
+    "vllm/v1/worker/gpu/warmup.py",
+)
 
 
 def dockerfile_arg_defaults(name: str) -> list[str]:
@@ -74,6 +80,17 @@ def dockerfile_run_blocks() -> list[str]:
     return [
         line for line in joined.splitlines() if line.lstrip().upper().startswith("RUN ")
     ]
+
+
+def test_python_overlay_is_generic_and_installs_runtime_fixes() -> None:
+    """The fast validation image must be explicit and base-image agnostic."""
+    dockerfile = PYTHON_OVERLAY_DOCKERFILE.read_text(encoding="utf-8")
+    assert re.search(r"^ARG BASE_IMAGE\s*$", dockerfile, re.MULTILINE)
+    assert "ARG BASE_IMAGE=" not in dockerfile
+    assert "FROM ${BASE_IMAGE}" in dockerfile
+    for relative in RUNTIME_OVERLAY_FILES:
+        assert f"COPY {relative} " in dockerfile
+        assert f'"{relative.removeprefix("vllm/")}"' in dockerfile
 
 
 def test_torch_cuda_arch_list_arg_is_consistent() -> None:

@@ -1,0 +1,45 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE
+ARG VLLM_BUILD_COMMIT
+ARG VLLM_IMAGE_TAG
+
+COPY vllm/model_executor/model_loader/default_loader.py /tmp/vllm-overlay/model_executor/model_loader/default_loader.py
+COPY vllm/models/deepseek_v4/nvidia/dspark.py /tmp/vllm-overlay/models/deepseek_v4/nvidia/dspark.py
+COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm-overlay/v1/worker/gpu/warmup.py
+
+RUN python3 - <<'PY'
+import importlib.util
+import pathlib
+import shutil
+
+spec = importlib.util.find_spec("vllm")
+assert spec is not None and spec.submodule_search_locations
+root = pathlib.Path(next(iter(spec.submodule_search_locations)))
+sources = pathlib.Path("/tmp/vllm-overlay")
+runtime_files = (
+    "model_executor/model_loader/default_loader.py",
+    "models/deepseek_v4/nvidia/dspark.py",
+    "v1/worker/gpu/warmup.py",
+)
+for relative in runtime_files:
+    shutil.copy2(sources / relative, root / relative)
+
+loader = (root / runtime_files[0]).read_text()
+draft = (root / runtime_files[1]).read_text()
+warmup = (root / runtime_files[2]).read_text()
+assert "matched_overrides" in loader
+assert "model.safetensors.index.json" in draft
+assert "Running full-model long-prefill warmup" in warmup
+shutil.rmtree(sources)
+print("installed validated Python runtime fixes")
+PY
+
+ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT} \
+    VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG}
+LABEL org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
+      ai.vllm.build.commit="${VLLM_BUILD_COMMIT}" \
+      ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
+      ai.vllm.overlay.base="${BASE_IMAGE}"
