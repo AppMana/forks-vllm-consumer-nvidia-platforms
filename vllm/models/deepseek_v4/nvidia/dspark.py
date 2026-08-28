@@ -749,7 +749,11 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                     f"weight iterator: {missing_checkpoint_names}"
                 )
 
-        required = {name for name, _ in self.named_parameters()}
+        required = {
+            name
+            for name, param in self.named_parameters()
+            if not getattr(param, "is_checkpoint_optional", False)
+        }
         if not self.has_own_lm_head:
             required = {
                 name

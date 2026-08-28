@@ -685,6 +685,7 @@ def test_wo_a_create_weights_registers_bf16_weight_and_nan_scale(
     assert layer.weight.shape == (128, 256)
     # Sentinel: a native BF16 checkpoint never loads the scale.
     assert torch.isnan(layer.weight_scale_inv.data).all()
+    assert layer.weight_scale_inv.is_checkpoint_optional
 
 
 @pytest.mark.parametrize("strategy", ["block", "channel"])

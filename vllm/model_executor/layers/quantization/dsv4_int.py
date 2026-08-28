@@ -809,6 +809,13 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
             )
         layer.register_parameter("weight_scale_inv", weight_scale)
         set_weight_attrs(weight_scale, parameter_attrs)
+        if self.force_dequant:
+            # Native BF16 wo_a tensors deliberately have no checkpoint scale;
+            # the registered NaN scale is runtime state used to distinguish
+            # them from legacy INT8+scale checkpoints. Completeness validators
+            # must still require the source when an indexed legacy checkpoint
+            # advertises one, but must not require this sentinel on its own.
+            weight_scale.is_checkpoint_optional = True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_dsv4_int_dequanted", False) or getattr(

@@ -215,6 +215,17 @@ def test_dspark_rejects_missing_owned_checkpoint_parameter(monkeypatch) -> None:
         model.load_weights([])
 
 
+def test_dspark_allows_runtime_parameter_without_checkpoint_source(monkeypatch) -> None:
+    model = _make_weight_loading_model(monkeypatch)
+    runtime_scale = nn.Parameter(torch.full((1,), float("nan")))
+    runtime_scale.is_checkpoint_optional = True
+    model.model.main_norm.register_parameter("weight_scale_inv", runtime_scale)
+
+    loaded = model.load_weights([("mtp.0.main_norm.weight", torch.ones(1))])
+
+    assert loaded == {"model.main_norm.weight"}
+
+
 def test_dspark_allows_target_aliases_and_unsupported_confidence_head(
     monkeypatch,
 ) -> None:
