@@ -6,6 +6,7 @@ Run `pytest tests/distributed/test_comm_ops.py`.
 """
 
 from collections.abc import Callable
+from threading import Event, Thread
 from typing import Any
 
 import pytest
@@ -251,9 +252,7 @@ def test_irecv_tensor_dict_send_allgather_postprocess_binds_keys(
         ("a", TensorMetadata("cpu", torch.int32, torch.Size([4]))),
         ("b", TensorMetadata("cpu", torch.int32, torch.Size([4]))),
     ]
-    g._recv_tensor_dict_metadata = (  # type: ignore[method-assign]
-        lambda src=None: metadata_list
-    )
+    g.recv_object = lambda src: metadata_list  # type: ignore[method-assign]
 
     ag = _DummyAllGatherGroup(world_size=2, rank_in_group=0)
     td, handles, postprocess = g.irecv_tensor_dict(all_gather_group=ag)
@@ -297,7 +296,7 @@ def test_irecv_tensor_dict_can_use_preallocated_recv_buffers(
     monkeypatch.setattr(torch.distributed, "irecv", fake_irecv)
 
     g = _make_group_for_unit_test(rank_in_group=1, world_size=2)
-    g._recv_tensor_dict_metadata = lambda src=None: [  # type: ignore[method-assign]
+    g.recv_object = lambda src: [  # type: ignore[method-assign]
         ("hidden_states", TensorMetadata("cpu", torch.int32, torch.Size([4])))
     ]
 
@@ -312,6 +311,68 @@ def test_irecv_tensor_dict_can_use_preallocated_recv_buffers(
     assert postprocess == []
     handles[0].wait()
     torch.testing.assert_close(preallocated, torch.full((4,), 7, dtype=torch.int32))
+
+
+def test_isend_tensor_dict_does_not_wait_for_metadata_receiver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sender_started = Event()
+    release_metadata = Event()
+    send_returned = Event()
+    errors: list[BaseException] = []
+    raw_handles: list[_DummyWork] = []
+    raw_tensors: list[torch.Tensor] = []
+    returned_handles: list[Any] = []
+
+    def blocking_metadata_send(*args: Any, **kwargs: Any) -> None:
+        release_metadata.wait(timeout=5)
+
+    def fake_isend(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        handle = _DummyWork()
+        raw_handles.append(handle)
+        raw_tensors.append(tensor)
+        return handle
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "isend", fake_isend)
+
+    group = _make_group_for_unit_test()
+    group.send_object = blocking_metadata_send  # type: ignore[method-assign]
+
+    def send() -> None:
+        sender_started.set()
+        try:
+            returned_handles.extend(
+                group.isend_tensor_dict({"hidden_states": torch.zeros(1)})
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            send_returned.set()
+
+    thread = Thread(target=send)
+    thread.start()
+    assert sender_started.wait(timeout=1)
+    try:
+        assert send_returned.wait(timeout=0.2), (
+            "the asynchronous tensor send waited for metadata receiver progress"
+        )
+    finally:
+        release_metadata.set()
+        thread.join(timeout=1)
+
+    assert not errors
+    assert len(raw_handles) == 3
+    assert [tensor.dtype for tensor in raw_tensors] == [
+        torch.long,
+        torch.uint8,
+        torch.float32,
+    ]
+    assert raw_tensors[0].item() == raw_tensors[1].numel()
+    assert len(returned_handles) == 2
+    for handle in returned_handles:
+        handle.wait()
+    assert all(handle.wait_calls == 1 for handle in raw_handles)
 
 
 def test_async_intermediate_tensors_lazy_wait() -> None:
