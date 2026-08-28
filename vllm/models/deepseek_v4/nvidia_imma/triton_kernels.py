@@ -1266,33 +1266,14 @@ def tf32_hc_prenorm_gemm_triton(
     )
 
 
-# Keep context-varying dimensions, strides, and pointer alignment out of
-# specialization. Scheduler chunks and gathered workspace views can vary all
-# three without changing the algorithm; specializing them recompiles in the
-# serving loop and can stall a coupled pipeline while one rank compiles.
+# Context length, row count, and the output row stride vary between scheduler
+# chunks. K-scale alignment also varies when a streaming slab begins on a
+# non-multiple-of-four row. The remaining strides and pointer alignment are
+# fixed by contiguous workspace allocation and row-aligned slices, so retain
+# those compile-time facts for vectorized address generation.
 @triton.jit(
-    do_not_specialize=[
-        "num_rows",
-        "seq_len_kv",
-        "stride_qm",
-        "stride_qh",
-        "stride_qd",
-        "stride_kn",
-        "stride_kd",
-        "stride_wm",
-        "stride_wh",
-        "stride_lm",
-        "stride_ln",
-    ],
-    do_not_specialize_on_alignment=[
-        "q_ptr",
-        "k_ptr",
-        "k_scale_ptr",
-        "weights_ptr",
-        "ks_ptr",
-        "ke_ptr",
-        "logits_ptr",
-    ],
+    do_not_specialize=["num_rows", "seq_len_kv", "stride_lm"],
+    do_not_specialize_on_alignment=["k_scale_ptr"],
 )
 def _mqa_logits_workspace_kernel(
     q_ptr,
@@ -1306,15 +1287,15 @@ def _mqa_logits_workspace_kernel(
     seq_len_kv,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    stride_qm: tl.int64,
-    stride_qh: tl.int64,
-    stride_qd: tl.int64,
-    stride_kn: tl.int64,
-    stride_kd: tl.int64,
-    stride_wm: tl.int64,
-    stride_wh: tl.int64,
+    stride_qm: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kn: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_wh: tl.constexpr,
     stride_lm: tl.int64,
-    stride_ln: tl.int64,
+    stride_ln: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,

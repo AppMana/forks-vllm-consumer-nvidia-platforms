@@ -10,7 +10,11 @@ reached by the later continuation chunks.
 """
 
 import os
+import statistics
+import subprocess
+import sys
 import tempfile
+import textwrap
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -24,17 +28,23 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 import vllm.v1.worker.gpu.warmup as gpu_warmup  # noqa: E402
+from vllm import _custom_ops as ops  # noqa: E402
+from vllm.model_executor.layers import sparse_attn_indexer  # noqa: E402
 from vllm.model_executor.layers.sparse_attn_indexer import (  # noqa: E402
     warmup_indexer_prefill_logits_kernel,
 )
 from vllm.models.deepseek_v4.common.ops.cache_utils import (  # noqa: E402
     build_flashinfer_mixed_sparse_indices,
 )
+from vllm.models.deepseek_v4.nvidia_imma import triton_kernels  # noqa: E402
 from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (  # noqa: E402
     mqa_logits_workspace_triton,
 )
 from vllm.triton_utils import triton  # noqa: E402
 from vllm.utils import jit_monitor  # noqa: E402
+from vllm.v1.attention.backends.mla.indexer import (  # noqa: E402
+    build_prefill_chunk_metadata,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 8,
@@ -264,7 +274,6 @@ def _run_mqa_workspace(
     frame: _PrefillFrame,
     *,
     seq_len_kv: int,
-    unaligned_row_bounds: bool,
 ) -> None:
     device = torch.device("cuda")
     num_rows = frame.num_scheduled_tokens
@@ -273,20 +282,10 @@ def _run_mqa_workspace(
     k_scale = torch.rand(seq_len_kv, dtype=torch.float32, device=device)
     weights = torch.rand((num_rows, 64), dtype=torch.float32, device=device)
 
-    if unaligned_row_bounds:
-        starts_storage = torch.zeros(num_rows + 1, dtype=torch.int32, device=device)
-        ends_storage = torch.full(
-            (num_rows + 1,), seq_len_kv, dtype=torch.int32, device=device
-        )
-        starts = starts_storage[1:]
-        ends = ends_storage[1:]
-        assert starts.data_ptr() % 16 == 4
-        assert ends.data_ptr() % 16 == 4
-    else:
-        starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
-        ends = torch.full((num_rows,), seq_len_kv, dtype=torch.int32, device=device)
-        assert starts.data_ptr() % 16 == 0
-        assert ends.data_ptr() % 16 == 0
+    starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    ends = torch.full((num_rows,), seq_len_kv, dtype=torch.int32, device=device)
+    assert starts.data_ptr() % 16 == 0
+    assert ends.data_ptr() % 16 == 0
 
     mqa_logits_workspace_triton(
         q,
@@ -299,7 +298,7 @@ def _run_mqa_workspace(
     torch.accelerator.synchronize()
 
 
-def test_direct_warmup_covers_mqa_first_scored_continuation_and_alignment(
+def test_direct_warmup_covers_mqa_first_scored_continuation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     warmup_frame = _direct_deep_pipeline_warmup_prefill_frame(monkeypatch)
@@ -330,8 +329,335 @@ def test_direct_warmup_covers_mqa_first_scored_continuation_and_alignment(
         _run_mqa_workspace(
             frame,
             seq_len_kv=frame.seq_len // compress_ratio,
-            unaligned_row_bounds=False,
         )
+
+
+def test_real_mixed_continuation_metadata_has_aligned_row_bounds() -> None:
+    """The metadata builder allocates row bounds; it never returns offset views."""
+    device = torch.device("cuda")
+    query_start_loc_cpu = torch.tensor([0, 1, 941], dtype=torch.int32)
+    query_start_loc = query_start_loc_cpu.to(device)
+    uncompressed_seq_lens = torch.tensor([1, 4000], dtype=torch.int32, device=device)
+    compressed_seq_lens_cpu = torch.tensor([1, 1000], dtype=torch.int32)
+    compressed_seq_lens = compressed_seq_lens_cpu.to(device)
+    block_table = torch.zeros((2, 16), dtype=torch.int32, device=device)
+
+    metadata = build_prefill_chunk_metadata(
+        start_idx=1,
+        end_idx=2,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        uncompressed_seq_lens=uncompressed_seq_lens,
+        compressed_seq_lens=compressed_seq_lens,
+        compressed_seq_lens_cpu=compressed_seq_lens_cpu,
+        block_table=block_table,
+        compress_ratio=4,
+        query_slice=slice(5, 929),
+    )
+
+    assert metadata is not None
+    assert metadata.token_start == 6
+    assert metadata.token_end == 930
+    for row_bounds in (metadata.cu_seqlen_ks, metadata.cu_seqlen_ke):
+        assert row_bounds.shape == (924,)
+        assert row_bounds.is_contiguous()
+        assert row_bounds.stride() == (1,)
+        assert row_bounds.storage_offset() == 0
+        assert row_bounds.data_ptr() % 16 == 0
+
+
+def test_long_prefill_warmup_loads_native_gather_boundary_specializations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup must execute the native templates used at 256 and 512+ rows."""
+    calls = []
+    synchronizations = []
+    real_gather = ops.cp_gather_indexer_k_quant_cache
+    real_synchronize = torch.accelerator.synchronize
+
+    def record_real_gather(kv_cache, dst_k, dst_scale, block_table, cu_seq_lens):
+        calls.append(
+            (
+                dst_k.shape,
+                dst_k.dtype,
+                dst_scale.shape,
+                kv_cache.shape,
+                block_table.shape,
+                tuple(cu_seq_lens.tolist()),
+            )
+        )
+        real_gather(kv_cache, dst_k, dst_scale, block_table, cu_seq_lens)
+
+    def record_real_synchronize():
+        real_synchronize()
+        synchronizations.append(None)
+
+    monkeypatch.setattr(ops, "cp_gather_indexer_k_quant_cache", record_real_gather)
+    monkeypatch.setattr(torch.accelerator, "synchronize", record_real_synchronize)
+    monkeypatch.setattr(triton_kernels, "indexer_cache_is_int8", lambda: True)
+    monkeypatch.setattr(
+        sparse_attn_indexer, "_INDEXER_PREFILL_GATHER_KERNEL_WARMUPS", set()
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_prefill_chunk_metadata_kernel",
+        lambda _device, *, compress_ratio: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_indexer_prefill_logits_kernel",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_block_table_slot_mapping_kernel",
+        lambda _runner, _device: False,
+    )
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        max_num_reqs=1,
+        device=torch.device("cuda"),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=1024),
+        input_batch=None,
+    )
+
+    gpu_warmup.warmup_long_prefill_kernels(
+        runner,
+        lambda _output: None,
+        lambda _grammar: None,
+    )
+    gpu_warmup.warmup_long_prefill_kernels(
+        runner,
+        lambda _output: None,
+        lambda _grammar: None,
+    )
+
+    assert calls == [
+        (
+            torch.Size((256, 128)),
+            torch.int8,
+            torch.Size((256, 4)),
+            torch.Size((4, 64, 132)),
+            torch.Size((1, 4)),
+            (0, 256),
+        ),
+        (
+            torch.Size((512, 128)),
+            torch.int8,
+            torch.Size((512, 4)),
+            torch.Size((8, 64, 132)),
+            torch.Size((1, 8)),
+            (0, 512),
+        ),
+    ]
+    assert synchronizations == [None]
+
+
+def test_indexer_logits_warmup_covers_production_rows_in_fresh_process() -> None:
+    """The startup helper must cover M > 1 without a persistent cache hit."""
+    script = textwrap.dedent(
+        """
+        from unittest.mock import patch
+
+        import torch
+
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            warmup_indexer_prefill_logits_kernel,
+        )
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
+            mqa_logits_workspace_triton,
+        )
+        from vllm.utils import jit_monitor
+
+        warmup_indexer_prefill_logits_kernel(
+            torch.device("cuda"),
+            qk_int8=True,
+        )
+
+        with (
+            patch.object(jit_monitor, "_setup_cutedsl_jit_hook", lambda: None),
+            patch.object(jit_monitor, "_setup_tilelang_jit_hook", lambda: None),
+        ):
+            jit_monitor.activate(mode="error", verbose=True)
+
+        for num_rows, seq_len_kv in ((1024, 768), (928, 1000)):
+            q = torch.zeros(
+                (num_rows, 64, 128), dtype=torch.int8, device="cuda"
+            )
+            k = torch.zeros((seq_len_kv, 128), dtype=torch.int8, device="cuda")
+            k_scale = torch.ones(seq_len_kv, dtype=torch.float32, device="cuda")
+            weights = torch.ones(
+                (num_rows, 64), dtype=torch.float32, device="cuda"
+            )
+            row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+            row_ends = torch.full(
+                (num_rows,), seq_len_kv, dtype=torch.int32, device="cuda"
+            )
+            mqa_logits_workspace_triton(
+                q,
+                (k, k_scale),
+                weights,
+                row_starts,
+                row_ends,
+                qk_int8=True,
+            )
+            torch.accelerator.synchronize()
+        """
+    )
+    with tempfile.TemporaryDirectory(prefix="triton_dsv4_fresh_process_") as cache:
+        env = os.environ.copy()
+        env["TRITON_CACHE_DIR"] = cache
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_indexer_logits_warmup_covers_unaligned_streaming_scale_slab() -> None:
+    """A valid odd slab width must not compile a new scale-pointer variant."""
+    script = textwrap.dedent(
+        """
+        from unittest.mock import patch
+
+        import torch
+
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            warmup_indexer_prefill_logits_kernel,
+        )
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
+            mqa_logits_workspace_triton,
+        )
+        from vllm.utils import jit_monitor
+
+        device = torch.device("cuda")
+        warmup_indexer_prefill_logits_kernel(device, qk_int8=True)
+
+        with (
+            patch.object(jit_monitor, "_setup_cutedsl_jit_hook", lambda: None),
+            patch.object(jit_monitor, "_setup_tilelang_jit_hook", lambda: None),
+        ):
+            jit_monitor.activate(mode="error", verbose=True)
+
+        # `indexer_prefill_topk_slab_rows=5001` is valid configuration.  Its
+        # second slab preserves K's 128-byte row alignment but offsets the
+        # float32 scale pointer by four bytes.
+        slab_rows = 5001
+        context_rows = 513
+        k_storage = torch.zeros(
+            (slab_rows + context_rows, 128), dtype=torch.int8, device=device
+        )
+        k_scale_storage = torch.ones(
+            slab_rows + context_rows, dtype=torch.float32, device=device
+        )
+        k = k_storage[slab_rows:]
+        k_scale = k_scale_storage[slab_rows:]
+        assert k.data_ptr() % 16 == 0
+        assert k_scale.data_ptr() % 16 == 4
+
+        q = torch.zeros((1, 64, 128), dtype=torch.int8, device=device)
+        weights = torch.ones((1, 64), dtype=torch.float32, device=device)
+        row_starts = torch.zeros(1, dtype=torch.int32, device=device)
+        row_ends = torch.full(
+            (1,), context_rows, dtype=torch.int32, device=device
+        )
+        mqa_logits_workspace_triton(
+            q,
+            (k, k_scale),
+            weights,
+            row_starts,
+            row_ends,
+            qk_int8=True,
+        )
+        torch.accelerator.synchronize()
+        """
+    )
+    with tempfile.TemporaryDirectory(prefix="triton_dsv4_unaligned_scale_") as cache:
+        env = os.environ.copy()
+        env["TRITON_CACHE_DIR"] = cache
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("num_rows", "seq_len_kv"),
+    [(1024, 768), (928, 1000)],
+)
+def test_mqa_scored_prefill_sm86_performance(
+    num_rows: int,
+    seq_len_kv: int,
+) -> None:
+    """Keep the real scored 4k-prefill shapes on the vectorized path."""
+    if "RTX A5000" not in torch.cuda.get_device_name():
+        pytest.skip("performance threshold is calibrated for an RTX A5000")
+
+    device = torch.device("cuda")
+    q = torch.randint(
+        -8,
+        8,
+        (num_rows, 64, 128),
+        dtype=torch.int8,
+        device=device,
+    )
+    k = torch.randint(
+        -8,
+        8,
+        (seq_len_kv, 128),
+        dtype=torch.int8,
+        device=device,
+    )
+    k_scale = torch.rand(seq_len_kv, dtype=torch.float32, device=device)
+    weights = torch.rand((num_rows, 64), dtype=torch.float32, device=device)
+    starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    ends = torch.full((num_rows,), seq_len_kv, dtype=torch.int32, device=device)
+
+    # Compile outside the measurement and settle clocks/caches before sampling.
+    for _ in range(6):
+        mqa_logits_workspace_triton(
+            q,
+            (k, k_scale),
+            weights,
+            starts,
+            ends,
+            qk_int8=True,
+        )
+    torch.accelerator.synchronize()
+
+    samples_ms = []
+    for _ in range(21):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        mqa_logits_workspace_triton(
+            q,
+            (k, k_scale),
+            weights,
+            starts,
+            ends,
+            qk_int8=True,
+        )
+        end.record()
+        end.synchronize()
+        samples_ms.append(start.elapsed_time(end))
+
+    median_ms = statistics.median(samples_ms)
+    assert median_ms < 0.40, (
+        f"scored-prefill MQA regression: M={num_rows}, N={seq_len_kv}, "
+        f"median={median_ms:.3f} ms"
+    )
 
 
 def test_long_prefill_warmup_invokes_indexer_logits_warmup(

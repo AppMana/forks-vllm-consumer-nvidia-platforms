@@ -45,6 +45,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 _INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS: set[tuple[int, bool]] = set()
+_INDEXER_PREFILL_GATHER_KERNEL_WARMUPS: set[tuple[int, bool]] = set()
 
 SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH = 4096
 # GB10's DSV4 C4 indexer is at most 65,536 compressed rows for the planned
@@ -389,6 +390,64 @@ def warmup_indexer_prefill_logits_kernel(
     )
     torch.accelerator.synchronize()
     _INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS.add(key)
+
+
+def warmup_indexer_prefill_gather_kernel(
+    device: torch.device,
+    *,
+    qk_int8: bool | None = None,
+) -> None:
+    """Load the native gather variants reached by long compressed contexts."""
+    if device.type != "cuda":
+        return
+
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
+        indexer_cache_is_int8,
+    )
+
+    if qk_int8 is None:
+        qk_int8 = indexer_cache_is_int8()
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    key = (device_index, qk_int8)
+    if key in _INDEXER_PREFILL_GATHER_KERNEL_WARMUPS:
+        return
+
+    head_dim = 128
+    block_size = 64
+    scale_bytes = 4
+    cache_stride = head_dim + scale_bytes
+    dst_dtype = torch.int8 if qk_int8 else current_platform.fp8_dtype()
+
+    # The native launcher selects distinct CUDA template functions at these
+    # exact boundaries. A single-sequence configuration skips mixed warmup;
+    # other mixed batches can still land just below a compressed boundary.
+    for context_rows in (256, 512):
+        num_blocks = (context_rows + block_size - 1) // block_size
+        kv_cache = torch.zeros(
+            (num_blocks, block_size, cache_stride),
+            dtype=torch.uint8,
+            device=device,
+        )
+        dst_k = torch.empty((context_rows, head_dim), dtype=dst_dtype, device=device)
+        dst_scale = torch.empty(
+            (context_rows, scale_bytes), dtype=torch.uint8, device=device
+        )
+        block_table = torch.arange(
+            num_blocks, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        cu_seq_lens = torch.tensor([0, context_rows], dtype=torch.int32, device=device)
+        ops.cp_gather_indexer_k_quant_cache(
+            kv_cache,
+            dst_k,
+            dst_scale,
+            block_table,
+            cu_seq_lens,
+        )
+
+    torch.accelerator.synchronize()
+    _INDEXER_PREFILL_GATHER_KERNEL_WARMUPS.add(key)
 
 
 def _decode_topk_keys(
