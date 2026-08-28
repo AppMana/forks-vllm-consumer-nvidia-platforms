@@ -123,27 +123,35 @@ class PPHandler:
             return None
 
         # Skip requests which did not need sampled output and/or those already
-        # finished. The post_update kernel skips the -1 entries.
+        # finished. This validity information is already available on the CPU,
+        # so compact the fixed-size device tensors here instead of returning -1
+        # entries that downstream code must discover with a synchronizing CUDA
+        # boolean reduction and dynamic boolean indexing.
         freed = self.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
         exclude_mask = freed | ~slot.need_sampled_mask
         idx_mapping = slot.idx_mapping
+        payload = slot.payload
         if exclude_mask.any():
             if exclude_mask.all():
                 # No states require update anymore.
                 return None
-            # Filter excluded request indices.
-            idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
+            keep_mask = ~exclude_mask
+            idx_mapping_np = slot.idx_mapping_np[keep_mask]
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+            row_indices_np = np.flatnonzero(keep_mask).astype(np.int64)
+            row_indices = async_copy_to_gpu(row_indices_np, device=self.device)
 
         self.main_stream.wait_event(slot.event)
-        sampled_tokens = slot.payload[:, : self.max_sample_len]
+        if exclude_mask.any():
+            payload = payload.index_select(0, row_indices)
+        sampled_tokens = payload[:, : self.max_sample_len]
         proposed_tokens = (
-            slot.payload[:, self.max_sample_len : self.tokens_width]
+            payload[:, self.max_sample_len : self.tokens_width]
             if self.num_speculative_steps > 0
             else None
         )
-        num_sampled = slot.payload[:, self.tokens_width].to(torch.int32)
-        num_rejected = slot.payload[:, self.tokens_width + 1].to(torch.int32)
+        num_sampled = payload[:, self.tokens_width].to(torch.int32)
+        num_rejected = payload[:, self.tokens_width + 1].to(torch.int32)
         return dict(
             sampled_tokens=sampled_tokens,
             num_sampled=num_sampled,

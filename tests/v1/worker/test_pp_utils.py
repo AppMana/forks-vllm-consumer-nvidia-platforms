@@ -49,6 +49,49 @@ def test_non_speculative_pp_does_not_return_empty_proposed_tokens() -> None:
     assert output["proposed_tokens"] is None
 
 
+def test_pp_deferred_output_compacts_cpu_known_excluded_rows() -> None:
+    """The receiver already knows invalid rows on the CPU.
+
+    Returning a CUDA mapping containing -1 forces the model runner to build a
+    device mask, reduce it to the host, and use dynamic boolean indexing.
+    Compact here so downstream scatter remains fixed-shape and asynchronous.
+    """
+    handler = object.__new__(PPHandler)
+    handler.queue = deque()
+    handler.queue.append(
+        PendingRecv(
+            event=object(),  # type: ignore[arg-type]
+            payload=torch.tensor(
+                [
+                    [11, 12, 13, 21, 22, 2, 1],
+                    [31, 32, 33, 41, 42, 1, 2],
+                ],
+                dtype=torch.int64,
+            ),
+            idx_mapping=torch.tensor([0, 1], dtype=torch.int32),
+            idx_mapping_np=np.array([0, 1], dtype=np.int32),
+            need_sampled_mask=np.array([True, False]),
+            gen_at_receive_np=np.array([0, 0], dtype=np.int32),
+        )
+    )
+    handler.num_speculative_steps = 2
+    handler.max_sample_len = 3
+    handler.tokens_width = 5
+    handler.req_idx_gen_np = np.zeros(2, dtype=np.int32)
+    handler.main_stream = _FakeMainStream()
+    handler.device = torch.device("cpu")
+
+    output = handler.get_prev_sampled_outputs()
+
+    assert output is not None
+    torch.testing.assert_close(
+        output["idx_mapping"], torch.tensor([0], dtype=torch.int32)
+    )
+    assert output["sampled_tokens"].shape == (1, 3)
+    assert output["proposed_tokens"].shape == (1, 2)
+    torch.testing.assert_close(output["proposed_tokens"], torch.tensor([[21, 22]]))
+
+
 def test_pp_receive_has_a_profile_scope(monkeypatch) -> None:
     scopes = []
 

@@ -136,6 +136,15 @@ def _copy_or_reuse_pp_intermediate_tensor(
     return dst_slice.copy_(src_slice)
 
 
+def scatter_draft_tokens(
+    draft_tokens: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    proposed_tokens: torch.Tensor,
+) -> None:
+    """Scatter a compact deferred PP payload without a host synchronization."""
+    draft_tokens.index_copy_(0, idx_mapping.to(dtype=torch.int64), proposed_tokens)
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -1263,11 +1272,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Deferred PP consume path only: the same-rank case (last rank
             # applying its own draft) already writes this directly in
             # sample_tokens(), before propose()'s return value is broadcast.
-            valid = idx_mapping >= 0
-            if bool(valid.any()):
-                self.req_states.draft_tokens[idx_mapping[valid]] = proposed_tokens[
-                    valid
-                ]
+            # PPHandler has already compacted CPU-known invalid rows, so this
+            # fixed-shape scatter stays asynchronous with the receive stream.
+            scatter_draft_tokens(
+                self.req_states.draft_tokens, idx_mapping, proposed_tokens
+            )
 
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
