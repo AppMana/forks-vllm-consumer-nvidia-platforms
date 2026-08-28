@@ -83,7 +83,19 @@ def test_mixed_prefill_decode_warmup_drains_async_pp_slots():
     scheduled_token_counts = [
         output.total_num_scheduled_tokens for output in executed
     ]
-    assert scheduled_token_counts == [2, 16, 0, 0, 0, 0, 0]
+    assert scheduled_token_counts == [
+        2,
+        0,
+        0,
+        0,
+        0,
+        16,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
     assert executed[-1].finished_req_ids == {
         "_v2_mixed_warmup_decode_",
         "_v2_mixed_warmup_prefill_",
@@ -273,6 +285,11 @@ def test_non_deepseek_v4_pp_warmup_kernels_keeps_generic_execute_model(monkeypat
         6,
         0,
         2,
+        0,
+        0,
+        0,
+        0,
+        0,
         16,
         0,
         0,

@@ -250,10 +250,18 @@ def run_mixed_prefill_decode_warmup(
     cleanup_output.finished_req_ids = {decode_req_id, prefill_req_id}
 
     context = mixed_step_context or nullcontext()
+    pp_size = _pp_size(model_runner)
 
     def _sequence() -> None:
+        def _advance_deferred_state() -> None:
+            for _ in range(max(0, pp_size)):
+                worker_execute_model(SchedulerOutput.make_empty())
+
         worker_execute_model(decode_prefill_output)
         worker_sample_tokens(None)
+        # The mixed step reuses the decode request. Match scheduler cadence:
+        # its sampled state must traverse one pipeline depth first.
+        _advance_deferred_state()
         with context:
             worker_execute_model(mixed_output)
             worker_sample_tokens(None)
@@ -263,8 +271,7 @@ def run_mixed_prefill_decode_warmup(
         # deferred post_update path is JIT-warmed while request state is valid.
         # These batches carry zero scheduled tokens, so they post no PP
         # transfers on any rank (see run_spec_verify_warmup).
-        for _ in range(max(0, _pp_size(model_runner))):
-            worker_execute_model(SchedulerOutput.make_empty())
+        _advance_deferred_state()
 
         worker_execute_model(cleanup_output)
 
@@ -291,13 +298,10 @@ def run_spec_verify_warmup(
     post-update kernels, the multi-token verify attention metadata kernels,
     and (on the last PP rank) the draft-propose + rejection-sampling stack.
 
-    Two decode steps cover the two verify layouts the scheduler emits under
-    PP-deferred verification: the FIRST verify after a prefill schedules the
-    anchor position plus the drafts (1 + T query tokens), while steady-state
-    verify batches hold ONLY the draft positions (T query tokens). Both are
-    distinct kernel specializations. State bookkeeping for the synthetic
-    request only needs to be internally consistent enough to reach the
-    kernels; the request is finished and its blocks dropped afterwards.
+    Two decode steps exercise the scheduler-reachable atomic verification
+    layout: the anchor position plus the drafts (1 + T query tokens). State
+    bookkeeping for the synthetic request follows the real PP cadence before
+    the request is finished and its blocks are dropped.
 
     Participation is a COLLECTIVE decision. Every non-empty batch below is a
     matched PP send/recv rendezvous, so this either runs on all PP ranks or
