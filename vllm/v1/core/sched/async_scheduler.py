@@ -34,25 +34,21 @@ class AsyncScheduler(Scheduler):
             # The request will generate num_sampled_tokens_per_step new tokens
             # plus num_spec_tokens in this scheduling step. Diffusion has no AR
             # bonus token (num_sampled_tokens_per_step == 0), only the canvas
-            # (spec) tokens. A PP-deferred STEADY-STATE verify step (scheduled
-            # query == drafts) emits at most num_draft tokens: no anchor bonus
-            # (it was emitted by the step that sampled it), so no bonus
-            # placeholder. The first verify after a prefill schedules the
-            # anchor position too (query == drafts + 1) and verifies
-            # classically with its bonus.
+            # (spec) tokens. A PP-deferred STEADY-STATE verify replays its
+            # anchor in the same target forward as the draft block, but emits
+            # at most num_draft tokens: the replay row has no output slot of
+            # its own. The shape-only fallback below preserves compatibility
+            # with older synthetic drafts-only SchedulerOutputs.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
-            deferred_verify = (
+            deferred_verify = req_id in scheduler_output.replayed_pp_anchor_req_ids or (
                 self.pp_deferred_spec
                 and cur_num_spec_tokens > 0
-                and scheduler_output.num_scheduled_tokens[req_id]
-                == cur_num_spec_tokens
+                and scheduler_output.num_scheduled_tokens[req_id] == cur_num_spec_tokens
             )
             bonus_placeholders = (
                 0 if deferred_verify else self.num_sampled_tokens_per_step
             )
-            request.num_output_placeholders += (
-                bonus_placeholders + cur_num_spec_tokens
-            )
+            request.num_output_placeholders += bonus_placeholders + cur_num_spec_tokens
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = self._spec_token_placeholders

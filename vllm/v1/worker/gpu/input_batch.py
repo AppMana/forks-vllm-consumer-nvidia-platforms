@@ -99,6 +99,11 @@ class InputBatch:
     # [num_reqs] per-request prompt length, only populated for R-SWA.
     prompt_lens: torch.Tensor | None
 
+    # [num_reqs] bool mask for steady PP verifies whose first query row
+    # replays the most recently emitted anchor.
+    replayed_pp_anchor: torch.Tensor | None = None
+    replayed_pp_anchor_np: np.ndarray | None = None
+
     @classmethod
     def make_dummy(
         cls,
@@ -328,10 +333,10 @@ def _combine_sampled_and_draft_tokens_kernel(
     cu_num_logits_end = tl.load(cu_num_logits_ptr + batch_idx + 1)
     num_logits = cu_num_logits_end - cu_num_logits_start
     if HAS_PER_REQ_DRAFTS:
-        # PP-deferred: verify batches hold ONLY draft positions (no bonus
-        # logit), while draft-less decode requests in the same batch still
-        # carry their single placeholder logit whose input id must be
-        # rewritten from last_sampled. The bonus count is per request.
+        # PP-deferred batches can carry a real replayed anchor plus drafts, or
+        # a legacy drafts-only frame. Draft-less decode requests in the same
+        # batch still carry their single placeholder logit whose input id must
+        # be rewritten from last_sampled. The bonus count is per request.
         num_draft_tokens = tl.load(num_draft_per_req_ptr + batch_idx)
         num_bonus_tokens = num_logits - num_draft_tokens
     else:
@@ -370,15 +375,13 @@ def _combine_sampled_and_draft_tokens_kernel(
         j = query_end - 1 - block
         pos = seq_len - 1 - block
         in_window = (j >= query_end - num_logits) & (pos >= prefill_len)
-        # First verify after a prefill carries a bonus/anchor logit
-        # (num_bonus_tokens==1; steady-state verify batches are drafts-only,
-        # num_bonus_tokens==0). On a NON-last PP rank the anchor's just-sampled
-        # token has NOT yet been committed to all_token_ids/total_len at combine
-        # time -- the prefill broadcast that carries it is consumed a pipeline
-        # step later. Read the anchor from last_sampled_tokens (as the non-PP
-        # branch does), and shift draft indexing so drafts start one position
-        # AFTER the uncommitted anchor. On the last rank last_sampled_tokens
-        # already holds this same value, so the path is uniform and safe.
+        # A current steady verify and the first verify after prefill both carry
+        # an anchor logit (num_bonus_tokens==1); only legacy drafts-only frames
+        # have zero. On a NON-last PP rank the anchor's just-sampled token may
+        # not yet be committed to all_token_ids/total_len at combine time.
+        # Read it from last_sampled_tokens (as the non-PP branch does), and
+        # shift draft indexing so drafts start one position after it. On the
+        # last rank last_sampled_tokens already holds the same value.
         has_anchor = num_bonus_tokens > 0
         anchor_pos = seq_len - num_logits
         is_anchor = in_window & has_anchor & (pos == anchor_pos)

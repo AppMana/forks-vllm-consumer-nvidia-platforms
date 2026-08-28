@@ -141,25 +141,34 @@ class RejectionSampler:
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Prepend a virtual anchor row per draft-carrying request.
+        """Prepend a virtual anchor row for legacy drafts-only PP frames.
 
-        Under PP-deferred scheduling the verify step's batch holds only the
-        draft positions: the anchor position ran (and was sampled) in a prior
-        in-flight step, so its target DISTRIBUTION is unavailable here -- but
-        its SAMPLE is (``last_sampled``). A one-hot logits row at that token
-        is an exact stand-in given the token was already sampled from the
-        real distribution: greedy argmax, the probabilistic ratio test, and
-        the rejection residual all reduce to ``accept d1 iff d1 ==
-        last_sampled``, the correct coupled-verification rule (the DSpark
-        draft gumbel-samples d1 with the anchor position's key for exactly
-        this reason). The unchanged rejection kernels then run on
-        ``[virtual, d1..dn]`` and the caller drops each virtual slot from the
-        outputs.
+        Current PP-deferred scheduling supplies the real [anchor, drafts...]
+        rows in one target forward and bypasses this compatibility path. For
+        an older drafts-only frame, the anchor position ran and was sampled in
+        a prior in-flight step, so only its sample (``last_sampled``) remains.
+        A one-hot row at that token preserves the coupled-verification result;
+        the caller then drops the virtual slot from emitted outputs.
         """
         device = logits.device
         num_reqs = input_batch.idx_mapping.shape[0]
         cu_np = input_batch.cu_num_logits_np
         counts_np = np.diff(cu_np)
+        replayed_np = getattr(input_batch, "replayed_pp_anchor_np", None)
+        if replayed_np is not None and replayed_np.all():
+            # The scheduler supplied the real anchor row for every request in
+            # this batch. Use the target logits directly; constructing virtual
+            # one-hot distributions here would both duplicate the anchors and
+            # skip their target verification.
+            return (
+                logits,
+                input_batch.input_ids[input_batch.logits_indices],
+                input_batch.positions[input_batch.logits_indices],
+                input_batch.cu_num_logits,
+                input_batch.expanded_idx_mapping,
+                input_batch.expanded_local_pos,
+                torch.zeros(num_reqs, dtype=torch.int64, device=device),
+            )
         # A request needs a virtual anchor row iff its FIRST logit position is
         # a draft position -- i.e. the real anchor (the last known token) was
         # NOT scheduled in this step. Decide this from the SAME GPU token
@@ -178,6 +187,8 @@ class RejectionSampler:
         has_virtual_np = (
             (first_pos >= total_len_g.to(torch.int64)).to(torch.int64).cpu().numpy()
         )
+        if replayed_np is not None:
+            has_virtual_np[replayed_np] = 0
         if not has_virtual_np.any():
             # Classic-only batch: nothing to expand.
             return (
@@ -243,6 +254,7 @@ class RejectionSampler:
             expanded_local_pos,
             has_virtual,
         )
+
     def _verify(
         self,
         logits: torch.Tensor,
@@ -424,6 +436,16 @@ class RejectionSampler:
             ).clamp_max_(steps1 - 1)
             sampled = torch.gather(sampled, 1, gather_idx)
             num_sampled = num_sampled - has_virtual.to(num_sampled.dtype)
+            replayed_pp_anchor = getattr(input_batch, "replayed_pp_anchor", None)
+            if replayed_pp_anchor is not None:
+                max_emitted = torch.diff(input_batch.cu_num_logits).to(
+                    num_sampled.dtype
+                ) - replayed_pp_anchor.to(num_sampled.dtype)
+                num_sampled = torch.where(
+                    replayed_pp_anchor,
+                    torch.minimum(num_sampled, max_emitted),
+                    num_sampled,
+                )
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
             input_batch.seq_lens,
@@ -431,6 +453,11 @@ class RejectionSampler:
             input_batch.idx_mapping,
             self.sampler.req_states.prefill_len.gpu,
         )
+        replayed_pp_anchor = getattr(input_batch, "replayed_pp_anchor", None)
+        if deferred and replayed_pp_anchor is not None:
+            # The replay row is a real target row but not a draft rejection.
+            # Exclude it from rejection accounting after capping emission.
+            num_rejected = num_rejected - replayed_pp_anchor.to(num_rejected.dtype)
 
         return SamplerOutput(
             sampled_token_ids=sampled,

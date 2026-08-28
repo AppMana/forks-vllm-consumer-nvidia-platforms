@@ -5,13 +5,24 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from tests.v1.core.utils import create_requests, create_scheduler
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.request import RequestStatus
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    _is_compatible,
+    get_uniform_token_count,
+)
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
     _copy_or_reuse_pp_intermediate_tensor,
 )
+from vllm.v1.worker.gpu.states import RequestState
 
 
 def test_pp_intermediate_copy_uses_received_length() -> None:
@@ -31,6 +42,113 @@ def test_pp_intermediate_copy_reuses_matching_view() -> None:
 
     assert actual.shape == src.shape
     assert actual.data_ptr() == src.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA input kernels")
+def test_pp_deferred_steady_verify_is_one_width_k_plus_one_forward() -> None:
+    """A steady K=5 verify is one width-6 target-model transaction.
+
+    The anchor and all five draft tokens must traverse pipeline parallelism in
+    the same model forward. The target therefore produces six logits rows,
+    while request accounting reserves at most five emitted-token slots.
+    """
+    num_draft_tokens = 5
+    anchor = 99
+    draft_tokens = [101, 102, 103, 104, 105]
+
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        pipeline_parallel_size=2,
+        num_speculative_tokens=num_draft_tokens,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+        max_num_batched_tokens=128,
+        max_model_len=128,
+    )
+    request = create_requests(1, num_tokens=2, max_tokens=20)[0]
+    request.append_output_token_ids(anchor)
+    request.num_computed_tokens = 3
+    request.spec_token_ids = draft_tokens
+    request.status = RequestStatus.RUNNING
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    placeholders_before = request.num_output_placeholders
+    scheduler_output = scheduler.schedule()
+
+    device = torch.device("cuda")
+    req_states = RequestState(
+        max_num_reqs=1,
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        num_speculative_steps=num_draft_tokens,
+        vocab_size=1000,
+        device=device,
+    )
+    req_states.add_request(
+        request.request_id,
+        prompt_len=2,
+        all_token_ids=[0, 0, anchor],
+        num_computed_tokens=3,
+        max_tokens=20,
+    )
+    req_states.last_sampled_tokens[0, 0] = anchor
+    req_states.draft_tokens[0] = torch.tensor(draft_tokens, device=device)
+    req_states.apply_staged_writes()
+
+    runner = object.__new__(GPUModelRunner)
+    runner.decode_query_len = num_draft_tokens + 1
+    runner.pp_handler = object()
+    runner.device = device
+    runner.max_num_reqs = 1
+    runner.use_dcp = False
+    runner.use_pp = True
+    runner.model_config = SimpleNamespace(rswa_window=None)
+    runner.input_buffers = InputBuffers(1, 128, device)
+    runner.req_states = req_states
+    runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
+    runner.pcp_manager = None
+    runner.block_tables = MagicMock()
+    runner.update_requests(scheduler_output)
+
+    uniform_token_count = get_uniform_token_count(
+        num_reqs=1,
+        num_tokens=scheduler_output.total_num_scheduled_tokens,
+        max_query_len=max(scheduler_output.num_scheduled_tokens.values()),
+    )
+    batch_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=scheduler_output.total_num_scheduled_tokens,
+        num_reqs=1,
+        uniform_token_count=uniform_token_count,
+    )
+    input_batch = runner.prepare_inputs(scheduler_output, batch_desc)
+    torch.cuda.synchronize()
+
+    observed = (
+        scheduler_output.num_scheduled_tokens[request.request_id],
+        input_batch.input_ids[: input_batch.num_tokens].tolist(),
+        input_batch.positions[: input_batch.num_tokens].tolist(),
+        input_batch.logits_indices.tolist(),
+        request.num_output_placeholders - placeholders_before,
+        scheduler_output.replayed_pp_anchor_req_ids,
+    )
+    expected = (
+        num_draft_tokens + 1,
+        [anchor, *draft_tokens],
+        list(range(2, 2 + num_draft_tokens + 1)),
+        list(range(num_draft_tokens + 1)),
+        num_draft_tokens,
+        {request.request_id},
+    )
+    assert observed == expected
+    assert _is_compatible(
+        batch_desc,
+        num_reqs=1,
+        num_tokens=num_draft_tokens + 1,
+        uniform_token_count=num_draft_tokens + 1,
+        num_active_loras=0,
+    )
 
 
 def _record_profile_scopes(monkeypatch):

@@ -125,12 +125,10 @@ class Scheduler(SchedulerInterface):
         self.num_sampled_tokens_per_step = (
             1 if not vllm_config.model_config.is_diffusion else 0
         )
-        # PP-deferred speculative decoding: a verify step schedules ONLY the
-        # draft positions (the bonus/anchor position was already scheduled as
-        # a placeholder in a prior in-flight step, and its token was emitted
-        # by the step that sampled it). Such steps therefore materialize at
-        # most num_draft tokens -- possibly ZERO when the first draft is
-        # rejected -- and the accounting below must not assume the +1 bonus.
+        # PP-deferred speculative decoding: a steady verify replays the most
+        # recently emitted anchor together with its draft block in one target
+        # forward. The replay row consumes compute but does not advance the
+        # request or reserve another emitted-token slot.
         self.pp_deferred_spec = (
             vllm_config.parallel_config.pipeline_parallel_size > 1
             and self.num_sampled_tokens_per_step > 0
@@ -469,6 +467,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        replayed_pp_anchor_req_ids: set[str] = set()
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
 
@@ -543,18 +542,43 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            num_draft_tokens = len(request.spec_token_ids)
+            replays_pp_anchor = (
+                self.pp_deferred_spec
+                and self.use_v2_model_runner
+                and num_draft_tokens > 0
+                and not request.is_prefill_chunk
+                and num_new_tokens == num_draft_tokens
+            )
+            if replays_pp_anchor:
+                # A steady verify must target-check [anchor, d0, ..., dK-1]
+                # atomically. The anchor is a replayed query row, not another
+                # logical sequence position.
+                num_new_tokens += 1
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens,
+            max_num_new_tokens = (
                 self.max_model_len
                 - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
+                - self.num_sampled_tokens_per_step
+                # The replay row does not advance the model-length boundary.
+                # Permit it in addition to the logical draft positions.
+                + int(replays_pp_anchor)
             )
+            num_new_tokens = min(
+                num_new_tokens,
+                max_num_new_tokens,
+            )
+
+            if replays_pp_anchor and num_new_tokens != num_draft_tokens + 1:
+                # Never split the anchor from its draft block. A later step
+                # with enough token budget can schedule the atomic verify.
+                req_index += 1
+                continue
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -602,7 +626,7 @@ class Scheduler(SchedulerInterface):
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
-                        num_new_tokens,
+                        num_new_tokens - int(replays_pp_anchor),
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
 
@@ -624,6 +648,7 @@ class Scheduler(SchedulerInterface):
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            replayed_pp_anchor_req_ids.discard(preempted_req_id)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
                             )
@@ -655,6 +680,8 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if replays_pp_anchor:
+                replayed_pp_anchor_req_ids.add(request_id)
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -1191,6 +1218,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            replayed_pp_anchor_req_ids=replayed_pp_anchor_req_ids,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1273,7 +1301,10 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            request.num_computed_tokens += num_scheduled_token
+            logical_num_scheduled = num_scheduled_token - int(
+                req_id in scheduler_output.replayed_pp_anchor_req_ids
+            )
+            request.num_computed_tokens += logical_num_scheduled
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -1705,11 +1736,14 @@ class Scheduler(SchedulerInterface):
             # Skip a stale frame still pending discard (async_tokens_to_discard
             # > 0): its pre-reset rejection count would underflow the counters.
             was_deferred_verify = (
-                self.pp_deferred_spec
-                and scheduled_spec_token_ids is not None
-                and len(scheduled_spec_token_ids) > 0
-                and scheduler_output.num_scheduled_tokens.get(req_id)
-                == len(scheduled_spec_token_ids)
+                req_id in scheduler_output.replayed_pp_anchor_req_ids
+                or (
+                    self.pp_deferred_spec
+                    and scheduled_spec_token_ids is not None
+                    and len(scheduled_spec_token_ids) > 0
+                    and scheduler_output.num_scheduled_tokens.get(req_id)
+                    == len(scheduled_spec_token_ids)
+                )
             )
             if (
                 scheduled_spec_token_ids

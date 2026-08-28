@@ -412,6 +412,7 @@ def run_spec_verify_warmup(
     steady_verify.num_scheduled_tokens = {req_id: 1 + num_spec}
     steady_verify.total_num_scheduled_tokens = 1 + num_spec
     steady_verify.scheduled_spec_decode_tokens = {req_id: [0] * num_spec}
+    steady_verify.replayed_pp_anchor_req_ids = {req_id}
     steady_verify.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
     cleanup_output = SchedulerOutput.make_empty()

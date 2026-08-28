@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -258,6 +258,12 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Steady PP-deferred verifies replay the most recently emitted anchor as
+    # the first row of the same target-model forward as their draft block.
+    # The row consumes compute but does not advance logical request state or
+    # reserve an output slot of its own.
+    replayed_pp_anchor_req_ids: set[str] = field(default_factory=set)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

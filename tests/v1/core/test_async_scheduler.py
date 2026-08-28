@@ -7,6 +7,7 @@ import pytest
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.scheduler import SchedulingPolicy
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar
@@ -112,6 +113,137 @@ def test_empty_final_prefill_output_does_not_wedge_max_tokens_guard():
     scheduler.update_from_output(recovery, recovered_output)
     assert scheduler.get_num_unfinished_requests() == 0
     assert list(request.output_token_ids) == [123]
+
+
+def test_pp_steady_verify_schedules_real_anchor_without_bonus_placeholder():
+    num_spec = 5
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        pipeline_parallel_size=2,
+        num_speculative_tokens=num_spec,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+        max_num_batched_tokens=128,
+        max_model_len=128,
+    )
+    request = create_requests(num_requests=1, num_tokens=2, max_tokens=20)[0]
+    request.append_output_token_ids(99)
+    request.num_computed_tokens = 3
+    request.spec_token_ids = [101, 102, 103, 104, 105]
+    request.status = RequestStatus.RUNNING
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    scheduler_output = scheduler.schedule()
+
+    assert scheduler_output.num_scheduled_tokens == {request.request_id: 6}
+    assert scheduler_output.scheduled_spec_decode_tokens == {
+        request.request_id: [101, 102, 103, 104, 105]
+    }
+    assert scheduler_output.replayed_pp_anchor_req_ids == {request.request_id}
+    assert request.num_output_placeholders == num_spec
+    assert request.num_computed_tokens == 3 + num_spec
+    assert request.num_in_flight_tokens == num_spec + 1
+
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[201, 202, 203, 204, 205]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.num_output_placeholders == 0
+    assert request.num_computed_tokens == 3 + num_spec
+    assert request.num_in_flight_tokens == 0
+    assert list(request.output_token_ids)[-num_spec:] == [201, 202, 203, 204, 205]
+
+
+def test_pp_first_verify_keeps_classic_bonus_accounting():
+    num_spec = 5
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        pipeline_parallel_size=2,
+        num_speculative_tokens=num_spec,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+        max_num_batched_tokens=128,
+        max_model_len=128,
+    )
+    request = create_requests(num_requests=1, num_tokens=2, max_tokens=20)[0]
+    request.append_output_token_ids(99)
+    request.num_computed_tokens = 2
+    request.spec_token_ids = [101, 102, 103, 104, 105]
+    request.status = RequestStatus.RUNNING
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    scheduler_output = scheduler.schedule()
+
+    assert scheduler_output.num_scheduled_tokens == {request.request_id: 6}
+    assert scheduler_output.replayed_pp_anchor_req_ids == set()
+    assert request.num_output_placeholders == num_spec + 1
+    assert request.num_computed_tokens == 2 + num_spec + 1
+
+
+def test_preempted_pp_replay_is_removed_from_scheduler_output():
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        pipeline_parallel_size=2,
+        num_speculative_tokens=5,
+        speculative_method="ngram_gpu",
+        use_v2_model_runner=True,
+        max_num_batched_tokens=128,
+        max_model_len=128,
+    )
+    req_a, req_b = create_requests(
+        num_requests=2,
+        num_tokens=2,
+        max_tokens=30,
+        req_ids=["a", "b"],
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+    prefill_output = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=["a", "b"],
+            req_id_to_index={"a": 0, "b": 1},
+            sampled_token_ids=[[90], [91]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    for request, priority in ((req_a, 10), (req_b, 0)):
+        request.num_computed_tokens = 3
+        request.spec_token_ids = [101, 102, 103, 104, 105]
+        request.next_decode_eligible_step = 0
+        request.priority = priority
+        request.status = RequestStatus.RUNNING
+    scheduler.policy = SchedulingPolicy.PRIORITY
+
+    allocate_slots = scheduler.kv_cache_manager.allocate_slots
+    req_b_attempts = 0
+
+    def fail_req_b_once(request, *args, **kwargs):
+        nonlocal req_b_attempts
+        if request is req_b and req_b_attempts == 0:
+            req_b_attempts += 1
+            return None
+        return allocate_slots(request, *args, **kwargs)
+
+    scheduler.kv_cache_manager.allocate_slots = Mock(side_effect=fail_req_b_once)
+
+    scheduler_output = scheduler.schedule()
+
+    assert scheduler_output.num_scheduled_tokens == {"b": 6}
+    assert scheduler_output.preempted_req_ids == {"a"}
+    assert scheduler_output.replayed_pp_anchor_req_ids == {"b"}
 
 
 def test_abort():

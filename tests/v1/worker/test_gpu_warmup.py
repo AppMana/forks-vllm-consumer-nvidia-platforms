@@ -541,9 +541,10 @@ def test_spec_verify_warmup_uses_scheduler_reachable_atomic_width():
         output for output in executed if output.scheduled_spec_decode_tokens
     ]
     assert len(verify_frames) == 2
-    for output in verify_frames:
+    for frame_idx, output in enumerate(verify_frames):
         req_id, draft_tokens = next(iter(output.scheduled_spec_decode_tokens.items()))
         assert output.num_scheduled_tokens[req_id] == 1 + len(draft_tokens)
+        assert output.replayed_pp_anchor_req_ids == ({req_id} if frame_idx else set())
 
 
 def test_spec_verify_warmup_respects_per_request_pp_cadence():

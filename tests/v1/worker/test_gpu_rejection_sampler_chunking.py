@@ -10,10 +10,85 @@ import torch
 
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.platforms import current_platform
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     _iter_request_chunks,
 )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_real_pp_anchor_is_verified_and_caps_emission_at_k() -> None:
+    device = torch.device("cuda")
+    input_ids = torch.tensor(
+        [99, 101, 102, 103, 104, 105], dtype=torch.int32, device=device
+    )
+    positions = torch.arange(2, 8, dtype=torch.int64, device=device)
+    cu_num_logits_np = np.array([0, 6], dtype=np.int32)
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+        idx_mapping_np=np.array([0], dtype=np.int32),
+        input_ids=input_ids,
+        positions=positions,
+        logits_indices=torch.arange(6, dtype=torch.int64, device=device),
+        cu_num_logits=torch.tensor([0, 6], dtype=torch.int32, device=device),
+        cu_num_logits_np=cu_num_logits_np,
+        expanded_idx_mapping=torch.zeros(6, dtype=torch.int32, device=device),
+        expanded_local_pos=torch.arange(6, dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=device),
+        num_draft_tokens_per_req=np.array([5], dtype=np.int32),
+        replayed_pp_anchor=torch.tensor([True], device=device),
+        replayed_pp_anchor_np=np.array([True]),
+    )
+    rejection_sampler = object.__new__(RejectionSampler)
+    rejection_sampler.num_speculative_steps = 5
+    rejection_sampler.sampler = SimpleNamespace(
+        compute_nans=False,
+        sampling_states=SimpleNamespace(
+            max_num_logprobs=lambda _idx_mapping_np: NO_LOGPROBS
+        ),
+        req_states=SimpleNamespace(
+            total_len=SimpleNamespace(
+                gpu=torch.tensor([3], dtype=torch.int32, device=device)
+            ),
+            prefill_len=SimpleNamespace(
+                gpu=torch.tensor([2], dtype=torch.int32, device=device)
+            ),
+        ),
+    )
+
+    def fake_verify(
+        self,
+        logits,
+        _draft_logits,
+        draft_sampled,
+        pos,
+        cu_num_logits,
+        *_mappings,
+    ):
+        assert logits.shape[0] == 6
+        assert draft_sampled.tolist() == input_ids.tolist()
+        assert pos.tolist() == positions.tolist()
+        assert cu_num_logits.tolist() == [0, 6]
+        sampled = torch.tensor(
+            [[201, 202, 203, 204, 205, 206]], dtype=torch.int64, device=device
+        )
+        return logits, sampled, torch.tensor([6], dtype=torch.int32, device=device)
+
+    rejection_sampler._verify = MethodType(fake_verify, rejection_sampler)
+    logits = torch.zeros((6, 32), dtype=torch.float32, device=device)
+
+    output = rejection_sampler(
+        logits,
+        input_batch,
+        draft_logits=None,
+        prev_sampled_tokens=torch.tensor([[99]], dtype=torch.int64, device=device),
+    )
+
+    assert output.sampled_token_ids[0, :5].tolist() == [201, 202, 203, 204, 205]
+    assert output.num_sampled.tolist() == [5]
+    assert output.num_rejected.tolist() == [0]
 
 
 def test_iter_request_chunks_preserves_request_boundaries():

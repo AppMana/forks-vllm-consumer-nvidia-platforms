@@ -892,15 +892,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        replayed_req_ids = scheduler_output.replayed_pp_anchor_req_ids
+        replayed_req_indices: list[int] = []
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
-            num_computed_tokens_np[req_index] = num_computed_tokens
+            replays_anchor = req_id in replayed_req_ids
+            num_computed_tokens_np[req_index] = num_computed_tokens - int(
+                replays_anchor
+            )
+            if replays_anchor:
+                replayed_req_indices.append(req_index)
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+
+        if replayed_req_indices:
+            replayed_indices = torch.tensor(
+                replayed_req_indices, dtype=torch.int64, device=self.device
+            )
+            replay_deltas = torch.full(
+                (len(replayed_req_indices),),
+                -1,
+                dtype=self.req_states.num_computed_tokens.gpu.dtype,
+                device=self.device,
+            )
+            self.req_states.num_computed_tokens.gpu.index_add_(
+                0, replayed_indices, replay_deltas
+            )
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -960,6 +981,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        replayed_pp_anchor = None
+        replayed_pp_anchor_np = None
+        if scheduler_output.replayed_pp_anchor_req_ids:
+            replayed_pp_anchor_np = np.fromiter(
+                (
+                    req_id in scheduler_output.replayed_pp_anchor_req_ids
+                    for req_id in req_ids
+                ),
+                dtype=np.bool_,
+                count=num_reqs,
+            )
+            replayed_pp_anchor = async_copy_to_gpu(
+                replayed_pp_anchor_np, device=self.device
+            )
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -986,15 +1021,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             if self.pp_handler is not None:
-                # PP-deferred scheduling: a steady-state verify batch holds
-                # ONLY the draft positions -- the anchor/bonus position was
-                # scheduled in a prior in-flight step, so such requests
-                # contribute no bonus logit (counting one shifts logits_start
-                # negative: an OOB gather). The FIRST verify after a prefill
-                # still schedules the anchor position itself (its KV was never
-                # computed), making the scheduled query one longer than the
-                # drafts: that request keeps its bonus logit and verifies
-                # classically against the real anchor row. Draft-less decode
+                # PP-deferred scheduling can supply either the current
+                # scheduler contract (one real [anchor, drafts...] target
+                # forward) or a legacy drafts-only synthetic frame. Derive the
+                # logit count from the physical scheduled width so both remain
+                # safe; replayed anchors are tracked separately on InputBatch
+                # and do not become an extra emitted token. Draft-less decode
                 # requests keep their single placeholder logit.
                 num_bonus_tokens = 0
                 num_logits = np.minimum(
@@ -1139,6 +1171,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
             prompt_lens=prompt_lens,
+            replayed_pp_anchor=replayed_pp_anchor,
+            replayed_pp_anchor_np=replayed_pp_anchor_np,
         )
         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
 
@@ -1219,9 +1253,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     # Draft logits are needed for probabilistic rejection sampling.
                     self.speculator.draft_logits,
-                    # PP-deferred verify: the anchor position's sample stands in
-                    # for its (unavailable) distribution -- see
-                    # RejectionSampler._expand_for_deferred.
+                    # Legacy drafts-only PP frames still need a synthetic
+                    # anchor. Steady replay frames carry the real row and are
+                    # recognized by input_batch.replayed_pp_anchor.
                     prev_sampled_tokens=self.req_states.last_sampled_tokens
                     if self.pp_handler is not None
                     else None,
