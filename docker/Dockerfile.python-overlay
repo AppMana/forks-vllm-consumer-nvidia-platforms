@@ -29,9 +29,9 @@ for relative in runtime_files:
 loader = (root / runtime_files[0]).read_text()
 draft = (root / runtime_files[1]).read_text()
 warmup = (root / runtime_files[2]).read_text()
-assert "matched_overrides" in loader
-assert "model.safetensors.index.json" in draft
-assert "Running full-model long-prefill warmup" in warmup
+assert "matched_files" in loader
+assert "_indexed_dspark_weight_files" in draft
+assert "token_sizes = sorted({16, max_tokens})" in warmup
 shutil.rmtree(sources)
 print("installed validated Python runtime fixes")
 PY
