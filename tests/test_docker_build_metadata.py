@@ -98,6 +98,7 @@ def test_python_overlay_is_generic_and_installs_runtime_fixes() -> None:
     for relative in RUNTIME_OVERLAY_FILES:
         assert f"COPY {relative} " in dockerfile
         assert f'"{relative.removeprefix("vllm/")}"' in dockerfile
+    assert '"scatter_draft_tokens"' in dockerfile
 
 
 def test_torch_cuda_arch_list_arg_is_consistent() -> None:
