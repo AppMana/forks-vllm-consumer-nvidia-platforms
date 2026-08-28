@@ -502,6 +502,64 @@ def test_spec_verify_warmup_transfers_match_on_every_rank(monkeypatch):
     assert links.unmatched == 0
 
 
+def test_spec_verify_warmup_uses_scheduler_reachable_atomic_width():
+    """Every target verification is one anchor plus its speculative block.
+
+    The scheduler's working PP path never emits a drafts-only target forward:
+    its fixed-width transaction is the leading anchor followed by K draft
+    tokens.  Warmup must exercise that reachable shape rather than manufacture
+    a different protocol.
+    """
+    num_spec = 7
+    runner = _spec_runner(0, 1, num_speculative_steps=num_spec)
+    executed = []
+
+    assert gpu_warmup.run_spec_verify_warmup(
+        runner,
+        executed.append,
+        lambda _grammar_output: None,
+    )
+
+    verify_frames = [
+        output for output in executed if output.scheduled_spec_decode_tokens
+    ]
+    assert len(verify_frames) == 2
+    for output in verify_frames:
+        req_id, draft_tokens = next(iter(output.scheduled_spec_decode_tokens.items()))
+        assert output.num_scheduled_tokens[req_id] == 1 + len(draft_tokens)
+
+
+def test_spec_verify_warmup_respects_per_request_pp_cadence():
+    """A request cannot be reused until its PP state has reached every rank."""
+    pp_size = 4
+    runner = _spec_runner(0, pp_size)
+    executed = []
+
+    assert gpu_warmup.run_spec_verify_warmup(
+        runner,
+        executed.append,
+        lambda _grammar_output: None,
+    )
+
+    nonzero_indices = [
+        idx
+        for idx, output in enumerate(executed)
+        if output.total_num_scheduled_tokens > 0
+    ]
+    assert len(nonzero_indices) == 3
+    for left, right in zip(nonzero_indices, nonzero_indices[1:]):
+        advances = executed[left + 1 : right]
+        assert len(advances) == pp_size
+        assert all(output.total_num_scheduled_tokens == 0 for output in advances)
+
+    cleanup_idx = next(
+        idx for idx, output in enumerate(executed) if output.finished_req_ids
+    )
+    final_drain = executed[nonzero_indices[-1] + 1 : cleanup_idx]
+    assert len(final_drain) == pp_size
+    assert all(output.total_num_scheduled_tokens == 0 for output in final_drain)
+
+
 def test_spec_verify_warmup_is_skipped_on_all_ranks_when_one_rank_declines(
     monkeypatch,
 ):

@@ -395,11 +395,14 @@ def run_spec_verify_warmup(
     first_verify.scheduled_spec_decode_tokens = {req_id: [0] * num_spec}
     first_verify.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
-    # Steady-state PP-deferred verify: drafts only (T tokens).
+    # Steady-state verify: anchor position + T drafts (1 + T tokens), matching
+    # the scheduler-reachable atomic target-forward shape. A drafts-only
+    # synthetic frame exercises a fallback that production scheduling does
+    # not enter and can JIT-compile rank by rank inside the coupled pipeline.
     steady_verify = SchedulerOutput.make_empty()
     steady_verify.scheduled_cached_reqs = _cached_step(prompt_len + 1, 2, False)
-    steady_verify.num_scheduled_tokens = {req_id: num_spec}
-    steady_verify.total_num_scheduled_tokens = num_spec
+    steady_verify.num_scheduled_tokens = {req_id: 1 + num_spec}
+    steady_verify.total_num_scheduled_tokens = 1 + num_spec
     steady_verify.scheduled_spec_decode_tokens = {req_id: [0] * num_spec}
     steady_verify.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
@@ -409,13 +412,23 @@ def run_spec_verify_warmup(
     pp_size = _pp_size(model_runner)
 
     def _sequence() -> None:
+        # Async PP applies a sampled result to a request only after one full
+        # pipeline depth. Zero-token worker calls post no PP transfers, but
+        # they advance the deferred queue exactly like intervening scheduler
+        # steps, so the same synthetic request is not reused with stale state.
+        def _advance_deferred_state() -> None:
+            for _ in range(max(0, pp_size)):
+                worker_execute_model(SchedulerOutput.make_empty())
+
         # Three batches with scheduled tokens: each is exactly one PP
         # transfer per hop, identical in count on every rank (a recv on
         # every non-first rank, a send on every non-last rank).
         worker_execute_model(prefill_output)
         worker_sample_tokens(None)
+        _advance_deferred_state()
         worker_execute_model(first_verify)
         worker_sample_tokens(None)
+        _advance_deferred_state()
         worker_execute_model(steady_verify)
         worker_sample_tokens(None)
         # Async PP defers sampled-token postprocessing by one pipeline depth.
@@ -432,8 +445,7 @@ def run_spec_verify_warmup(
         # so the isend at gpu_worker.py:1116 is never reached. The drain is
         # therefore collectively symmetric on first, middle and last ranks
         # alike, and stays inside the agreed sequence.
-        for _ in range(max(0, pp_size)):
-            worker_execute_model(SchedulerOutput.make_empty())
+        _advance_deferred_state()
         worker_execute_model(cleanup_output)
 
     model_runner.kv_connector.set_disabled(True)
@@ -444,7 +456,7 @@ def run_spec_verify_warmup(
     logger.info(
         "V2 spec verify warmup completed (first-verify %d tokens, steady %d tokens).",
         1 + num_spec,
-        num_spec,
+        1 + num_spec,
     )
     return True
 
