@@ -6,10 +6,12 @@ import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 import vllm.model_executor.warmup.flashinfer_sparse_mla_warmup as sparse_mla_warmup
+import vllm.v1.worker.gpu.sample.states as sampling_states
 import vllm.v1.worker.gpu.warmup as gpu_warmup
 
 
@@ -547,6 +549,60 @@ def test_spec_verify_warmup_uses_scheduler_reachable_atomic_width():
         req_id, draft_tokens = next(iter(output.scheduled_spec_decode_tokens.items()))
         assert output.num_scheduled_tokens[req_id] == 1 + len(draft_tokens)
         assert output.replayed_pp_anchor_req_ids == ({req_id} if frame_idx else set())
+
+
+def test_spec_verify_warmup_exercises_runtime_temperature_processing(monkeypatch):
+    """Warmup must take the same non-greedy temperature branch as requests."""
+    runner = _spec_runner(0, 1, num_speculative_steps=5)
+    executed = []
+
+    assert gpu_warmup.run_spec_verify_warmup(
+        runner,
+        executed.append,
+        lambda _grammar_output: None,
+    )
+    sampling_params = executed[0].scheduled_new_reqs[0].sampling_params
+    assert sampling_params is not None
+
+    class _CpuStagedArray:
+        def __init__(self, dtype):
+            self.np = np.zeros(1, dtype=dtype)
+            self.gpu = torch.from_numpy(self.np.copy())
+
+        def copy_to_uva(self):
+            self.gpu.copy_(torch.from_numpy(self.np))
+
+    states = object.__new__(sampling_states.SamplingStates)
+    states.max_num_reqs = 1
+    states.vocab_size = 4
+    states.temperature = _CpuStagedArray(np.float32)
+    states.top_k = _CpuStagedArray(np.int32)
+    states.top_p = _CpuStagedArray(np.float32)
+    states.min_p = _CpuStagedArray(np.float32)
+    states.seeds = _CpuStagedArray(np.int64)
+    states.seeds_set = np.zeros(1, dtype=bool)
+    states.num_logprobs = np.full(1, sampling_states.NO_LOGPROBS, dtype=np.int32)
+    states.add_request(0, sampling_params)
+    states.apply_staged_writes()
+
+    def _emulate_temperature_kernel(logits, idx_mapping, temperatures):
+        logits.div_(temperatures[idx_mapping].unsqueeze(1))
+
+    monkeypatch.setattr(
+        sampling_states, "apply_temperature", _emulate_temperature_kernel
+    )
+    logits = torch.tensor([[2.0, 4.0]])
+    states.apply_temperature(
+        logits,
+        torch.tensor([0]),
+        np.array([0], dtype=np.int32),
+    )
+
+    # A representative non-greedy warmup temperature of 0.5 must run the
+    # real SamplingStates branch and transform logits just as a live request
+    # does. Greedy temperature=0 bypasses the kernel and leaves these values
+    # unchanged, reproducing the request-time first JIT.
+    torch.testing.assert_close(logits, torch.tensor([[4.0, 8.0]]))
 
 
 def test_spec_verify_warmup_respects_per_request_pp_cadence():

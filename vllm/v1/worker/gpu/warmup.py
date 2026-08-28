@@ -362,7 +362,9 @@ def run_spec_verify_warmup(
         next_block_id += num_blocks
         return block_ids
 
-    sampling_params = SamplingParams(max_tokens=max_len, temperature=0.0)
+    # Use a nontrivial value: SamplingStates intentionally skips its Triton
+    # temperature kernel when every request has temperature 0 or 1.
+    sampling_params = SamplingParams(max_tokens=max_len, temperature=0.5)
 
     prefill_output = SchedulerOutput.make_empty()
     prefill_output.scheduled_new_reqs = [
