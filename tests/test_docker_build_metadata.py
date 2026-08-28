@@ -40,7 +40,13 @@ REQUIRED_SPARKINFER_REF = "78cc92eaad3bf0378d199c44621bbaee75d0cb47"
 RUNTIME_OVERLAY_FILES = (
     "vllm/model_executor/model_loader/default_loader.py",
     "vllm/models/deepseek_v4/nvidia/dspark.py",
+    "vllm/v1/executor/ray_executor.py",
+    "vllm/v1/executor/ray_executor_v2.py",
+    "vllm/v1/executor/ray_utils.py",
     "vllm/v1/worker/gpu/warmup.py",
+    "vllm/v1/worker/gpu/model_runner.py",
+    "vllm/v1/worker/gpu/pp_utils.py",
+    "vllm/v1/worker/gpu_worker.py",
 )
 
 

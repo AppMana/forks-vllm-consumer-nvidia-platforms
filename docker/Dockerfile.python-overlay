@@ -7,7 +7,13 @@ ARG VLLM_IMAGE_TAG
 
 COPY vllm/model_executor/model_loader/default_loader.py /tmp/vllm-overlay/model_executor/model_loader/default_loader.py
 COPY vllm/models/deepseek_v4/nvidia/dspark.py /tmp/vllm-overlay/models/deepseek_v4/nvidia/dspark.py
+COPY vllm/v1/executor/ray_executor.py /tmp/vllm-overlay/v1/executor/ray_executor.py
+COPY vllm/v1/executor/ray_executor_v2.py /tmp/vllm-overlay/v1/executor/ray_executor_v2.py
+COPY vllm/v1/executor/ray_utils.py /tmp/vllm-overlay/v1/executor/ray_utils.py
 COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm-overlay/v1/worker/gpu/warmup.py
+COPY vllm/v1/worker/gpu/model_runner.py /tmp/vllm-overlay/v1/worker/gpu/model_runner.py
+COPY vllm/v1/worker/gpu/pp_utils.py /tmp/vllm-overlay/v1/worker/gpu/pp_utils.py
+COPY vllm/v1/worker/gpu_worker.py /tmp/vllm-overlay/v1/worker/gpu_worker.py
 
 RUN python3 - <<'PY'
 import importlib.util
@@ -21,17 +27,28 @@ sources = pathlib.Path("/tmp/vllm-overlay")
 runtime_files = (
     "model_executor/model_loader/default_loader.py",
     "models/deepseek_v4/nvidia/dspark.py",
+    "v1/executor/ray_executor.py",
+    "v1/executor/ray_executor_v2.py",
+    "v1/executor/ray_utils.py",
     "v1/worker/gpu/warmup.py",
+    "v1/worker/gpu/model_runner.py",
+    "v1/worker/gpu/pp_utils.py",
+    "v1/worker/gpu_worker.py",
 )
 for relative in runtime_files:
     shutil.copy2(sources / relative, root / relative)
 
 loader = (root / runtime_files[0]).read_text()
 draft = (root / runtime_files[1]).read_text()
-warmup = (root / runtime_files[2]).read_text()
 assert "matched_files" in loader
 assert "_indexed_dspark_weight_files" in draft
-assert "token_sizes = sorted({16, max_tokens})" in warmup
+assert "RAY_NSYS_PROFILE_CONFIG" in (root / "v1/executor/ray_utils.py").read_text()
+assert "token_sizes = sorted({16, max_tokens})" in (
+    root / "v1/worker/gpu/warmup.py"
+).read_text()
+assert "gpu_model_runner: target_forward" in (
+    root / "v1/worker/gpu/model_runner.py"
+).read_text()
 shutil.rmtree(sources)
 print("installed validated Python runtime fixes")
 PY
