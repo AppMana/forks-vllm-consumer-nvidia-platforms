@@ -10,6 +10,7 @@ import torch
 
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -172,9 +173,10 @@ class PPHandler:
             payload = torch.empty(
                 num_reqs, self.payload_width, dtype=torch.int64, device=self.device
             )
-            torch.distributed.broadcast(
-                payload, src=self.last_rank, group=self.broadcast_group
-            )
+            with record_function_or_nullcontext("gpu_model_runner: pp_receive"):
+                torch.distributed.broadcast(
+                    payload, src=self.last_rank, group=self.broadcast_group
+                )
             event = self.broadcast_stream.record_event()
             # Must record_stream since this was allocated on broadcast stream but
             # later used on the main stream.
@@ -237,7 +239,8 @@ class PPHandler:
 
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            torch.distributed.broadcast(
-                payload, src=self.last_rank, group=self.broadcast_group
-            )
+            with record_function_or_nullcontext("gpu_model_runner: pp_broadcast"):
+                torch.distributed.broadcast(
+                    payload, src=self.last_rank, group=self.broadcast_group
+                )
             payload.record_stream(self.broadcast_stream)

@@ -69,7 +69,11 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.utils import (
+    compute_iteration_details,
+    record_function_or_nullcontext,
+    report_usage_stats,
+)
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -121,12 +125,13 @@ class AsyncIntermediateTensors(IntermediateTensors):
     def wait_for_comm(self) -> None:
         if self._comm_waited:
             return
-        if self._comm_handles:
-            for handle in self._comm_handles:
-                handle.wait()
-        if self._comm_postprocess:
-            for fn in self._comm_postprocess:
-                fn()
+        with record_function_or_nullcontext("gpu_worker: pp_recv_wait"):
+            if self._comm_handles:
+                for handle in self._comm_handles:
+                    handle.wait()
+            if self._comm_postprocess:
+                for fn in self._comm_postprocess:
+                    fn()
         self._comm_waited = True
 
     def __getattribute__(self, name: str):
@@ -1028,8 +1033,9 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
+            with record_function_or_nullcontext("gpu_worker: pp_send_wait"):
+                for handle in self._pp_send_work:
+                    handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
@@ -1076,13 +1082,14 @@ class Worker(WorkerBase):
                 and self.model_runner.intermediate_tensors is not None
             ):
                 recv_tensor_dict = self.model_runner.intermediate_tensors.tensors
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
-                    recv_tensor_dict=recv_tensor_dict,
+            with record_function_or_nullcontext("gpu_worker: pp_recv"):
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                        recv_tensor_dict=recv_tensor_dict,
+                    )
                 )
-            )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -1113,11 +1120,12 @@ class Worker(WorkerBase):
         )
 
         # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        with record_function_or_nullcontext("gpu_worker: pp_send"):
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
 
         return None
 

@@ -27,6 +27,18 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import ModelRunnerOutput
 
 logger = init_logger(__name__)
+
+RAY_NSYS_PROFILE_CONFIG = {
+    "t": "cuda,nvtx,osrt,cudnn,cublas",
+    "o": "'worker_process_%p'",
+    "cuda-graph-trace": "node",
+    "capture-range": "cudaProfilerApi",
+    "capture-range-end": "repeat",
+    "flush-on-cudaprofilerstop": "true",
+    "stop-on-exit": "true",
+    "trace-fork-before-exec": "true",
+}
+
 PG_WAIT_TIMEOUT = 1800
 
 # Env vars that are worker-specific and must NOT be copied from the

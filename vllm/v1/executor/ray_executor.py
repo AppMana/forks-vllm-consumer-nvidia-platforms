@@ -23,6 +23,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.ray_utils import (
+    RAY_NSYS_PROFILE_CONFIG,
     WORKER_SPECIFIC_ENV_VARS,
     FutureWrapper,
     RayWorkerWrapper,
@@ -116,15 +117,7 @@ class RayDistributedExecutor(Executor):
         # If nsight profiling is enabled, we need to set the profiling
         # configuration for the ray workers as runtime env.
         runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
-        runtime_env.update(
-            {
-                "nsight": {
-                    "t": "cuda,cudnn,cublas",
-                    "o": "'worker_process_%p'",
-                    "cuda-graph-trace": "node",
-                }
-            }
-        )
+        runtime_env.update({"nsight": RAY_NSYS_PROFILE_CONFIG.copy()})
 
         return ray_remote_kwargs
 

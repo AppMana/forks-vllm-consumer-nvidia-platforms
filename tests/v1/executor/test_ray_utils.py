@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 
+from vllm.v1.executor.ray_executor import RayDistributedExecutor
+from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
 from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, ModelRunnerOutput
 
@@ -52,3 +56,33 @@ def test_detach_zero_copy_from_model_runner_output_copies_only_numpy_views():
     assert detached_logprobs.sampled_token_ranks.flags.writeable
     assert detached_logprobs.cu_num_generated_tokens is cu_num_generated_tokens
     assert output.prompt_logprobs_dict["req-0"] is prompt_logprobs
+
+
+def _assert_bounded_nsight_capture(runtime_env: dict) -> None:
+    nsight = runtime_env["nsight"]
+    trace_kinds = set(nsight["t"].split(","))
+
+    assert {"cuda", "nvtx", "osrt"} <= trace_kinds
+    assert nsight["capture-range"] == "cudaProfilerApi"
+    assert nsight["capture-range-end"] == "repeat"
+    assert nsight["cuda-graph-trace"] == "node"
+
+
+def test_ray_distributed_executor_uses_bounded_nsight_capture() -> None:
+    executor = object.__new__(RayDistributedExecutor)
+
+    remote_kwargs = executor._configure_ray_workers_use_nsight({})
+
+    _assert_bounded_nsight_capture(remote_kwargs["runtime_env"])
+
+
+def test_ray_executor_v2_uses_bounded_nsight_capture() -> None:
+    executor = object.__new__(RayExecutorV2)
+    executor.parallel_config = SimpleNamespace(
+        ray_runtime_env=None,
+        ray_workers_use_nsight=True,
+    )
+
+    runtime_env = executor._build_runtime_env()
+
+    _assert_bounded_nsight_capture(runtime_env)
