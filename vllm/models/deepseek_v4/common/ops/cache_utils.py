@@ -165,6 +165,10 @@ def quantize_and_insert_int8_ds_mla_cache(
         "num_slots",
         "num_positions",
     ],
+    # Scheduler batches can expose the same logical tensors through either an
+    # allocation-aligned base or an offset view (for example after slicing
+    # decode rows away from a mixed batch).  Neither layout changes the
+    # algorithm, so compile one safe pointer class for every runtime buffer.
     do_not_specialize_on_alignment=[
         "q_ptr",
         "q_out_ptr",
@@ -2084,7 +2088,21 @@ def _remap_flashinfer_index(values, block_size, block_span):
         "compressed_block_span",
         "NUM_DECODE_TOKENS",
         "PREFILL_TOPK_STRIDE",
-    ]
+    ],
+    do_not_specialize_on_alignment=[
+        "sparse_indices_ptr",
+        "sparse_topk_lens_ptr",
+        "decode_swa_indices_ptr",
+        "decode_compressed_indices_ptr",
+        "decode_compressed_topk_lens_ptr",
+        "decode_is_valid_token_ptr",
+        "prefill_topk_indices_ptr",
+        "query_start_loc_ptr",
+        "seq_lens_ptr",
+        "token_to_req_indices_ptr",
+        "swa_block_table_ptr",
+        "compressed_block_table_ptr",
+    ],
 )
 def _build_flashinfer_mixed_sparse_indices_kernel(
     sparse_indices_ptr,

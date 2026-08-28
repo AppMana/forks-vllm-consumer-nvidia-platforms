@@ -1266,13 +1266,34 @@ def tf32_hc_prenorm_gemm_triton(
     )
 
 
-# do_not_specialize the context-varying runtime ints. Triton otherwise compiles a
-# separate kernel per divisibility-by-16 class of num_rows / seq_len_kv / the output
-# row-stride stride_lm; during decode the context grows by 1 token per step and keeps
-# crossing the ÷16 boundary, recompiling ~every 16 tokens. Stacked over a long
-# generation these ~165ms compiles wedge the whole PP chain (one rank pinned in
-# Triton launch, the rest blocked on the collective). Pinning them off compiles once.
-@triton.jit(do_not_specialize=["num_rows", "seq_len_kv", "stride_lm"])
+# Keep context-varying dimensions, strides, and pointer alignment out of
+# specialization. Scheduler chunks and gathered workspace views can vary all
+# three without changing the algorithm; specializing them recompiles in the
+# serving loop and can stall a coupled pipeline while one rank compiles.
+@triton.jit(
+    do_not_specialize=[
+        "num_rows",
+        "seq_len_kv",
+        "stride_qm",
+        "stride_qh",
+        "stride_qd",
+        "stride_kn",
+        "stride_kd",
+        "stride_wm",
+        "stride_wh",
+        "stride_lm",
+        "stride_ln",
+    ],
+    do_not_specialize_on_alignment=[
+        "q_ptr",
+        "k_ptr",
+        "k_scale_ptr",
+        "weights_ptr",
+        "ks_ptr",
+        "ke_ptr",
+        "logits_ptr",
+    ],
+)
 def _mqa_logits_workspace_kernel(
     q_ptr,
     k_ptr,
@@ -1285,15 +1306,15 @@ def _mqa_logits_workspace_kernel(
     seq_len_kv,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    stride_qm: tl.constexpr,
-    stride_qh: tl.constexpr,
-    stride_qd: tl.constexpr,
-    stride_kn: tl.constexpr,
-    stride_kd: tl.constexpr,
-    stride_wm: tl.constexpr,
-    stride_wh: tl.constexpr,
+    stride_qm: tl.int64,
+    stride_qh: tl.int64,
+    stride_qd: tl.int64,
+    stride_kn: tl.int64,
+    stride_kd: tl.int64,
+    stride_wm: tl.int64,
+    stride_wh: tl.int64,
     stride_lm: tl.int64,
-    stride_ln: tl.constexpr,
+    stride_ln: tl.int64,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,

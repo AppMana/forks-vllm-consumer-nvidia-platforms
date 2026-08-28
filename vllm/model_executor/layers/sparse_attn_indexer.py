@@ -44,6 +44,8 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+_INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS: set[tuple[int, bool]] = set()
+
 SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH = 4096
 # GB10's DSV4 C4 indexer is at most 65,536 compressed rows for the planned
 # 250k-token admission limit. Keep its decode on the row-local kernel we
@@ -341,6 +343,52 @@ def _indexer_prefill_logits(
         cu_seqlen_ke,
         qk_int8=qk_int8,
     )
+
+
+def warmup_indexer_prefill_logits_kernel(
+    device: torch.device,
+    *,
+    qk_int8: bool | None = None,
+) -> None:
+    """Compile the contiguous prefill-logits kernel used by the indexer."""
+    if device.type != "cuda":
+        return
+
+    from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
+        indexer_cache_is_int8,
+    )
+
+    if qk_int8 is None:
+        qk_int8 = indexer_cache_is_int8()
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    key = (device_index, qk_int8)
+    if key in _INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS:
+        return
+
+    num_rows = 1
+    num_heads = 64
+    head_dim = 128
+    context_rows = 513
+    qk_dtype = torch.int8 if qk_int8 else current_platform.fp8_dtype()
+    q = torch.zeros((num_rows, num_heads, head_dim), dtype=qk_dtype, device=device)
+    k = torch.zeros((context_rows, head_dim), dtype=qk_dtype, device=device)
+    k_scale = torch.ones(context_rows, dtype=torch.float32, device=device)
+    weights = torch.ones((num_rows, num_heads), dtype=torch.float32, device=device)
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    row_ends = torch.full((num_rows,), context_rows, dtype=torch.int32, device=device)
+
+    _indexer_prefill_logits(
+        q,
+        (k, k_scale),
+        weights,
+        row_starts,
+        row_ends,
+        qk_int8=qk_int8,
+    )
+    torch.accelerator.synchronize()
+    _INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS.add(key)
 
 
 def _decode_topk_keys(
