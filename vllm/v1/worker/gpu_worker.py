@@ -1031,13 +1031,6 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
-            with record_function_or_nullcontext("gpu_worker: pp_send_wait"):
-                for handle in self._pp_send_work:
-                    handle.wait()
-            self._pp_send_work = []
-
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1079,6 +1072,7 @@ class Worker(WorkerBase):
             if (
                 self.use_v2_model_runner
                 and not all_gather_tensors
+                and not self._pp_send_work
                 and self.model_runner.intermediate_tensors is not None
             ):
                 recv_tensor_dict = self.model_runner.intermediate_tensors.tensors
@@ -1096,6 +1090,15 @@ class Worker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
+
+        # Post the next upstream receive before retiring the previous
+        # downstream send. A downstream peer can require that receive to make
+        # progress, so waiting first introduces head-of-line blocking in PP.
+        if self._pp_send_work:
+            with record_function_or_nullcontext("gpu_worker: pp_send_wait"):
+                for handle in self._pp_send_work:
+                    handle.wait()
+            self._pp_send_work = []
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
