@@ -421,8 +421,8 @@ def warmup_indexer_prefill_gather_kernel(
     dst_dtype = torch.int8 if qk_int8 else current_platform.fp8_dtype()
 
     # The native launcher selects distinct CUDA template functions at these
-    # exact boundaries. A single-sequence configuration skips mixed warmup;
-    # other mixed batches can still land just below a compressed boundary.
+    # exact boundaries. The 1024-token mixed warmup reserves one decode token,
+    # so a 4:1 compressed prefill reaches only 255 rows and misses both.
     for context_rows in (256, 512):
         num_blocks = (context_rows + block_size - 1) // block_size
         kv_cache = torch.zeros(

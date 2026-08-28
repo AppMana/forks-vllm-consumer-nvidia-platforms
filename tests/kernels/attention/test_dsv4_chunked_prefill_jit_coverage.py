@@ -87,7 +87,7 @@ def _direct_deep_pipeline_warmup_prefill_frame(
     pipeline_parallel_size = 12
     runner = SimpleNamespace(
         is_pooling_model=False,
-        max_num_reqs=2,
+        max_num_reqs=32,
         parallel_config=SimpleNamespace(pipeline_parallel_size=pipeline_parallel_size),
         kv_connector=_FakeKVConnector(),
         kv_cache_config=SimpleNamespace(
@@ -396,7 +396,10 @@ def test_long_prefill_warmup_loads_native_gather_boundary_specializations(
     monkeypatch.setattr(torch.accelerator, "synchronize", record_real_synchronize)
     monkeypatch.setattr(triton_kernels, "indexer_cache_is_int8", lambda: True)
     monkeypatch.setattr(
-        sparse_attn_indexer, "_INDEXER_PREFILL_GATHER_KERNEL_WARMUPS", set()
+        sparse_attn_indexer,
+        "_INDEXER_PREFILL_GATHER_KERNEL_WARMUPS",
+        set(),
+        raising=False,
     )
     monkeypatch.setattr(
         gpu_warmup,
@@ -415,15 +418,29 @@ def test_long_prefill_warmup_loads_native_gather_boundary_specializations(
     )
     runner = SimpleNamespace(
         is_pooling_model=False,
-        max_num_reqs=1,
+        max_num_reqs=32,
         device=torch.device("cuda"),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=12),
+        kv_connector=_FakeKVConnector(),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))
+            ],
+        ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=1024),
         input_batch=None,
+    )
+    outputs = []
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_pp_coupled",
+        lambda _runner, _what, body: body(),
     )
 
     gpu_warmup.warmup_long_prefill_kernels(
         runner,
-        lambda _output: None,
+        outputs.append,
         lambda _grammar: None,
     )
     gpu_warmup.warmup_long_prefill_kernels(
@@ -431,6 +448,14 @@ def test_long_prefill_warmup_loads_native_gather_boundary_specializations(
         lambda _output: None,
         lambda _grammar: None,
     )
+
+    mixed_prefill_rows = [
+        output.num_scheduled_tokens[request.req_id] // 4
+        for output in outputs
+        for request in output.scheduled_new_reqs
+        if request.req_id.endswith("_prefill_")
+    ]
+    assert max(mixed_prefill_rows) == 255
 
     assert calls == [
         (
