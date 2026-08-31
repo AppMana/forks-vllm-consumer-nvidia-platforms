@@ -151,6 +151,9 @@ def test_deepseek_v4_long_prefill_warmup_includes_scheduler_cap(monkeypatch):
         method = "dspark"
         num_speculative_tokens = 5
         parallel_drafting = True
+        draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(sample_from_anchor=True)
+        )
 
         uses_draft_model = SpeculativeConfig.uses_draft_model
         max_num_new_slots_for_drafting = (
@@ -202,7 +205,82 @@ def test_deepseek_v4_long_prefill_warmup_includes_scheduler_cap(monkeypatch):
 
     assert scheduler_config.max_num_scheduled_tokens == 1024
     assert mixed_sizes == [16, 1024]
-    assert pure_prefill_sizes == [1020]
+    assert pure_prefill_sizes == [1, 28, 60, 1020]
+
+
+def test_dspark_prepare_input_warmup_covers_every_reachable_block_size(monkeypatch):
+    class ParallelDraftSpec:
+        method = "dspark"
+        num_speculative_tokens = 7
+        draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(sample_from_anchor=True)
+        )
+
+        max_num_new_slots_for_drafting = 6
+
+    pure_prefill_sizes = []
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        device=None,
+        num_speculative_steps=7,
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=1024,
+            max_num_scheduled_tokens=1024,
+        ),
+        vllm_config=SimpleNamespace(speculative_config=ParallelDraftSpec()),
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_mixed_prefill_decode_warmup",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_pure_prefill_warmup",
+        lambda _runner, _execute, _sample, num_tokens, **_kwargs: (
+            pure_prefill_sizes.append(num_tokens) or True
+        ),
+    )
+
+    gpu_warmup.warmup_long_prefill_kernels(
+        runner,
+        lambda _scheduler_output: None,
+        lambda _grammar_output: None,
+    )
+
+    assert pure_prefill_sizes == [1, 26, 58, 1018]
+
+
+def test_topk_topp_warmup_covers_each_triton_specialization(monkeypatch):
+    calls = []
+    runner = SimpleNamespace(
+        is_last_pp_rank=True,
+        device=torch.device("cpu"),
+        decode_query_len=8,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 128),
+    )
+
+    def apply(logits, top_k, top_p):
+        calls.append(
+            (
+                tuple(logits.shape),
+                None if top_k is None else top_k.dtype,
+                None if top_p is None else top_p.dtype,
+            )
+        )
+        return logits
+
+    monkeypatch.setattr(
+        gpu_warmup, "apply_top_k_top_p_triton", apply, raising=False
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    assert gpu_warmup.warmup_topk_topp_sampler(runner)
+    assert calls == [
+        ((8, 128), None, torch.float32),
+        ((8, 128), torch.int32, None),
+        ((8, 128), torch.int32, torch.float32),
+    ]
 
 
 def test_deepseek_v4_long_prefill_warmup_replays_pure_prefill_boundary_shape():
@@ -341,6 +419,7 @@ def test_block_table_warmup_clamps_to_table_capacity(monkeypatch):
 def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch):
     mixed_sizes = []
     metadata_warmup = []
+    sampler_warmup = []
     runner = SimpleNamespace(
         is_pooling_model=False,
         parallel_config=SimpleNamespace(pipeline_parallel_size=5),
@@ -367,6 +446,12 @@ def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch)
             mixed_sizes.append(num_tokens) or True
         ),
     )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_topk_topp_sampler",
+        lambda _runner: sampler_warmup.append(True) or True,
+        raising=False,
+    )
 
     gpu_warmup.warmup_kernels(
         runner,
@@ -376,6 +461,7 @@ def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch)
 
     assert mixed_sizes == [16]
     assert metadata_warmup == [(torch.device("cuda", 0), 4)]
+    assert sampler_warmup == [True]
 
 
 def test_non_deepseek_v4_pp_warmup_kernels_keeps_generic_execute_model(monkeypatch):
