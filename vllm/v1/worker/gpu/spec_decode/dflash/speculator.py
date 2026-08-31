@@ -105,7 +105,7 @@ def sync_debug(tag: str) -> None:
     surfaces later through the NCCL watchdog with no useful stack (even under
     CUDA_LAUNCH_BLOCKING). With this enabled, the first stage containing the
     faulty kernel raises HERE with a named tag in the worker traceback."""
-    if _SYNC_DEBUG:
+    if _SYNC_DEBUG and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
         logger.warning("dspark-sync-debug ok: %s", tag)
 
