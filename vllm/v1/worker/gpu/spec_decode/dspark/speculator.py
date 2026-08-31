@@ -85,6 +85,14 @@ class DSparkSpeculator(DFlashSpeculator):
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
+        self.enable_adaptive_verification = (
+            self.speculative_config.enable_adaptive_verification
+        )
+        self.draft_token_confidence_probs: torch.Tensor | None = None
+        if self.enable_adaptive_verification:
+            self.draft_token_confidence_probs = torch.empty_like(
+                self.draft_tokens, dtype=torch.float32
+            )
 
     def load_draft_model(
         self,
@@ -108,6 +116,12 @@ class DSparkSpeculator(DFlashSpeculator):
                 dtype=self.draft_logits.dtype,
                 device=self.device,
             )
+        if self.enable_adaptive_verification and model.model.confidence_head is None:
+            raise ValueError(
+                "Adaptive verification requires a DSpark checkpoint with a "
+                "confidence head. Disable adaptive verification for older "
+                "checkpoints."
+            )
         return model
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
@@ -125,6 +139,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        confidence_markov_embeds: list[torch.Tensor] = []
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
@@ -133,6 +148,8 @@ class DSparkSpeculator(DFlashSpeculator):
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
+            if self.enable_adaptive_verification:
+                confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
             if self.draft_logits is not None:
@@ -162,6 +179,16 @@ class DSparkSpeculator(DFlashSpeculator):
                 )
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
+
+        if self.enable_adaptive_verification:
+            assert self.draft_token_confidence_probs is not None
+            confidence = self.model.compute_confidence(
+                sample_hidden,
+                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+            )
+            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+                num_reqs, n_spec
+            )
 
     def _generate_draft(
         self,

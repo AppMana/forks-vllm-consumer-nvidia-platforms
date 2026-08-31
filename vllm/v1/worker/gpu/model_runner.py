@@ -1700,6 +1700,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 proposed_token_ids = self.req_states.draft_tokens[
                     input_batch.idx_mapping
                 ]
+                confidence_probs = getattr(
+                    self.speculator, "draft_token_confidence_probs", None
+                )
+                if confidence_probs is not None:
+                    # The speculator buffer is persistent and reused by the next
+                    # step. Clone this tiny [num_reqs, K] view so its async D2H
+                    # cannot race the next proposal's in-place update.
+                    async_output.set_draft_token_confidences(
+                        confidence_probs[: input_batch.num_reqs].clone()
+                    )
                 sync_debug("runner_post_propose_scatter")
 
         if self.pp_handler is not None:

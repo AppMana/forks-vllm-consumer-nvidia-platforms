@@ -24,6 +24,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
+        self.main_stream = main_stream
+        self.copy_stream = copy_stream
+        self.draft_token_confidences: np.ndarray | None = None
+        self.draft_confidence_event: torch.cuda.Event | None = None
+        self._draft_confidences_gpu: torch.Tensor | None = None
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
 
@@ -46,8 +51,24 @@ class AsyncOutput(AsyncModelRunnerOutput):
             }
             self.copy_event.record(copy_stream)
 
+    def set_draft_token_confidences(self, confidence_probs: torch.Tensor) -> None:
+        """Append draft confidence to this step's existing async result."""
+        self._draft_confidences_gpu = confidence_probs
+        self.draft_confidence_event = torch.cuda.Event(blocking=True)
+        with stream(self.copy_stream, self.main_stream):
+            self.copy_stream.wait_stream(self.main_stream)
+            self.draft_token_confidences = async_copy_to_np(confidence_probs)
+            confidence_probs.record_stream(self.copy_stream)
+            self.draft_confidence_event.record(self.copy_stream)
+
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
+        if self.draft_confidence_event is not None:
+            self.draft_confidence_event.synchronize()
+            assert self.draft_token_confidences is not None
+            self.model_runner_output.draft_token_confidences = (
+                self.draft_token_confidences.tolist()
+            )
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.

@@ -270,6 +270,11 @@ class ModelRunnerOutput:
     # each request due to speculative/jump decoding.
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
+    # Per-position conditional acceptance probabilities for the draft block
+    # proposed by this step. Only the sampling PP rank produces these; the
+    # scheduler converts them into one authoritative next-step verify shape.
+    draft_token_confidences: list[list[float]] | None = None
+
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs, max_num_logprobs + 1]
     # [num_reqs]

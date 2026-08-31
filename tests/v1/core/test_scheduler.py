@@ -1452,6 +1452,113 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
         assert stats.num_accepted_tokens_per_pos == expected[3]
 
 
+def test_pp_async_confidence_budget_is_scheduler_authoritative():
+    """The last PP rank's confidence must select one globally shared shape.
+
+    Computing a verification length independently in each worker is invalid:
+    only the last rank has the DSpark confidence head, so other ranks would use
+    stale/default values and choose a different target-forward shape.  The
+    existing model-result path instead returns confidence to the scheduler,
+    whose single SchedulerOutput is consumed by every pipeline rank.
+    """
+    scheduler = create_scheduler(
+        num_speculative_tokens=5,
+        speculative_method="ngram_gpu",
+        async_scheduling=True,
+        pipeline_parallel_size=2,
+        use_v2_model_runner=True,
+    )
+    scheduler.adaptive_verification_min_survival_probability = 0.10
+    (request,) = create_requests(num_requests=1, num_tokens=1)
+    scheduler.add_request(request)
+
+    prefill = scheduler.schedule()
+    assert request.spec_token_ids == [-1] * 5
+    scheduler.update_from_output(
+        prefill,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[7]],
+            draft_token_confidences=[[0.99, 0.80, 0.60, 0.10, 0.90]],
+        ),
+    )
+
+    # Survival is [.99, .792, .4752, .04752, ...], so only the first
+    # three positions clear the 0.10 scheduler policy.  The async scheduler
+    # must trim its already-created placeholders before the request becomes
+    # PP-cadence eligible again.
+    assert request.spec_token_ids == [-1] * 3
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    verify = scheduler.schedule()
+    assert verify.scheduled_spec_decode_tokens[request.request_id] == [-1] * 3
+    assert verify.num_scheduled_tokens[request.request_id] == 4
+
+
+def test_non_async_confidence_budget_trims_returned_drafts():
+    """The synchronous draft-token path obeys the same scheduler decision."""
+    scheduler = create_scheduler(num_speculative_tokens=5)
+    scheduler.adaptive_verification_min_survival_probability = 0.10
+    (request,) = create_requests(num_requests=1, num_tokens=1)
+    scheduler.add_request(request)
+
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[7]],
+            draft_token_confidences=[[0.99, 0.80, 0.60, 0.10, 0.90]],
+        ),
+    )
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [[11, 12, 13, 14, 15]])
+    )
+
+    assert request.spec_token_ids == [11, 12, 13]
+    verify = scheduler.schedule()
+    assert verify.scheduled_spec_decode_tokens[request.request_id] == [11, 12, 13]
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    [
+        None,
+        [],
+        [0.99, float("nan"), 0.8, 0.7, 0.6],
+        [0.99, 1.1, 0.8, 0.7, 0.6],
+        [0.99, 0.8],
+    ],
+)
+def test_confidence_budget_fails_open_for_missing_or_malformed_data(confidence):
+    """Telemetry failure must retain fixed-K behavior, never corrupt shape."""
+    scheduler = create_scheduler(num_speculative_tokens=5)
+    scheduler.adaptive_verification_min_survival_probability = 0.10
+    (request,) = create_requests(num_requests=1, num_tokens=1)
+    scheduler.add_request(request)
+
+    prefill = scheduler.schedule()
+    scheduler._pending_draft_verification_lengths[request.request_id] = 2
+    kwargs = {}
+    if confidence is not None:
+        kwargs["draft_token_confidences"] = [confidence]
+    scheduler.update_from_output(
+        prefill,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[7]],
+            **kwargs,
+        ),
+    )
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [[11, 12, 13, 14, 15]])
+    )
+
+    assert request.spec_token_ids == [11, 12, 13, 14, 15]
+
+
 def test_spec_decoding_stats_empty_output():
     """Test that spec decoding stats handle empty output tokens gracefully.
 

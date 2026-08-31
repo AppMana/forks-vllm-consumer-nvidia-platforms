@@ -288,6 +288,18 @@ class SpeculativeConfig:
     during rejection sampling. This comes at the cost of additional GPU memory
     usage."""
 
+    enable_adaptive_verification: bool = False
+    """Use DSpark's confidence head to choose the number of draft tokens that
+    the target verifies. The scheduler makes this decision so every pipeline
+    rank receives the same verification shape."""
+
+    adaptive_verification_min_survival_probability: float = Field(
+        default=0.05, ge=0.0, le=1.0
+    )
+    """Minimum cumulative acceptance probability for retaining a draft
+    position when adaptive verification is enabled. A value of zero records
+    confidence while retaining the full fixed-size draft block."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -310,6 +322,7 @@ class SpeculativeConfig:
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
+        factors.append(self.enable_adaptive_verification)
 
         if uses_aux_hidden_states and self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1298,6 +1311,9 @@ class SpeculativeConfig:
 
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
+
+        if self.enable_adaptive_verification and self.method != "dspark":
+            raise ValueError("Adaptive verification is only supported with DSpark")
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):

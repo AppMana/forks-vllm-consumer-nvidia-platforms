@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -70,6 +71,7 @@ class Scheduler(SchedulerInterface):
     # Class-level default: some tests construct schedulers through partial
     # init paths; __init__ overrides this from the parallel config.
     pp_deferred_spec = False
+    adaptive_verification_min_survival_probability: float | None = None
 
     def __init__(
         self,
@@ -254,7 +256,16 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self.adaptive_verification_min_survival_probability: float | None = None
+        # Non-async scheduling receives the proposed token IDs through the
+        # existing take_draft_token_ids RPC after update_from_output. Preserve
+        # the scheduler's confidence decision until those IDs arrive.
+        self._pending_draft_verification_lengths: dict[str, int] = {}
         if speculative_config is not None:
+            if speculative_config.enable_adaptive_verification:
+                self.adaptive_verification_min_survival_probability = (
+                    speculative_config.adaptive_verification_min_survival_probability
+                )
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -1293,6 +1304,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        self._pending_draft_verification_lengths.pop(request.request_id, None)
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1672,6 +1684,8 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        self._update_draft_verification_lengths(model_runner_output)
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -2165,15 +2179,78 @@ class Scheduler(SchedulerInterface):
 
             if request.is_prefill_chunk:
                 # Ignore draft tokens for prefill chunks.
+                self._pending_draft_verification_lengths.pop(req_id, None)
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
+
+            verification_length = self._pending_draft_verification_lengths.pop(
+                req_id, None
+            )
+            if verification_length is not None:
+                spec_token_ids = spec_token_ids[:verification_length]
 
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = spec_token_ids
+
+    def _update_draft_verification_lengths(
+        self, model_runner_output: ModelRunnerOutput
+    ) -> None:
+        """Choose one next-step draft prefix in the scheduler process.
+
+        DSpark confidence exists only on the sampling (last pipeline) rank.
+        Returning it in the ordinary model result and choosing the prefix here
+        avoids rank-local state-machine divergence and adds no communication
+        operation. Missing or malformed telemetry deliberately keeps fixed-K.
+        """
+        threshold = self.adaptive_verification_min_survival_probability
+        if threshold is None:
+            return
+        for req_id in model_runner_output.req_ids:
+            self._pending_draft_verification_lengths.pop(req_id, None)
+
+        confidences = model_runner_output.draft_token_confidences
+        if confidences is None:
+            return
+        if len(confidences) != len(model_runner_output.req_ids):
+            return
+
+        for req_id, per_position in zip(
+            model_runner_output.req_ids, confidences, strict=True
+        ):
+            request = self.requests.get(req_id)
+            if (
+                request is None
+                or request.is_finished()
+                or request.is_prefill_chunk
+                or len(per_position) != self.num_spec_tokens
+                or any(
+                    not math.isfinite(probability)
+                    or probability < 0.0
+                    or probability > 1.0
+                    for probability in per_position
+                )
+            ):
+                continue
+
+            survival = 1.0
+            verification_length = 0
+            for probability in per_position:
+                survival *= probability
+                if survival < threshold:
+                    break
+                verification_length += 1
+
+            self._pending_draft_verification_lengths[req_id] = verification_length
+            if self.scheduler_config.async_scheduling:
+                # AsyncScheduler has already installed the full-K placeholders
+                # for this proposal. PP cadence prevents the request from being
+                # scheduled again until this result is processed.
+                request.spec_token_ids = request.spec_token_ids[:verification_length]
+                self._pending_draft_verification_lengths.pop(req_id, None)
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
@@ -2322,6 +2399,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self._pending_draft_verification_lengths.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
