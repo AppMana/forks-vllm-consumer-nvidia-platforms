@@ -1636,6 +1636,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
         )
 
+        produces_sample = bool(
+            np.any(
+                input_batch.num_computed_prefill_tokens_np
+                + input_batch.num_scheduled_tokens
+                >= input_batch.prefill_len_np
+            )
+        )
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.speculator is not None and self.speculator.supports_mm_inputs:
             # Get cached multimodal embeddings for draft forward.
@@ -1661,6 +1668,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         sync_debug("runner_postprocess_sampled")
 
+        proposed_token_ids = None
         if self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -1685,9 +1693,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
                     mm_inputs=mm_inputs,
+                    generate_draft=produces_sample,
                 )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            sync_debug("runner_post_propose_scatter")
+            if produces_sample:
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                proposed_token_ids = self.req_states.draft_tokens[
+                    input_batch.idx_mapping
+                ]
+                sync_debug("runner_post_propose_scatter")
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks: this step's verified sampled
@@ -1700,18 +1713,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_sampled,
                 num_rejected,
                 input_batch,
-                proposed_token_ids=self.req_states.draft_tokens[input_batch.idx_mapping]
-                if self.speculator is not None
-                else None,
+                proposed_token_ids=proposed_token_ids,
             )
             sync_debug("runner_pp_broadcast")
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
+            draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]
+            if self.speculator is not None and not produces_sample:
+                draft_tokens = draft_tokens[:, :0]
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                draft_tokens,
             )
 
         # Post-step KV connector related operations.

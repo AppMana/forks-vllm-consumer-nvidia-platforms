@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from tests.v1.core.utils import create_requests
@@ -21,6 +23,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_module
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 # Matches defaults from tests/v1/spec_decode/test_eagle.py
@@ -152,3 +156,92 @@ def test_dflash_drafter_window_reserves_bonus_token():
         speculative_config=SimpleNamespace(use_dflash=lambda: False),
     )
     assert input_fits_in_drafter(plain_runner, SimpleNamespace(max_seq_len=97))
+
+
+@pytest.mark.parametrize("generate_draft", [False, True])
+def test_dflash_context_update_only_drafts_when_requested(
+    monkeypatch,
+    generate_draft: bool,
+) -> None:
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.num_query_per_req = 5
+    speculator.num_speculative_steps = 5
+    speculator.max_model_len = 8192
+    speculator.max_num_reqs = 1
+    speculator.max_num_tokens = 1024
+    speculator.parallel_drafting_token_id = 1
+    speculator.hidden_states = torch.zeros((1024, 4))
+    speculator.context_positions = torch.zeros(1024, dtype=torch.int64)
+    speculator.sample_indices = torch.zeros(5, dtype=torch.int64)
+    speculator.sample_pos = torch.zeros(5, dtype=torch.int64)
+    speculator.sample_idx_mapping = torch.zeros(5, dtype=torch.int32)
+    speculator.sample_from_anchor = True
+    speculator.input_buffers = SimpleNamespace()
+    speculator.block_tables = SimpleNamespace(
+        slot_mappings=torch.zeros((1, 1024), dtype=torch.int64),
+        input_block_tables=[torch.zeros((1, 64), dtype=torch.int32)],
+        kernel_block_sizes=[16],
+    )
+    speculator.draft_kv_cache_group_id = 0
+    speculator.draft_kv_cache_group_ids = [0]
+    speculator._context_slot_mappings = [
+        torch.zeros(1024, dtype=torch.int64)
+    ]
+    speculator._layer_group_idx = None
+    speculator._group_causal = True
+    speculator.model = SimpleNamespace(
+        precompute_and_store_context_kv=MagicMock()
+    )
+    speculator._copy_request_inputs = MagicMock()
+    speculator._prepare_eplb_forward = MagicMock()
+    speculator._build_draft_attn_metadata = MagicMock(return_value={})
+    speculator._generate_draft = MagicMock()
+    speculator._prof = None
+    speculator.draft_tokens = torch.zeros((1, 5), dtype=torch.int64)
+    speculator.query_cudagraph_manager = None
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+    speculator.kv_cache_config = SimpleNamespace()
+
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=896,
+        seq_lens_cpu_upper_bound=torch.tensor([896], dtype=torch.int32),
+        idx_mapping=torch.tensor([0], dtype=torch.int32),
+    )
+    monkeypatch.setattr(dflash_module, "prepare_dflash_inputs", MagicMock())
+    monkeypatch.setattr(
+        dflash_module,
+        "dispatch_cg_and_sync_dp",
+        MagicMock(
+            return_value=(
+                SimpleNamespace(
+                    num_reqs=None,
+                    num_tokens=5,
+                    cg_mode=dflash_module.CUDAGraphMode.NONE,
+                ),
+                None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        dflash_module, "build_slot_mappings_by_layer", MagicMock(return_value={})
+    )
+
+    speculator.propose(
+        input_batch=input_batch,
+        attn_metadata={},
+        slot_mappings={},
+        last_hidden_states=torch.zeros((896, 4)),
+        aux_hidden_states=None,
+        num_sampled=torch.zeros(1, dtype=torch.int32),
+        num_rejected=torch.zeros(1, dtype=torch.int32),
+        last_sampled=torch.zeros(1, dtype=torch.int64),
+        next_prefill_tokens=torch.zeros(1, dtype=torch.int64),
+        temperature=torch.ones(1),
+        seeds=torch.zeros(1, dtype=torch.int64),
+        generate_draft=generate_draft,
+    )
+
+    speculator.model.precompute_and_store_context_kv.assert_called_once()
+    assert speculator._generate_draft.call_count == int(generate_draft)

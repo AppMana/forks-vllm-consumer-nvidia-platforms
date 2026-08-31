@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -19,6 +20,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import (
+    ExecuteModelState,
     GPUModelRunner,
     _copy_or_reuse_pp_intermediate_tensor,
 )
@@ -264,4 +266,102 @@ def test_deferred_draft_update_does_not_reduce_a_cuda_mask_on_the_host(
         runner.req_states.draft_tokens,
         idx_mapping,
         proposed_tokens,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_computed_tokens", "num_scheduled_tokens", "should_generate"),
+    [(0, 896, False), (7168, 832, True)],
+)
+def test_chunked_prefill_drafts_only_after_final_chunk(
+    monkeypatch,
+    num_computed_tokens: int,
+    num_scheduled_tokens: int,
+    should_generate: bool,
+) -> None:
+    """Intermediate chunks update draft context without generating tokens."""
+    runner = object.__new__(GPUModelRunner)
+    input_batch = SimpleNamespace(
+        req_ids=["request"],
+        num_reqs=1,
+        idx_mapping=torch.tensor([0]),
+        query_start_loc=torch.tensor([0, num_scheduled_tokens]),
+        num_scheduled_tokens=np.array([num_scheduled_tokens], dtype=np.int32),
+        num_computed_prefill_tokens_np=np.array(
+            [num_computed_tokens], dtype=np.int32
+        ),
+        prefill_len_np=np.array([8000], dtype=np.int32),
+    )
+    runner.execute_model_state = ExecuteModelState(
+        input_batch=input_batch,
+        attn_metadata={},
+        slot_mappings_by_layer={},
+        hidden_states=torch.zeros(num_scheduled_tokens, 4),
+        aux_hidden_states=None,
+        finished_req_ids=set(),
+    )
+    runner.is_last_pp_rank = True
+    runner.pcp_manager = None
+    sampler_output = SimpleNamespace(sampled_token_ids=torch.zeros((1, 1)))
+    num_sampled = torch.tensor([int(should_generate)], dtype=torch.int32)
+    num_rejected = torch.zeros(1, dtype=torch.int32)
+    runner.sample = MagicMock(
+        return_value=(sampler_output, num_sampled, num_rejected)
+    )
+    runner.prompt_logprobs_worker = SimpleNamespace(
+        compute_prompt_logprobs=MagicMock(return_value={})
+    )
+    runner.model = SimpleNamespace(compute_logits=MagicMock())
+    runner.__dict__["main_stream"] = object()
+    runner.output_copy_stream = object()
+    runner.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=torch.zeros((1, 8000))),
+        num_computed_tokens=SimpleNamespace(gpu=torch.zeros(1)),
+        prompt_len=SimpleNamespace(np=np.array([8000], dtype=np.int32)),
+        last_sampled_tokens=torch.zeros(1),
+        next_prefill_tokens=torch.zeros(1),
+        draft_tokens=torch.zeros((1, 5), dtype=torch.int64),
+    )
+    runner.model_state = SimpleNamespace(gather_mm_embeddings=MagicMock())
+    runner.postprocess_sampled = MagicMock()
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(gpu=torch.ones(1)),
+            seeds=SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int64)),
+        )
+    )
+    runner.speculator = SimpleNamespace(
+        supports_mm_inputs=False,
+        propose=MagicMock(return_value=torch.ones((1, 5), dtype=torch.int64)),
+    )
+    runner.pp_handler = MagicMock()
+    runner.num_speculative_steps = 5
+    runner.draft_tokens_handler = MagicMock()
+    runner.kv_connector = SimpleNamespace(post_forward=MagicMock(return_value=None))
+    runner.eplb = SimpleNamespace(step=MagicMock())
+
+    monkeypatch.setattr(model_runner_module, "AsyncOutput", MagicMock())
+
+    runner.sample_tokens(None)
+
+    runner.speculator.propose.assert_called_once()
+    assert (
+        runner.speculator.propose.call_args.kwargs["generate_draft"]
+        is should_generate
+    )
+    proposed_token_ids = runner.pp_handler.broadcast.call_args.kwargs[
+        "proposed_token_ids"
+    ]
+    if should_generate:
+        torch.testing.assert_close(
+            proposed_token_ids, torch.ones((1, 5), dtype=torch.int64)
+        )
+    else:
+        assert proposed_token_ids is None
+    runner.pp_handler.broadcast.assert_called_once_with(
+        sampler_output.sampled_token_ids,
+        num_sampled,
+        num_rejected,
+        input_batch,
+        proposed_token_ids=proposed_token_ids,
     )

@@ -414,6 +414,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        generate_draft: bool = True,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
@@ -522,6 +523,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 context_slots,
             )
         sync_debug("precompute_and_store_context_kv")
+
+        if not generate_draft:
+            return self.draft_tokens[:num_reqs]
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         with self._prof_phase("attn_meta"):
