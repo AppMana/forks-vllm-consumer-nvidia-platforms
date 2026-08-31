@@ -136,6 +136,7 @@ def _assert_distribution_match(
         (3, 0.6),
         (1, 1.0),
         (3, 1.0),
+        (7, 1.0),
     ],
 )
 def test_stochastic_rejection_sample(num_speculative_steps: int, temperature: float):
@@ -319,6 +320,7 @@ def test_placeholder_draft_token_rejected():
         (1, 1.0),
         (3, 1.0),
         (5, 1.0),
+        (7, 1.0),
     ],
 )
 @pytest.mark.parametrize("has_draft_logits", [True, False])
