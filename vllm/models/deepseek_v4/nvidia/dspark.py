@@ -42,6 +42,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
@@ -70,8 +71,6 @@ def _remap_dspark_checkpoint_name(name: str) -> str | None:
         return None
     stage = int(m.group(1))
     rest = m.group(2)
-    if rest.startswith("confidence_head."):
-        return None
     if rest == "emb.tok_emb.weight":
         return "model.embed_tokens.weight" if stage == 0 else None
     if rest == "head.weight":
@@ -82,6 +81,7 @@ def _remap_dspark_checkpoint_name(name: str) -> str | None:
         "hc_head_base",
         "hc_head_scale",
         "markov_head.",
+        "confidence_head.",
     )
     if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
         head_prefixes
@@ -244,6 +244,15 @@ class DSparkDeepseekV4Model(nn.Module):
                 config.dspark_markov_rank,
                 prefix=maybe_prefix(prefix, "markov_head"),
             )
+            self.confidence_head: DSparkConfidenceHead | None = DSparkConfidenceHead(
+                config.hidden_size + config.dspark_markov_rank,
+                prefix=maybe_prefix(prefix, "confidence_head"),
+            )
+            # The head was added after the first DSpark checkpoints. The indexed
+            # source manifest still requires it when advertised, but checkpoints
+            # that genuinely omit it remain loadable.
+            for param in self.confidence_head.parameters():
+                param.is_checkpoint_optional = True
         else:
             self.main_proj = PPMissingLayer()
             self.main_norm = PPMissingLayer()
@@ -254,6 +263,7 @@ class DSparkDeepseekV4Model(nn.Module):
             )
             self.norm = PPMissingLayer()
             self.markov_head = PPMissingLayer()
+            self.confidence_head = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -600,13 +610,20 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def compute_confidence(
+        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-position acceptance probability for each drafted token."""
+        assert self.model.confidence_head is not None
+        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
+
     # --- Weight loading ----------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
 
-        Non-MTP and unsupported confidence-head weights are skipped. The target
-        always supplies ``lm_head``; it also supplies ``embed_tokens`` for PP=1.
+        Non-MTP weights are skipped. The target always supplies ``lm_head``; it
+        also supplies ``embed_tokens`` for PP=1.
         """
         if not self.model._owns_dspark_layers:
             return set()
@@ -648,6 +665,7 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         seen_checkpoint_names: set[str] = set()
+        loaded_confidence_head = False
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -662,6 +680,8 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 continue
             seen_checkpoint_names.add(checkpoint_name)
             name = mapped
+            if "confidence_head." in name:
+                loaded_confidence_head = True
 
             # ``.scale`` -> per-method scale suffix.
             if name.endswith(".scale"):
@@ -731,6 +751,11 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 loaded_params.add(name)
 
         self._validate_loaded_parameters(loaded_params, seen_checkpoint_names)
+        if (
+            getattr(self.model, "confidence_head", None) is not None
+            and not loaded_confidence_head
+        ):
+            self.model.confidence_head = None
         self._finalize_moe()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params

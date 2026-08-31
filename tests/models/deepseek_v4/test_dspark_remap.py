@@ -16,6 +16,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.models import qwen3_dspark
 from vllm.models.deepseek_v4.nvidia import dspark
 from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 
@@ -37,8 +38,11 @@ def remap(name: str) -> str | None:
         # lm_head is aliased from the target (same last rank under any PP).
         ("mtp.0.head.weight", None),
         ("mtp.2.head.weight", None),
-        # Confidence head is not wired into inference.
-        ("mtp.0.confidence_head.proj.weight", None),
+        # The 0731 confidence head is a model-level draft head.
+        (
+            "mtp.0.confidence_head.proj.weight",
+            "model.confidence_head.proj.weight",
+        ),
         # Non-mtp weights belong to the target model.
         ("embed.weight", None),
         ("head.weight", None),
@@ -99,10 +103,15 @@ def test_remap_dspark_name(name: str, expected: str | None) -> None:
                 "mtp.0.ffn.shared_experts.w1.weight": "model-mtp-shared.safetensors",
                 "mtp.0.confidence_head.proj.weight": "model-mtp-confidence.safetensors",
             },
-            ["model-mtp-experts.safetensors", "model-mtp-shared.safetensors"],
+            [
+                "model-mtp-confidence.safetensors",
+                "model-mtp-experts.safetensors",
+                "model-mtp-shared.safetensors",
+            ],
             {
                 "mtp.0.ffn.experts.7.w1.weight",
                 "mtp.0.ffn.shared_experts.w1.weight",
+                "mtp.0.confidence_head.proj.weight",
             },
         ),
     ],
@@ -168,6 +177,7 @@ def _make_weight_loading_model(
     *,
     owns_layers: bool = True,
     include_embed: bool = False,
+    include_confidence: bool = False,
     shares_target_embed: bool = False,
     expected_checkpoint_names: set[str] | None = None,
 ) -> DSparkDeepseekV4ForCausalLM:
@@ -195,6 +205,10 @@ def _make_weight_loading_model(
     model.model.main_norm.weight = nn.Parameter(torch.empty(1))
     if include_embed:
         model.model.embed_tokens = nn.Embedding(1, 1)
+    if include_confidence:
+        model.model.confidence_head = nn.Module()
+        model.model.confidence_head.proj = nn.Linear(1, 1, bias=False)
+        model.model.confidence_head.proj.weight.is_checkpoint_optional = True
     model.lm_head = nn.Linear(1, 1, bias=False)
     model.config = SimpleNamespace(
         n_routed_experts=0,
@@ -226,11 +240,14 @@ def test_dspark_allows_runtime_parameter_without_checkpoint_source(monkeypatch) 
     assert loaded == {"model.main_norm.weight"}
 
 
-def test_dspark_allows_target_aliases_and_unsupported_confidence_head(
+def test_dspark_loads_confidence_head_while_allowing_target_aliases(
     monkeypatch,
 ) -> None:
     model = _make_weight_loading_model(
-        monkeypatch, include_embed=True, shares_target_embed=True
+        monkeypatch,
+        include_embed=True,
+        include_confidence=True,
+        shares_target_embed=True,
     )
 
     loaded = model.load_weights(
@@ -240,7 +257,34 @@ def test_dspark_allows_target_aliases_and_unsupported_confidence_head(
         ]
     )
 
-    assert loaded == {"model.main_norm.weight"}
+    assert loaded == {
+        "model.main_norm.weight",
+        "model.confidence_head.proj.weight",
+    }
+
+
+def test_dspark_disables_confidence_for_older_checkpoint(monkeypatch) -> None:
+    model = _make_weight_loading_model(monkeypatch, include_confidence=True)
+
+    model.load_weights([("mtp.0.main_norm.weight", torch.ones(1))])
+
+    assert model.model.confidence_head is None
+
+
+def test_dspark_confidence_uses_hidden_and_markov_state(monkeypatch) -> None:
+    class SumProjection(nn.Module):
+        def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value.sum(dim=-1, keepdim=True)
+
+    monkeypatch.setattr(qwen3_dspark, "ReplicatedLinear", SumProjection)
+    head = qwen3_dspark.DSparkConfidenceHead(3, prefix="confidence")
+    hidden = torch.tensor([[1.0, 2.0]])
+    markov = torch.tensor([[3.0]])
+
+    assert head(hidden, markov).tolist() == [6.0]
 
 
 def test_dspark_requires_pp_local_embedding_when_it_cannot_be_aliased(
