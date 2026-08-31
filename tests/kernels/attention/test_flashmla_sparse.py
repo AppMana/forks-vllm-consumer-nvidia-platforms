@@ -1,7 +1,136 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
+
+
+def test_deepseek_v4_c128a_adaptive_widths_cover_8k_and_capture() -> None:
+    from vllm.models.deepseek_v4.sparse_mla import (
+        c128a_active_topk_width,
+        c128a_prefill_topk_width,
+    )
+
+    capacity_width = c128a_prefill_topk_width(1_000_000, 128)
+    assert capacity_width == 7936
+    assert c128a_active_topk_width(8_000, 128, capacity_width) == 128
+    assert c128a_active_topk_width(1_000_000, 128, capacity_width) == 7936
+
+
+def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride() -> None:
+    from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
+
+    device = torch.device("cuda")
+    capacity_width = 512
+    global_decode_buffer = torch.empty(
+        (2, capacity_width), dtype=torch.int32, device=device
+    )
+    prefill_buffer = torch.empty_like(global_decode_buffer)
+    kwargs = dict(
+        positions=torch.tensor([255, 511, 383, 639], device=device),
+        compress_ratio=128,
+        num_decode_tokens=2,
+        token_to_req_indices=torch.tensor(
+            [0, 1, 0, 1], dtype=torch.int32, device=device
+        ),
+        block_table=torch.tensor([[3], [5]], dtype=torch.int32, device=device),
+        block_size=capacity_width,
+        slot_mapping=torch.arange(4, dtype=torch.int64, device=device),
+        global_decode_buffer=global_decode_buffer,
+        decode_lens_buffer=torch.empty(2, dtype=torch.int32, device=device),
+        prefill_buffer=prefill_buffer,
+    )
+    captured_decode, _, captured_prefill = build_c128a_topk_metadata(
+        max_compressed_tokens=256,
+        **kwargs,
+    )
+    assert captured_decode.shape == captured_prefill.shape == (2, 256)
+    assert captured_decode.stride(0) == captured_prefill.stride(0) == capacity_width
+
+    captured_rows = torch.empty((4, 4), dtype=torch.int32, device=device)
+    captured_rows[:2].copy_(captured_decode[:, :4])
+    captured_rows[2:].copy_(captured_prefill[:, :4])
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_rows[:2].copy_(captured_decode[:, :4])
+        captured_rows[2:].copy_(captured_prefill[:, :4])
+
+    global_decode_buffer.fill_(-99)
+    prefill_buffer.fill_(-99)
+    build_c128a_topk_metadata(
+        max_compressed_tokens=128,
+        **kwargs,
+    )
+    graph.replay()
+
+    assert captured_rows.cpu().tolist() == [
+        [1536, 1537, -1, -1],
+        [2560, 2561, 2562, 2563],
+        [0, 1, 2, -1],
+        [0, 1, 2, 3],
+    ]
+    assert torch.all(global_decode_buffer[:, 128:] == -99)
+    assert torch.all(prefill_buffer[:, 128:] == -99)
+
+
+@pytest.mark.parametrize(
+    ("max_seq_len", "expected_width"),
+    [(8_000, 128), (1_000_000, 7936)],
+)
+def test_deepseek_v4_c128a_builder_exposes_only_active_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    max_seq_len: int,
+    expected_width: int,
+) -> None:
+    import vllm.models.deepseek_v4.sparse_mla as sparse_mla
+
+    capacity_width = 7936
+    builder = object.__new__(sparse_mla.DeepseekV4FlashMLAMetadataBuilder)
+    builder.compress_ratio = 128
+    builder.reorder_batch_threshold = 1
+    builder.kv_cache_spec = SimpleNamespace(block_size=8192)
+    builder.c128a_max_compressed = capacity_width
+    builder.c128a_global_decode_buffer = torch.empty((1, capacity_width))
+    builder.c128a_decode_lens_buffer = torch.empty(1)
+    builder.c128a_prefill_buffer = torch.empty((1, capacity_width))
+
+    monkeypatch.setattr(
+        sparse_mla,
+        "split_decodes_and_prefills",
+        lambda *_args, **_kwargs: (0, 1, 0, 1),
+    )
+    observed_widths = []
+
+    def fake_build(*args, max_compressed_tokens):
+        observed_widths.append(max_compressed_tokens)
+        global_buffer = args[7]
+        decode_lens_buffer = args[8]
+        prefill_buffer = args[9]
+        return (
+            global_buffer[:0, :max_compressed_tokens],
+            decode_lens_buffer[:0],
+            prefill_buffer[:1, :max_compressed_tokens],
+        )
+
+    monkeypatch.setattr(sparse_mla, "build_c128a_topk_metadata", fake_build)
+    cm = SimpleNamespace(
+        max_seq_len=max_seq_len,
+        positions=torch.tensor([max_seq_len - 1]),
+        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+        slot_mapping=torch.zeros(1, dtype=torch.int64),
+    )
+
+    result = builder._build_c128a_metadata(
+        cm,
+        torch.zeros(1, dtype=torch.int32),
+    )
+
+    prefill = result["c128a_prefill_topk_indices"]
+    assert observed_widths == [expected_width]
+    assert prefill.shape == (1, expected_width)
+    assert prefill.stride(0) == capacity_width
 
 
 def test_sparse_flashmla_metadata_smoke():

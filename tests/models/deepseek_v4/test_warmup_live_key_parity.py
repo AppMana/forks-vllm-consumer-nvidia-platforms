@@ -81,7 +81,7 @@ def live_combine_topk_swa_keys(vllm_config: SimpleNamespace) -> set:
     from vllm.models.deepseek_v4.common.ops.cache_utils import (
         _COMBINE_TOPK_SWA_INDICES_KERNEL,
     )
-    from vllm.models.deepseek_v4.sparse_mla import c128a_prefill_topk_width
+    from vllm.models.deepseek_v4.sparse_mla import c128a_active_topk_widths
 
     hf_config = vllm_config.model_config.hf_config
     index_topk = hf_config.index_topk
@@ -96,8 +96,8 @@ def live_combine_topk_swa_keys(vllm_config: SimpleNamespace) -> set:
         elif ratio == 4:
             layers.add((ratio, index_topk, index_topk))
         else:
-            width = c128a_prefill_topk_width(max_model_len, ratio)
-            layers.add((ratio, width, width))
+            for width in c128a_active_topk_widths(max_model_len, ratio):
+                layers.add((ratio, width, width))
 
     keys = set()
     for ratio, top_k, width in layers:
@@ -118,7 +118,7 @@ def live_combine_topk_swa_keys(vllm_config: SimpleNamespace) -> set:
     return keys
 
 
-@pytest.mark.parametrize("max_model_len", [8192, 163840])
+@pytest.mark.parametrize("max_model_len", [8192, 163840, 1_000_000])
 def test_combine_topk_swa_warmup_matches_live(max_model_len: int) -> None:
     """Warmup must enumerate exactly the live key set -- no more, no less.
 
@@ -151,14 +151,17 @@ def test_combine_topk_swa_c128a_width_tracks_max_model_len() -> None:
     from vllm.models.deepseek_v4.common.ops.cache_utils import (
         _COMBINE_TOPK_SWA_INDICES_KERNEL,
     )
-    from vllm.models.deepseek_v4.sparse_mla import c128a_prefill_topk_width
+    from vllm.models.deepseek_v4.sparse_mla import (
+        c128a_active_topk_widths,
+        c128a_prefill_topk_width,
+    )
     from vllm.utils.math_utils import next_power_of_2
 
     assert c128a_prefill_topk_width(163840, 128) == 1280
     assert c128a_prefill_topk_width(8192, 128) == 128
 
     keys_by_len = {}
-    for max_model_len in (8192, 163840):
+    for max_model_len in (8192, 163840, 1_000_000):
         keys = _COMBINE_TOPK_SWA_INDICES_KERNEL.get_warmup_keys(
             make_vllm_config(max_model_len=max_model_len)
         )
@@ -166,10 +169,15 @@ def test_combine_topk_swa_c128a_width_tracks_max_model_len() -> None:
             (key.TOP_K, key.PADDED_TOP_K) for key in keys if key.COMPRESS_RATIO == 128
         }
 
-    # PADDED_TOP_K is next_power_of_2 of the live buffer width. The hardcoded
-    # row warmed TOP_K=8192/PADDED_TOP_K=8192 at every context length.
-    assert keys_by_len[163840] == {(1280, next_power_of_2(1280))}, keys_by_len
+    # Adaptive metadata can expose every power-of-two width up to capacity;
+    # the final clamped capacity is not itself necessarily a power of two.
+    assert c128a_active_topk_widths(163840, 128) == (128, 256, 512, 1024, 1280)
+    assert keys_by_len[163840] == {
+        (width, next_power_of_2(width)) for width in (128, 256, 512, 1024, 1280)
+    }, keys_by_len
     assert keys_by_len[8192] == {(128, 128)}, keys_by_len
+    assert (128, 128) in keys_by_len[1_000_000]
+    assert (7936, 8192) in keys_by_len[1_000_000]
 
 
 def test_no_warmup_key_has_zero_compress_ratio() -> None:
