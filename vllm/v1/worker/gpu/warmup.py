@@ -19,6 +19,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
     warmup_indexer_prefill_topk_kernel,
 )
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.mla.indexer import (
     warmup_prefill_chunk_metadata_kernel,
@@ -34,6 +35,9 @@ from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+
+if HAS_TRITON:
+    from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
 
 
 def _pp_size(model_runner: GPUModelRunner) -> int:
@@ -128,6 +132,104 @@ def _is_deepseek_v4_model_runner(model_runner: GPUModelRunner) -> bool:
     hf_config = getattr(model_config, "hf_config", None)
     architectures = getattr(hf_config, "architectures", None) or ()
     return any("DeepseekV4" in arch or "DeepSeekV4" in arch for arch in architectures)
+
+
+def _parallel_draft_query_len(model_runner: GPUModelRunner) -> int | None:
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    method = getattr(speculative_config, "method", None)
+    if method not in ("dflash", "dspark"):
+        return None
+
+    num_speculative_tokens = int(
+        getattr(
+            speculative_config,
+            "num_speculative_tokens",
+            getattr(model_runner, "num_speculative_steps", 0),
+        )
+    )
+    if num_speculative_tokens <= 0:
+        return None
+    if method == "dflash":
+        return 1 + num_speculative_tokens
+
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    hf_config = getattr(draft_model_config, "hf_config", None)
+    sample_from_anchor = getattr(hf_config, "sample_from_anchor", True)
+    return num_speculative_tokens if sample_from_anchor else 1 + num_speculative_tokens
+
+
+def _prepare_dflash_inputs_block_size(
+    max_target_query_len: int, num_query_per_req: int
+) -> int:
+    span = max(1, max_target_query_len + num_query_per_req)
+    return min(256, 1 << (span - 1).bit_length())
+
+
+def _missing_dflash_prepare_warmup_sizes(
+    model_runner: GPUModelRunner, max_tokens: int
+) -> set[int]:
+    num_query_per_req = _parallel_draft_query_len(model_runner)
+    if num_query_per_req is None or max_tokens <= 0:
+        return set()
+
+    num_speculative_steps = int(
+        getattr(model_runner, "num_speculative_steps", num_query_per_req)
+    )
+    covered_target_sizes = {
+        min(max_tokens, 1 + num_speculative_steps),
+        min(max_tokens, 15),
+        max(1, max_tokens - 1),
+    }
+    covered_block_sizes = {
+        _prepare_dflash_inputs_block_size(size, num_query_per_req)
+        for size in covered_target_sizes
+    }
+
+    missing_sizes: set[int] = set()
+    for block_size in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+        first_span = 1 if block_size == 1 else block_size // 2 + 1
+        target_size = max(1, first_span - num_query_per_req)
+        if target_size > max_tokens:
+            continue
+        if (
+            _prepare_dflash_inputs_block_size(target_size, num_query_per_req)
+            == block_size
+            and block_size not in covered_block_sizes
+        ):
+            missing_sizes.add(target_size)
+    return missing_sizes
+
+
+def warmup_topk_topp_sampler(model_runner: GPUModelRunner) -> bool:
+    """Warm the three Triton top-k/top-p constexpr combinations."""
+    if not HAS_TRITON or not getattr(model_runner, "is_last_pp_rank", False):
+        return False
+
+    device = getattr(model_runner, "device", None)
+    model_config = getattr(model_runner, "model_config", None)
+    get_vocab_size = getattr(model_config, "get_vocab_size", None)
+    if not isinstance(device, torch.device) or not callable(get_vocab_size):
+        return False
+
+    vocab_size = int(get_vocab_size())
+    if vocab_size <= 0:
+        return False
+    batch_size = max(8, int(getattr(model_runner, "decode_query_len", 1)))
+    logits = torch.zeros(
+        (batch_size, vocab_size), dtype=torch.float32, device=device
+    )
+    top_k = torch.full(
+        (batch_size,), min(50, vocab_size), dtype=torch.int32, device=device
+    )
+    top_p = torch.full((batch_size,), 0.9, dtype=torch.float32, device=device)
+
+    apply_top_k_top_p_triton(logits, None, top_p)
+    apply_top_k_top_p_triton(logits, top_k, None)
+    apply_top_k_top_p_triton(logits, top_k, top_p)
+    torch.accelerator.synchronize()
+    logger.info("Triton top-k/top-p sampler warmup completed.")
+    return True
 
 
 def run_mixed_prefill_decode_warmup(
@@ -584,6 +686,9 @@ def warmup_long_prefill_kernels(
         adaptive_budget = max_tokens - draft_slots
         if 0 < adaptive_budget < max_tokens:
             pure_prefill_token_sizes.add(adaptive_budget)
+    pure_prefill_token_sizes.update(
+        _missing_dflash_prepare_warmup_sizes(model_runner, max_tokens)
+    )
 
     warmed_mixed_sizes: list[int] = []
     for num_tokens in sorted(mixed_token_sizes):
@@ -841,6 +946,7 @@ def warmup_kernels(
         run_spec_verify_warmup(
             model_runner, worker_execute_model, worker_sample_tokens
         )
+        warmup_topk_topp_sampler(model_runner)
         torch.accelerator.synchronize()
         return
 
@@ -1003,4 +1109,6 @@ def warmup_kernels(
     warmup_long_prefill_kernels(
         model_runner, worker_execute_model, worker_sample_tokens
     )
+    if _is_deepseek_v4_model_runner(model_runner):
+        warmup_topk_topp_sampler(model_runner)
     torch.accelerator.synchronize()
