@@ -342,6 +342,97 @@ def test_sm86_native_int8_prefill_consumes_adaptive_c128a_width(
     }
 
 
+def test_sm86_native_int8_prefill_excludes_cudagraph_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native prefill must use metadata's live rows, not the graph bucket.
+
+    A 14-token request can execute in a 16-token piecewise CUDA-graph bucket.
+    The sparse metadata has 14 rows; passing all 16 query rows makes the native
+    kernel read beyond both index and length arrays.
+    """
+    import vllm.models.deepseek_v4.nvidia_imma.attention as attention_mod
+
+    live_tokens = 14
+    graph_tokens = 16
+    window = 128
+    topk = 32
+    attn = object.__new__(DeepseekV4SM86Attention)
+    attn.compress_ratio = 4
+    attn.window_size = window
+    attn.kv_cache_dtype = "int8_ds_mla"
+    attn.scale = 1.0
+    attn.attn_sink = torch.zeros(64)
+    attn.n_local_heads = 64
+    attn.topk_indices_buffer = torch.zeros(
+        (graph_tokens, topk), dtype=torch.int32
+    )
+
+    swa_metadata = SimpleNamespace(
+        num_decodes=0,
+        num_prefills=1,
+        num_decode_tokens=0,
+        num_prefill_tokens=live_tokens,
+        query_start_loc=torch.tensor([0, live_tokens], dtype=torch.int32),
+        token_to_req_indices=torch.zeros(live_tokens, dtype=torch.int32),
+        seq_lens=torch.tensor([live_tokens], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        block_size=128,
+    )
+    attn_metadata = SimpleNamespace(
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        block_size=512,
+    )
+    observed: dict[str, object] = {}
+
+    def fake_build(*_args, **_kwargs):
+        mixed = torch.zeros((live_tokens, window + topk), dtype=torch.int32)
+        lens = torch.full((live_tokens,), window + topk, dtype=torch.int32)
+        return mixed, lens
+
+    def fake_native_prefill(**kwargs):
+        observed["q_shape"] = kwargs["q"].shape
+        observed["positions_shape"] = kwargs["swa_lens"].shape
+        observed["indices_shape"] = kwargs["swa_indices"].shape
+        return torch.ones_like(kwargs["q"])
+
+    monkeypatch.setattr(
+        attention_mod, "build_flashinfer_mixed_sparse_indices", fake_build
+    )
+    monkeypatch.setattr(
+        attention_mod,
+        "get_int8_ds_mla_cache_views",
+        lambda cache, _block_size: (cache, torch.ones(1)),
+    )
+    monkeypatch.setattr(
+        attention_mod, "sparse_mla_prefill_int8", fake_native_prefill
+    )
+
+    q = torch.zeros((graph_tokens, 64, 512), dtype=torch.bfloat16)
+    output = torch.full_like(q, -1)
+    attn._forward_prefill_flash(
+        q=q,
+        positions=torch.arange(graph_tokens),
+        compressed_k_cache=torch.empty((1, 1), dtype=torch.uint8),
+        swa_k_cache=torch.empty((1, 1), dtype=torch.uint8),
+        output=output,
+        attn_metadata=attn_metadata,
+        swa_metadata=swa_metadata,
+    )
+
+    assert observed == {
+        "q_shape": torch.Size((live_tokens, 64, 512)),
+        "positions_shape": torch.Size((live_tokens,)),
+        "indices_shape": torch.Size((live_tokens, window)),
+    }
+    torch.testing.assert_close(
+        output[:live_tokens], torch.ones_like(output[:live_tokens])
+    )
+    torch.testing.assert_close(
+        output[live_tokens:], -torch.ones_like(output[live_tokens:])
+    )
+
+
 @pytest.mark.parametrize(
     ("max_seq_len", "active_width"),
     [(8_000, 128), (1_000_000, 7936)],

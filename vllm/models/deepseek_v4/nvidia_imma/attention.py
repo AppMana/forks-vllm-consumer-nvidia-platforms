@@ -482,6 +482,27 @@ class DeepseekV4TritonSM86Attention(DeepseekV4FlashMLAAttention):
         num_reqs = num_decodes + num_prefills
         num_tokens = num_decode_tokens + num_prefill_tokens
 
+        # Piecewise CUDA graphs bucket the model inputs, so q/positions/output
+        # can include padding rows beyond the live prefill metadata. The native
+        # op takes its token count from q.shape[0] and then indexes swa_lens and
+        # the sparse-index matrices with that count. Passing the graph bucket
+        # therefore reads those metadata arrays out of bounds (for example, a
+        # 14-token prefill in a 16-token bucket). Keep the native op and all of
+        # its metadata on the same live prefix.
+        if (
+            q.shape[0] < num_prefill_tokens
+            or positions.shape[0] < num_prefill_tokens
+            or output.shape[0] < num_prefill_tokens
+        ):
+            raise ValueError(
+                "Native sparse-MLA prefill metadata exceeds its input buffers: "
+                f"live_tokens={num_prefill_tokens}, q={q.shape[0]}, "
+                f"positions={positions.shape[0]}, output={output.shape[0]}"
+            )
+        q = q[:num_prefill_tokens]
+        positions = positions[:num_prefill_tokens]
+        output = output[:num_prefill_tokens]
+
         assert swa_metadata.query_start_loc is not None
         assert swa_metadata.token_to_req_indices is not None
         assert swa_metadata.seq_lens is not None
