@@ -143,6 +143,115 @@ def test_deepseek_v4_long_prefill_warmup_runs_production_shapes(monkeypatch):
     assert mixed_sizes == [16, 1024]
 
 
+def test_deepseek_v4_long_prefill_warmup_includes_scheduler_cap(monkeypatch):
+    from vllm.config import VllmConfig
+    from vllm.config.speculative import SpeculativeConfig
+
+    class ParallelDraftSpec:
+        method = "dspark"
+        num_speculative_tokens = 5
+        parallel_drafting = True
+
+        uses_draft_model = SpeculativeConfig.uses_draft_model
+        max_num_new_slots_for_drafting = (
+            SpeculativeConfig.max_num_new_slots_for_drafting
+        )
+
+    scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=1024,
+        max_num_scheduled_tokens=None,
+        max_num_seqs=6,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=ParallelDraftSpec(),
+        scheduler_config=scheduler_config,
+    )
+    VllmConfig._set_max_num_scheduled_tokens(vllm_config)
+
+    mixed_sizes = []
+    pure_prefill_sizes = []
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        device=None,
+        scheduler_config=scheduler_config,
+        vllm_config=vllm_config,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        ),
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_mixed_prefill_decode_warmup",
+        lambda _runner, _execute, _sample, num_tokens, **_kwargs: (
+            mixed_sizes.append(num_tokens) or True
+        ),
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_pure_prefill_warmup",
+        lambda _runner, _execute, _sample, num_tokens, **_kwargs: (
+            pure_prefill_sizes.append(num_tokens) or True
+        ),
+    )
+
+    gpu_warmup.warmup_long_prefill_kernels(
+        runner,
+        lambda _scheduler_output: None,
+        lambda _grammar_output: None,
+    )
+
+    assert scheduler_config.max_num_scheduled_tokens == 1024
+    assert mixed_sizes == [16, 1024]
+    assert pure_prefill_sizes == [1020]
+
+
+def test_deepseek_v4_long_prefill_warmup_replays_pure_prefill_boundary_shape():
+    runner = _FakeModelRunner()
+    runner.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=1024,
+        max_num_scheduled_tokens=1000,
+        max_num_seqs=6,
+    )
+    runner.vllm_config = SimpleNamespace(speculative_config=None)
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+    )
+    executed = []
+
+    gpu_warmup.warmup_long_prefill_kernels(
+        runner,
+        executed.append,
+        lambda _grammar_output: None,
+    )
+
+    boundary_shapes = [
+        (
+            len(output.num_scheduled_tokens),
+            tuple(output.num_scheduled_tokens.values()),
+            bool(output.scheduled_spec_decode_tokens),
+            all(
+                (
+                    new_req := next(
+                        (
+                            req
+                            for req in output.scheduled_new_reqs
+                            if req.req_id == req_id
+                        ),
+                        None,
+                    )
+                )
+                is not None
+                and new_req.num_computed_tokens + num_scheduled
+                < len(new_req.prefill_token_ids)
+                for req_id, num_scheduled in output.num_scheduled_tokens.items()
+            ),
+        )
+        for output in executed
+        if output.total_num_scheduled_tokens == 1000
+    ]
+    assert boundary_shapes == [(1, (1000,), False, True)]
+
+
 def test_deepseek_v4_long_prefill_warmup_directly_warms_slot_mapping(monkeypatch):
     mixed_sizes = []
     metadata_warmup = []

@@ -288,6 +288,83 @@ def run_mixed_prefill_decode_warmup(
     return True
 
 
+def run_pure_prefill_warmup(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+    num_tokens: int,
+    *,
+    req_id_prefix: str = "_v2_pure_prefill_warmup",
+) -> bool:
+    """Warm an intermediate single-request prefill chunk at an exact size."""
+    if model_runner.is_pooling_model or num_tokens < 1:
+        return False
+
+    req_id = f"{req_id_prefix}_prefill_"
+    # One unscheduled prompt token keeps this on the intermediate-prefill path,
+    # matching a long request whose current chunk consumes the whole budget.
+    prompt_token_ids = list(range(num_tokens + 1))
+    kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
+    num_kv_cache_groups = len(kv_cache_groups)
+    block_counts = [
+        cdiv(num_tokens, group.kv_cache_spec.block_size)
+        for group in kv_cache_groups
+    ]
+    required_blocks = sum(block_counts)
+    has_blocks = model_runner.kv_cache_config.num_blocks > required_blocks
+    if not has_blocks:
+        logger.warning(
+            "Skipping V2 pure prefill warmup because only %d KV blocks are "
+            "available for %d required warmup blocks.",
+            model_runner.kv_cache_config.num_blocks,
+            required_blocks,
+        )
+    if not pp_ranks_all_agree(model_runner, has_blocks, "V2 pure prefill warmup"):
+        return False
+
+    next_block_id = 1
+    block_ids = []
+    for count in block_counts:
+        block_ids.append(list(range(next_block_id, next_block_id + count)))
+        next_block_id += count
+
+    prefill_output = SchedulerOutput.make_empty()
+    prefill_output.scheduled_new_reqs = [
+        NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=prompt_token_ids,
+            mm_features=[],
+            sampling_params=SamplingParams(max_tokens=2, temperature=0.0),
+            pooling_params=None,
+            block_ids=tuple(block_ids),
+            num_computed_tokens=0,
+            lora_request=None,
+            prefill_token_ids=prompt_token_ids,
+        )
+    ]
+    prefill_output.num_scheduled_tokens = {req_id: num_tokens}
+    prefill_output.total_num_scheduled_tokens = num_tokens
+    prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+
+    cleanup_output = SchedulerOutput.make_empty()
+    cleanup_output.finished_req_ids = {req_id}
+    pp_size = _pp_size(model_runner)
+
+    def _sequence() -> None:
+        worker_execute_model(prefill_output)
+        worker_sample_tokens(None)
+        for _ in range(max(0, pp_size)):
+            worker_execute_model(SchedulerOutput.make_empty())
+        worker_execute_model(cleanup_output)
+
+    model_runner.kv_connector.set_disabled(True)
+    try:
+        run_pp_coupled(model_runner, "V2 pure prefill warmup", _sequence)
+    finally:
+        model_runner.kv_connector.set_disabled(False)
+    return True
+
+
 def run_spec_verify_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -492,10 +569,24 @@ def warmup_long_prefill_kernels(
         warmup_indexer_prefill_topk_kernel(device)
         warmup_block_table_slot_mapping_kernel(model_runner, device)
 
-    max_tokens = model_runner.scheduler_config.max_num_batched_tokens
-    token_sizes = sorted({16, max_tokens})
-    warmed_sizes: list[int] = []
-    for num_tokens in token_sizes:
+    scheduler_config = model_runner.scheduler_config
+    max_tokens = scheduler_config.max_num_batched_tokens
+    mixed_token_sizes = {16, max_tokens}
+    pure_prefill_token_sizes: set[int] = set()
+    max_scheduled_tokens = getattr(scheduler_config, "max_num_scheduled_tokens", None)
+    if max_scheduled_tokens is not None and max_scheduled_tokens != max_tokens:
+        pure_prefill_token_sizes.add(max_scheduled_tokens)
+
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is not None:
+        draft_slots = speculative_config.max_num_new_slots_for_drafting
+        adaptive_budget = max_tokens - draft_slots
+        if 0 < adaptive_budget < max_tokens:
+            pure_prefill_token_sizes.add(adaptive_budget)
+
+    warmed_mixed_sizes: list[int] = []
+    for num_tokens in sorted(mixed_token_sizes):
         if num_tokens < 3:
             continue
         if run_mixed_prefill_decode_warmup(
@@ -505,12 +596,25 @@ def warmup_long_prefill_kernels(
             num_tokens,
             req_id_prefix=f"_v2_long_prefill_warmup_{num_tokens}",
         ):
-            warmed_sizes.append(num_tokens)
+            warmed_mixed_sizes.append(num_tokens)
 
-    if warmed_sizes:
+    warmed_pure_prefill_sizes: list[int] = []
+    for num_tokens in sorted(pure_prefill_token_sizes):
+        if run_pure_prefill_warmup(
+            model_runner,
+            worker_execute_model,
+            worker_sample_tokens,
+            num_tokens,
+            req_id_prefix=f"_v2_long_prefill_boundary_warmup_{num_tokens}",
+        ):
+            warmed_pure_prefill_sizes.append(num_tokens)
+
+    if warmed_mixed_sizes or warmed_pure_prefill_sizes:
         logger.info(
-            "V2 long prefill kernel warmup completed with scheduled tokens: %s.",
-            warmed_sizes,
+            "V2 long prefill kernel warmup completed with mixed scheduled "
+            "tokens %s and pure-prefill scheduled tokens %s.",
+            warmed_mixed_sizes,
+            warmed_pure_prefill_sizes,
         )
 
 

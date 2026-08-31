@@ -104,12 +104,22 @@ def kernel_warmup(worker: "Worker"):
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+    max_batched_tokens = worker.scheduler_config.max_num_batched_tokens
+    additional_mhc_token_sizes: list[int] = []
+    speculative_config = getattr(worker.vllm_config, "speculative_config", None)
+    if speculative_config is not None:
+        draft_slots = speculative_config.max_num_new_slots_for_drafting
+        adaptive_prefill_tokens = max_batched_tokens - draft_slots
+        if 0 < adaptive_prefill_tokens < max_batched_tokens:
+            additional_mhc_token_sizes.append(adaptive_prefill_tokens)
+
     deepseek_v4_mhc_warmup(
         worker.get_model(),
-        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        max_tokens=max_batched_tokens,
         cudagraph_capture_sizes=(
             worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
         ),
+        additional_token_sizes=additional_mhc_token_sizes,
     )
 
     # Run next so input-prep kernels JIT against pristine runner state.

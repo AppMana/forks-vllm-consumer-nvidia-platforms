@@ -49,6 +49,7 @@ def _select_mhc_warmup_token_sizes(
     *,
     max_tokens: int,
     cudagraph_capture_sizes: list[int],
+    additional_token_sizes: Iterable[int] = (),
 ) -> list[int]:
     if max_tokens <= 0:
         return []
@@ -56,6 +57,7 @@ def _select_mhc_warmup_token_sizes(
     max_auto_tokens = min(max_tokens, _AUTO_WARMUP_MAX_TOKENS)
     candidates = list(_DEFAULT_TOKEN_SIZE_CANDIDATES)
     candidates.extend(cudagraph_capture_sizes)
+    candidates.extend(additional_token_sizes)
     candidates.append(max_auto_tokens)
     return _normalize_token_sizes(candidates, max_tokens=max_auto_tokens)
 
@@ -223,6 +225,7 @@ def deepseek_v4_mhc_warmup(
     *,
     max_tokens: int,
     cudagraph_capture_sizes: list[int] | None = None,
+    additional_token_sizes: Iterable[int] = (),
 ) -> None:
     # Cheap model-type gate before walking ``model.modules()``. The class
     # walk below is O(num_layers) and shows up in startup time on very
@@ -244,6 +247,7 @@ def deepseek_v4_mhc_warmup(
     token_sizes = _select_mhc_warmup_token_sizes(
         max_tokens=max_tokens,
         cudagraph_capture_sizes=cudagraph_capture_sizes or [],
+        additional_token_sizes=additional_token_sizes,
     )
     if not token_sizes:
         return

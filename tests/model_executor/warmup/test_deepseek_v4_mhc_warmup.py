@@ -93,6 +93,32 @@ def test_mhc_warmup_covers_every_decode_token_count() -> None:
     assert set(range(1, 17)).issubset(token_sizes)
 
 
+def test_mhc_warmup_covers_parallel_draft_scheduler_budget() -> None:
+    from vllm.config import VllmConfig
+
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(max_num_new_slots_for_drafting=4),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=1024,
+            max_num_scheduled_tokens=None,
+            max_num_seqs=32,
+        ),
+    )
+    VllmConfig._set_max_num_scheduled_tokens(config)
+
+    assert config.scheduler_config.max_num_scheduled_tokens == 1024
+    token_sizes = _select_mhc_warmup_token_sizes(
+        max_tokens=config.scheduler_config.max_num_batched_tokens,
+        additional_token_sizes=[
+            config.scheduler_config.max_num_batched_tokens
+            - config.speculative_config.max_num_new_slots_for_drafting
+        ],
+        cudagraph_capture_sizes=[],
+    )
+
+    assert 1020 in token_sizes
+
+
 def test_mhc_warmup_exercises_fused_post_pre() -> None:
     layer = FakeMHCLayer()
 
