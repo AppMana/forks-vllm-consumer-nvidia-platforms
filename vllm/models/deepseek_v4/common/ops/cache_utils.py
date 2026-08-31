@@ -1841,11 +1841,9 @@ def _dsv4_combine_topk_swa_warmup_inputs(vllm_config: Any) -> Any:
     Mirrors the live branch in ``DeepseekV4FlashMLAImpl._forward_prefill``:
     SWA-only layers pin ``TOP_K=0`` but still pass the full-width
     ``topk_indices_buffer``; C4A layers pass that same buffer and derive
-    ``top_k`` from its width; every other ratio reads the C128A prefill buffer,
-    whose width comes from ``max_model_len``. Deriving all three from config
-    rather than hardcoding them is what keeps the warmed key set equal to the
-    live one -- the previous hardcoded C128A row (8192) was only correct at a
-    ~1M-token max_model_len.
+    ``top_k`` from its width; every other ratio reads an adaptive-width view of
+    the C128A prefill buffer. Enumerating every width reachable up to
+    ``max_model_len`` keeps first use of each prefill shape out of live traffic.
     """
     index_topk = _hf_config_int(vllm_config, "index_topk", 2048)
     model_config = getattr(vllm_config, "model_config", None)
@@ -1867,16 +1865,16 @@ def _dsv4_combine_topk_swa_warmup_inputs(vllm_config: Any) -> Any:
                 )
             )
         else:
-            from vllm.models.deepseek_v4.sparse_mla import (
-                c128a_prefill_topk_width,
-            )
+            from vllm.models.deepseek_v4.sparse_mla import c128a_active_topk_widths
 
-            width = c128a_prefill_topk_width(max_model_len, compress_ratio)
-            rows.append(
+            rows.extend(
                 dict(
                     compress_ratio=compress_ratio,
                     topk=width,
                     topk_width=width,
+                )
+                for width in c128a_active_topk_widths(
+                    max_model_len, compress_ratio
                 )
             )
 

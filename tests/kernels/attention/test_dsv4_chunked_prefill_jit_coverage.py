@@ -194,7 +194,7 @@ def _run_sparse_indices_builder(
     device = torch.device("cuda")
     window_size = 128
     block_size = 64
-    max_seq_len = 4000
+    max_seq_len = max(4000, frame.seq_len)
 
     decode_swa_indices = torch.empty((0, window_size), dtype=torch.int32, device=device)
     prefill_topk_indices = torch.zeros(
@@ -246,6 +246,37 @@ def _run_sparse_indices_builder(
     torch.accelerator.synchronize()
 
 
+def _run_c128a_metadata_builder(frame: _PrefillFrame, *, active_width: int) -> None:
+    from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
+
+    device = torch.device("cuda")
+    num_tokens = frame.num_scheduled_tokens
+    capacity_width = 256
+    build_c128a_topk_metadata(
+        positions=torch.arange(
+            frame.num_computed_tokens,
+            frame.seq_len,
+            dtype=torch.int64,
+            device=device,
+        ),
+        compress_ratio=128,
+        num_decode_tokens=0,
+        token_to_req_indices=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+        block_table=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        block_size=64,
+        slot_mapping=torch.zeros(num_tokens, dtype=torch.int64, device=device),
+        global_decode_buffer=torch.empty(
+            (1, capacity_width), dtype=torch.int32, device=device
+        ),
+        decode_lens_buffer=torch.empty(1, dtype=torch.int32, device=device),
+        prefill_buffer=torch.empty(
+            (num_tokens, capacity_width), dtype=torch.int32, device=device
+        ),
+        max_compressed_tokens=active_width,
+    )
+    torch.accelerator.synchronize()
+
+
 @pytest.mark.parametrize(("compress_ratio", "topk"), [(1, 0), (4, 512)])
 def test_direct_warmup_covers_sparse_builder_for_continuations(
     monkeypatch: pytest.MonkeyPatch,
@@ -268,6 +299,38 @@ def test_direct_warmup_covers_sparse_builder_for_continuations(
             topk=topk,
             mixed_warmup_layout=False,
         )
+
+
+def test_direct_warmup_covers_c128a_native_prefill_builder_at_8k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.models.deepseek_v4.sparse_mla import (
+        c128a_active_topk_width,
+        c128a_prefill_topk_width,
+    )
+
+    warmup_frame = _direct_deep_pipeline_warmup_prefill_frame(monkeypatch)
+    request_frame = _PrefillFrame(0, 8_000)
+    capacity_width = c128a_prefill_topk_width(1_000_000, 128)
+    warmup_width = c128a_active_topk_width(warmup_frame.seq_len, 128, capacity_width)
+    request_width = c128a_active_topk_width(request_frame.seq_len, 128, capacity_width)
+    assert warmup_width == request_width == 128
+
+    _run_c128a_metadata_builder(warmup_frame, active_width=warmup_width)
+    _run_sparse_indices_builder(
+        warmup_frame,
+        compress_ratio=128,
+        topk=warmup_width,
+        mixed_warmup_layout=True,
+    )
+    _activate_real_triton_monitor(monkeypatch)
+    _run_c128a_metadata_builder(request_frame, active_width=request_width)
+    _run_sparse_indices_builder(
+        request_frame,
+        compress_ratio=128,
+        topk=request_width,
+        mixed_warmup_layout=False,
+    )
 
 
 def _run_mqa_workspace(

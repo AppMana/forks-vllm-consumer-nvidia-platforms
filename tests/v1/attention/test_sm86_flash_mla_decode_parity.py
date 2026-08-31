@@ -10,6 +10,7 @@ Skipped unless run on Ampere (sm_8x) with the flash_mla kernel importable.
 
 import inspect
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -248,6 +249,171 @@ def test_sm86_int8_dispatch_supports_native_and_triton_fqns() -> None:
     native = inspect.getsource(DeepseekV4SM86Attention._forward_prefill_flash)
     assert "sparse_mla_prefill_int8(" in native
     assert "get_int8_ds_mla_cache_views(" in native
+
+
+@pytest.mark.parametrize(
+    ("max_seq_len", "active_width"),
+    [(8_000, 128), (1_000_000, 7936)],
+)
+def test_sm86_native_int8_prefill_consumes_adaptive_c128a_width(
+    monkeypatch: pytest.MonkeyPatch,
+    max_seq_len: int,
+    active_width: int,
+) -> None:
+    import vllm.models.deepseek_v4.nvidia_imma.attention as attention_mod
+
+    capacity_width = 7936
+    backing = torch.zeros((2, capacity_width), dtype=torch.int32)
+    prefill_topk = backing[:, :active_width]
+    attn = object.__new__(DeepseekV4SM86Attention)
+    attn.compress_ratio = 128
+    attn.window_size = 128
+    attn.kv_cache_dtype = "int8_ds_mla"
+    attn.scale = 1.0
+    attn.attn_sink = torch.zeros(64)
+    attn.n_local_heads = 64
+
+    swa_metadata = SimpleNamespace(
+        num_decodes=0,
+        num_prefills=1,
+        num_decode_tokens=0,
+        num_prefill_tokens=2,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        token_to_req_indices=torch.zeros(2, dtype=torch.int32),
+        seq_lens=torch.tensor([max_seq_len], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        block_size=128,
+    )
+    attn_metadata = SimpleNamespace(
+        c128a_prefill_topk_indices=prefill_topk,
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        block_size=8192,
+    )
+    observed = {}
+
+    def fake_build(
+        _decode_swa,
+        _decode_compressed,
+        _decode_lens,
+        prefill_indices,
+        *_args,
+    ):
+        observed["prefill_shape"] = prefill_indices.shape
+        observed["prefill_stride"] = prefill_indices.stride()
+        mixed = torch.zeros((2, attn.window_size + active_width), dtype=torch.int32)
+        return mixed, torch.full((2,), attn.window_size, dtype=torch.int32)
+
+    def fake_native_prefill(**kwargs):
+        observed["extra_shape"] = kwargs["extra_indices"].shape
+        return torch.zeros_like(kwargs["q"])
+
+    monkeypatch.setattr(
+        attention_mod,
+        "build_flashinfer_mixed_sparse_indices",
+        fake_build,
+    )
+    monkeypatch.setattr(
+        attention_mod,
+        "get_int8_ds_mla_cache_views",
+        lambda cache, _block_size: (cache, torch.ones(1)),
+    )
+    monkeypatch.setattr(
+        attention_mod,
+        "sparse_mla_prefill_int8",
+        fake_native_prefill,
+    )
+
+    q = torch.zeros((2, 64, 512), dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+    attn._forward_prefill_flash(
+        q=q,
+        positions=torch.tensor([max_seq_len - 2, max_seq_len - 1]),
+        compressed_k_cache=torch.empty((1, 1), dtype=torch.uint8),
+        swa_k_cache=torch.empty((1, 1), dtype=torch.uint8),
+        output=output,
+        attn_metadata=attn_metadata,
+        swa_metadata=swa_metadata,
+    )
+
+    assert observed == {
+        "prefill_shape": torch.Size((2, active_width)),
+        "prefill_stride": (capacity_width, 1),
+        "extra_shape": torch.Size((2, active_width)),
+    }
+
+
+@pytest.mark.parametrize(
+    ("max_seq_len", "active_width"),
+    [(8_000, 128), (1_000_000, 7936)],
+)
+def test_sm86_native_int8_decode_consumes_adaptive_c128a_width(
+    monkeypatch: pytest.MonkeyPatch,
+    max_seq_len: int,
+    active_width: int,
+) -> None:
+    import vllm.models.deepseek_v4.nvidia_imma.attention as attention_mod
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
+        SPARSE_MLA_DECODE_INT8_FLASH,
+    )
+
+    capacity_width = 7936
+    backing = torch.zeros((1, capacity_width), dtype=torch.int32)
+    attn = object.__new__(DeepseekV4SM86Attention)
+    attn.compress_ratio = 128
+    attn.kv_cache_dtype = "int8_ds_mla"
+    attn.int8_decode_symbol = SPARSE_MLA_DECODE_INT8_FLASH
+    attn.scale = 1.0
+    attn.attn_sink = torch.zeros(64)
+    attn.n_local_heads = 64
+    attn.swa_cache_layer = SimpleNamespace(
+        kv_cache=torch.empty((1, 1), dtype=torch.uint8)
+    )
+
+    swa_metadata = SimpleNamespace(
+        num_decodes=1,
+        num_decode_tokens=1,
+        is_valid_token=torch.ones(1, dtype=torch.bool),
+        decode_swa_indices=torch.zeros((1, 128), dtype=torch.int32),
+        decode_swa_lens=torch.full((1,), 128, dtype=torch.int32),
+        block_size=128,
+    )
+    attn_metadata = SimpleNamespace(
+        max_seq_len=max_seq_len,
+        c128a_global_decode_topk_indices=backing[:, :active_width].view(
+            1, 1, active_width
+        ),
+        c128a_decode_topk_lens=torch.tensor([active_width], dtype=torch.int32),
+        block_size=8192,
+    )
+    observed = {}
+
+    def fake_native_decode(**kwargs):
+        observed["extra_shape"] = kwargs["extra_indices"].shape
+        return torch.zeros_like(kwargs["q"])
+
+    monkeypatch.setattr(
+        attention_mod,
+        "get_int8_ds_mla_cache_views",
+        lambda cache, _block_size: (cache, torch.ones(1)),
+    )
+    monkeypatch.setattr(
+        attention_mod,
+        "sparse_mla_decode_int8",
+        fake_native_decode,
+    )
+
+    q = torch.zeros((1, 64, 512), dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+    attn._forward_decode(
+        q=q,
+        kv_cache=torch.empty((1, 1), dtype=torch.uint8),
+        swa_metadata=swa_metadata,
+        attn_metadata=attn_metadata,
+        swa_only=False,
+        output=output,
+    )
+
+    assert observed["extra_shape"] == torch.Size((1, active_width))
 
 
 @pytest.mark.skipif(
