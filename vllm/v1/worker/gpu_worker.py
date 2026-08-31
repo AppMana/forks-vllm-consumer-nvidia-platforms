@@ -1067,12 +1067,21 @@ class Worker(WorkerBase):
                 )
             }
 
+        # WorkNCCL.wait() orders the current CUDA stream after the previous
+        # send without blocking the host. Do this before irecv_tensor_dict(),
+        # whose metadata exchange is synchronous, so the receive cannot hold
+        # Python progress before the send dependency has been scheduled.
+        if forward_pass and self._pp_send_work:
+            with record_function_or_nullcontext("gpu_worker: pp_send_wait"):
+                for handle in self._pp_send_work:
+                    handle.wait()
+            self._pp_send_work = []
+
         if forward_pass and not get_pp_group().is_first_rank:
             recv_tensor_dict = None
             if (
                 self.use_v2_model_runner
                 and not all_gather_tensors
-                and not self._pp_send_work
                 and self.model_runner.intermediate_tensors is not None
             ):
                 recv_tensor_dict = self.model_runner.intermediate_tensors.tensors
@@ -1090,15 +1099,6 @@ class Worker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
-
-        # Post the next upstream receive before retiring the previous
-        # downstream send. A downstream peer can require that receive to make
-        # progress, so waiting first introduces head-of-line blocking in PP.
-        if self._pp_send_work:
-            with record_function_or_nullcontext("gpu_worker: pp_send_wait"):
-                for handle in self._pp_send_work:
-                    handle.wait()
-            self._pp_send_work = []
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(

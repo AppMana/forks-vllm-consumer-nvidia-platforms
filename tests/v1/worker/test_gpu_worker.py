@@ -22,24 +22,30 @@ from vllm.v1.worker.startup_plan import (
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.
 
 
-def test_pp_posts_next_receive_before_waiting_for_previous_send(monkeypatch):
-    """A downstream send may need its peer to progress before it completes."""
+def test_pp_orders_previous_send_before_entering_next_receive(monkeypatch):
+    """Schedule the send dependency before synchronous receive metadata."""
     events = []
 
     class PreviousSend:
+        completed = False
+
+        def is_completed(self):
+            return self.completed
+
         def wait(self):
-            events.append("wait_previous_send")
-            assert "post_next_receive" in events, (
-                "previous downstream send was waited before the next upstream "
-                "receive was posted"
-            )
+            assert not self.completed
+            events.append("enqueue_previous_send_dependency")
 
     class PPGroup:
         is_first_rank = False
         is_last_rank = False
 
         def irecv_tensor_dict(self, **_kwargs):
-            events.append("post_next_receive")
+            events.append("enter_receive_metadata")
+            assert events == [
+                "enqueue_previous_send_dependency",
+                "enter_receive_metadata",
+            ]
             return {"hidden_states": torch.zeros(1)}, [], []
 
         def isend_tensor_dict(self, _tensor_dict, **_kwargs):
@@ -85,23 +91,29 @@ def test_pp_posts_next_receive_before_waiting_for_previous_send(monkeypatch):
     execute_model(worker, scheduler_output)
 
     assert events == [
-        "post_next_receive",
-        "wait_previous_send",
+        "enqueue_previous_send_dependency",
+        "enter_receive_metadata",
         "execute_forward",
         "post_next_send",
     ]
 
 
-def test_pp_receive_uses_fresh_storage_while_previous_send_is_outstanding(
+def test_pp_receive_reuses_storage_after_send_dependency_is_enqueued(
     monkeypatch,
 ):
-    """Preposting a receive must not overwrite a buffer still being sent."""
+    """Stream ordering permits persistent receive storage without a host wait."""
     events = []
     persistent_tensors = {"hidden_states": torch.zeros(1)}
 
     class PreviousSend:
+        completed = False
+
+        def is_completed(self):
+            return self.completed
+
         def wait(self):
-            events.append("wait_previous_send")
+            assert not self.completed
+            events.append("enqueue_previous_send_dependency")
 
     class PPGroup:
         is_first_rank = False
@@ -109,7 +121,7 @@ def test_pp_receive_uses_fresh_storage_while_previous_send_is_outstanding(
 
         def irecv_tensor_dict(self, *, recv_tensor_dict, **_kwargs):
             storage = "fresh" if recv_tensor_dict is None else "persistent"
-            events.append(f"post_next_receive:{storage}")
+            events.append(f"enter_receive_metadata:{storage}")
             return {"hidden_states": torch.zeros(1)}, [], []
 
         def isend_tensor_dict(self, _tensor_dict, **_kwargs):
@@ -155,11 +167,60 @@ def test_pp_receive_uses_fresh_storage_while_previous_send_is_outstanding(
     execute_model(worker, scheduler_output)
 
     assert events == [
-        "post_next_receive:fresh",
-        "wait_previous_send",
+        "enqueue_previous_send_dependency",
+        "enter_receive_metadata:persistent",
         "execute_forward",
         "post_next_send",
     ]
+
+
+def test_pp_empty_control_turn_preserves_pending_activation_send(monkeypatch):
+    """Empty PP turns advance control state without retiring activation sends."""
+    events = []
+
+    class PreviousSend:
+        def wait(self):
+            events.append("wait_previous_send")
+
+    class PPGroup:
+        is_first_rank = False
+        is_last_rank = False
+
+    class ModelRunner:
+        is_pooling_model = False
+
+        def execute_model(self, scheduler_output, intermediate_tensors):
+            assert scheduler_output.total_num_scheduled_tokens == 0
+            assert intermediate_tensors is None
+            events.append("advance_control_state")
+            return None
+
+    previous_send = PreviousSend()
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_worker.get_pp_group", lambda: PPGroup()
+    )
+
+    worker = SimpleNamespace(
+        _pp_send_work=[previous_send],
+        use_v2_model_runner=True,
+        model_runner=ModelRunner(),
+        annotate_profile=lambda _scheduler_output: nullcontext(),
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                pass_config=SimpleNamespace(enable_sp=False)
+            ),
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=3,
+                distributed_executor_backend="mp",
+            ),
+        ),
+    )
+
+    execute_model = Worker.execute_model.__wrapped__
+    execute_model(worker, SchedulerOutput.make_empty())
+
+    assert events == ["advance_control_state"]
+    assert worker._pp_send_work == [previous_send]
 
 
 def _plan_worker(config_hash="abc123", free_memory=78 * GiB_bytes, kv_bytes=None):
