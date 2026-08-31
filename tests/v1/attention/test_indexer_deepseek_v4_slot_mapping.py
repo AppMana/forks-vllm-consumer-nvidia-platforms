@@ -1,16 +1,147 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import pytest
-import torch
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 from tests.v1.attention.utils import create_vllm_config
+from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadataBuilder
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadataBuilder
+from vllm.v1.attention.backends.mla import indexer as indexer_module
+from vllm.v1.attention.backends.mla import sparse_swa as sparse_swa_module
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+@pytest.mark.parametrize(
+    ("is_prefilling", "expected_decodes"),
+    [(True, 0), (None, 1)],
+)
+def test_indexer_phase_selects_runtime_path_and_capture_fallback(
+    monkeypatch, is_prefilling, expected_decodes
+):
+    """Runtime honors prompt phase; synthetic capture retains width fallback."""
+    query_len = 4
+    seq_len = 8004
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, query_len], dtype=torch.int32),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([seq_len], dtype=torch.int32),
+        num_reqs=1,
+        num_actual_tokens=query_len,
+        max_query_len=query_len,
+        max_seq_len=seq_len,
+        block_table_tensor=torch.zeros((1, 64), dtype=torch.int32),
+        slot_mapping=torch.arange(query_len, dtype=torch.int64),
+        causal=True,
+        is_prefilling=(
+            torch.tensor([is_prefilling]) if is_prefilling is not None else None
+        ),
+    )
+
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.decode_threshold = 6
+    builder.use_flattening = True
+    builder.use_pcp = False
+    builder.compress_ratio = 1
+    builder.dcp_world_size = 1
+    builder.dcp_rank = 0
+    builder.cp_kv_cache_interleave_size = 1
+    builder.max_prefill_buffer_size = seq_len
+    builder.use_fp4_indexer_cache = False
+    builder.num_speculative_tokens = 5
+    builder.kv_cache_spec = SimpleNamespace(storage_block_size=256, block_size=256)
+    builder.decode_lens_buffer = torch.zeros(1024, dtype=torch.int32)
+    builder.decode_seq_lens_buffer = torch.zeros(1024, dtype=torch.int32)
+    builder.global_decode_seq_lens_buffer = torch.zeros(1024, dtype=torch.int32)
+    builder.expanded_block_table_buffer = torch.zeros((1024, 64), dtype=torch.int32)
+    builder.arange_buffer = torch.arange(1024, dtype=torch.int32)
+    builder.offsets_buffer = torch.arange(6, dtype=torch.int32)
+    builder.expanded_seq_lens_buffer = torch.zeros(1024, dtype=torch.int32)
+    builder.scheduler_metadata_buffer = torch.empty((0, 2), dtype=torch.int32)
+
+    monkeypatch.setattr(indexer_module.current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(
+        builder,
+        "_prepare_decode_tensors",
+        lambda **kwargs: (
+            kwargs["seq_lens"].unsqueeze(-1),
+            kwargs["block_table"],
+            kwargs["decode_lens"],
+            kwargs["num_decodes"],
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        indexer_module,
+        "build_prefill_chunk_metadata",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+
+    metadata = builder.build(0, common)
+
+    expected_prefills = 1 - expected_decodes
+    assert metadata.num_decodes == expected_decodes
+    assert metadata.num_decode_tokens == expected_decodes * query_len
+    assert metadata.num_prefills == expected_prefills
+    assert metadata.num_prefill_tokens == expected_prefills * query_len
+
+
+def test_sparse_swa_short_prompt_tail_stays_on_prefill_metadata_path(monkeypatch):
+    """SWA and indexer metadata must use the same prompt-phase boundary."""
+    query_len = 4
+    seq_len = 8004
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, query_len], dtype=torch.int32),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([seq_len], dtype=torch.int32),
+        num_reqs=1,
+        num_actual_tokens=query_len,
+        max_query_len=query_len,
+        max_seq_len=seq_len,
+        block_table_tensor=torch.zeros((1, 64), dtype=torch.int32),
+        slot_mapping=torch.arange(query_len, dtype=torch.int64),
+        causal=True,
+        is_prefilling=torch.tensor([True]),
+    )
+
+    builder = object.__new__(DeepseekSparseSWAMetadataBuilder)
+    builder.decode_threshold = 6
+    builder.window_size = 128
+    builder.block_size = 256
+    builder.is_dspark = False
+    builder.token_to_req_indices = torch.zeros(1024, dtype=torch.int32)
+    builder.is_valid_token = torch.zeros(1024, dtype=torch.bool)
+    builder.decode_swa_indices = torch.zeros((1024, 1, 128), dtype=torch.int32)
+    builder.decode_swa_lens = torch.zeros(1024, dtype=torch.int32)
+    builder.prefill_swa_indices = torch.zeros((1024, 1, 128), dtype=torch.int32)
+    builder.prefill_swa_lens = torch.zeros(1024, dtype=torch.int32)
+    builder._build_deepseek_v4_metadata = lambda *args: {}
+    builder.build_tile_scheduler = lambda _num_tokens: {
+        "swaonly": None,
+        "c4a": None,
+        "c128a": None,
+    }
+
+    class NoopKernel:
+        def __getitem__(self, _grid):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(
+        sparse_swa_module, "_compute_swa_indices_and_lens_kernel", NoopKernel()
+    )
+
+    metadata = builder.build(0, common)
+
+    assert metadata.num_decodes == 0
+    assert metadata.num_decode_tokens == 0
+    assert metadata.num_prefills == 1
+    assert metadata.num_prefill_tokens == query_len
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -126,6 +257,7 @@ def test_deepseek_v4_mtp_verifier_rows_stay_on_decode_metadata_path():
     vllm_config.speculative_config = SimpleNamespace(
         num_speculative_tokens=1,
         parallel_drafting=False,
+        use_dspark=lambda: False,
     )
 
     indexer = DeepseekV32IndexerMetadataBuilder(
@@ -134,7 +266,7 @@ def test_deepseek_v4_mtp_verifier_rows_stay_on_decode_metadata_path():
         vllm_config=vllm_config,
         device=device,
     )
-    flashmla = FlashMLASparseMetadataBuilder(
+    flashmla = DeepseekV4FlashMLAMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
         layer_names=["dummy_mla"],
         vllm_config=vllm_config,
@@ -147,7 +279,8 @@ def test_deepseek_v4_mtp_verifier_rows_stay_on_decode_metadata_path():
         device=device,
     )
 
-    assert indexer.reorder_batch_threshold == 2
+    assert indexer.reorder_batch_threshold is None
+    assert indexer.decode_threshold == 2
     assert flashmla.reorder_batch_threshold == 2
     assert sparse_swa.decode_threshold == 2
 

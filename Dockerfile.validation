@@ -1,0 +1,93 @@
+ARG BASE_IMAGE=ubuntu:24.04
+
+FROM ${BASE_IMAGE} AS source-validation
+
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${SOURCE_REVISION}
+
+COPY --chown=root:root vllm/model_executor/warmup/deepseek_v4_mhc_warmup.py \
+    vllm/model_executor/warmup/kernel_warmup.py \
+    vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/
+COPY --chown=root:root vllm/model_executor/warmup/deepseek_v4_mhc_warmup.py \
+    vllm/model_executor/warmup/kernel_warmup.py \
+    vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py \
+    /vllm-workspace/vllm/model_executor/warmup/
+
+COPY --chown=root:root vllm/v1/worker/gpu/warmup.py \
+    vllm/v1/worker/gpu/model_runner.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/
+COPY --chown=root:root vllm/v1/worker/gpu/warmup.py \
+    vllm/v1/worker/gpu/model_runner.py \
+    /vllm-workspace/vllm/v1/worker/gpu/
+
+COPY --chown=root:root vllm/v1/worker/gpu/spec_decode/speculator.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/speculator.py
+COPY --chown=root:root vllm/v1/worker/gpu/spec_decode/speculator.py \
+    /vllm-workspace/vllm/v1/worker/gpu/spec_decode/speculator.py
+COPY --chown=root:root \
+    vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+COPY --chown=root:root \
+    vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py \
+    /vllm-workspace/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+COPY --chown=root:root vllm/v1/worker/gpu/spec_decode/dflash/speculator.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+COPY --chown=root:root vllm/v1/worker/gpu/spec_decode/dflash/speculator.py \
+    /vllm-workspace/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+
+COPY --chown=root:root vllm/models/deepseek_v4/attention.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/attention.py
+COPY --chown=root:root vllm/models/deepseek_v4/attention.py \
+    /vllm-workspace/vllm/models/deepseek_v4/attention.py
+COPY --chown=root:root vllm/models/deepseek_v4/common/rope.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/common/rope.py
+COPY --chown=root:root vllm/models/deepseek_v4/common/rope.py \
+    /vllm-workspace/vllm/models/deepseek_v4/common/rope.py
+
+COPY --chown=root:root vllm/v1/worker/gpu_worker.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py
+COPY --chown=root:root vllm/v1/worker/gpu_worker.py \
+    /vllm-workspace/vllm/v1/worker/gpu_worker.py
+
+FROM ${BASE_IMAGE} AS stable-extension-validation
+
+COPY --chown=root:root vllm/_C_stable_libtorch.abi3.so \
+    /usr/local/lib/python3.12/dist-packages/vllm/_C_stable_libtorch.abi3.so
+
+FROM ${BASE_IMAGE} AS provider-validation
+
+ARG PROVIDER_DEB_URL
+ARG PROVIDER_DEB_SHA256
+ARG EXPECTED_PROVIDER_VERSION
+ARG PROVIDER_RELEASE
+
+ADD ${PROVIDER_DEB_URL} /tmp/usb4-rdma-provider.deb
+
+RUN echo "${PROVIDER_DEB_SHA256}  /tmp/usb4-rdma-provider.deb" \
+        | sha256sum --check - \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        /tmp/usb4-rdma-provider.deb \
+    && rm -f /tmp/usb4-rdma-provider.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN test "$(dpkg-query -W -f='${Version}' usb4-rdma-provider)" \
+        = "${EXPECTED_PROVIDER_VERSION}" \
+    && test -f /etc/libibverbs.d/tbrxe.driver \
+    && test -f /etc/libibverbs.d/usb4_rdma.driver \
+    && test -f \
+        /usr/lib/x86_64-linux-gnu/libibverbs/libtbrxe-rdmav34.so \
+    && test -f \
+        /usr/lib/x86_64-linux-gnu/libibverbs/libusb4_rdma-rdmav34.so \
+    && grep -Eq '^[[:space:]]*driver[[:space:]]+tbrxe[[:space:]]*$' \
+        /etc/libibverbs.d/tbrxe.driver \
+    && grep -Eq '^[[:space:]]*driver[[:space:]]+usb4_rdma[[:space:]]*$' \
+        /etc/libibverbs.d/usb4_rdma.driver \
+    && ! ldd /usr/lib/x86_64-linux-gnu/libibverbs/libtbrxe-rdmav34.so \
+        | grep -q 'not found' \
+    && ! ldd /usr/lib/x86_64-linux-gnu/libibverbs/libusb4_rdma-rdmav34.so \
+        | grep -q 'not found'
+
+LABEL org.opencontainers.image.version="${EXPECTED_PROVIDER_VERSION}" \
+      org.opencontainers.image.revision="${PROVIDER_RELEASE}"

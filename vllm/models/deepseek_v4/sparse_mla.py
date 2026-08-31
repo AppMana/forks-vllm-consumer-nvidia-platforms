@@ -327,6 +327,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
             split_decodes_and_prefills(
                 cm,
                 decode_threshold=self.reorder_batch_threshold or 1,
+                treat_short_extends_as_decodes=cm.is_prefilling is None,
             )
         )
 

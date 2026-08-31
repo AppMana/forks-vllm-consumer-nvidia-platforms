@@ -40,11 +40,24 @@ def test_compute_layer_counts_non_draft_unchanged_with_flag_default():
 
 
 def test_compute_layer_counts_draft_zero_last_pp12_reference():
-    # Validated hand partition for the DSV4 int4/int8 + DSpark checkpoint
-    # (43 target layers, 3 grafted draft stages on the last rank).
+    # Keep one target block on the MTP/head rank so the ordinary transformer
+    # pipeline and draft path do not become separate zero-layer stages.
     assert compute_layer_counts(43, 12, draft_zero_last=True) == [
-        3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0
+        3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 1
     ]
+
+
+def test_mtp_partition_keeps_a_cost_neutral_transformer_seam():
+    """The MTP seam must not be a zero-layer pipeline stage.
+
+    When doing so does not raise the peak rank cost, keep the final target block
+    beside MTP instead of turning the last rank into a draft-only stage. Moving
+    only the final boundary makes the PP=12 experiment a controlled
+    ``...,4,0`` to ``...,3,1`` comparison.
+    """
+    counts = compute_layer_counts(DSV4_LAYERS, 12, mtp_cost=DSV4_MTP_COST)
+    assert counts == [3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 1]
+    assert all(count >= 1 for count in counts)
 
 
 def test_compute_layer_counts_draft_zero_last_pp10_properties():
@@ -59,8 +72,8 @@ def test_compute_layer_counts_draft_zero_last_pp10_properties():
 def test_compute_layer_range_draft_zero_last():
     assert compute_layer_range(43, 12, 0, draft_zero_last=True) == (0, 3)
     assert compute_layer_range(43, 12, 1, draft_zero_last=True) == (3, 7)
-    assert compute_layer_range(43, 12, 10, draft_zero_last=True) == (39, 43)
-    assert compute_layer_range(43, 12, 11, draft_zero_last=True) == (43, 43)
+    assert compute_layer_range(43, 12, 10, draft_zero_last=True) == (39, 42)
+    assert compute_layer_range(43, 12, 11, draft_zero_last=True) == (42, 43)
 
 
 def test_compute_layer_range():
@@ -123,9 +136,8 @@ def test_select_shards_draft_zero_last_matches_partition(tmp_path):
             }
         }))
 
-    # shards must follow the same draft partition as the partition
-    # subcommand: 7 layers over pp_size=3 -> 3,4,0.
-    assert compute_layer_counts(7, 3, draft_zero_last=True) == [3, 4, 0]
+    # Shards must follow the same draft partition as the partition subcommand.
+    assert compute_layer_counts(7, 3, draft_zero_last=True) == [3, 3, 1]
     assert select_shards(
         index, config, rank=0, tp_size=1, pp_size=3,
         draft_zero_last=True) == [
@@ -135,13 +147,14 @@ def test_select_shards_draft_zero_last_matches_partition(tmp_path):
     assert select_shards(
         index, config, rank=1, tp_size=1, pp_size=3,
         draft_zero_last=True) == [
-            "l3.safetensors", "l4.safetensors", "l5.safetensors",
-            "l6.safetensors"
+            "l3.safetensors", "l4.safetensors", "l5.safetensors"
         ]
-    # Last rank owns zero target layers: only the draft stages and head.
+    # Last rank retains the target/draft seam plus the draft stages and head.
     assert select_shards(
         index, config, rank=2, tp_size=1, pp_size=3,
-        draft_zero_last=True) == ["mtp.safetensors", "tail.safetensors"]
+        draft_zero_last=True) == [
+            "l6.safetensors", "mtp.safetensors", "tail.safetensors"
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -180,16 +193,15 @@ def _rank_costs(counts, mtp_cost, embed_cost):
 
 
 def test_pp12_draft_partition_is_not_valid_at_pp11():
-    """Production incident: the PP=12 answer minus its trailing zero.
+    """A PP=12 partition cannot be truncated for an 11-rank job.
 
-    ``3,4,4,4,4,4,4,4,4,4,4`` was hand-pinned for an 11-rank job. It sums to
-    43 so vLLM accepted it, then rank 10 loaded a full 4-layer share PLUS the
-    ~10.8 GiB MTP block and OOM'd a 24 GiB RTX 3090 inside load_model.
+    The truncated string does not sum to the model's layer count, so vLLM must
+    reject it rather than silently changing ownership at the MTP seam.
     """
     pp12 = compute_layer_counts(DSV4_LAYERS, 12, mtp_cost=DSV4_MTP_COST)
     chopped = pp12[:-1]
-    assert sum(chopped) == DSV4_LAYERS
-    assert chopped == [3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+    assert sum(chopped) == DSV4_LAYERS - 1
+    assert chopped == [3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
 
     pp11 = compute_layer_counts(DSV4_LAYERS, 11, mtp_cost=DSV4_MTP_COST)
     assert pp11 != chopped
@@ -211,7 +223,7 @@ def test_dsv4_reference_partitions_with_mtp():
     ]
     # The balancer independently reproduces the validated PP=12 partition.
     assert compute_layer_counts(DSV4_LAYERS, 12, mtp_cost=DSV4_MTP_COST) == [
-        3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0
+        3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 1
     ]
 
 
@@ -366,9 +378,12 @@ def test_select_shards_auto_detects_mtp(tmp_path):
 
     # Auto-detection alone reproduces the draft partition: 7 layers, pp=3.
     counts = compute_layer_counts(7, 3, mtp_cost=3.0)
-    assert counts == [3, 4, 0]
+    assert counts == [3, 3, 1]
     assert select_shards(index, config, rank=2, tp_size=1,
-                         pp_size=3) == ["mtp.safetensors", "tail.safetensors"]
+                         pp_size=3) == [
+                             "l6.safetensors", "mtp.safetensors",
+                             "tail.safetensors"
+                         ]
     # Explicitly off falls back to the plain split: last rank owns layers 5-6.
     assert select_shards(index, config, rank=2, tp_size=1, pp_size=3,
                          draft_zero_last=False) == [

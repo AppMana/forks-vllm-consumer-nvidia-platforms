@@ -275,3 +275,68 @@ def test_sparkinfer_extension_artifacts_are_asserted() -> None:
         "docker/Dockerfile no longer asserts the sparkinfer AOT extensions "
         "exist; the pure-Python fallback would regress unnoticed"
     )
+
+
+def test_final_image_validates_the_nccl_elf_mapped_by_pytorch() -> None:
+    """Validate the ELF selected by the runtime loader after all installs."""
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    stage_match = re.search(
+        r"^FROM\s+\S+\s+AS\s+vllm-openai-base\s*$\n"
+        r"(?P<body>.*?)(?=^FROM\s|\Z)",
+        dockerfile,
+        re.DOTALL | re.MULTILINE,
+    )
+    assert stage_match, "no vllm-openai-base stage in docker/Dockerfile"
+    stage = stage_match.group("body")
+
+    python_run_blocks = list(
+        re.finditer(
+            r"^RUN\s+[^\n]*python3\s+-\s+<<'PY'\n(?P<body>.*?)^PY\s*$",
+            stage,
+            re.DOTALL | re.MULTILINE,
+        )
+    )
+    validators = [
+        match for match in python_run_blocks if "libnccl.so" in match.group("body")
+    ]
+    assert validators, "no final-image NCCL ELF validation block"
+    validator = validators[-1]
+
+    dependency_installs = list(
+        re.finditer(
+            r"\b(?:uv\s+pip|python3\s+-m\s+pip|apt-get)\s+install\b", stage
+        )
+    )
+    assert dependency_installs, "no dependency installs found in vllm-openai-base"
+    assert validator.start() > max(match.end() for match in dependency_installs), (
+        "NCCL validation must run after every dependency install"
+    )
+
+    final_stage_match = re.search(
+        r"^FROM\s+vllm-openai-base\s+AS\s+vllm-openai\s*$\n"
+        r"(?P<body>.*?)(?=^FROM\s|\Z)",
+        dockerfile,
+        re.DOTALL | re.MULTILINE,
+    )
+    assert final_stage_match, "no vllm-openai final stage in docker/Dockerfile"
+    final_stage = final_stage_match.group("body")
+    assert not re.search(
+        r"\b(?:uv\s+pip|python3\s+-m\s+pip|apt-get)\s+install\b", final_stage
+    ), "the final image installs dependencies after NCCL validation"
+
+    validation = validator.group("body")
+    assert re.search(r"^import\s+torch\b", validation, re.MULTILINE), (
+        "NCCL validation must load PyTorch"
+    )
+    assert re.search(r"^import\s+ctypes\b", validation, re.MULTILINE), (
+        "NCCL validation must use the runtime ELF loader"
+    )
+    assert "libtorch_cuda.so" in validation, (
+        "NCCL validation must load PyTorch's CUDA ELF before inspecting mappings"
+    )
+    assert "/proc/self/maps" in validation, (
+        "NCCL validation must inspect the NCCL ELF actually mapped at runtime"
+    )
+    assert "torch.cuda.nccl.version" not in validation, (
+        "the compiled NCCL version does not identify the ELF mapped at runtime"
+    )

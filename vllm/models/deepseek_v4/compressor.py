@@ -134,7 +134,11 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         num_decode_tokens = None
         if _prefer_two_stage_compressor():
             _, _, num_decode_tokens, _ = split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=1
+                common_attn_metadata,
+                decode_threshold=1,
+                treat_short_extends_as_decodes=(
+                    common_attn_metadata.is_prefilling is None
+                ),
             )
         return CompressorMetadata(
             block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),

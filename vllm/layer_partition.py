@@ -191,6 +191,28 @@ def _balanced_counts(
         for rank, count in zip(ranks, sorted(counts[r] for r in ranks)):
             counts[rank] = count
 
+    # A draft-only final rank is a qualitatively different PP stage: it has no
+    # target-model forward to bridge the ordinary pipeline and the draft/head
+    # path. When there are enough target layers to populate every rank and the
+    # move is cost-neutral, retain that seam by moving only the final contiguous
+    # layer boundary. Taking the layer from the nearest donor preserves every
+    # earlier pipeline boundary and keeps the maximum load unchanged.
+    peak_cost = max(count + extra for count, extra in zip(counts, extras))
+    seam_cost = mtp_cost + 1.0
+    if (num_layers >= pp_size and counts[-1] == 0
+            and seam_cost <= peak_cost):
+        donor = next(
+            (rank for rank in range(pp_size - 2, -1, -1)
+             if counts[rank] > 1),
+            None,
+        )
+        if donor is None:
+            raise AssertionError(
+                f"balanced partition {counts} has no donor for its empty "
+                "final rank")
+        counts[donor] -= 1
+        counts[-1] = 1
+
     return counts
 
 

@@ -1321,11 +1321,14 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
     fi
 
 RUN INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS}" python3 - <<'PY'
+import ctypes
 import importlib
 import importlib.metadata
 import os
 import pathlib
 import sysconfig
+
+import torch
 
 names = ["ray"]
 # lmcache ships only when INSTALL_KV_CONNECTORS asks for it; assert on the same
@@ -1359,6 +1362,22 @@ if b"rail routing:" not in nccl.read_bytes():
     raise AssertionError(
         "libnccl lacks the prefer_hca rail/fallback selection "
         "(APPMANA_NCCL_GIT_REF predates forks-nccl-rdma-routing 22355b6)"
+    )
+
+# PyTorch's reported NCCL version is a compile-time value, not the shared
+# object selected by the runtime loader. Force libtorch_cuda into this process,
+# then verify the mapped NCCL path after every dependency install.
+libtorch_cuda = pathlib.Path(torch.__file__).parent / "lib" / "libtorch_cuda.so"
+ctypes.CDLL(str(libtorch_cuda), mode=ctypes.RTLD_GLOBAL)
+mapped_nccl = {
+    pathlib.Path(line.split()[-1]).resolve()
+    for line in pathlib.Path("/proc/self/maps").read_text().splitlines()
+    if "libnccl.so" in line and line.split()[-1].startswith("/")
+}
+if mapped_nccl != {nccl.resolve()}:
+    raise AssertionError(
+        f"PyTorch mapped NCCL {sorted(map(str, mapped_nccl))}, "
+        f"expected {nccl.resolve()}"
     )
 
 site_paths = {
