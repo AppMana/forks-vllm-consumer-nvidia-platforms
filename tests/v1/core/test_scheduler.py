@@ -1259,6 +1259,88 @@ def test_reset_connector_cache_no_connector_is_no_op_success():
     assert scheduler.reset_prefix_cache(reset_connector=True) is True
 
 
+def test_draft_slots_budgeted_per_scheduled_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_seqs=32,
+        max_num_batched_tokens=1024,
+        num_speculative_tokens=7,
+        parallel_drafting=True,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    assert speculative_config.max_num_new_slots_for_drafting == 6
+    assert scheduler.max_num_scheduled_tokens == 1024
+
+    request = create_requests(num_requests=1, num_tokens=2048)[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {request.request_id: 1018}
+    assert output.total_num_scheduled_tokens + 6 == 1024
+
+
+def test_each_admitted_request_reserves_its_own_draft_slots(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_seqs=16,
+        max_num_batched_tokens=20,
+        num_speculative_tokens=4,
+        parallel_drafting=True,
+        skip_tokenizer_init=True,
+    )
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {
+        requests[0].request_id: 10,
+        requests[1].request_id: 4,
+    }
+    assert output.total_num_scheduled_tokens + 2 * 3 == 20
+
+
+def test_pp_anchor_replay_counts_physical_input_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_seqs=2,
+        max_num_batched_tokens=8,
+        num_speculative_tokens=4,
+        parallel_drafting=True,
+        pipeline_parallel_size=2,
+        skip_tokenizer_init=True,
+        use_v2_model_runner=True,
+    )
+    scheduler.pp_deferred_spec = True
+    request = create_requests(num_requests=1, num_tokens=1)[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+
+    request.num_computed_tokens = request.num_tokens
+    request.append_output_token_ids(1)
+    request.num_computed_tokens = request.num_tokens
+    request.spec_token_ids = [2, 3, 4]
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {request.request_id: 4}
+    assert output.replayed_pp_anchor_req_ids == {request.request_id}
+    assert output.total_num_scheduled_tokens + 3 == 7
+
+
 # Note - these test cases mirror some of those in test_rejection_sampler.py
 @pytest.mark.parametrize(
     "spec_tokens,output_tokens,expected",
