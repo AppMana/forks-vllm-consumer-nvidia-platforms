@@ -171,6 +171,21 @@ def test_ampere_build_includes_flash_attention_for_model_inspection() -> None:
     assert "_vllm_fa3_C" in guarded_body
 
 
+def test_ampere_helper_uses_current_provider_release() -> None:
+    """The build helper must not override the image's provider pins."""
+    helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
+    provider = dockerfile_arg_defaults("USB4_RDMA_PROVIDER_VERSION")[0]
+    release = dockerfile_arg_defaults("APPMANA_THUNDERBOLT_RELEASE_TAG")[0]
+    assert (
+        f'usb4_rdma_provider_version="${{USB4_RDMA_PROVIDER_VERSION:-{provider}}}"'
+        in helper
+    )
+    assert (
+        f'appmana_thunderbolt_release_tag="${{APPMANA_THUNDERBOLT_RELEASE_TAG:-{release}}}"'
+        in helper
+    )
+
+
 def test_sccache_has_a_persistent_buildkit_local_cache() -> None:
     """A source-layer rebuild must not require a remote round trip per object."""
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
