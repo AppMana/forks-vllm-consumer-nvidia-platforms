@@ -198,6 +198,37 @@ def test_ampere_flash_attention_build_omits_hopper_objects() -> None:
     )
 
 
+def test_flash_attention_arch_patch_applies_to_pinned_source(tmp_path: Path) -> None:
+    """The gating patch must match the pinned dependency's actual preamble."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.26)\n\n"
+        "project(vllm_flash_attn LANGUAGES CXX CUDA)\n"
+        "set(CMAKE_CXX_STANDARD 20)\n"
+        "set(CMAKE_CXX_EXTENSIONS OFF)\n\n"
+        "set(FA2_ENABLED ON)\n"
+        "set(FA3_ENABLED ON)\n\n"
+        "# CUDA by default, can be overridden by using "
+        "-DVLLM_TARGET_DEVICE=... (used by setup.py)\n"
+        'set(VLLM_TARGET_DEVICE "cuda" CACHE STRING '
+        '"Target device backend for vLLM")\n',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "git",
+            "apply",
+            "--check",
+            "--ignore-space-change",
+            "--ignore-whitespace",
+            str(FLASH_ATTN_ARCH_PATCH),
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_ampere_helper_uses_current_provider_release() -> None:
     """The build helper must not override the image's provider pins."""
     helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
