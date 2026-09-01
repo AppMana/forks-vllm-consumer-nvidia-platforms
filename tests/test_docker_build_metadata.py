@@ -147,14 +147,14 @@ def test_versions_json_matches_the_dockerfile() -> None:
         )
 
 
-def test_flash_attention_skip_is_forwarded_to_the_extension_build() -> None:
-    """Architecture-specific builds must be able to omit unused FA2/FA3 SASS."""
+def test_ampere_build_includes_flash_attention_for_model_inspection() -> None:
+    """The serving image must import model metadata before backend selection."""
     assert dockerfile_arg_defaults("VLLM_SKIP_FLASH_ATTN_BUILD") == ["0"]
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     assert "ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}" in dockerfile
 
     helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
-    assert 'skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-1}"' in helper
+    assert 'skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"' in helper
     assert '--build-arg "VLLM_SKIP_FLASH_ATTN_BUILD=${skip_flash_attn_build}"' in helper
 
     setup_source = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
