@@ -25,6 +25,9 @@
     "APPMANA_NCCL_GIT_REF": {
       "default": "22355b63ea9ffd869e208e4f6d381e6f31b471d9"
     },
+    "BUILD_DEEPEP": {
+      "default": "1"
+    },
     "APPMANA_THUNDERBOLT_RELEASE_REPO": {
       "default": "https://github.com/AppMana/forks-thunderbolt"
     },

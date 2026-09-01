@@ -50,6 +50,7 @@ ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 ARG APPMANA_NCCL_GENCODE="-gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_121,code=compute_121"
 ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 ARG APPMANA_NCCL_GIT_REF=22355b63ea9ffd869e208e4f6d381e6f31b471d9
+ARG BUILD_DEEPEP=1
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
 # 0.2.70 is the first provider that serves BOTH host engines: libusb4_rdma for
@@ -468,6 +469,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # if USE_SCCACHE is set, use sccache to speed up compilation
 # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
 RUN --mount=type=cache,target=/workspace/tmp/sccache,sharing=shared \
+    --mount=type=cache,target=/workspace/.deps,sharing=shared \
     --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
@@ -543,6 +545,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # This stage is independent and doesn't affect csrc cache
 FROM base AS extensions-build
 ARG CUDA_VERSION
+ARG BUILD_DEEPEP
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 ENV UV_HTTP_TIMEOUT=500
@@ -558,13 +561,17 @@ ARG DEEPEP_COMMIT_HASH=73b6ea4
 ARG NVSHMEM_VER
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
-    export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
-    /tmp/install_python_libraries.sh \
-        --workspace /tmp/ep_kernels_workspace \
-        --mode wheel \
-        ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
-        ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
-    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
+    if [ "${BUILD_DEEPEP}" = "1" ]; then \
+        export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
+        /tmp/install_python_libraries.sh \
+            --workspace /tmp/ep_kernels_workspace \
+            --mode wheel \
+            ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
+            ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
+        find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete; \
+    else \
+        touch /tmp/ep_kernels_workspace/dist/deepep-disabled; \
+    fi
 #################### EXTENSIONS BUILD IMAGE ####################
 
 #################### WHEEL BUILD IMAGE ####################
@@ -746,6 +753,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 FROM ${FINAL_BASE_IMAGE} AS vllm-base
 
 ARG CUDA_VERSION
+ARG BUILD_DEEPEP
 ARG PYTHON_VERSION
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
@@ -1063,8 +1071,12 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    if [ "${BUILD_DEEPEP}" = "1" ]; then \
+        uv pip install --system ep_kernels/dist/*.whl --verbose \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+    else \
+        test -f ep_kernels/dist/deepep-disabled; \
+    fi
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
@@ -1255,8 +1267,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Fail the build if the published wheel loses either native INT8 sparse-MLA
 # entry point. The int4-int8 checkpoint selects these symbols explicitly.
 RUN python3 -c "\
+import importlib.metadata as importlib_metadata; \
 import flash_mla; \
-assert flash_mla.__version__ == '2.0.1.dev1', flash_mla.__version__; \
+assert importlib_metadata.version('flash-mla') == '2.0.1.dev1'; \
 assert callable(flash_mla.sparse_mla_decode_int8); \
 assert callable(flash_mla.sparse_mla_prefill_int8); \
 print('flash_mla 2.0.1.dev1 native INT8 decode/prefill importable')"

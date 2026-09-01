@@ -132,6 +132,7 @@ def test_versions_json_matches_the_dockerfile() -> None:
         ("torch_cuda_arch_list", "TORCH_CUDA_ARCH_LIST"),
         ("max_jobs", "MAX_JOBS"),
         ("nvcc_threads", "NVCC_THREADS"),
+        ("BUILD_DEEPEP", "BUILD_DEEPEP"),
         ("APPMANA_NCCL_GIT_REF", "APPMANA_NCCL_GIT_REF"),
         ("USB4_RDMA_PROVIDER_VERSION", "USB4_RDMA_PROVIDER_VERSION"),
         ("APPMANA_THUNDERBOLT_RELEASE_TAG", "APPMANA_THUNDERBOLT_RELEASE_TAG"),
@@ -159,9 +160,7 @@ def test_flash_attention_skip_is_forwarded_to_the_extension_build() -> None:
     setup_source = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
     guard = 'os.environ.get("VLLM_SKIP_FLASH_ATTN_BUILD") != "1"'
     assert guard in setup_source
-    guarded_body = setup_source.split(guard, 1)[1].split(
-        "# FA4 CuteDSL", 1
-    )[0]
+    guarded_body = setup_source.split(guard, 1)[1].split("# FA4 CuteDSL", 1)[0]
     assert "_vllm_fa2_C" in guarded_body
     assert "_vllm_fa3_C" in guarded_body
 
@@ -175,6 +174,43 @@ def test_sccache_has_a_persistent_buildkit_local_cache() -> None:
         dockerfile,
         re.DOTALL,
     )
+
+
+def test_cmake_dependencies_have_a_persistent_buildkit_cache() -> None:
+    """A source rebuild must not clone every pinned CMake dependency again."""
+    csrc_builds = [
+        block
+        for block in dockerfile_run_blocks()
+        if "python3 setup.py bdist_wheel" in block
+    ]
+    assert any(
+        "--mount=type=cache,target=/workspace/tmp/sccache,sharing=shared" in block
+        and "--mount=type=cache,target=/workspace/.deps,sharing=shared" in block
+        for block in csrc_builds
+    )
+
+
+def test_ampere_build_skips_unsupported_deepep_extensions() -> None:
+    """SM86 builds must not compile DeepEP's SM90/SM100-only wheel."""
+    assert dockerfile_arg_defaults("BUILD_DEEPEP") == ["1"]
+
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert re.search(
+        r'if \[ "\$\{BUILD_DEEPEP\}" = "1" \]; then.*?'
+        r"/tmp/install_python_libraries\.sh",
+        dockerfile,
+        re.DOTALL,
+    )
+    assert re.search(
+        r'if \[ "\$\{BUILD_DEEPEP\}" = "1" \]; then.*?'
+        r"uv pip install --system ep_kernels/dist/\*\.whl",
+        dockerfile,
+        re.DOTALL,
+    )
+
+    helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
+    assert 'build_deepep="${BUILD_DEEPEP:-0}"' in helper
+    assert '--build-arg "BUILD_DEEPEP=${build_deepep}"' in helper
 
 
 def test_bake_hcl_arch_list_matches_the_dockerfile() -> None:
@@ -290,6 +326,14 @@ def test_sparkinfer_is_installed_from_the_published_wheel() -> None:
     assert dockerfile_arg_defaults("SPARKINFER_SPEC") == [REQUIRED_SPARKINFER_SPEC]
 
 
+def test_flashmla_release_check_uses_distribution_metadata() -> None:
+    """The package's kernel ABI version is distinct from its wheel release."""
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert "import importlib.metadata as importlib_metadata" in dockerfile
+    assert "importlib_metadata.version('flash-mla') == '2.0.1.dev1'" in dockerfile
+    assert "flash_mla.__version__ == '2.0.1.dev1'" not in dockerfile
+
+
 def test_sparkinfer_ref_includes_native_int8_indexer_kernels() -> None:
     """The shared image needs both paged decode and contiguous prefill."""
     defaults = dockerfile_arg_defaults("SPARKINFER_REF")
@@ -333,9 +377,7 @@ def test_final_image_validates_the_nccl_elf_mapped_by_pytorch() -> None:
     validator = validators[-1]
 
     dependency_installs = list(
-        re.finditer(
-            r"\b(?:uv\s+pip|python3\s+-m\s+pip|apt-get)\s+install\b", stage
-        )
+        re.finditer(r"\b(?:uv\s+pip|python3\s+-m\s+pip|apt-get)\s+install\b", stage)
     )
     assert dependency_installs, "no dependency installs found in vllm-openai-base"
     assert validator.start() > max(match.end() for match in dependency_installs), (
