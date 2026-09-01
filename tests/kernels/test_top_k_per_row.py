@@ -531,10 +531,55 @@ def test_persistent_topk_long_decode_order_is_repeatable() -> None:
 
     expected_set = logits.topk(top_k, dim=-1).indices.sort(dim=-1).values
     for indices in outputs:
-        assert torch.equal(indices.sort(dim=-1).values, expected_set)
+        assert torch.equal(indices, expected_set)
         assert torch.equal(indices, outputs[0]), (
             "persistent_topk returned the correct set in a different order"
         )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_persistent_topk_large_short_large_state_reuse() -> None:
+    """A short row must not advance a cooperative group's radix state slot."""
+    seq_lens = [
+        131559,
+        2822,
+        60988,
+        46836,
+        51000,
+        63693,
+        147397,
+        152134,
+        5016,
+        35108,
+        126797,
+        16659,
+        131746,
+        28692,
+        50355,
+        144291,
+        1830,
+        85477,
+        134980,
+        140175,
+        29806,
+        6935,
+        10669,
+        58019,
+        22966,
+        132372,
+        23065,
+        130912,
+        106809,
+        104964,
+    ]
+    run_large_context_topk_test(
+        batch_size=len(seq_lens),
+        seq_lens=seq_lens,
+        top_k=2048,
+        seed=2,
+        backend="persistent_topk",
+    )
 
 
 def run_large_context_topk_test(
