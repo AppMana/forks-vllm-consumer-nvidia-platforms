@@ -120,6 +120,11 @@ ARG UV_KEYRING_PROVIDER=${PIP_KEYRING_PROVIDER}
 # Flag enables built-in KV-connector dependency libs into docker images
 ARG INSTALL_KV_CONNECTORS=false
 
+# Architecture-scoped images can omit vLLM's bundled FlashAttention kernels.
+# Keep this global default out of the base stage so changing the native
+# extension set does not invalidate OS, Python, or PyTorch dependency layers.
+ARG VLLM_SKIP_FLASH_ATTN_BUILD=0
+
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
@@ -134,12 +139,6 @@ ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
 ARG SCCACHE_S3_NO_CREDENTIALS=0
-ARG VLLM_SKIP_FLASH_ATTN_BUILD=0
-
-# Architecture-scoped images can omit vLLM's bundled FlashAttention kernels
-# when their serving path provides a different attention backend. Keep the
-# default unchanged for general-purpose images.
-ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -392,6 +391,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 #################### CSRC BUILD IMAGE ####################
 FROM base AS csrc-build
 
+ARG VLLM_SKIP_FLASH_ATTN_BUILD
+ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}
+
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ARG PYTORCH_CUDA_INDEX_BASE_URL
@@ -584,6 +586,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
 ARG TARGETPLATFORM
+ARG VLLM_SKIP_FLASH_ATTN_BUILD
+ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL

@@ -151,7 +151,13 @@ def test_ampere_build_includes_flash_attention_for_model_inspection() -> None:
     """The serving image must import model metadata before backend selection."""
     assert dockerfile_arg_defaults("VLLM_SKIP_FLASH_ATTN_BUILD") == ["0"]
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    assert "ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}" in dockerfile
+    base, csrc = dockerfile.split("FROM base AS csrc-build", 1)
+    csrc, build = csrc.split("FROM base AS build", 1)
+    build = build.split("FROM ${BUILD_BASE_IMAGE} AS appmana-nccl-build", 1)[0]
+    assignment = "ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}"
+    assert assignment not in base
+    assert assignment in csrc
+    assert assignment in build
 
     helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
     assert 'skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"' in helper
