@@ -166,6 +166,17 @@ def test_flash_attention_skip_is_forwarded_to_the_extension_build() -> None:
     assert "_vllm_fa3_C" in guarded_body
 
 
+def test_sccache_has_a_persistent_buildkit_local_cache() -> None:
+    """A source-layer rebuild must not require a remote round trip per object."""
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert re.search(
+        r"RUN\s+--mount=type=cache,target=/workspace/tmp/sccache,sharing=shared"
+        r".*?python3 setup\.py bdist_wheel",
+        dockerfile,
+        re.DOTALL,
+    )
+
+
 def test_bake_hcl_arch_list_matches_the_dockerfile() -> None:
     """``docker buildx bake`` reads the .hcl even when versions.json is absent.
 

@@ -467,7 +467,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Build the vLLM wheel
 # if USE_SCCACHE is set, use sccache to speed up compilation
 # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
-RUN --mount=type=cache,target=/opt/uv/cache \
+RUN --mount=type=cache,target=/workspace/tmp/sccache,sharing=shared \
+    --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
         echo "Installing sccache..." \
