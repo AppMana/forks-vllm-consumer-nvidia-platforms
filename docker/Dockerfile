@@ -133,6 +133,12 @@ ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
 ARG SCCACHE_S3_NO_CREDENTIALS=0
+ARG VLLM_SKIP_FLASH_ATTN_BUILD=0
+
+# Architecture-scoped images can omit vLLM's bundled FlashAttention kernels
+# when their serving path provides a different attention backend. Keep the
+# default unchanged for general-purpose images.
+ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}
 
 ENV DEBIAN_FRONTEND=noninteractive
 

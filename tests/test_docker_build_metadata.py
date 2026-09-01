@@ -32,6 +32,7 @@ BAKE_HCL = REPO_ROOT / "docker" / "docker-bake.hcl"
 CMAKE_LISTS = REPO_ROOT / "CMakeLists.txt"
 CMAKE_UTILS = REPO_ROOT / "cmake" / "utils.cmake"
 PYTHON_OVERLAY_DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile.python-overlay"
+AMPERE_BUILD_HELPER = REPO_ROOT / "tools" / "ampere" / "build_vllm_ampere_image.sh"
 
 # The architectures this branch exists to serve: sm_86 (Ampere consumer) and
 # sm_121a (GB10 / DGX Spark).
@@ -142,6 +143,26 @@ def test_versions_json_matches_the_dockerfile() -> None:
             f"but docker/Dockerfile ARG {arg_name}={defaults[0]!r}; "
             f"regenerate with tools/generate_versions_json.py"
         )
+
+
+def test_flash_attention_skip_is_forwarded_to_the_extension_build() -> None:
+    """Architecture-specific builds must be able to omit unused FA2/FA3 SASS."""
+    assert dockerfile_arg_defaults("VLLM_SKIP_FLASH_ATTN_BUILD") == ["0"]
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert "ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}" in dockerfile
+
+    helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
+    assert 'skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"' in helper
+    assert '--build-arg "VLLM_SKIP_FLASH_ATTN_BUILD=${skip_flash_attn_build}"' in helper
+
+    setup_source = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
+    guard = 'os.environ.get("VLLM_SKIP_FLASH_ATTN_BUILD") != "1"'
+    assert guard in setup_source
+    guarded_body = setup_source.split(guard, 1)[1].split(
+        "# FA4 CuteDSL", 1
+    )[0]
+    assert "_vllm_fa2_C" in guarded_body
+    assert "_vllm_fa3_C" in guarded_body
 
 
 def test_bake_hcl_arch_list_matches_the_dockerfile() -> None:
