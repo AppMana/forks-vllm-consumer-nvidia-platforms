@@ -289,14 +289,43 @@ def _resolve_local_layer_range(
 ) -> tuple[int, int] | None:
     if pp_size <= 1:
         return None
-    from vllm.config import ModelConfig
+    if not 0 <= pp_rank < pp_size:
+        raise ValueError(f"{pp_rank=} must be in [0, {pp_size})")
+
+    partition = os.environ.get("VLLM_PP_LAYER_PARTITION")
+    if partition is not None:
+        try:
+            partitions = [int(count) for count in partition.split(",")]
+        except ValueError as err:
+            raise ValueError(f"Invalid partition string: {partition}") from err
+        if len(partitions) != pp_size:
+            raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
+        if any(count < 0 for count in partitions):
+            raise ValueError(f"Partition counts must be non-negative: {partition}")
+        start_layer = sum(partitions[:pp_rank])
+        return start_layer, start_layer + partitions[pp_rank]
+
+    # Shard staging only needs the layer count. Constructing ModelConfig also
+    # performs architecture inspection, which can reject a valid checkpoint
+    # when the serving image and checkpoint override evolve independently.
+    # Read the standard HF field directly and leave architecture validation to
+    # the actual vLLM server startup.
+    del trust_remote_code
+    config_path = os.path.join(source_dir, "config.json")
+    with open(config_path, encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    total_num_hidden_layers = config.get("num_hidden_layers")
+    if total_num_hidden_layers is None and isinstance(config.get("text_config"), dict):
+        total_num_hidden_layers = config["text_config"].get("num_hidden_layers")
+    if (
+        isinstance(total_num_hidden_layers, bool)
+        or not isinstance(total_num_hidden_layers, int)
+        or total_num_hidden_layers <= 0
+    ):
+        raise ValueError(f"No positive integer num_hidden_layers in {config_path}")
+
     from vllm.distributed.utils import get_pp_indices
 
-    # This script's contract is "stdout is exactly the staged path" (callers
-    # do `path=$(...)`); ModelConfig logs to stdout, so divert it to stderr.
-    with contextlib.redirect_stdout(sys.stderr):
-        model_config = ModelConfig(model=source_dir, trust_remote_code=trust_remote_code)
-        total_num_hidden_layers = model_config.get_total_num_hidden_layers()
     return get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
 
 

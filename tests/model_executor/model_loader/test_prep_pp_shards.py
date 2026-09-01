@@ -315,3 +315,17 @@ def test_every_index_shard_resolves(tmp_path):
     index = json.load(open(os.path.join(dest, prep.SAFE_WEIGHTS_INDEX_NAME)))
     for shard in set(index["weight_map"].values()):
         assert os.path.exists(os.path.join(dest, shard)), shard
+
+
+def test_resolve_layer_range_uses_explicit_partition_without_model_config(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "4,4,5")
+    missing_model = tmp_path / "not-a-model"
+    assert prep._resolve_local_layer_range(str(missing_model), 1, 3) == (4, 8)
+
+
+def test_resolve_layer_range_reads_plain_hf_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 10}))
+    assert prep._resolve_local_layer_range(str(tmp_path), 2, 3) == (7, 10)
