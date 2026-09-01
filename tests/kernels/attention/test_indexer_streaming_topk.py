@@ -187,9 +187,15 @@ def test_streaming_matches_production_kernel_set(qk_int8):
     _assert_sets_equal_mod_boundary_ties(out, prod, logits, ke, topk)
 
 
-def test_streaming_ties_preserve_score_multiset():
-    """Slab size may permute boundary ties but not selected scores."""
-    m, n, topk = 128, 16384, 2048
+def test_streaming_ties_use_one_deterministic_total_order():
+    """Equal scores must resolve identically across launches and slab sizes.
+
+    INT8 indexer logits contain genuine bit-equal boundary scores. Selecting
+    different physical columns for those ties changes the attention context,
+    so equality of score multisets is insufficient for deterministic greedy
+    generation.
+    """
+    m, n, topk = 16, 16384, 2048
     torch.manual_seed(2)
     q = torch.randint(-2, 3, (m, HEADS, HEAD_DIM), dtype=torch.int8, device="cuda")
     base = torch.randint(-2, 3, (256, HEAD_DIM), dtype=torch.int8, device="cuda")
@@ -203,20 +209,20 @@ def test_streaming_ties_preserve_score_multiset():
         q, (k, k_scale), weights, ks, ke, topk, qk_int8=True
     )
     for slab in (1024, 4096, 5000, 16384):
-        out = torch.empty(m, topk, dtype=torch.int32, device="cuda")
-        streaming_prefill_topk(
-            q,
-            (k, k_scale),
-            weights,
-            ks,
-            ke,
-            out,
-            topk,
-            slab_rows=slab,
-            qk_int8=True,
-        )
-        logits = _indexer_prefill_logits(q, (k, k_scale), weights, ks, ke, qk_int8=True)
-        _assert_sets_equal_mod_boundary_ties(out, ref, logits, ke, topk)
+        for _ in range(2):
+            out = torch.empty(m, topk, dtype=torch.int32, device="cuda")
+            streaming_prefill_topk(
+                q,
+                (k, k_scale),
+                weights,
+                ks,
+                ke,
+                out,
+                topk,
+                slab_rows=slab,
+                qk_int8=True,
+            )
+            assert torch.equal(out, ref), f"tie order changed at slab={slab}"
 
 
 def test_short_rows_pad_minus_one():
