@@ -37,8 +37,8 @@ AMPERE_BUILD_HELPER = REPO_ROOT / "tools" / "ampere" / "build_vllm_ampere_image.
 # The architectures this branch exists to serve: sm_86 (Ampere consumer) and
 # sm_121a (GB10 / DGX Spark).
 REQUIRED_ARCHES = ("8.6", "12.1a")
-REQUIRED_SPARKINFER_REF = "d8446f421929282317a69566b2d951335cbd88ee"
-REQUIRED_SPARKINFER_SPEC = "sparkinfer==1.0.2.dev0"
+REQUIRED_SPARKINFER_REF = "d91c0a600c0a18d008c649d2aa30e89514ffba16"
+REQUIRED_SPARKINFER_SPEC = "sparkinfer==1.0.2.dev1"
 RUNTIME_OVERLAY_FILES = (
     "vllm/model_executor/layers/quantization/dsv4_int.py",
     "vllm/model_executor/model_loader/default_loader.py",
