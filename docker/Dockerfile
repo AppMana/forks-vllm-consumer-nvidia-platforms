@@ -1165,7 +1165,7 @@ ARG LMCACHE_GIT_REF=cd51f3a15766e326f92998c072264a5a6caa4efe
 # a pinned wheel URL: the URL baked in an x86_64 filename, so an aarch64 build
 # could not install it at all. The index lets pip resolve per platform.
 ARG FLASHMLA_INDEX_URL=https://appmana.github.io/forks-flash-mla-int/
-ARG FLASHMLA_SPEC=flash-mla==2.0.0
+ARG FLASHMLA_SPEC=flash-mla==2.0.1.dev0
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
@@ -1255,41 +1255,34 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # entry point. The int4-int8 checkpoint selects these symbols explicitly.
 RUN python3 -c "\
 import flash_mla; \
-assert flash_mla.__version__ == '2.0.0', flash_mla.__version__; \
+assert flash_mla.__version__ == '2.0.1.dev0', flash_mla.__version__; \
 assert callable(flash_mla.sparse_mla_decode_int8); \
 assert callable(flash_mla.sparse_mla_prefill_int8); \
-print('flash_mla 2.0.0 native INT8 decode/prefill importable')"
+print('flash_mla 2.0.1.dev0 native INT8 decode/prefill importable')"
 
 # sparkinfer supplies SM12x kernels for FP8/NVFP4 and the native INT8
 # sparse-indexer decode and prefill paths used by the int4-int8 checkpoint.
 # Install order matters -- it pins nvidia-cutlass-dsl, which quack must not
 # drag backwards; requirements/cuda.txt already pins 4.6.0 for both.
-ARG SPARKINFER_REPO=https://github.com/AppMana/forks-sparkinfer
-ARG SPARKINFER_REF=78cc92eaad3bf0378d199c44621bbaee75d0cb47
-# uv shells out to git for a `git+` requirement, and this stage has no git.
-RUN --mount=type=cache,target=/var/cache/apt \
-    --mount=type=cache,target=/var/lib/apt \
-    --mount=type=cache,target=/opt/uv/cache \
-    if [ -n "${SPARKINFER_REF}" ]; then \
-        rm -f /etc/apt/apt.conf.d/docker-clean; \
-        apt-get update -y && \
-        apt-get install -y --no-install-recommends git ca-certificates && \
-        uv pip install --system --no-build-isolation \
-            "git+${SPARKINFER_REPO}@${SPARKINFER_REF}"; \
+ARG SPARKINFER_INDEX_URL=https://appmana.github.io/forks-sparkinfer/
+ARG SPARKINFER_SPEC=sparkinfer==1.0.2.dev0
+ARG SPARKINFER_REF=d8446f421929282317a69566b2d951335cbd88ee
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ -n "${SPARKINFER_SPEC}" ]; then \
+        uv pip install --system --no-deps \
+            --extra-index-url "${SPARKINFER_INDEX_URL}" "${SPARKINFER_SPEC}"; \
     fi
 
-# sparkinfer's setup.py builds the PCIe comm CUDA extensions only if it can
-# import torch.utils.cpp_extension, and falls back to a pure-Python install
-# otherwise -- silently. Under build isolation that fallback ALWAYS fires,
-# which is why --no-build-isolation is above: torch is already in this
-# stage. Without the extensions the first collective nvcc-compiles inside a
-# live request. Assert the artifacts exist so this cannot regress unnoticed.
-RUN if [ -n "${SPARKINFER_REF}" ] && [ "${SPARKINFER_SKIP_EXT_BUILD:-0}" != "1" ]; then \
+# The published wheel must carry the PCIe extensions. Without them the first
+# collective nvcc-compiles inside a live request. Assert the artifacts rather
+# than trusting package metadata.
+RUN if [ -n "${SPARKINFER_SPEC}" ]; then \
         python3 -c "\
-import glob, sysconfig; \
+import glob, importlib.metadata, sysconfig; \
+assert importlib.metadata.version('sparkinfer') == '1.0.2.dev0'; \
 sp = sysconfig.get_paths()['platlib']; \
 found = glob.glob(sp + '/sparkinfer_pcie_*_ext*.so'); \
-assert found, 'sparkinfer PCIe extensions were not built (pure-Python fallback); check build isolation'; \
+assert found, 'sparkinfer PCIe extensions are absent from the published wheel'; \
 print(f'sparkinfer AOT extensions: {len(found)}')"; \
     fi
 
@@ -1424,6 +1417,8 @@ LABEL org.opencontainers.image.source="${VLLM_SOURCE_REPO}" \
       ai.vllm.source.repo="${VLLM_SOURCE_REPO}" \
       ai.appmana.lmcache.ref="${LMCACHE_GIT_REF}" \
       ai.appmana.flashmla.spec="${FLASHMLA_SPEC} from ${FLASHMLA_INDEX_URL}" \
+      ai.appmana.sparkinfer.spec="${SPARKINFER_SPEC} from ${SPARKINFER_INDEX_URL}" \
+      ai.appmana.sparkinfer.ref="${SPARKINFER_REF}" \
       ai.appmana.nccl.repo="${APPMANA_NCCL_GIT_REPO}" \
       ai.appmana.nccl.ref="${APPMANA_NCCL_GIT_REF}" \
       ai.appmana.usb4_rdma.provider="${USB4_RDMA_PROVIDER_VERSION}" \

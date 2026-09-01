@@ -37,7 +37,8 @@ AMPERE_BUILD_HELPER = REPO_ROOT / "tools" / "ampere" / "build_vllm_ampere_image.
 # The architectures this branch exists to serve: sm_86 (Ampere consumer) and
 # sm_121a (GB10 / DGX Spark).
 REQUIRED_ARCHES = ("8.6", "12.1a")
-REQUIRED_SPARKINFER_REF = "78cc92eaad3bf0378d199c44621bbaee75d0cb47"
+REQUIRED_SPARKINFER_REF = "d8446f421929282317a69566b2d951335cbd88ee"
+REQUIRED_SPARKINFER_SPEC = "sparkinfer==1.0.2.dev0"
 RUNTIME_OVERLAY_FILES = (
     "vllm/model_executor/layers/quantization/dsv4_int.py",
     "vllm/model_executor/model_loader/default_loader.py",
@@ -262,23 +263,20 @@ def test_gdrcopy_os_version_tracks_ubuntu_version() -> None:
     )
 
 
-def test_sparkinfer_is_installed_without_build_isolation() -> None:
-    """Under isolation sparkinfer's setup.py silently ships no extensions.
-
-    Would have caught 419d9d92b6.
-    """
+def test_sparkinfer_is_installed_from_the_published_wheel() -> None:
+    """Image builds must not recompile Sparkinfer from a mutable source tree."""
     install_lines = [
         line
         for line in dockerfile_run_blocks()
-        if "SPARKINFER_REPO" in line and "pip install" in line
+        if "SPARKINFER_SPEC" in line and "pip install" in line
     ]
     assert install_lines, "no sparkinfer install found in docker/Dockerfile"
     for line in install_lines:
-        assert "--no-build-isolation" in line, (
-            "sparkinfer is installed with build isolation, so its setup.py "
-            "falls back to a pure-Python install and the AOT CUDA extensions "
-            f"are never built: {line.strip()}"
-        )
+        assert "--extra-index-url" in line
+        assert "git+" not in line
+        assert "--no-build-isolation" not in line
+
+    assert dockerfile_arg_defaults("SPARKINFER_SPEC") == [REQUIRED_SPARKINFER_SPEC]
 
 
 def test_sparkinfer_ref_includes_native_int8_indexer_kernels() -> None:

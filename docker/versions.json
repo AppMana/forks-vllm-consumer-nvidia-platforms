@@ -64,6 +64,9 @@
     "SCCACHE_S3_NO_CREDENTIALS": {
       "default": "0"
     },
+    "VLLM_SKIP_FLASH_ATTN_BUILD": {
+      "default": "0"
+    },
     "TORCH_CUDA_ARCH_LIST": {
       "default": "8.6 12.1a"
     },
@@ -125,16 +128,19 @@
       "default": "https://appmana.github.io/forks-flash-mla-int/"
     },
     "FLASHMLA_SPEC": {
-      "default": "flash-mla==2.0.0"
+      "default": "flash-mla==2.0.1.dev0"
     },
     "VLLM_SOURCE_REPO": {
       "default": "https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms"
     },
-    "SPARKINFER_REPO": {
-      "default": "https://github.com/AppMana/forks-sparkinfer"
+    "SPARKINFER_INDEX_URL": {
+      "default": "https://appmana.github.io/forks-sparkinfer/"
+    },
+    "SPARKINFER_SPEC": {
+      "default": "sparkinfer==1.0.2.dev0"
     },
     "SPARKINFER_REF": {
-      "default": "78cc92eaad3bf0378d199c44621bbaee75d0cb47"
+      "default": "d8446f421929282317a69566b2d951335cbd88ee"
     }
   }
 }
