@@ -1410,11 +1410,24 @@ endif()
 
 # For CUDA we also build and ship some external projects.
 if (VLLM_GPU_LANG STREQUAL "CUDA")
+  cuda_archs_loose_intersection(VLLM_HIGH_END_EXTERNAL_ARCHS
+    "9.0a;10.0a;10.0f;10.3a;12.0a;12.0f;12.1a" "${CUDA_ARCHS}")
+  if(VLLM_HIGH_END_EXTERNAL_ARCHS)
     include(cmake/external_projects/deepgemm.cmake)
     include(cmake/external_projects/fmha_sm100.cmake)
     include(cmake/external_projects/flashmla.cmake)
     include(cmake/external_projects/qutlass.cmake)
     include(cmake/external_projects/tml_fa4.cmake)
+  else()
+    message(STATUS
+      "Skipping high-end CUDA external projects for architectures ${CUDA_ARCHS}")
+    add_custom_target(_deep_gemm_C)
+    add_custom_target(fmha_sm100)
+    add_custom_target(_flashmla_C)
+    add_custom_target(_flashmla_extension_C)
+    add_custom_target(_qutlass_C)
+    add_custom_target(tml_fa4)
+  endif()
 
     # vllm-flash-attn should be last as it overwrites some CMake functions
     include(cmake/external_projects/vllm_flash_attn.cmake)

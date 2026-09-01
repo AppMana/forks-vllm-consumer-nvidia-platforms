@@ -205,6 +205,33 @@ def test_cmake_dependencies_have_a_persistent_buildkit_cache() -> None:
     )
 
 
+def test_sm86_skips_high_end_cuda_external_projects() -> None:
+    """Ampere-only builds must not fetch or package newer-architecture code."""
+    cmake = CMAKE_LISTS.read_text(encoding="utf-8")
+    match = re.search(
+        r"cuda_archs_loose_intersection\(VLLM_HIGH_END_EXTERNAL_ARCHS"
+        r'\s+"(?P<supported>[^"]+)"\s+"\$\{CUDA_ARCHS\}"\)'
+        r"(?P<body>.*?)# vllm-flash-attn should be last",
+        cmake,
+        re.DOTALL,
+    )
+    assert match, "high-end external projects are not architecture-gated"
+    assert "8.6" not in match.group("supported").split(";")
+    body = match.group("body")
+    assert "if(VLLM_HIGH_END_EXTERNAL_ARCHS)" in body
+    for project in ("deepgemm", "fmha_sm100", "flashmla", "qutlass", "tml_fa4"):
+        assert f"include(cmake/external_projects/{project}.cmake)" in body
+    for target in (
+        "_deep_gemm_C",
+        "fmha_sm100",
+        "_flashmla_C",
+        "_flashmla_extension_C",
+        "_qutlass_C",
+        "tml_fa4",
+    ):
+        assert f"add_custom_target({target})" in body
+
+
 def test_ampere_build_skips_unsupported_deepep_extensions() -> None:
     """SM86 builds must not compile DeepEP's SM90/SM100-only wheel."""
     assert dockerfile_arg_defaults("BUILD_DEEPEP") == ["1"]
