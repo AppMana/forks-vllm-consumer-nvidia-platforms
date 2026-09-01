@@ -62,6 +62,10 @@ if(VLLM_FLASH_ATTN_FA3_ARCHS)
   set(FA3_ENABLED ON CACHE BOOL "Build FlashAttention 3" FORCE)
 else()
   set(FA3_ENABLED OFF CACHE BOOL "Build FlashAttention 3" FORCE)
+  # setup.py requests every declared extension target in one CMake build. Keep
+  # that target contract when FA3 is intentionally absent for non-Hopper
+  # builds, without compiling or installing an FA3 shared object.
+  add_custom_target(_vllm_fa3_C)
 endif()
 
 # Make sure vllm-flash-attn install rules are nested under vllm/

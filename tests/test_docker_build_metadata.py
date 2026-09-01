@@ -192,7 +192,8 @@ def test_ampere_flash_attention_build_omits_hopper_objects() -> None:
         r"if\(VLLM_FLASH_ATTN_FA3_ARCHS\).*?"
         r"set\(FA3_ENABLED ON CACHE BOOL.*?FORCE\).*?"
         r"else\(\).*?"
-        r"set\(FA3_ENABLED OFF CACHE BOOL.*?FORCE\)",
+        r"set\(FA3_ENABLED OFF CACHE BOOL.*?FORCE\).*?"
+        r"add_custom_target\(_vllm_fa3_C\)",
         cmake,
         re.DOTALL,
     )
