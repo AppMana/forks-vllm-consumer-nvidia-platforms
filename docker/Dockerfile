@@ -370,7 +370,14 @@ ENV SCCACHE_SERVER_PORT=4227
 # cache reuse.
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/workspace/tmp/sccache,sharing=shared \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
+    mkdir -p /workspace/tmp /workspace/tmp/sccache \
+    && export TMPDIR=/workspace/tmp \
+    && export SCCACHE_DIR=/workspace/tmp/sccache \
+    && export SCCACHE_SERVER_UDS=/workspace/tmp/sccache/sccache.sock \
+    && export SCCACHE_IDLE_TIMEOUT=0 \
+    && \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi; \
         export RUSTC_WRAPPER=sccache; \

@@ -176,6 +176,21 @@ def test_sccache_has_a_persistent_buildkit_local_cache() -> None:
     )
 
 
+def test_rust_sccache_uses_a_prepared_persistent_temp_directory() -> None:
+    """Rust caching must not rely on an image's transient /tmp directory."""
+    rust_builds = [
+        block for block in dockerfile_run_blocks() if "build_rust.sh" in block
+    ]
+    assert any(
+        "--mount=type=cache,target=/workspace/tmp/sccache,sharing=shared" in block
+        and "mkdir -p /workspace/tmp /workspace/tmp/sccache" in block
+        and "export TMPDIR=/workspace/tmp" in block
+        and "export SCCACHE_DIR=/workspace/tmp/sccache" in block
+        and "export SCCACHE_SERVER_UDS=/workspace/tmp/sccache/sccache.sock" in block
+        for block in rust_builds
+    )
+
+
 def test_cmake_dependencies_have_a_persistent_buildkit_cache() -> None:
     """A source rebuild must not clone every pinned CMake dependency again."""
     csrc_builds = [
