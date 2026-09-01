@@ -153,7 +153,7 @@ def test_flash_attention_skip_is_forwarded_to_the_extension_build() -> None:
     assert "ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}" in dockerfile
 
     helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
-    assert 'skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"' in helper
+    assert 'skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-1}"' in helper
     assert '--build-arg "VLLM_SKIP_FLASH_ATTN_BUILD=${skip_flash_attn_build}"' in helper
 
     setup_source = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
