@@ -661,8 +661,9 @@ RUN sha256sum dist/*.whl > dist/wheel.sha256
 # Copy extension wheels from extensions-build stage for later use
 COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
 
-# Record the EP kernels wheel checksum for the same cache-busting purpose.
-RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
+# Record the EP kernels wheel or disabled marker checksum for the same
+# cache-busting purpose.
+RUN sha256sum /tmp/ep_kernels_workspace/dist/* \
     > /tmp/ep_kernels_workspace/dist/wheels.sha256
 
 # Check the size of the wheel if RUN_WHEEL_CHECK is true

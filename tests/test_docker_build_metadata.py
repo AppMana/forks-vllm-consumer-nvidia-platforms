@@ -228,6 +228,14 @@ def test_ampere_build_skips_unsupported_deepep_extensions() -> None:
     assert '--build-arg "BUILD_DEEPEP=${build_deepep}"' in helper
 
 
+def test_deepep_disabled_marker_reaches_the_final_image() -> None:
+    """DeepEP-off builds must checksum the marker instead of requiring a wheel."""
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert "touch /tmp/ep_kernels_workspace/dist/deepep-disabled" in dockerfile
+    assert "sha256sum /tmp/ep_kernels_workspace/dist/*" in dockerfile
+    assert "sha256sum /tmp/ep_kernels_workspace/dist/*.whl" not in dockerfile
+
+
 def test_bake_hcl_arch_list_matches_the_dockerfile() -> None:
     """``docker buildx bake`` reads the .hcl even when versions.json is absent.
 
