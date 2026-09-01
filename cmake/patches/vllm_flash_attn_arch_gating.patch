@@ -1,0 +1,15 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4b17b72..3c57188 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,8 +4,8 @@ project(vllm_flash_attn LANGUAGES CXX CUDA)
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+ 
+-set(FA2_ENABLED ON)
+-set(FA3_ENABLED ON)
++set(FA2_ENABLED ON CACHE BOOL "Build FlashAttention 2")
++set(FA3_ENABLED ON CACHE BOOL "Build FlashAttention 3")
+ 
+ # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
+ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")

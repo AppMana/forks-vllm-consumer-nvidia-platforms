@@ -41,9 +41,27 @@ else()
           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
           GIT_TAG ed4b7342bc8f0489dd9b649d5288867e35fc6a32
           GIT_PROGRESS TRUE
+          PATCH_COMMAND
+            git apply --ignore-space-change --ignore-whitespace
+            ${CMAKE_CURRENT_LIST_DIR}/../patches/vllm_flash_attn_arch_gating.patch
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
+endif()
+
+# The dependency enables FA3 based only on the CUDA compiler version. Restrict
+# it to builds that actually contain a Hopper target; otherwise an Ampere build
+# still compiles the full SM90 instantiation matrix with no usable output.
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  cuda_archs_loose_intersection(VLLM_FLASH_ATTN_FA3_ARCHS
+    "9.0a" "${CUDA_ARCHS}")
+else()
+  set(VLLM_FLASH_ATTN_FA3_ARCHS "")
+endif()
+if(VLLM_FLASH_ATTN_FA3_ARCHS)
+  set(FA3_ENABLED ON CACHE BOOL "Build FlashAttention 3" FORCE)
+else()
+  set(FA3_ENABLED OFF CACHE BOOL "Build FlashAttention 3" FORCE)
 endif()
 
 # Make sure vllm-flash-attn install rules are nested under vllm/

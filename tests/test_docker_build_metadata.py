@@ -31,6 +31,10 @@ VERSIONS_JSON = REPO_ROOT / "docker" / "versions.json"
 BAKE_HCL = REPO_ROOT / "docker" / "docker-bake.hcl"
 CMAKE_LISTS = REPO_ROOT / "CMakeLists.txt"
 CMAKE_UTILS = REPO_ROOT / "cmake" / "utils.cmake"
+FLASH_ATTN_CMAKE = REPO_ROOT / "cmake" / "external_projects" / "vllm_flash_attn.cmake"
+FLASH_ATTN_ARCH_PATCH = (
+    REPO_ROOT / "cmake" / "patches" / "vllm_flash_attn_arch_gating.patch"
+)
 PYTHON_OVERLAY_DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile.python-overlay"
 AMPERE_BUILD_HELPER = REPO_ROOT / "tools" / "ampere" / "build_vllm_ampere_image.sh"
 
@@ -169,6 +173,29 @@ def test_ampere_build_includes_flash_attention_for_model_inspection() -> None:
     guarded_body = setup_source.split(guard, 1)[1].split("# FA4 CuteDSL", 1)[0]
     assert "_vllm_fa2_C" in guarded_body
     assert "_vllm_fa3_C" in guarded_body
+
+
+def test_ampere_flash_attention_build_omits_hopper_objects() -> None:
+    """SM86 needs FA2 for inspection, but must not compile FA3's SM90 matrix."""
+    patch = FLASH_ATTN_ARCH_PATCH.read_text(encoding="utf-8")
+    assert "set(FA3_ENABLED ON CACHE BOOL" in patch
+
+    cmake = FLASH_ATTN_CMAKE.read_text(encoding="utf-8")
+    assert "PATCH_COMMAND" in cmake
+    assert "vllm_flash_attn_arch_gating.patch" in cmake
+    assert re.search(
+        r'cuda_archs_loose_intersection\(VLLM_FLASH_ATTN_FA3_ARCHS\s+"9\.0a"'
+        r'\s+"\$\{CUDA_ARCHS\}"\)',
+        cmake,
+    )
+    assert re.search(
+        r"if\(VLLM_FLASH_ATTN_FA3_ARCHS\).*?"
+        r"set\(FA3_ENABLED ON CACHE BOOL.*?FORCE\).*?"
+        r"else\(\).*?"
+        r"set\(FA3_ENABLED OFF CACHE BOOL.*?FORCE\)",
+        cmake,
+        re.DOTALL,
+    )
 
 
 def test_ampere_helper_uses_current_provider_release() -> None:
