@@ -60,6 +60,39 @@ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
   return static_cast<uint8_t>(key >> 8);
 }
 
+template <int TopK>
+__global__ void canonicalize_topk_indices_kernel(
+    int32_t* __restrict__ output, uint32_t num_rows) {
+  constexpr int kItemsPerThread =
+      (TopK + kThreadsPerBlock - 1) / kThreadsPerBlock;
+  using BlockSort =
+      cub::BlockRadixSort<int32_t, kThreadsPerBlock, kItemsPerThread>;
+  __shared__ typename BlockSort::TempStorage sort_storage;
+
+  const uint32_t row = blockIdx.x;
+  if (row >= num_rows) return;
+
+  int32_t keys[kItemsPerThread];
+#pragma unroll
+  for (int item = 0; item < kItemsPerThread; ++item) {
+    const int offset = threadIdx.x * kItemsPerThread + item;
+    const int32_t index =
+        offset < TopK ? output[row * TopK + offset] : INT32_MAX;
+    keys[item] = index < 0 ? INT32_MAX : index;
+  }
+
+  BlockSort(sort_storage).Sort(keys);
+
+#pragma unroll
+  for (int item = 0; item < kItemsPerThread; ++item) {
+    const int offset = threadIdx.x * kItemsPerThread + item;
+    if (offset < TopK) {
+      const int32_t index = keys[item];
+      output[row * TopK + offset] = index == INT32_MAX ? -1 : index;
+    }
+  }
+}
+
 // ============================================================================
 // Vectorized load helpers
 // ============================================================================

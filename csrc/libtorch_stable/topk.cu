@@ -14,6 +14,18 @@ namespace {
 
 #ifndef USE_ROCM
 template <int TopK>
+void launch_canonicalize_topk_indices(torch::stable::Tensor& output,
+                                      int64_t num_rows,
+                                      cudaStream_t stream) {
+  namespace P = vllm::persistent;
+  if (num_rows == 0) return;
+  P::canonicalize_topk_indices_kernel<TopK>
+      <<<num_rows, P::kThreadsPerBlock, 0, stream>>>(
+          output.mutable_data_ptr<int32_t>(),
+          static_cast<uint32_t>(num_rows));
+}
+
+template <int TopK>
 void launch_persistent_topk(const torch::stable::Tensor& logits,
                             const torch::stable::Tensor& lengths,
                             torch::stable::Tensor& output,
@@ -152,6 +164,11 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
               static_cast<uint32_t>(stride), stream);
       STD_TORCH_CHECK(status == cudaSuccess, "FilteredTopK fallback failed: ",
                       cudaGetErrorString(status));
+      launch_canonicalize_topk_indices<TopK>(output, num_rows, stream);
+      cudaError_t canonical_err = cudaGetLastError();
+      STD_TORCH_CHECK(canonical_err == cudaSuccess,
+                      "persistent_topk canonicalization failed: ",
+                      cudaGetErrorString(canonical_err));
       return;
     }
 
@@ -223,6 +240,11 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     }
   #undef LAUNCH_PERSISTENT
   }
+
+  // Selection kernels append winners through atomics, so the set is exact but
+  // its order follows CTA scheduling. Sparse attention reduces in this order;
+  // canonical logical-token order makes repeated decode numerically stable.
+  launch_canonicalize_topk_indices<TopK>(output, num_rows, stream);
 
   cudaError_t err = cudaGetLastError();
   STD_TORCH_CHECK(err == cudaSuccess,

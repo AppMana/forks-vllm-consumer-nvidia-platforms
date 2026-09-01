@@ -501,6 +501,42 @@ def test_deepseek_workspace_topk(
     )
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_persistent_topk_long_decode_order_is_repeatable() -> None:
+    """Repeated long-context decode selection must have a canonical order.
+
+    Sparse attention consumes the selected cache rows in the order returned by
+    this kernel. An atomically appended but set-correct result can therefore
+    change the floating-point reduction order on every decode step.
+    """
+    set_random_seed(7)
+    device = torch.device("cuda:0")
+    seq_len = 512_287
+    top_k = 2048
+    logits = torch.randn(1, seq_len, dtype=torch.float32, device=device)
+    lengths = torch.tensor([seq_len], dtype=torch.int32, device=device)
+    workspace = torch.empty(
+        RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device=device
+    )
+
+    outputs = []
+    for _ in range(8):
+        indices = torch.empty(1, top_k, dtype=torch.int32, device=device)
+        torch.ops._C.persistent_topk(
+            logits, lengths, indices, workspace, top_k, seq_len
+        )
+        outputs.append(indices)
+    torch.accelerator.synchronize()
+
+    expected_set = logits.topk(top_k, dim=-1).indices.sort(dim=-1).values
+    for indices in outputs:
+        assert torch.equal(indices.sort(dim=-1).values, expected_set)
+        assert torch.equal(indices, outputs[0]), (
+            "persistent_topk returned the correct set in a different order"
+        )
+
+
 def run_large_context_topk_test(
     batch_size: int,
     seq_lens: list[int],
