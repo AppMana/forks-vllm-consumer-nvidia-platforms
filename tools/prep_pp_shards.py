@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import json
 import os
 import re
@@ -58,6 +59,41 @@ SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 COMPLETE_MARKER = ".prep-complete"
 _LEGACY_CONFIG_DIR_RE = re.compile(r"^[0-9a-f]{16}$")
 _LEGACY_STORE_DIR = "store"
+_CLASSIFY_SHARDS = None
+
+
+def _classify_shards(
+    weight_map: dict[str, str],
+    local_layer_range: tuple[int, int] | None,
+    *,
+    is_first_pipeline_rank: bool,
+    is_last_pipeline_rank: bool,
+) -> dict[str, bool]:
+    """Load the pure classifier without executing model_loader/__init__.py."""
+    global _CLASSIFY_SHARDS
+    if _CLASSIFY_SHARDS is None:
+        import vllm
+
+        module_path = os.path.join(
+            os.path.dirname(vllm.__file__),
+            "model_executor",
+            "model_loader",
+            "pp_weight_filter.py",
+        )
+        spec = importlib.util.spec_from_file_location(
+            "_vllm_standalone_pp_weight_filter", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load PP weight classifier from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CLASSIFY_SHARDS = module.classify_shards
+    return _CLASSIFY_SHARDS(
+        weight_map,
+        local_layer_range,
+        is_first_pipeline_rank=is_first_pipeline_rank,
+        is_last_pipeline_rank=is_last_pipeline_rank,
+    )
 
 
 def _parse_source_snapshot(source_dir: str) -> tuple[str, str]:
@@ -172,15 +208,13 @@ def stage_shards(
     is_first_pipeline_rank: bool = True,
     is_last_pipeline_rank: bool = True,
 ) -> str:
-    from vllm.model_executor.model_loader.pp_weight_filter import classify_shards
-
     source_dir = os.path.abspath(source_dir)
     index_path = os.path.join(source_dir, SAFE_WEIGHTS_INDEX_NAME)
     with open(index_path, "rb") as f:
         index_bytes = f.read()
     weight_map: dict[str, str] = json.loads(index_bytes)["weight_map"]
 
-    needs_copy = classify_shards(
+    needs_copy = _classify_shards(
         weight_map,
         local_layer_range,
         is_first_pipeline_rank=is_first_pipeline_rank,
