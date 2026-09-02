@@ -292,6 +292,163 @@ def _fp32_sort_keys_into(
     )
 
 
+# Padding key for rows shorter than k; below every packed real score/column.
+_INT64_MIN = tl.constexpr(-(1 << 63))
+
+
+@triton.jit(do_not_specialize=["col_offset", "stride_lm"])
+def _exact_slab_keys_kernel(
+    logits_ptr,
+    ks_ptr,
+    ke_ptr,
+    cand_idx_ptr,
+    cand_val_ptr,
+    tie_ptr,
+    keys_ptr,
+    col_offset,
+    stride_lm: tl.int64,
+    stride_km: tl.int64,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Turn one row of native candidate (index, score) pairs into the exact
+    (score desc, column asc) top-K key set.
+
+    The native selector returns a correct top-K score multiset but breaks
+    ties at the K-th score in atomic collection order. With T = the K-th
+    largest score, the exact set is every column with score > T plus the
+    smallest (K - count_gt) columns whose score == T. One ascending pass over
+    the row collects those tie columns; the candidate slots holding T are then
+    rewritten in slot order. Rows with fewer than K valid columns already hold
+    every valid column and need no fix-up.
+    """
+    row = tl.program_id(0)
+    ks = tl.load(ks_ptr + row)
+    ke = tl.load(ke_ptr + row)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    idx = tl.load(cand_idx_ptr + row * K + offs_k, mask=mask_k, other=-1)
+    val = tl.load(
+        cand_val_ptr + row * K + offs_k, mask=mask_k, other=float("-inf")
+    )
+    valid = idx >= 0
+    n_valid = tl.sum(valid.to(tl.int32), axis=0)
+    threshold = tl.min(tl.where(valid, val, float("inf")), axis=0)
+
+    if n_valid == K:
+        gt = tl.zeros((), dtype=tl.int32)
+        eq_before = tl.zeros((), dtype=tl.int32)
+        row_ptr = logits_ptr + row * stride_lm
+        for start in range(ks, ke, BLOCK_N):
+            cols = start + tl.arange(0, BLOCK_N)
+            in_row = cols < ke
+            x = tl.load(row_ptr + cols, mask=in_row, other=float("-inf"))
+            gt += tl.sum((x > threshold).to(tl.int32), axis=0)
+            eq = (x == threshold) & in_row
+            eq_i = eq.to(tl.int32)
+            rank = eq_before + tl.cumsum(eq_i, axis=0) - 1
+            tl.store(tie_ptr + row * K + rank, cols, mask=eq & (rank < K))
+            eq_before += tl.sum(eq_i, axis=0)
+        need = K - gt
+        eq_slot = (val == threshold) & valid
+        slot_rank = tl.cumsum(eq_slot.to(tl.int32), axis=0) - 1
+        take = eq_slot & (slot_rank < need)
+        tie_cols = tl.load(tie_ptr + row * K + slot_rank, mask=take, other=0)
+        idx = tl.where(take, tie_cols + col_offset, idx)
+
+    bits = val.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    centered = tl.where(bits < (1 << 31), bits, (1 << 31) - 1 - bits)
+    key = (centered << 32) + ((1 << 32) - 1 - idx.to(tl.int64))
+    key = tl.where(valid, key, _INT64_MIN)
+    tl.store(keys_ptr + row * stride_km + offs_k, key, mask=mask_k)
+
+
+@triton.jit
+def _merge_topk_keys_kernel(
+    keys_ptr,
+    stride_km: tl.int64,
+    K: tl.constexpr,
+):
+    """Keep the K largest of one row's 2K unique keys in [:, :K] (unordered
+    within the kept prefix). 2K is a power of two for every supported top-k."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, 2 * K)
+    keys = tl.load(keys_ptr + row * stride_km + offs)
+    ordered = tl.sort(keys, dim=0, descending=True)
+    tl.store(keys_ptr + row * stride_km + offs, ordered, mask=offs < K)
+
+
+def merge_topk_keys_(candidates: torch.Tensor, topk_tokens: int) -> None:
+    """In place: ``candidates[:, :k]`` becomes the top-k over all 2k keys."""
+    m = candidates.shape[0]
+    assert candidates.shape[1] == 2 * topk_tokens and candidates.stride(1) == 1
+    assert topk_tokens & (topk_tokens - 1) == 0, "top-k must be a power of two"
+    if m == 0:
+        return
+    _merge_topk_keys_kernel[(m,)](
+        candidates, candidates.stride(0), K=topk_tokens, num_warps=8
+    )
+
+
+def exact_slab_topk_keys(
+    slab_logits: torch.Tensor,  # [M, S] fp32, contiguous rows
+    ks_local: torch.Tensor,  # [M] int32 slab-local valid start
+    ke_local: torch.Tensor,  # [M] int32 slab-local valid end
+    col_offset: int,
+    topk_tokens: int,
+    keys_out: torch.Tensor,  # [M, topk] int64
+    *,
+    workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> None:
+    """Exact key-order top-k of one slab: native candidate selection followed
+    by the deterministic tie fix-up, packed as unique int64 keys (padding
+    int64.min for rows shorter than k)."""
+    m, s = slab_logits.shape
+    assert slab_logits.stride(1) == 1 and keys_out.shape == (m, topk_tokens)
+    assert keys_out.stride(1) == 1
+    if m == 0:
+        return
+    if workspace is None:
+        workspace = exact_slab_topk_workspace(m, topk_tokens, slab_logits.device)
+    cand_idx, cand_val, tie_cols = workspace
+    ops.top_k_per_row_prefill_candidates(
+        slab_logits,
+        ks_local,
+        ke_local,
+        cand_idx,
+        cand_val,
+        topk_tokens,
+        col_offset,
+    )
+    _exact_slab_keys_kernel[(m,)](
+        slab_logits,
+        ks_local,
+        ke_local,
+        cand_idx,
+        cand_val,
+        tie_cols,
+        keys_out,
+        col_offset,
+        slab_logits.stride(0),
+        keys_out.stride(0),
+        K=topk_tokens,
+        BLOCK_N=1024,
+        BLOCK_K=triton.next_power_of_2(topk_tokens),
+        num_warps=8,
+    )
+
+
+def exact_slab_topk_workspace(
+    m: int, topk_tokens: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty((m, topk_tokens), dtype=torch.int32, device=device),
+        torch.empty((m, topk_tokens), dtype=torch.float32, device=device),
+        torch.empty((m, topk_tokens), dtype=torch.int32, device=device),
+    )
+
+
 def oneshot_prefill_topk_reference(
     q_cast: torch.Tensor,  # [M, H, D] fp8-bytes or int8
     kv: tuple[torch.Tensor, torch.Tensor],  # ([N, D], [N] fp32 scale)
@@ -521,9 +678,11 @@ def streaming_prefill_topk(
 ) -> None:
     """Exact slab-tiled replacement for full-logits + prefill top-k.
 
-    Scores and global columns are packed into unique int64 keys before every
-    merge. This makes boundary ties deterministic and keeps the selected rows
-    and their order invariant across launches and slab sizes.
+    Each slab is reduced to its exact (score desc, column asc) top-k key set
+    by the native candidate selector plus the tie fix-up, so the running
+    merge only ever ranks 2k unique int64 keys instead of the whole slab.
+    Boundary ties are deterministic and the selected rows and their order are
+    invariant across launches and slab sizes.
     """
     from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         indexer_imma_enabled,
@@ -545,14 +704,11 @@ def streaming_prefill_topk(
     ks32 = cu_seqlen_ks.to(torch.int32)
     ke32 = cu_seqlen_ke.to(torch.int32)
 
-    # The running prefix holds the selected set; the slab suffix is overwritten
-    # on every iteration. int64.min is below every packed real score/column key.
-    candidates = torch.full(
-        (m, k_top + slab_rows),
-        torch.iinfo(torch.int64).min,
-        dtype=torch.int64,
-        device=device,
-    )
+    # [:, :k] holds the running selection, [:, k:] the current slab's exact
+    # selection; the first slab is written straight into the running half.
+    candidates = torch.empty((m, 2 * k_top), dtype=torch.int64, device=device)
+    workspace = exact_slab_topk_workspace(m, k_top, device)
+    first = True
     for n0 in range(0, n, slab_rows):
         n1 = min(n0 + slab_rows, n)
         s = n1 - n0
@@ -566,17 +722,20 @@ def streaming_prefill_topk(
             ke_local,
             qk_int8=qk_int8,
         )
-        _fp32_sort_keys_into(
-            slab_logits, n0, candidates[:, k_top : k_top + s]
-        )
-        running = torch.topk(
-            candidates[:, : k_top + s],
+        target = candidates[:, :k_top] if first else candidates[:, k_top:]
+        exact_slab_topk_keys(
+            slab_logits,
+            ks_local,
+            ke_local,
+            n0,
             k_top,
-            dim=1,
-            largest=True,
-            sorted=False,
-        ).values
-        candidates[:, :k_top].copy_(running)
+            target,
+            workspace=workspace,
+        )
+        if first:
+            first = False
+            continue
+        merge_topk_keys_(candidates, k_top)
 
     final = torch.topk(
         candidates[:, :k_top],

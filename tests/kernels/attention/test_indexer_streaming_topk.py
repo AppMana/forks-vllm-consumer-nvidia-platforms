@@ -26,6 +26,7 @@ if not current_platform.is_cuda() or capability is None or capability.major < 8:
     )
 
 from vllm.model_executor.layers.sparse_attn_indexer import (  # noqa: E402
+    _decode_topk_keys,
     _fp32_sort_keys_into,
     _indexer_prefill_logits,
     oneshot_prefill_topk_reference,
@@ -223,6 +224,61 @@ def test_streaming_ties_use_one_deterministic_total_order():
                 qk_int8=True,
             )
             assert torch.equal(out, ref), f"tie order changed at slab={slab}"
+
+
+def _adversarial_tie_inputs(m, n, period=256, seed=2):
+    """INT8 rows whose scores repeat every ``period`` columns, so every
+    boundary carries many bit-equal ties."""
+    torch.manual_seed(seed)
+    q = torch.randint(-2, 3, (m, HEADS, HEAD_DIM), dtype=torch.int8, device="cuda")
+    base = torch.randint(-2, 3, (period, HEAD_DIM), dtype=torch.int8, device="cuda")
+    k = base.repeat(n // period, 1)
+    k_scale = torch.ones(n, dtype=torch.float32, device="cuda")
+    weights = torch.ones(m, HEADS, dtype=torch.float32, device="cuda")
+    return q, k, k_scale, weights
+
+
+def _reference_slab_keys(logits, col_offset, topk):
+    keys = torch.empty(logits.shape, dtype=torch.int64, device="cuda")
+    _fp32_sort_keys_into(logits, col_offset, keys)
+    return torch.topk(keys, topk, dim=1, largest=True, sorted=True).values
+
+
+@pytest.mark.parametrize("col_offset", [0, 16384])
+def test_exact_slab_keys_match_key_order_reference_on_boundary_ties(col_offset):
+    """One slab through the native candidate selector plus the tie fix-up
+    must yield exactly the (score desc, column asc) top-k key set, including
+    rows whose valid range starts late, ends early, or is shorter than k."""
+    from vllm.model_executor.layers.sparse_attn_indexer import exact_slab_topk_keys
+
+    m, n, topk = 32, 16384, 512
+    q, k, k_scale, weights = _adversarial_tie_inputs(m, n)
+    ks = torch.zeros(m, dtype=torch.int32, device="cuda")
+    ke = torch.full((m,), n, dtype=torch.int32, device="cuda")
+    ks[8:16] = 1000  # late start
+    ke[16:24] = 9000  # early end
+    ke[24:28] = 300  # shorter than k
+    ke[28:30] = topk  # exactly k
+    ke[30:] = 0  # empty
+
+    logits = _indexer_prefill_logits(q, (k, k_scale), weights, ks, ke, qk_int8=True)
+    ref = _reference_slab_keys(logits, col_offset, topk)
+    out = torch.empty((m, topk), dtype=torch.int64, device="cuda")
+    exact_slab_topk_keys(logits, ks, ke, col_offset, topk, out)
+
+    # Compare through the decoder: padding is -1 on both sides.
+    got = _decode_topk_keys(torch.sort(out, dim=1, descending=True).values, ks)
+    want = _decode_topk_keys(ref, ks)
+    assert torch.equal(got, want)
+
+    # The key SET is repeatable, unlike the bare native selector on tied
+    # boundaries; slot order follows the native selector and is canonicalized
+    # by the final sorted top-k of the streaming path.
+    again = torch.empty_like(out)
+    exact_slab_topk_keys(logits, ks, ke, col_offset, topk, again)
+    assert torch.equal(
+        torch.sort(out, dim=1).values, torch.sort(again, dim=1).values
+    )
 
 
 def test_short_rows_pad_minus_one():
