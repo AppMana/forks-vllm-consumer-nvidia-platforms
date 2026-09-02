@@ -74,12 +74,12 @@ def _parse_rank_nodes(value: str | None) -> list[tuple[str, str]]:
             continue
         if "=" not in item:
             raise ValueError(
-                "--rank-nodes entries must be HOST=IP, got " f"{item!r}"
+                f"--rank-nodes entries must be HOST=IP, got {item!r}"
             )
         host, ip = item.split("=", 1)
         if not host or not ip:
             raise ValueError(
-                "--rank-nodes entries must be HOST=IP, got " f"{item!r}"
+                f"--rank-nodes entries must be HOST=IP, got {item!r}"
             )
         nodes.append((host, ip))
     if not nodes:
@@ -106,7 +106,30 @@ CONTROLLER_OWNED_NCCL_ENV = {
     "NCCL_NET_MERGE_LEVEL",
     "NCCL_PROTO",
     "NCCL_SOCKET_IFNAME",
+    "VLLM_RAY_WORKER_IP_ORDER",
 }
+
+
+def _set_pipeline_parallel_size(
+    env: list[dict[str, Any]], world_size: int, env_overrides: dict[str, str]
+) -> None:
+    """Derive PP from the requested world size so the template's value can
+    never lag the rank count (a stale PP=10 with 11 ranks makes the last rank
+    reject itself)."""
+    tp = int(
+        env_overrides.get("VLLM_TENSOR_PARALLEL_SIZE")
+        or next(
+            (
+                item["value"]
+                for item in env
+                if item.get("name") == "VLLM_TENSOR_PARALLEL_SIZE"
+            ),
+            "1",
+        )
+    )
+    if world_size % tp:
+        raise ValueError(f"world-size={world_size} is not a multiple of tp={tp}")
+    _set_env(env, "VLLM_PIPELINE_PARALLEL_SIZE", str(world_size // tp))
 
 
 def _scrub_controller_owned_env(
@@ -251,6 +274,10 @@ def main() -> None:
     old_script_name = script_cm["metadata"]["name"]
     new_script_name = f"{args.name}-script"
     script_cm["metadata"]["name"] = new_script_name
+    # The needle stage runs the standalone tool from the mounted ConfigMap;
+    # the image ships the vllm package, not tools/ampere.
+    needle_tool = Path(__file__).resolve().parent.parent / "dsv4_needle_bench.py"
+    script_cm["data"][needle_tool.name] = needle_tool.read_text()
     for volume in jobset["spec"]["replicatedJobs"][0]["template"]["spec"]["template"][
         "spec"
     ].get("volumes", []):
@@ -310,7 +337,7 @@ def main() -> None:
         _scrub_controller_owned_env(env, env_overrides)
         _set_env(env, "JOBSET_NAME", args.name)
         _set_env(env, "WORLD_SIZE", str(args.world_size))
-        _set_env(env, "VLLM_RAY_WORKER_IP_ORDER", chain_ips)
+        _set_pipeline_parallel_size(env, args.world_size, env_overrides)
         _set_env(
             env,
             "APPMANA_DSV4_USE_SHARED_MODEL_PATH",
@@ -381,6 +408,7 @@ def main() -> None:
         _scrub_controller_owned_env(env, env_overrides)
         _set_env(env, "JOBSET_NAME", args.name)
         _set_env(env, "WORLD_SIZE", str(args.world_size))
+        _set_pipeline_parallel_size(env, args.world_size, env_overrides)
         _set_env(env, "VLLM_RAY_WORKER_IP_ORDER", chain_ips)
         _set_env(
             env,

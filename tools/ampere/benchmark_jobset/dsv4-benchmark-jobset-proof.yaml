@@ -211,6 +211,62 @@ data:
       done
     }
 
+    run_needle_matrix() {
+      if [ "${APPMANA_DSV4_RUN_NEEDLE_BENCH:-0}" != "1" ]; then
+        return 0
+      fi
+      local needle_dir="${RESULT_DIR}/needle-bench"
+      local timeout_s="${APPMANA_DSV4_BENCH_TIMEOUT_SECONDS:-1800}"
+      local seed="${APPMANA_DSV4_NEEDLE_SEED:-0}"
+      mkdir -p "$needle_dir"
+      # Rows are INPUT_TOKENS:NEEDLE_TOKENS:CONCURRENCY, space separated. Every
+      # request reproduces a unique needle verbatim, so output length equals
+      # the needle length and correctness is exact containment.
+      local rows="${APPMANA_DSV4_NEEDLE_ROWS:-8000:1000:1}"
+      local row input_tokens needle_tokens concurrency
+      # A missed needle is a result, not an abort: every row still runs and
+      # the leader exits 31 afterwards so the JobSet records the failure.
+      NEEDLE_FAILED=0
+      for row in $rows; do
+        IFS=: read -r input_tokens needle_tokens concurrency <<< "$row"
+        local label="needle-${APPMANA_DSV4_REPO_ID##*/}-c${concurrency}-in${input_tokens}-needle${needle_tokens}"
+        log_line "[needle] label=$label input_tokens=$input_tokens needle_tokens=$needle_tokens concurrency=$concurrency seed=$seed timeout_s=$timeout_s"
+        if ! timeout --preserve-status "$timeout_s" python3 /work/dsv4_needle_bench.py \
+          --base-url http://127.0.0.1:8080 \
+          --model "$APPMANA_DSV4_REPO_ID" \
+          --tokenizer "$APPMANA_LOCAL_MODEL_PATH" \
+          --input-tokens "$input_tokens" \
+          --needle-tokens "$needle_tokens" \
+          --concurrency "$concurrency" \
+          --run-seed "$seed" \
+          --output-json "${needle_dir}/${label}.json" \
+          > "${needle_dir}/${label}.log" 2>&1; then
+          NEEDLE_FAILED=1
+        fi
+        if [ ! -s "${needle_dir}/${label}.json" ]; then
+          log_line "[needle-summary] label=$label no result file; see ${needle_dir}/${label}.log"
+          tail -20 "${needle_dir}/${label}.log" || true
+          continue
+        fi
+        python3 - "${needle_dir}/${label}.json" <<'PY' | while IFS= read -r line; do log_line "$line"; done
+    import json, sys
+    path = sys.argv[1]
+    summary = json.load(open(path))["summary"]
+    print(
+        "[needle-summary] "
+        f"file={path} "
+        f"needle_verbatim_passed={summary['needle_verbatim_passed']}/{summary['concurrency']} "
+        f"match_ratio_min={summary['match_ratio']['min']} "
+        f"prompt_tokens_total={summary['prompt_tokens_total']} "
+        f"ttft_s_p50={summary['ttft_s']['p50']} "
+        f"prefill_tok_s_p50={summary['per_request_prefill_tok_s']['p50']} "
+        f"decode_tok_s_p50={summary['per_request_decode_tok_s']['p50']} "
+        f"finish_reasons={json.dumps(summary['finish_reasons'])}"
+    )
+    PY
+      done
+    }
+
     { grep -vE '^127\.0\.1\.1\b' /etc/hosts; echo "${HOST_IP} $(hostname)"; } > /tmp/hosts.new
     cat /tmp/hosts.new > /etc/hosts
     rm -f /tmp/hosts.new
@@ -638,8 +694,14 @@ data:
         touch "$DONE_FILE"
         exit 22
       fi
+      run_needle_matrix
       run_vllm_bench_matrix
       touch "$DONE_FILE"
+      if [ "${NEEDLE_FAILED:-0}" = "1" ]; then
+        log_line "[leader] needle benchmark missed at least one row"
+        ray stop --force || true
+        exit 31
+      fi
       ray stop --force || true
       wait "$server_pid" || true
     else

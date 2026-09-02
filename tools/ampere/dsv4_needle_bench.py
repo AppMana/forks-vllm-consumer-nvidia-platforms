@@ -144,12 +144,18 @@ async def run_request(
                 if choice.get("finish_reason"):
                     finish = choice["finish_reason"]
     elapsed = time.perf_counter() - t0
+    prompt_tokens = usage.get("prompt_tokens")
     return {
         "ttft_s": ttft,
         "elapsed_s": elapsed,
         "finish_reason": finish,
-        "prompt_tokens": usage.get("prompt_tokens"),
+        "prompt_tokens": prompt_tokens,
         "completion_tokens": usage.get("completion_tokens"),
+        # Single-stream prefill rate: the whole prompt is prefilled before the
+        # first token, so prompt_tokens / TTFT is the per-request rate.
+        "prefill_tok_s": (
+            prompt_tokens / ttft if ttft and prompt_tokens else None
+        ),
         "needle_verbatim": needle in text,
         # autojunk=False: with a small word vocabulary every word is
         # "popular" and the default heuristic degenerates ratio() to 0.
@@ -157,6 +163,8 @@ async def run_request(
             None, needle.split(), text.split(), autojunk=False
         ).ratio(),
         "text": text,
+        # Kept so a miss can be diffed token by token after the fact.
+        "needle": needle,
     }
 
 
@@ -214,6 +222,7 @@ async def main() -> int:
         for r in results
         if r["ttft_s"] and r["completion_tokens"] and r["completion_tokens"] > 1
     ]
+    prefill_tps = [r["prefill_tok_s"] for r in results if r["prefill_tok_s"]]
 
     summary = {
         "concurrency": args.concurrency,
@@ -229,10 +238,18 @@ async def main() -> int:
         },
         "prompt_tokens_total": in_tokens,
         "completion_tokens_total": out_tokens,
-        "aggregate_output_tok_s": round(out_tokens / wall_s, 2),
-        "aggregate_prefill_tok_s_upper_bound": round(
+        # Totals over the benchmark wall clock. At concurrency 1 these are
+        # just the single stream's numbers diluted by its own prefill/decode
+        # phases; report per_request_* for a single stream.
+        "output_tok_s_total_over_wall": round(out_tokens / wall_s, 2),
+        "prefill_tok_s_total_over_max_ttft": round(
             in_tokens / max(ttfts) if ttfts else 0.0, 2
         ),
+        "per_request_prefill_tok_s": {
+            "mean": round(statistics.mean(prefill_tps), 2) if prefill_tps else None,
+            "p50": round(statistics.median(prefill_tps), 2) if prefill_tps else None,
+            "min": round(min(prefill_tps), 2) if prefill_tps else None,
+        },
         "ttft_s": {
             "mean": round(statistics.mean(ttfts), 2) if ttfts else None,
             "p50": round(statistics.median(ttfts), 2) if ttfts else None,
