@@ -17,6 +17,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
     warmup_indexer_prefill_gather_kernel,
     warmup_indexer_prefill_logits_kernel,
     warmup_indexer_prefill_topk_kernel,
+    warmup_indexer_streaming_topk_kernels,
 )
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.triton_utils import HAS_TRITON
@@ -669,6 +670,7 @@ def warmup_long_prefill_kernels(
         warmup_indexer_prefill_gather_kernel(device)
         warmup_indexer_prefill_logits_kernel(device)
         warmup_indexer_prefill_topk_kernel(device)
+        warmup_indexer_streaming_topk_kernels(device)
         warmup_block_table_slot_mapping_kernel(model_runner, device)
 
     scheduler_config = model_runner.scheduler_config

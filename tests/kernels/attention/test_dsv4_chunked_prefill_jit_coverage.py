@@ -896,3 +896,46 @@ def test_long_prefill_warmup_exercises_native_prefill_topk(
     assert row_starts.min().item() == 0
     assert row_ends.max().item() > topk
     assert logits.shape[1] >= row_ends.max().item()
+
+
+def test_streaming_topk_warmup_covers_production_slab_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming prefill top-k only runs once the gathered context exceeds
+    one slab (16384 compressed rows), far beyond the 1024-token warmup batch,
+    so its Triton kernels need a direct warmup or the first deep prefill JITs
+    them live on one PP rank while its peers wait."""
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        streaming_prefill_topk,
+        warmup_indexer_streaming_topk_kernels,
+    )
+
+    device = torch.device("cuda")
+    monkeypatch.setattr(
+        sparse_attn_indexer,
+        "_INDEXER_STREAMING_TOPK_KERNEL_WARMUPS",
+        set(),
+        raising=False,
+    )
+    # The slab logits producer has its own startup warmup; this test is about
+    # the selection kernels that follow it.
+    warmup_indexer_prefill_logits_kernel(device, qk_int8=True)
+    warmup_indexer_streaming_topk_kernels(device)
+
+    _activate_real_triton_monitor(monkeypatch)
+    m, slab_rows, topk = 64, 16384, 512
+    n = 2 * slab_rows + m
+    torch.manual_seed(11)
+    q = torch.randint(-16, 16, (m, 64, 128), dtype=torch.int8, device=device)
+    k = torch.randint(-16, 16, (n, 128), dtype=torch.int8, device=device)
+    k_scale = torch.rand(n, dtype=torch.float32, device=device) + 0.5
+    weights = torch.randn(m, 64, dtype=torch.float32, device=device) * 0.05
+    ks = torch.zeros(m, dtype=torch.int32, device=device)
+    ke = (torch.arange(m, dtype=torch.int32, device=device) + (n - m) + 1).clamp_(
+        max=n
+    )
+    out = torch.empty((m, topk), dtype=torch.int32, device=device)
+    streaming_prefill_topk(
+        q, (k, k_scale), weights, ks, ke, out, topk, slab_rows=slab_rows, qk_int8=True
+    )
+    torch.accelerator.synchronize()

@@ -47,6 +47,7 @@ logger = init_logger(__name__)
 _INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS: set[tuple[int, bool]] = set()
 _INDEXER_PREFILL_GATHER_KERNEL_WARMUPS: set[tuple[int, bool]] = set()
 _INDEXER_PREFILL_TOPK_KERNEL_WARMUPS: set[int] = set()
+_INDEXER_STREAMING_TOPK_KERNEL_WARMUPS: set[int] = set()
 
 SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH = 4096
 # GB10's DSV4 C4 indexer is at most 65,536 compressed rows for the planned
@@ -593,6 +594,49 @@ def warmup_indexer_prefill_topk_kernel(device: torch.device) -> None:
     )
     torch.accelerator.synchronize()
     _INDEXER_PREFILL_TOPK_KERNEL_WARMUPS.add(device_index)
+
+
+def warmup_indexer_streaming_topk_kernels(device: torch.device) -> None:
+    """Compile the streaming prefill top-k Triton kernels before serving.
+
+    They only run once the gathered context exceeds one slab, which no
+    1024-token warmup batch reaches, so without this the first deep prefill
+    compiles them live on one PP rank while its peers wait at the handoff.
+    """
+    if device.type != "cuda":
+        return
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    if device_index in _INDEXER_STREAMING_TOPK_KERNEL_WARMUPS:
+        return
+
+    num_rows = 1
+    topk_tokens = 512
+    slab_rows = topk_tokens + 1
+    slab_logits = torch.zeros(
+        (num_rows, slab_rows), dtype=torch.float32, device=device
+    )
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    row_ends = torch.full((num_rows,), slab_rows, dtype=torch.int32, device=device)
+    candidates = torch.empty(
+        (num_rows, 2 * topk_tokens), dtype=torch.int64, device=device
+    )
+    workspace = exact_slab_topk_workspace(num_rows, topk_tokens, device)
+    # Both halves are written the way the streaming loop writes them so the
+    # pointer specializations match live launches.
+    exact_slab_topk_keys(
+        slab_logits, row_starts, row_ends, 0, topk_tokens,
+        candidates[:, :topk_tokens], workspace=workspace,
+    )
+    exact_slab_topk_keys(
+        slab_logits, row_starts, row_ends, slab_rows, topk_tokens,
+        candidates[:, topk_tokens:], workspace=workspace,
+    )
+    merge_topk_keys_(candidates, topk_tokens)
+    torch.accelerator.synchronize()
+    _INDEXER_STREAMING_TOPK_KERNEL_WARMUPS.add(device_index)
 
 
 def warmup_indexer_prefill_gather_kernel(
