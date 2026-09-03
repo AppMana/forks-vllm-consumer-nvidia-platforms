@@ -1211,6 +1211,13 @@ ENV UV_HTTP_TIMEOUT=500
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system "ray>=2.10,<3"
 
+# Operational tools that run inside the serving image: pipeline-rank shard
+# staging and the needle bench with its report.
+COPY tools/prep_pp_shards.py \
+     tools/ampere/dsv4_needle_bench.py \
+     tools/ampere/dsv4_needle_matrix_report.py \
+     /vllm-workspace/tools/
+
 # install kv_connectors if requested
 # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
 # Consumer NVIDIA platforms this image serves: Ampere (sm_86) and consumer
