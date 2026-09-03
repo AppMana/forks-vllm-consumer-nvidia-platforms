@@ -125,6 +125,10 @@ async def run_request(
     text = ""
     usage = {}
     finish = None
+    # Arrival time of every content chunk after the first, relative to the
+    # previous one: the inter-token latency series vllm bench serve reports.
+    itl: list[float] = []
+    last_chunk_t = None
     async with session.post(
         f"{base_url}/v1/chat/completions", json=payload
     ) as resp:
@@ -142,8 +146,12 @@ async def run_request(
             for choice in chunk.get("choices", []):
                 delta = choice.get("delta", {}).get("content")
                 if delta:
+                    now = time.perf_counter()
                     if ttft is None:
-                        ttft = time.perf_counter() - t0
+                        ttft = now - t0
+                    else:
+                        itl.append(now - last_chunk_t)
+                    last_chunk_t = now
                     text += delta
                 if choice.get("finish_reason"):
                     finish = choice["finish_reason"]
@@ -160,6 +168,7 @@ async def run_request(
         "prefill_tok_s": (
             prompt_tokens / ttft if ttft and prompt_tokens else None
         ),
+        "itl_s": itl,
         "needle_verbatim": needle in text,
         # autojunk=False: with a small word vocabulary every word is
         # "popular" and the default heuristic degenerates ratio() to 0.
