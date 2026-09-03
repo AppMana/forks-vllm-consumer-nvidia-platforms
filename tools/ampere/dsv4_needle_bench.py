@@ -94,7 +94,10 @@ def build_prompt(
     )
     filler = _text_of_tokens(tokenizer, rng, filler_budget)
 
-    depth = index / max(total - 1, 1)
+    # Depths span [0, 1): the last request's needle must not sit at the very
+    # end of the haystack. With a single filler word after END_NEEDLE the
+    # model (DeepSeek's endpoint included) returns that word and stops.
+    depth = index / total
     cut = int(len(filler) * depth)
     cut = filler.rfind(" ", 0, cut) + 1 if cut else 0
     document = salt + filler[:cut] + framed + filler[cut:]
