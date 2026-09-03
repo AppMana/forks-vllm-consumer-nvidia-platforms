@@ -22,7 +22,7 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     indexer_prefill_topk_slab_rows_override,
     indexer_streaming_topk_prefill_enabled,
 )
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -294,7 +294,9 @@ def _fp32_sort_keys_into(
 
 
 # Padding key for rows shorter than k; below every packed real score/column.
-_INT64_MIN = tl.constexpr(-(1 << 63))
+# The module must import without Triton (the image build's kernel-registry
+# check runs on a CPU-only stage where tl is the placeholder).
+_INT64_MIN = tl.constexpr(-(1 << 63)) if HAS_TRITON else -(1 << 63)
 
 
 @triton.jit(do_not_specialize=["col_offset", "stride_lm"])
