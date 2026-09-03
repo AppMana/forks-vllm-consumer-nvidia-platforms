@@ -1217,6 +1217,10 @@ COPY tools/prep_pp_shards.py \
      tools/ampere/dsv4_needle_bench.py \
      tools/ampere/dsv4_needle_matrix_report.py \
      /vllm-workspace/tools/
+# Server-side GenAI tracing (--middleware ...genai_trace_middleware).
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=bind,source=requirements/observability.txt,target=/tmp/observability.txt,ro \
+    uv pip install --system -r /tmp/observability.txt
 
 # install kv_connectors if requested
 # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.

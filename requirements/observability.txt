@@ -1,0 +1,8 @@
+# Server-side GenAI tracing for the OpenAI-compatible server
+# (vllm/entrypoints/serve/genai_trace_middleware.py): OpenTelemetry's GenAI
+# utilities produce the inference span, and their upload hook stores prompts
+# and completions at OTEL_INSTRUMENTATION_GENAI_UPLOAD_BASE_PATH, an fsspec
+# URL, referenced from the span instead of embedded in it. s3fs covers s3://
+# targets.
+opentelemetry-util-genai[upload] >= 1.1b0
+s3fs >= 2025.9.0

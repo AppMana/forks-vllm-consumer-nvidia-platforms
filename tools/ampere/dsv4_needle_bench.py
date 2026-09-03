@@ -32,7 +32,7 @@ import statistics
 import sys
 import time
 
-import aiohttp
+from openai import AsyncOpenAI
 from transformers import AutoTokenizer
 
 WORDS = (
@@ -102,24 +102,13 @@ def build_prompt(
 
 
 async def run_request(
-    session: aiohttp.ClientSession,
-    base_url: str,
+    client: AsyncOpenAI,
     model: str,
     prompt: str,
     needle: str,
     max_tokens: int,
     extra_body: dict | None = None,
 ) -> dict:
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
-    if extra_body:
-        payload.update(extra_body)
     t0 = time.perf_counter()
     ttft = None
     text = ""
@@ -129,32 +118,30 @@ async def run_request(
     # previous one: the inter-token latency series vllm bench serve reports.
     itl: list[float] = []
     last_chunk_t = None
-    async with session.post(
-        f"{base_url}/v1/chat/completions", json=payload
-    ) as resp:
-        resp.raise_for_status()
-        async for raw in resp.content:
-            line = raw.decode().strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[len("data:") :].strip()
-            if data == "[DONE]":
-                break
-            chunk = json.loads(data)
-            if chunk.get("usage"):
-                usage = chunk["usage"]
-            for choice in chunk.get("choices", []):
-                delta = choice.get("delta", {}).get("content")
-                if delta:
-                    now = time.perf_counter()
-                    if ttft is None:
-                        ttft = now - t0
-                    else:
-                        itl.append(now - last_chunk_t)
-                    last_chunk_t = now
-                    text += delta
-                if choice.get("finish_reason"):
-                    finish = choice["finish_reason"]
+    stream = await client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=max_tokens,
+        stream=True,
+        stream_options={"include_usage": True},
+        extra_body=extra_body or None,
+    )
+    async for chunk in stream:
+        if chunk.usage:
+            usage = chunk.usage.model_dump()
+        for choice in chunk.choices:
+            delta = choice.delta.content if choice.delta else None
+            if delta:
+                now = time.perf_counter()
+                if ttft is None:
+                    ttft = now - t0
+                else:
+                    itl.append(now - last_chunk_t)
+                last_chunk_t = now
+                text += delta
+            if choice.finish_reason:
+                finish = choice.finish_reason
     elapsed = time.perf_counter() - t0
     prompt_tokens = usage.get("prompt_tokens")
     return {
@@ -231,15 +218,17 @@ async def main() -> int:
         for i in range(args.concurrency)
     ]
 
-    timeout = aiohttp.ClientTimeout(total=args.request_timeout)
     bench_t0 = time.perf_counter()
-    headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+    async with AsyncOpenAI(
+        base_url=f"{args.base_url.rstrip('/')}/v1",
+        api_key=args.api_key or "none",
+        timeout=args.request_timeout,
+        max_retries=0,
+    ) as client:
         results = await asyncio.gather(
             *(
                 run_request(
-                    session, args.base_url, args.model, prompt, needle,
-                    max_tokens, extra_body,
+                    client, args.model, prompt, needle, max_tokens, extra_body,
                 )
                 for prompt, needle in prompts
             )
