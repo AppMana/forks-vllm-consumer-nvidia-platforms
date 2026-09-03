@@ -98,6 +98,12 @@ def test_traces(
             assert attributes.get(SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE) > 0
             assert attributes.get(SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN) > 0
             assert attributes.get(SpanAttributes.GEN_AI_LATENCY_E2E) > 0
+            assert attributes.get(SpanAttributes.GEN_AI_USAGE_CACHED_TOKENS) == 0
+            tpot = attributes.get(SpanAttributes.GEN_AI_LATENCY_TIME_PER_OUTPUT_TOKEN)
+            assert tpot > 0
+            assert tpot * (completion_tokens - 1) <= attributes.get(
+                SpanAttributes.GEN_AI_LATENCY_E2E
+            )
         finally:
             if llm is not None:
                 shutdown_timeout = 60.0 if current_platform.is_rocm() else 5.0

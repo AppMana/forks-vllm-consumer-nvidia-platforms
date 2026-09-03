@@ -32,8 +32,10 @@ class SpanAttributes:
     GEN_AI_REQUEST_ID = "gen_ai.request.id"
     GEN_AI_REQUEST_N = "gen_ai.request.n"
     GEN_AI_USAGE_NUM_SEQUENCES = "gen_ai.usage.num_sequences"
+    GEN_AI_USAGE_CACHED_TOKENS = "gen_ai.usage.cached_tokens"
     GEN_AI_LATENCY_TIME_IN_QUEUE = "gen_ai.latency.time_in_queue"
     GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN = "gen_ai.latency.time_to_first_token"
+    GEN_AI_LATENCY_TIME_PER_OUTPUT_TOKEN = "gen_ai.latency.time_per_output_token"
     GEN_AI_LATENCY_E2E = "gen_ai.latency.e2e"
     GEN_AI_LATENCY_TIME_IN_SCHEDULER = "gen_ai.latency.time_in_scheduler"
 

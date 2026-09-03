@@ -761,8 +761,13 @@ class OutputProcessor:
             SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL: prefill_time,
             SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE: decode_time,
             SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE: inference_time,
+            SpanAttributes.GEN_AI_USAGE_CACHED_TOKENS: req_state.num_cached_tokens,
             SpanAttributes.GEN_AI_REQUEST_ID: req_state.external_req_id,
         }
+        if metrics.num_generation_tokens > 1:
+            attributes[SpanAttributes.GEN_AI_LATENCY_TIME_PER_OUTPUT_TOKEN] = (
+                decode_time / (metrics.num_generation_tokens - 1)
+            )
 
         # Add optional request parameters
         if req_state.top_p:
