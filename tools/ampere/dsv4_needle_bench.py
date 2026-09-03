@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import difflib
 import json
+import os
 import random
 import statistics
 import sys
@@ -107,6 +108,7 @@ async def run_request(
     prompt: str,
     needle: str,
     max_tokens: int,
+    extra_body: dict | None = None,
 ) -> dict:
     payload = {
         "model": model,
@@ -116,6 +118,8 @@ async def run_request(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if extra_body:
+        payload.update(extra_body)
     t0 = time.perf_counter()
     ttft = None
     text = ""
@@ -185,7 +189,20 @@ async def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="defaults to needle-tokens + 128")
     ap.add_argument("--output-json", default=None)
+    ap.add_argument(
+        "--api-key",
+        default=os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+        help="bearer token for hosted OpenAI-compatible endpoints "
+        "(default: $DEEPSEEK_API_KEY, then $OPENAI_API_KEY)",
+    )
+    ap.add_argument(
+        "--extra-body",
+        default=None,
+        help="JSON object merged into every chat request, e.g. "
+        "'{\"thinking\": {\"type\": \"disabled\"}}' for the DeepSeek API",
+    )
     args = ap.parse_args()
+    extra_body = json.loads(args.extra_body) if args.extra_body else None
 
     max_tokens = args.max_tokens or args.needle_tokens + 128
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.model)
@@ -200,12 +217,13 @@ async def main() -> int:
 
     timeout = aiohttp.ClientTimeout(total=3600)
     bench_t0 = time.perf_counter()
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         results = await asyncio.gather(
             *(
                 run_request(
                     session, args.base_url, args.model, prompt, needle,
-                    max_tokens,
+                    max_tokens, extra_body,
                 )
                 for prompt, needle in prompts
             )
