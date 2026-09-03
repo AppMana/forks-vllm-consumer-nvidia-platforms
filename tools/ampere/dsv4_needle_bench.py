@@ -196,6 +196,13 @@ async def main() -> int:
         "(default: $DEEPSEEK_API_KEY, then $OPENAI_API_KEY)",
     )
     ap.add_argument(
+        "--request-timeout",
+        type=float,
+        default=3600.0,
+        help="per-request client timeout in seconds; queued requests at high "
+        "concurrency wait for the whole batch's prefill",
+    )
+    ap.add_argument(
         "--extra-body",
         default=None,
         help="JSON object merged into every chat request, e.g. "
@@ -215,7 +222,7 @@ async def main() -> int:
         for i in range(args.concurrency)
     ]
 
-    timeout = aiohttp.ClientTimeout(total=3600)
+    timeout = aiohttp.ClientTimeout(total=args.request_timeout)
     bench_t0 = time.perf_counter()
     headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:

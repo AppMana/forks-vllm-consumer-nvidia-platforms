@@ -247,6 +247,7 @@ data:
           --needle-tokens "$needle_tokens" \
           --concurrency "$concurrency" \
           --run-seed "$seed" \
+          --request-timeout "$timeout_s" \
           --output-json "${needle_dir}/${label}.json" \
           > "${needle_dir}/${label}.log" 2>&1; then
           NEEDLE_FAILED=1
