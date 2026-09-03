@@ -230,10 +230,14 @@ data:
       # A missed needle is a result, not an abort: every row still runs and
       # the leader exits 31 afterwards so the JobSet records the failure.
       NEEDLE_FAILED=0
+      local row_index=0
       for row in $rows; do
+        row_index=$((row_index + 1))
         IFS=: read -r input_tokens needle_tokens concurrency row_seed <<< "$row"
         seed="${row_seed:-${APPMANA_DSV4_NEEDLE_SEED:-0}}"
-        local label="needle-${APPMANA_DSV4_REPO_ID##*/}-c${concurrency}-in${input_tokens}-needle${needle_tokens}-seed${seed}"
+        # The ordinal keeps repeated rows (same prompt, run again for
+        # determinism) from overwriting each other's results.
+        local label="needle-${APPMANA_DSV4_REPO_ID##*/}-row${row_index}-c${concurrency}-in${input_tokens}-needle${needle_tokens}-seed${seed}"
         log_line "[needle] label=$label input_tokens=$input_tokens needle_tokens=$needle_tokens concurrency=$concurrency seed=$seed timeout_s=$timeout_s"
         if ! timeout --preserve-status "$timeout_s" python3 /work/dsv4_needle_bench.py \
           --base-url http://127.0.0.1:8080 \
@@ -506,6 +510,11 @@ data:
         reasoning_args=(--reasoning-parser deepseek_v4)
       fi
 
+      async_args=(--async-scheduling)
+      if [ "${APPMANA_DSV4_ASYNC_SCHEDULING:-1}" != "1" ]; then
+        async_args=(--no-async-scheduling)
+      fi
+
       vllm serve "$APPMANA_LOCAL_MODEL_PATH" \
         --served-model-name "$APPMANA_DSV4_REPO_ID" \
         --tokenizer-mode deepseek_v4 \
@@ -531,7 +540,7 @@ data:
         "${server_extra_args[@]}" \
         --host 0.0.0.0 \
         --port 8080 \
-        --async-scheduling \
+        "${async_args[@]}" \
         --no-enable-prefix-caching \
         >"${RESULT_DIR}/vllm-server.log" 2>&1 &
       server_pid=$!
