@@ -139,12 +139,21 @@ class KVBlockZeroer:
                 kv = static_forward_context[layer_name].kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
-                dp = kv.data_ptr()
+                el = kv.element_size()
+                # Packed layouts (DeepSeek V4) carve every layer's view out of
+                # one shared block slab at a byte offset, so the view's data
+                # pointer is not the start of page 0 and its block stride is
+                # the whole slab. A span of one block stride from the view's
+                # own pointer runs past the end of slab b into the head of
+                # slab b+1, which may hold a live block of another logical
+                # position. Zero from the backing tensor's base instead, so
+                # each block id maps exactly onto its own slab, and dedup on
+                # that base so the slab is zeroed once for all packed layers.
+                dp = kv.data_ptr() - kv.storage_offset() * el
                 if dp in seen_ptrs:
                     continue
                 seen_ptrs.add(dp)
 
-                el = kv.element_size()
                 cur_bytes = kv.stride(block_dim) * el
                 assert cur_bytes % 4 == 0
                 kernel_block_el = cur_bytes // 4
