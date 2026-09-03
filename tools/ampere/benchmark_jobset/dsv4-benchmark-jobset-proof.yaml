@@ -219,17 +219,21 @@ data:
       local timeout_s="${APPMANA_DSV4_BENCH_TIMEOUT_SECONDS:-1800}"
       local seed="${APPMANA_DSV4_NEEDLE_SEED:-0}"
       mkdir -p "$needle_dir"
-      # Rows are INPUT_TOKENS:NEEDLE_TOKENS:CONCURRENCY, space separated. Every
-      # request reproduces a unique needle verbatim, so output length equals
-      # the needle length and correctness is exact containment.
+      # Rows are INPUT_TOKENS:NEEDLE_TOKENS:CONCURRENCY[:SEED], space
+      # separated. Every request reproduces a unique needle verbatim, so
+      # output length equals the needle length and correctness is exact
+      # containment. The seed changes the haystack and the needle; at the
+      # model's depth limit single seeds pass or miss on their own, so judge
+      # an image on several.
       local rows="${APPMANA_DSV4_NEEDLE_ROWS:-8000:1000:1}"
-      local row input_tokens needle_tokens concurrency
+      local row input_tokens needle_tokens concurrency row_seed
       # A missed needle is a result, not an abort: every row still runs and
       # the leader exits 31 afterwards so the JobSet records the failure.
       NEEDLE_FAILED=0
       for row in $rows; do
-        IFS=: read -r input_tokens needle_tokens concurrency <<< "$row"
-        local label="needle-${APPMANA_DSV4_REPO_ID##*/}-c${concurrency}-in${input_tokens}-needle${needle_tokens}"
+        IFS=: read -r input_tokens needle_tokens concurrency row_seed <<< "$row"
+        seed="${row_seed:-${APPMANA_DSV4_NEEDLE_SEED:-0}}"
+        local label="needle-${APPMANA_DSV4_REPO_ID##*/}-c${concurrency}-in${input_tokens}-needle${needle_tokens}-seed${seed}"
         log_line "[needle] label=$label input_tokens=$input_tokens needle_tokens=$needle_tokens concurrency=$concurrency seed=$seed timeout_s=$timeout_s"
         if ! timeout --preserve-status "$timeout_s" python3 /work/dsv4_needle_bench.py \
           --base-url http://127.0.0.1:8080 \
