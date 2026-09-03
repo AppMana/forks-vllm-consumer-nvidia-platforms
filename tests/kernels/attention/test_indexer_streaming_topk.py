@@ -281,6 +281,38 @@ def test_exact_slab_keys_match_key_order_reference_on_boundary_ties(col_offset):
     )
 
 
+def test_exact_oneshot_prefill_topk_is_exact_on_boundary_ties():
+    """The one-shot prefill path (context within one slab) must select the
+    exact key-order top-k, repeatably, with request-local indices and -1
+    padding, on the tied INT8-style scores of a first prefill chunk."""
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        exact_oneshot_prefill_topk,
+    )
+
+    m, n, topk = 1024, 1024, 512
+    q, k, k_scale, weights = _adversarial_tie_inputs(m, n, period=64, seed=9)
+    ks = torch.zeros(m, dtype=torch.int32, device="cuda")
+    ke = (torch.arange(m, dtype=torch.int32, device="cuda") + 1).clamp_(max=n)
+    ks[512:] = 300  # a second request starting later in the gathered buffer
+    logits = _indexer_prefill_logits(q, (k, k_scale), weights, ks, ke, qk_int8=True)
+    ref = _reference_slab_keys(logits, 0, topk)
+    want = _decode_topk_keys(ref, ks)
+    want_sorted = torch.sort(
+        torch.where(want >= 0, want, want.new_tensor(2**30)), dim=1
+    ).values
+    outs = []
+    for _ in range(3):
+        out = torch.full((m, topk), -1, dtype=torch.int32, device="cuda")
+        exact_oneshot_prefill_topk(logits, ks, ke, out, topk)
+        outs.append(out.clone())
+    for out in outs:
+        got_sorted = torch.sort(
+            torch.where(out >= 0, out, out.new_tensor(2**30)), dim=1
+        ).values
+        assert torch.equal(got_sorted, want_sorted)
+        assert torch.equal(out, outs[0])
+
+
 def test_exact_decode_topk_indices_repair_boundary_ties():
     """Decode selection through persistent_topk plus the tie fix-up must be
     the (score desc, column asc) top-k set, ascending, repeatable across

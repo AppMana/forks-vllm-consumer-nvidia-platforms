@@ -536,6 +536,26 @@ def exact_slab_topk_keys(
     )
 
 
+def exact_oneshot_prefill_topk(
+    logits: torch.Tensor,  # [M, N] fp32 over the whole gathered context
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_indices_out: torch.Tensor,  # [M, topk] int32 request-local, -1 padded
+    topk_tokens: int,
+) -> None:
+    """Exact key-order top-k for a context that fits one slab: the native
+    candidate selector plus the tie repair, decoded to request-local indices.
+    Replaces ``top_k_per_row_prefill``, whose K-th boundary ties follow
+    launch order and made the first chunks of every prefill nondeterministic."""
+    m = logits.shape[0]
+    ks32 = cu_seqlen_ks.to(torch.int32)
+    ke32 = cu_seqlen_ke.to(torch.int32)
+    keys = torch.empty((m, topk_tokens), dtype=torch.int64, device=logits.device)
+    exact_slab_topk_keys(logits, ks32, ke32, 0, topk_tokens, keys)
+    final = torch.topk(keys, topk_tokens, dim=1, largest=True, sorted=True).values
+    topk_indices_out.copy_(_decode_topk_keys(final, ks32))
+
+
 def exact_slab_topk_workspace(
     m: int, topk_tokens: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1401,16 +1421,32 @@ def sparse_attn_indexer(
                     )
                 if not use_streaming_topk:
                     num_rows = logits.shape[0]
-                    ops.top_k_per_row_prefill(
-                        logits,
-                        cu_seqlen_ks,
-                        cu_seqlen_ke,
-                        topk_indices,
-                        num_rows,
-                        logits.stride(0),
-                        logits.stride(1),
-                        topk_tokens,
-                    )
+                    if (
+                        current_platform.is_cuda()
+                        and topk_tokens & (topk_tokens - 1) == 0
+                    ):
+                        # The native selector's K-th boundary ties follow
+                        # launch order; the first chunks of every prefill
+                        # (whole context within one slab) went through it
+                        # and selected a different context on every run.
+                        exact_oneshot_prefill_topk(
+                            logits,
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
+                            topk_indices,
+                            topk_tokens,
+                        )
+                    else:
+                        ops.top_k_per_row_prefill(
+                            logits,
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
+                            topk_indices,
+                            num_rows,
+                            logits.stride(0),
+                            logits.stride(1),
+                            topk_tokens,
+                        )
 
             _merge_dcp_topk_global(
                 logits,
