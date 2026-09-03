@@ -519,8 +519,8 @@ data:
       # Request spans go to the in-cluster OTLP collector like the serving
       # LWS's do, so JobSet runs show up in the same Jaeger service list.
       tracing_args=()
-      if [ -n "${APPMANA_DSV4_OTLP_TRACES_ENDPOINT:-}" ]; then
-        tracing_args=(--otlp-traces-endpoint "$APPMANA_DSV4_OTLP_TRACES_ENDPOINT")
+      if [ -n "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}" ]; then
+        tracing_args=(--otlp-traces-endpoint "$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
       fi
 
       vllm serve "$APPMANA_LOCAL_MODEL_PATH" \
@@ -1271,7 +1271,7 @@ spec:
                       value: "4"
                     # Request spans for the chain dashboard's trace table
                     # (service vllm-jobset), same collector as the serving LWS.
-                    - name: APPMANA_DSV4_OTLP_TRACES_ENDPOINT
+                    - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
                       value: http://otlp-collector.monitoring.svc.cluster.local:4318/v1/traces
                     - name: OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
                       value: http/protobuf
