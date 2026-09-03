@@ -416,6 +416,54 @@ def test_block_table_warmup_clamps_to_table_capacity(monkeypatch):
     assert block_table.calls[2] == ("compute_slot_mapping", 1, (0, 64), 64)
 
 
+def test_long_prefill_warmup_caps_synthetic_requests_at_max_model_len(monkeypatch):
+    """max_num_batched_tokens is a batch budget and may exceed max_model_len
+    (opt-125m: 8192 vs 2048). The mixed and pure-prefill warmups synthesize
+    ONE request from it, and a block-table row only holds
+    cdiv(max_model_len, block_size) blocks, so an unclamped size overflows the
+    row (staged block-table write overflows row ... len=8191 > 2048)."""
+    mixed_sizes = []
+    pure_prefill_sizes = []
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        device=None,
+        max_model_len=2048,
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=8192,
+            max_num_scheduled_tokens=8000,
+        ),
+        vllm_config=SimpleNamespace(speculative_config=None),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["OPTForCausalLM"])
+        ),
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_mixed_prefill_decode_warmup",
+        lambda _runner, _execute, _sample, num_tokens, **_kwargs: (
+            mixed_sizes.append(num_tokens) or True
+        ),
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_pure_prefill_warmup",
+        lambda _runner, _execute, _sample, num_tokens, **_kwargs: (
+            pure_prefill_sizes.append(num_tokens) or True
+        ),
+    )
+
+    gpu_warmup.warmup_long_prefill_kernels(
+        runner,
+        lambda _scheduler_output: None,
+        lambda _grammar_output: None,
+    )
+
+    # The mixed step's prefill request carries num_tokens - 1 prompt tokens;
+    # the pure-prefill request carries num_tokens + 1. Both must fit a row.
+    assert mixed_sizes == [16, 2048]
+    assert pure_prefill_sizes == [2047]
+
+
 def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch):
     mixed_sizes = []
     metadata_warmup = []

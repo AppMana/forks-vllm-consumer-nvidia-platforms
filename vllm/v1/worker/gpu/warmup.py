@@ -675,6 +675,15 @@ def warmup_long_prefill_kernels(
 
     scheduler_config = model_runner.scheduler_config
     max_tokens = scheduler_config.max_num_batched_tokens
+    # max_num_batched_tokens is a whole-batch budget and may exceed
+    # max_model_len. The sequences below synthesize ONE request from it, and
+    # a block-table row holds cdiv(max_model_len, block_size) blocks, so a
+    # single request longer than max_model_len overflows its row. The mixed
+    # step's prefill request carries num_tokens - 1 prompt tokens and the
+    # pure-prefill request num_tokens + 1; cap each so the prompt fits.
+    max_model_len = int(getattr(model_runner, "max_model_len", 0) or 0)
+    if max_model_len > 0:
+        max_tokens = min(max_tokens, max_model_len)
     mixed_token_sizes = {16, max_tokens}
     pure_prefill_token_sizes: set[int] = set()
     max_scheduled_tokens = getattr(scheduler_config, "max_num_scheduled_tokens", None)
@@ -691,6 +700,10 @@ def warmup_long_prefill_kernels(
     pure_prefill_token_sizes.update(
         _missing_dflash_prepare_warmup_sizes(model_runner, max_tokens)
     )
+    if max_model_len > 0:
+        pure_prefill_token_sizes = {
+            min(num_tokens, max_model_len - 1) for num_tokens in pure_prefill_token_sizes
+        }
 
     warmed_mixed_sizes: list[int] = []
     for num_tokens in sorted(mixed_token_sizes):
