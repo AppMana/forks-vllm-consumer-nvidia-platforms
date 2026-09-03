@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from functools import cached_property
 from typing import Any, Literal, cast
 
@@ -158,6 +159,15 @@ class ObservabilityConfig:
 
     @model_validator(mode="after")
     def _validate_tracing_config(self):
+        if self.otlp_traces_endpoint is None:
+            # The OpenTelemetry SDK's own variable enables request tracing
+            # too, so a deployment can turn it on through the environment
+            # without a server flag.
+            env_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+            if env_endpoint:
+                self.otlp_traces_endpoint = self._validate_otlp_traces_endpoint(
+                    env_endpoint
+                )
         if self.collect_detailed_traces and not self.otlp_traces_endpoint:
             raise ValueError(
                 "collect_detailed_traces requires `--otlp-traces-endpoint` to be set."
