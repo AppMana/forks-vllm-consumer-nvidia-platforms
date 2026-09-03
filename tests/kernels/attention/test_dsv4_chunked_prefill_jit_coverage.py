@@ -481,6 +481,11 @@ def test_long_prefill_warmup_loads_native_gather_boundary_specializations(
     )
     monkeypatch.setattr(
         gpu_warmup,
+        "warmup_indexer_streaming_topk_kernels",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
         "warmup_block_table_slot_mapping_kernel",
         lambda _runner, _device: False,
     )
@@ -790,6 +795,11 @@ def test_long_prefill_warmup_invokes_indexer_logits_warmup(
     )
     monkeypatch.setattr(
         gpu_warmup,
+        "warmup_indexer_streaming_topk_kernels",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
         "run_mixed_prefill_decode_warmup",
         lambda *_args, **_kwargs: False,
     )
@@ -856,6 +866,11 @@ def test_long_prefill_warmup_exercises_native_prefill_topk(
         gpu_warmup,
         "warmup_block_table_slot_mapping_kernel",
         lambda _runner, _device: False,
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_indexer_streaming_topk_kernels",
+        lambda _device: None,
     )
     monkeypatch.setattr(
         sparse_attn_indexer,

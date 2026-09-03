@@ -365,6 +365,102 @@ def _exact_slab_keys_kernel(
     tl.store(keys_ptr + row * stride_km + offs_k, key, mask=mask_k)
 
 
+@triton.jit(do_not_specialize=["stride_lm", "stride_im"])
+def _exact_decode_indices_kernel(
+    logits_ptr,
+    seq_lens_ptr,
+    idx_ptr,
+    tie_ptr,
+    stride_lm: tl.int64,
+    stride_im: tl.int64,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Repair one decode row's selected indices to the exact (score desc,
+    column asc) top-K set and write them back in ascending column order.
+
+    Same boundary rule as the slab kernel: with T the K-th largest score, keep
+    every column scoring above T and give the remaining slots to the smallest
+    columns scoring exactly T. The decode selectors (persistent, cooperative,
+    per-row) all break that tie in launch order, which changes the attended
+    context from step to step once the boundary sits in the zero-score tail.
+    """
+    row = tl.program_id(0)
+    seq_len = tl.load(seq_lens_ptr + row)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    idx = tl.load(idx_ptr + row * stride_im + offs_k, mask=mask_k, other=-1)
+    valid = (idx >= 0) & (idx < seq_len)
+    row_ptr = logits_ptr + row * stride_lm
+    val = tl.load(row_ptr + idx, mask=valid, other=float("-inf"))
+    n_valid = tl.sum(valid.to(tl.int32), axis=0)
+    threshold = tl.min(tl.where(valid, val, float("inf")), axis=0)
+
+    if n_valid == K:
+        gt = tl.zeros((), dtype=tl.int32)
+        eq_before = tl.zeros((), dtype=tl.int32)
+        for start in range(0, seq_len, BLOCK_N):
+            cols = start + tl.arange(0, BLOCK_N)
+            in_row = cols < seq_len
+            x = tl.load(row_ptr + cols, mask=in_row, other=float("-inf"))
+            gt += tl.sum((x > threshold).to(tl.int32), axis=0)
+            eq = (x == threshold) & in_row
+            eq_i = eq.to(tl.int32)
+            rank = eq_before + tl.cumsum(eq_i, axis=0) - 1
+            tl.store(tie_ptr + row * K + rank, cols, mask=eq & (rank < K))
+            eq_before += tl.sum(eq_i, axis=0)
+        need = K - gt
+        eq_slot = (val == threshold) & valid
+        slot_rank = tl.cumsum(eq_slot.to(tl.int32), axis=0) - 1
+        take = eq_slot & (slot_rank < need)
+        tie_cols = tl.load(tie_ptr + row * K + slot_rank, mask=take, other=0)
+        idx = tl.where(take, tie_cols, idx)
+
+    # Ascending column order, -1 padding last.
+    sort_key = tl.where(valid, idx, 2147483647)
+    ordered = tl.sort(sort_key, dim=0, descending=False)
+    ordered = tl.where(ordered == 2147483647, -1, ordered)
+    tl.store(idx_ptr + row * stride_im + offs_k, ordered, mask=mask_k)
+
+
+def exact_decode_topk_indices(
+    logits: torch.Tensor,  # [rows, width] fp32, contiguous columns
+    seq_lens: torch.Tensor,  # [rows] or [B, next_n] int32 valid lengths
+    topk_indices: torch.Tensor,  # [rows, topk] int32, repaired in place
+    topk_tokens: int,
+    *,
+    tie_workspace: torch.Tensor | None = None,
+) -> None:
+    """Make a decode selector's output the exact key-order top-k, ascending."""
+    rows = logits.shape[0]
+    assert logits.stride(1) == 1 and topk_indices.stride(1) == 1
+    assert topk_indices.shape == (rows, topk_tokens)
+    assert topk_tokens & (topk_tokens - 1) == 0, "top-k must be a power of two"
+    if rows == 0:
+        return
+    lens = seq_lens.reshape(-1)
+    assert lens.numel() == rows, (lens.shape, rows)
+    if lens.dtype != torch.int32 or not lens.is_contiguous():
+        lens = lens.to(torch.int32).contiguous()
+    if tie_workspace is None:
+        tie_workspace = torch.empty(
+            (rows, topk_tokens), dtype=torch.int32, device=logits.device
+        )
+    _exact_decode_indices_kernel[(rows,)](
+        logits,
+        lens,
+        topk_indices,
+        tie_workspace,
+        logits.stride(0),
+        topk_indices.stride(0),
+        K=topk_tokens,
+        BLOCK_N=1024,
+        BLOCK_K=topk_tokens,
+        num_warps=8,
+    )
+
+
 @triton.jit
 def _merge_topk_keys_kernel(
     keys_ptr,
@@ -635,6 +731,11 @@ def warmup_indexer_streaming_topk_kernels(device: torch.device) -> None:
         candidates[:, topk_tokens:], workspace=workspace,
     )
     merge_topk_keys_(candidates, topk_tokens)
+    # The decode repair runs inside the captured decode graph; compile it
+    # here with the production top-k so capture never JITs.
+    decode_logits = torch.zeros((num_rows, slab_rows), dtype=torch.float32, device=device)
+    decode_idx = torch.arange(topk_tokens, dtype=torch.int32, device=device).unsqueeze(0).contiguous()
+    exact_decode_topk_indices(decode_logits, row_ends, decode_idx, topk_tokens)
     torch.accelerator.synchronize()
     _INDEXER_STREAMING_TOPK_KERNEL_WARMUPS.add(device_index)
 
@@ -1483,6 +1584,21 @@ def sparse_attn_indexer(
                 logits.stride(0),
                 logits.stride(1),
                 topk_tokens,
+            )
+        if current_platform.is_cuda() and topk_tokens & (topk_tokens - 1) == 0:
+            # Every selector above breaks K-th-boundary ties in launch order;
+            # repair to the exact key-order set so the attended context of a
+            # decode step does not depend on scheduling.
+            workspace_manager = current_workspace_manager()
+            (tie_workspace,) = workspace_manager.get_simultaneous(
+                ((num_rows, topk_tokens), torch.int32),
+            )
+            exact_decode_topk_indices(
+                logits,
+                seq_lens,
+                topk_indices,
+                topk_tokens,
+                tie_workspace=tie_workspace,
             )
 
         if decode_metadata.global_seq_lens is not None:

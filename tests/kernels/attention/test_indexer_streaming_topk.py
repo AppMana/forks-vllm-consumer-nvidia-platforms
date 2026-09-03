@@ -281,6 +281,51 @@ def test_exact_slab_keys_match_key_order_reference_on_boundary_ties(col_offset):
     )
 
 
+def test_exact_decode_topk_indices_repair_boundary_ties():
+    """Decode selection through persistent_topk plus the tie fix-up must be
+    the (score desc, column asc) top-k set, ascending, repeatable across
+    launches, and honour per-row seq_lens including rows shorter than k."""
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        RADIX_TOPK_WORKSPACE_SIZE,
+        exact_decode_topk_indices,
+    )
+
+    rows, width, topk = 24, 32768, 512
+    torch.manual_seed(6)
+    # Tied ReLU'd INT8-like scores: a few positive values, most rows end in
+    # a long run of exact zeros around the k-th boundary.
+    logits = torch.zeros((rows, width), dtype=torch.float32, device="cuda")
+    for r in range(rows):
+        n_pos = 100 + 40 * r
+        cols = torch.randperm(width, device="cuda")[:n_pos]
+        logits[r, cols] = torch.randint(1, 7, (n_pos,), device="cuda").float()
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    seq_lens[0] = 300  # shorter than k
+    seq_lens[1] = topk  # exactly k
+    seq_lens[2] = 20000  # early end
+    col = torch.arange(width, device="cuda")
+    masked = logits.masked_fill(col[None, :] >= seq_lens[:, None], -torch.inf)
+
+    keys = torch.empty((rows, width), dtype=torch.int64, device="cuda")
+    _fp32_sort_keys_into(masked, 0, keys)
+    ref = _decode_topk_keys(
+        torch.topk(keys, topk, dim=1, largest=True, sorted=True).values,
+        torch.zeros(rows, dtype=torch.int32, device="cuda"),
+    )
+    ref_sorted = torch.sort(torch.where(ref >= 0, ref, ref.new_tensor(2**30)), dim=1).values
+    ref_sorted = torch.where(ref_sorted == 2**30, ref_sorted.new_tensor(-1), ref_sorted)
+
+    workspace = torch.empty(RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device="cuda")
+    outs = []
+    for _ in range(3):
+        idx = torch.full((rows, topk), -1, dtype=torch.int32, device="cuda")
+        torch.ops._C.persistent_topk(logits, seq_lens, idx, workspace, topk, width)
+        exact_decode_topk_indices(logits, seq_lens, idx, topk)
+        outs.append(idx.clone())
+    for idx in outs:
+        assert torch.equal(idx, ref_sorted)
+
+
 def test_short_rows_pad_minus_one():
     """Rows with fewer than top-k valid columns must select all of them and
     pad with -1, matching the production kernel's contract."""
