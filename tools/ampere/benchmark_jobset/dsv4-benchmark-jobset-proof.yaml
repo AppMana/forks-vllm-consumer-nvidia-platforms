@@ -516,10 +516,18 @@ data:
         async_args=(--no-async-scheduling)
       fi
 
+      # Request spans go to the in-cluster OTLP collector like the serving
+      # LWS's do, so JobSet runs show up in the same Jaeger service list.
+      tracing_args=()
+      if [ -n "${APPMANA_DSV4_OTLP_TRACES_ENDPOINT:-}" ]; then
+        tracing_args=(--otlp-traces-endpoint "$APPMANA_DSV4_OTLP_TRACES_ENDPOINT")
+      fi
+
       vllm serve "$APPMANA_LOCAL_MODEL_PATH" \
         --served-model-name "$APPMANA_DSV4_REPO_ID" \
         --tokenizer-mode deepseek_v4 \
         "${reasoning_args[@]}" \
+        "${tracing_args[@]}" \
         --enable-request-id-headers \
         --pipeline-parallel-size "${VLLM_PIPELINE_PARALLEL_SIZE:-10}" \
         --tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-1}" \
@@ -1168,6 +1176,8 @@ spec:
               labels:
                 appmana.com/tb-chain-hostnet: primary
                 appmana.com/tb-chain-nccl-transport: ibverbs
+                # Picked up by the inference-engines PodMonitor (index 0 only).
+                appmana.com/inference-engine: vllm
               annotations:
                 kueue.x-k8s.io/podset-required-topology: appmana.com/tb-chain-name
                 kueue.x-k8s.io/podset-slice-required-topology: appmana.com/tb-chain-index
@@ -1259,6 +1269,14 @@ spec:
                       value: "4096"
                     - name: APPMANA_DSV4_STREAM_INTERVAL
                       value: "4"
+                    # Request spans for the chain dashboard's trace table
+                    # (service vllm-jobset), same collector as the serving LWS.
+                    - name: APPMANA_DSV4_OTLP_TRACES_ENDPOINT
+                      value: http://otlp-collector.monitoring.svc.cluster.local:4318/v1/traces
+                    - name: OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
+                      value: http/protobuf
+                    - name: OTEL_SERVICE_NAME
+                      value: vllm-jobset
                     - name: VLLM_PIPELINE_PARALLEL_SIZE
                       value: "10"
                     - name: VLLM_TENSOR_PARALLEL_SIZE
