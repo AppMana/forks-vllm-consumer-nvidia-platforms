@@ -43,10 +43,15 @@ class _Recorder:
 
 def _make_layer(recorder: _Recorder, *, hc_attn_fn_broadcast=None):
     """A DeepseekV4DecoderLayer receiver with only the MHC wiring real."""
+    from vllm.models.deepseek_v4.nvidia import model as model_module
     from vllm.models.deepseek_v4.nvidia.model import DeepseekV4DecoderLayer
 
     layer = types.SimpleNamespace()
     layer.hc_mult = HC_MULT
+    layer.use_sequence_parallel = False
+    # The real layer caches this in __init__, so read it here rather than in
+    # forward; callers monkeypatch mhc_uses_tilelang before building the layer.
+    layer.use_tilelang_mhc = model_module.mhc_uses_tilelang()
     layer.rms_norm_eps = 1e-6
     layer.hc_eps = 1e-6
     layer.hc_post_alpha = 2.0

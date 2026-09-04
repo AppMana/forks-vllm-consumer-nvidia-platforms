@@ -48,6 +48,7 @@ def record_kernel_dtypes(monkeypatch):
         input_tokens,
         hash_indices_table,
         is_padding=None,
+        **kwargs,
     ):
         recorded["topk_indices"] = topk_indices.dtype
         recorded["input_tokens"] = input_tokens.dtype

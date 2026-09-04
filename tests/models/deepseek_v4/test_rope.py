@@ -88,6 +88,8 @@ def make_vllm_config(config: types.SimpleNamespace) -> types.SimpleNamespace:
         cache_config=types.SimpleNamespace(cache_dtype="fp8", block_size=16),
         scheduler_config=types.SimpleNamespace(max_num_batched_tokens=128),
         compilation_config=types.SimpleNamespace(static_forward_context={}),
+        use_v2_model_runner=True,
+        kernel_config=types.SimpleNamespace(enable_jit_warmup=False),
     )
 
 

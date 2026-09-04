@@ -16,9 +16,10 @@ empty slice. That StopIteration surfaces inside ``AutoWeightsLoader``'s
 The loading test goes through the real chain: a synthetic sharded safetensors
 checkpoint on disk -> ``safetensors_weights_iterator`` with a zero-layer
 ``local_layer_range`` -> the production weights mapper ->
-``AutoWeightsLoader(parent, skip_substrs=["mtp."])`` exactly as
+``AutoWeightsLoader(parent)`` exactly as
 ``DeepseekV4ForCausalLM.load_weights`` builds it. The rank's own tensors
 (final norm, lm_head) must load; ``mtp.*`` stays skipped for the target model
+(the mapper maps it to None)
 (the DSpark draft loads them through its own ``DeepseekV4MTP.load_weights``,
 whose mtp layer dict is never empty on the draft rank).
 
@@ -131,7 +132,7 @@ def test_zero_layer_rank_loads_sharded_checkpoint(monkeypatch, tmp_path):
         is_first_pipeline_rank=False,
         is_last_pipeline_rank=True,
     )
-    loader = AutoWeightsLoader(parent, skip_substrs=["mtp."])
+    loader = AutoWeightsLoader(parent)
     loaded = loader.load_weights(
         weights, mapper=m._make_deepseek_v4_weights_mapper("int8")
     )

@@ -65,6 +65,7 @@ def _make_model(
     inst.hc_eps = 1e-6
     inst.start_layer = start
     inst.end_layer = end
+    inst.use_sequence_parallel = False
     inst.layers = nn.ModuleList(
         [
             _FakeDecoderLayer() if start <= i < end else m.PPMissingLayer()

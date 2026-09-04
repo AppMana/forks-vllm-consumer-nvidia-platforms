@@ -18,8 +18,6 @@ from vllm.models.deepseek_v4.common.ops.cache_utils import (
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
 )
-from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLABackend
-from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
 
@@ -52,24 +50,24 @@ def test_int8_ds_mla_resolves_to_uint8_even_for_fp8_layout_backend() -> None:
 
 
 def test_int8_ds_mla_cache_shapes_and_page_sizes() -> None:
-    assert DeepseekV4FlashMLABackend.get_kv_cache_shape(
-        3, 64, 1, 512, "int8_ds_mla"
-    ) == (3, 64, 528)
-    assert DeepseekSparseSWABackend.get_kv_cache_shape(
-        3, 64, 1, 512, "int8_ds_mla"
-    ) == (3, 64, 528)
-
+    # The 528-byte row (512B signed-int8 + fp32 row scale + 12B pad) is carried
+    # by the spec, not by a backend get_kv_cache_shape override: upstream drives
+    # the page geometry from num_heads * num_states * state_content_size_bytes.
     main_spec = MLAAttentionSpec(
         block_size=256,
         num_kv_heads=1,
         head_size=512,
         dtype=torch.uint8,
-        compress_ratio=4,
+        tokens_per_state=4,
+        state_content_bytes=528,
         cache_dtype_str="int8_ds_mla",
         alignment=528,
         model_version="deepseek_v4",
     )
+    assert main_spec.num_states == 64
+    assert main_spec.state_content_size_bytes == 528
     assert main_spec.real_page_size_bytes == 64 * 528
+    assert main_spec.page_size_bytes == 64 * 528
 
     swa_spec = SlidingWindowMLASpec(
         block_size=64,
@@ -77,11 +75,13 @@ def test_int8_ds_mla_cache_shapes_and_page_sizes() -> None:
         head_size=512,
         dtype=torch.uint8,
         sliding_window=128,
+        state_content_bytes=528,
         cache_dtype_str="int8_ds_mla",
         alignment=528,
         model_version="deepseek_v4",
     )
     assert swa_spec.real_page_size_bytes == 64 * 528
+    assert swa_spec.page_size_bytes == 64 * 528
 
 
 def test_int8_ds_mla_insert_global_dequant_and_views() -> None:

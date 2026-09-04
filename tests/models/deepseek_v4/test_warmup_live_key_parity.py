@@ -199,7 +199,7 @@ def test_no_warmup_key_has_zero_compress_ratio() -> None:
     assert 0 in vllm_config.model_config.hf_config.compress_ratios
 
     indexer_ratios = {
-        key.COMPRESS_RATIO
+        key.compress_ratio
         for key in _BUILD_PREFILL_CHUNK_METADATA_KERNEL.get_warmup_keys(vllm_config)
     }
     assert 0 not in indexer_ratios, indexer_ratios

@@ -18,7 +18,7 @@ from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4Model
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4Model
 from vllm.models.deepseek_v4.nvidia.mtp import DeepSeekV4MTP
-from vllm.v1.attention.backends.mla.indexer import _prepare_uniform_decode_kernel
+from vllm.v1.attention.backends.mla.indexer import PrepareUniformDecodeKernel
 
 
 def test_deepseek_v4_models_register_for_torch_compile():
@@ -60,7 +60,20 @@ def test_indexer_forward_has_no_runtime_backend_resolution():
 
 
 def test_uniform_decode_length_does_not_create_jit_variants():
-    assert "max_decode_len" in _prepare_uniform_decode_kernel.do_not_specialize
+    # max_decode_len reaches the compile key through Triton's own
+    # specialization representative, and every class it can land in is warmed
+    # up front, so a new decode length cannot trigger a live JIT compile.
+    kernel = PrepareUniformDecodeKernel()
+    warmed = {key.max_decode_len for key in kernel.get_warmup_keys()}
+    assert warmed == {
+        kernel.dispatch(
+            block_size=kernel.BLOCK_SIZE,
+            block_table_stride=1,
+            expanded_bt_stride=1,
+            max_decode_len=length,
+        ).max_decode_len
+        for length in (1, 2, 16, 17, 64, 1024)
+    }
 
 
 def test_first_layer_tilelang_mhc_is_an_opaque_custom_op():

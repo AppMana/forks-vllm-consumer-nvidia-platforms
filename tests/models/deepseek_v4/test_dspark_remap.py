@@ -209,6 +209,8 @@ def _make_weight_loading_model(
         model.model.confidence_head = nn.Module()
         model.model.confidence_head.proj = nn.Linear(1, 1, bias=False)
         model.model.confidence_head.proj.weight.is_checkpoint_optional = True
+    else:
+        model.model.confidence_head = None
     model.lm_head = nn.Linear(1, 1, bias=False)
     model.config = SimpleNamespace(
         n_routed_experts=0,
