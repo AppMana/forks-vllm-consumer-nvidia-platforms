@@ -75,6 +75,13 @@ ARG USB4_RDMA_PROVIDER_VERSION=0.2.72
 # no longer a provider-versioned tag.
 ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v2.43
 
+# OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
+# Python bootstrap. Set to "manylinux" alongside a manylinux build base such
+# as pytorch/manylinux2_28-builder:cuda13.0 to produce wheels with a glibc
+# 2.28 floor (matches PyTorch's own published wheels). Default stays on
+# Ubuntu, which is what BUILD_BASE_IMAGE defaults to.
+ARG BUILD_OS=ubuntu
+
 # By parameterizing the Deadsnakes repository URL, we allow third-party to use
 # their own mirror. When doing so, we don't benefit from the transparent
 # installation of the GPG key of the PPA, as done by add-apt-repository, so we
@@ -132,6 +139,7 @@ ARG VLLM_SKIP_FLASH_ATTN_BUILD=0
 FROM ${BUILD_BASE_IMAGE} AS base
 
 ARG TARGETPLATFORM
+ARG BUILD_OS
 ARG INSTALL_RUBIN_PRERELEASE
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
@@ -159,16 +167,45 @@ ENV UV_INSTALL_DIR=/opt/uv/bin
 ENV PATH="/opt/venv/bin:/opt/uv/bin:$PATH"
 ENV VIRTUAL_ENV="/opt/venv"
 
-# Install system dependencies including build tools. The PyTorch manylinux
-# image enables EPEL, which provides ccache.
-RUN dnf install -y --setopt=install_weak_deps=False \
-        ccache \
-        git \
-        curl \
-        sudo \
-        rdma-core-devel \
-    && dnf clean all \
-    && rm -rf /var/cache/dnf
+# Install system dependencies including build tools.
+# The Ubuntu path uses apt + deadsnakes-via-uv for Python; the manylinux path
+# (AlmaLinux 8, e.g. pytorch/manylinux2_28-builder) uses dnf and the Python
+# interpreters pre-installed at /opt/python/cpXY-cpXY/.
+RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
+        # rdma-core-devel provides libibverbs headers; ccache lives in EPEL,
+        # which the pytorch manylinux image already enables. git/curl/sudo
+        # are typically pre-installed but listed defensively.
+        dnf install -y --setopt=install_weak_deps=False \
+            ccache \
+            git \
+            curl \
+            sudo \
+            rdma-core-devel \
+        && dnf clean all \
+        && rm -rf /var/cache/dnf; \
+    else \
+        apt-get update -y \
+        && apt-get install -y --no-install-recommends \
+            ccache \
+            software-properties-common \
+            git \
+            curl \
+            sudo \
+            python3-pip \
+            libibverbs-dev \
+            # GCC 10 was previously pinned to suppress spurious -Wredundant-move warnings
+            # from CUTLASS (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92519). That bug
+            # was fixed in GCC 11. GCC >= 11.3 is now required because PyTorch's C++20 headers
+            # (pytorch/pytorch#167929) are not compatible with GCC < 11.3.
+            gcc-11 \
+            g++-11 \
+        && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 --slave /usr/bin/g++ g++ /usr/bin/g++-11 \
+        # Install python dev headers if available (needed for cmake FindPython on Ubuntu 24.04
+        # which ships cmake 3.28 and requires Development.SABIModule; silently skipped on
+        # Ubuntu 20.04/22.04 where python3.x-dev is not available without a PPA)
+        && (apt-get install -y --no-install-recommends python${PYTHON_VERSION}-dev 2>/dev/null || true) \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Install sccache once in base so Rust and CMake/CUDA build stages share the
 # same binary and remote cache configuration.
@@ -200,9 +237,15 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     # pip` works regardless of how uv happens to link the venv back to the
     # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
     # doesn't always expose ensurepip via the default venv layout).
-    && PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
-    && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
-    && uv venv --seed /opt/venv --python "$MANYLINUX_PY" \
+    && if [ "${BUILD_OS}" = "manylinux" ]; then \
+           # manylinux images ship Python at /opt/python/cpXY-cpXY/; point uv
+           # at the matching interpreter rather than letting it fetch one.
+           PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
+           && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
+           && uv venv --seed /opt/venv --python "$MANYLINUX_PY"; \
+       else \
+           uv venv --seed /opt/venv --python ${PYTHON_VERSION}; \
+       fi \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
@@ -337,13 +380,19 @@ ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 # This stage reuses the Python environment from base and runs in parallel with
 # csrc-build/extensions-build.
 FROM base AS rust-build-cache
+ARG BUILD_OS
 ARG USE_SCCACHE
 ARG SCCACHE_ENDPOINT
 
 # Install native tools needed only for Rust builds.
-RUN dnf install -y --setopt=install_weak_deps=False make perl-core \
-    && dnf clean all \
-    && rm -rf /var/cache/dnf
+RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
+        dnf install -y --setopt=install_weak_deps=False make perl-core \
+        && dnf clean all && rm -rf /var/cache/dnf; \
+    else \
+        apt-get update -y \
+        && apt-get install -y --no-install-recommends make perl \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /workspace
 
@@ -569,6 +618,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # This stage is independent and doesn't affect csrc cache
 FROM base AS extensions-build
 ARG TARGETARCH
+ARG BUILD_OS
 ARG CUDA_VERSION
 ARG BUILD_DEEPEP
 ARG NCCL_VERSION
@@ -643,9 +693,15 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         echo "TRITON_INSTALL_FROM_SOURCE_REVISION requires TRITON_INSTALL_FROM_SOURCE_REPO" >&2; \
         exit 1; \
     elif [ -n "${TRITON_INSTALL_FROM_SOURCE_REPO}" ]; then \
-        dnf install -y --setopt=install_weak_deps=False zlib-devel; \
-        dnf clean all; \
-        rm -rf /var/cache/dnf; \
+        if [ "${BUILD_OS}" = "manylinux" ]; then \
+            dnf install -y --setopt=install_weak_deps=False zlib-devel; \
+            dnf clean all; \
+            rm -rf /var/cache/dnf; \
+        else \
+            apt-get update -y; \
+            apt-get install -y --no-install-recommends zlib1g-dev; \
+            rm -rf /var/lib/apt/lists/*; \
+        fi; \
         CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1,2); \
         if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
             case "${CUDA_MAJOR_MINOR}" in \
@@ -820,6 +876,7 @@ FROM base AS dev
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ARG PYTORCH_CUDA_INDEX_BASE_URL
+ARG BUILD_OS
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 # Reference: https://github.com/astral-sh/uv/pull/1694
@@ -829,9 +886,11 @@ ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE=copy
 
 # Install libnuma-dev, required by fastsafetensors (fixes #20384)
-RUN dnf install -y numactl-devel \
-    && dnf clean all \
-    && rm -rf /var/cache/dnf
+RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
+        dnf install -y numactl-devel && dnf clean all && rm -rf /var/cache/dnf; \
+    else \
+        apt-get update && apt-get install -y --no-install-recommends libnuma-dev && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 
 # We can specify the standard or nightly build of PyTorch
