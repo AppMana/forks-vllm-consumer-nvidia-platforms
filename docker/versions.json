@@ -10,6 +10,12 @@
     "UBUNTU_VERSION": {
       "default": "24.04"
     },
+    "INSTALL_RUBIN_PRERELEASE": {
+      "default": "false"
+    },
+    "NCCL_VERSION": {
+      "default": "2.30.7"
+    },
     "BUILD_BASE_IMAGE": {
       "default": "nvidia/cuda:13.0.3-devel-ubuntu24.04"
     },
@@ -40,9 +46,6 @@
     "APPMANA_THUNDERBOLT_RELEASE_TAG": {
       "default": "v2.43"
     },
-    "BUILD_OS": {
-      "default": "ubuntu"
-    },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
     },
@@ -58,6 +61,9 @@
     "INSTALL_KV_CONNECTORS": {
       "default": "false"
     },
+    "VLLM_SKIP_FLASH_ATTN_BUILD": {
+      "default": "0"
+    },
     "SCCACHE_BUCKET_NAME": {
       "default": "vllm-build-sccache"
     },
@@ -65,9 +71,6 @@
       "default": "us-west-2"
     },
     "SCCACHE_S3_NO_CREDENTIALS": {
-      "default": "0"
-    },
-    "VLLM_SKIP_FLASH_ATTN_BUILD": {
       "default": "0"
     },
     "TORCH_CUDA_ARCH_LIST": {
@@ -89,7 +92,7 @@
       "default": "cuda"
     },
     "DEEPEP_COMMIT_HASH": {
-      "default": "73b6ea4"
+      "default": "d4f41e4e93"
     },
     "GIT_REPO_CHECK": {
       "default": "0"
@@ -101,19 +104,13 @@
       "default": "true"
     },
     "FLASHINFER_VERSION": {
-      "default": "0.6.15.post1"
+      "default": "0.6.18"
     },
     "GDRCOPY_CUDA_VERSION": {
       "default": "12.8"
     },
     "GDRCOPY_OS_VERSION": {
       "default": "Ubuntu24_04"
-    },
-    "BITSANDBYTES_VERSION_X86": {
-      "default": "0.46.1"
-    },
-    "BITSANDBYTES_VERSION_ARM64": {
-      "default": "0.42.0"
     },
     "TIMM_VERSION": {
       "default": ">=1.0.17"

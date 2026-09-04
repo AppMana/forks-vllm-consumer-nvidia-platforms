@@ -8,7 +8,12 @@ import numpy as np
 from vllm.v1.executor.ray_executor import RayDistributedExecutor
 from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
 from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors, ModelRunnerOutput
+from vllm.v1.outputs import (
+    LogprobsLists,
+    LogprobsTensors,
+    ModelRunnerOutput,
+    RoutedExpertsLists,
+)
 
 
 def _make_readonly(arr: np.ndarray) -> np.ndarray:
@@ -86,3 +91,28 @@ def test_ray_executor_v2_uses_bounded_nsight_capture() -> None:
     runtime_env = executor._build_runtime_env()
 
     _assert_bounded_nsight_capture(runtime_env)
+
+
+def test_detach_zero_copy_routed_experts_without_logprobs():
+    output = ModelRunnerOutput(
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        routed_experts=RoutedExpertsLists(
+            routing_data=_make_readonly(np.arange(12, dtype=np.int32).reshape(2, 3, 2)),
+            slot_mapping=_make_readonly(np.array([7, 8], dtype=np.int64)),
+        ),
+    )
+    original = output.routed_experts
+    assert output.logprobs is None
+
+    detach_zero_copy_from_model_runner_output(output)
+
+    detached = output.routed_experts
+    assert detached is not None
+    assert detached is not original
+    assert detached.routing_data is not original.routing_data
+    assert detached.slot_mapping is not original.slot_mapping
+    assert detached.routing_data.flags.writeable
+    assert detached.slot_mapping.flags.writeable
+    np.testing.assert_array_equal(detached.routing_data, original.routing_data)
+    np.testing.assert_array_equal(detached.slot_mapping, original.slot_mapping)

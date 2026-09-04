@@ -4,13 +4,43 @@ import pytest
 import torch
 
 from vllm.utils.torch_utils import (
+    OMP_NUM_THREADS_SET_BY_VLLM,
     STR_DTYPE_TO_TORCH_DTYPE,
+    available_cpu_count,
     common_broadcastable_dtype,
     current_stream,
     get_kv_cache_torch_dtype,
     is_lossless_cast,
     is_quantized_kv_cache,
+    set_default_torch_dtype,
+    set_torch_threads_for_runtime,
+    startup_omp_num_threads,
 )
+
+
+def test_nvfp4_4over6_cache_dtype() -> None:
+    from vllm.config.cache import CacheConfig
+    from vllm.v1.kv_cache_interface import KVQuantMode, get_kv_quant_mode
+
+    cache_config = CacheConfig(cache_dtype="nvfp4_4over6")
+
+    assert cache_config.cache_dtype == "nvfp4_4over6"
+    assert get_kv_cache_torch_dtype(cache_config.cache_dtype) == torch.uint8
+    assert is_quantized_kv_cache(cache_config.cache_dtype)
+    assert get_kv_quant_mode(cache_config.cache_dtype) == KVQuantMode.NVFP4
+
+
+def test_set_default_torch_dtype_restores_dtype_after_exception() -> None:
+    original_dtype = torch.get_default_dtype()
+
+    with (
+        pytest.raises(RuntimeError, match="expected failure"),
+        set_default_torch_dtype(torch.bfloat16),
+    ):
+        assert torch.get_default_dtype() == torch.bfloat16
+        raise RuntimeError("expected failure")
+
+    assert torch.get_default_dtype() == original_dtype
 
 
 @pytest.mark.parametrize(
@@ -123,3 +153,49 @@ def test_int8_ds_mla_cache_dtype_maps_to_uint8() -> None:
     assert STR_DTYPE_TO_TORCH_DTYPE["int8_ds_mla"] is torch.uint8
     assert get_kv_cache_torch_dtype("int8_ds_mla") is torch.uint8
     assert is_quantized_kv_cache("int8_ds_mla")
+
+
+@pytest.fixture
+def restore_torch_threads(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    original = torch.get_num_threads()
+    yield
+    torch.set_num_threads(original)
+
+
+def test_startup_omp_num_threads_divides_between_local_workers():
+    """Workers share the node's usable CPUs rather than each taking them all."""
+    available = available_cpu_count()
+    if available < 4:
+        pytest.skip("needs at least 4 usable CPUs")
+    assert startup_omp_num_threads(1) == available
+    assert startup_omp_num_threads(2) == available // 2
+    # Never zero, however many workers share the node.
+    assert startup_omp_num_threads(available * 4) == 1
+
+
+def test_set_torch_threads_for_runtime(restore_torch_threads):
+    torch.set_num_threads(max(2, available_cpu_count()))
+    set_torch_threads_for_runtime()
+    assert torch.get_num_threads() == 1
+
+
+def test_runtime_threads_respect_user_omp_num_threads(
+    restore_torch_threads, monkeypatch: pytest.MonkeyPatch
+):
+    """An externally-set OMP_NUM_THREADS is the user's choice; leave it alone."""
+    monkeypatch.setenv("OMP_NUM_THREADS", "3")
+    torch.set_num_threads(3)
+    set_torch_threads_for_runtime()
+    assert torch.get_num_threads() == 3
+
+
+def test_runtime_threads_override_vllm_set_omp_num_threads(
+    restore_torch_threads, monkeypatch: pytest.MonkeyPatch
+):
+    """The value vLLM picked for worker startup is dropped once serving starts."""
+    monkeypatch.setenv("OMP_NUM_THREADS", "3")
+    monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
+    torch.set_num_threads(3)
+    set_torch_threads_for_runtime()
+    assert torch.get_num_threads() == 1

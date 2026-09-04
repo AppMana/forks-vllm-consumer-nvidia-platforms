@@ -1,20 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 
 import pytest
 
 from vllm.compilation.backends import wrap_with_cudagraph_if_needed
-from vllm.config.compilation import CompilationMode, CUDAGraphMode
-from vllm.config.vllm import (
-    _configure_breakable_cudagraph,
-    _should_auto_enable_breakable_cudagraph,
-)
+from vllm.config.compilation import CUDAGraphMode
+from vllm.config.vllm import VllmConfig
 
 
-def _model_config(architecture: str):
-    return SimpleNamespace(architectures=[architecture])
+def _config(architecture: str):
+    return SimpleNamespace(model_config=SimpleNamespace(architectures=[architecture]))
 
 
 @pytest.mark.parametrize(
@@ -29,7 +27,7 @@ def test_deepseek_v4_does_not_auto_enable_breakable_cudagraph(architecture):
     # DSV4 attention is an opaque splitting op; standard piecewise CUDA
     # graphs cover it, and lazy breakable capture stalls decode on a full
     # unified-memory pool.
-    assert not _should_auto_enable_breakable_cudagraph(_model_config(architecture))
+    assert not VllmConfig._uses_breakable_cudagraph_by_default(_config(architecture))
 
 
 @pytest.mark.parametrize(
@@ -44,49 +42,36 @@ def test_deepseek_v4_does_not_auto_enable_breakable_cudagraph(architecture):
 def test_unsupported_compile_architecture_auto_enables_breakable_cudagraph(
     architecture,
 ):
-    assert _should_auto_enable_breakable_cudagraph(_model_config(architecture))
+    assert VllmConfig._uses_breakable_cudagraph_by_default(_config(architecture))
 
 
 def test_deepseek_v4_compile_mode_defaults_to_standard_piecewise(monkeypatch):
     monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
-    compilation_config = SimpleNamespace(mode=CompilationMode.VLLM_COMPILE)
 
-    auto_enabled, breakable_enabled = _configure_breakable_cudagraph(
-        _model_config("DeepseekV4ForCausalLM"),
-        compilation_config,
+    breakable_enabled = VllmConfig._maybe_enable_breakable_cudagraph(
+        _config("DeepseekV4ForCausalLM")
     )
 
-    assert not auto_enabled
     assert not breakable_enabled
-    assert compilation_config.mode == CompilationMode.VLLM_COMPILE
+    # Nothing opted the architecture in, so the env stays unset and the model
+    # body keeps its standard piecewise compilation.
+    assert "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
 
 
 def test_deepseek_v4_explicit_breakable_opt_in_is_preserved(monkeypatch):
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
-    compilation_config = SimpleNamespace(mode=CompilationMode.VLLM_COMPILE)
 
-    auto_enabled, breakable_enabled = _configure_breakable_cudagraph(
-        _model_config("DeepseekV4ForCausalLM"),
-        compilation_config,
+    assert VllmConfig._maybe_enable_breakable_cudagraph(
+        _config("DeepseekV4ForCausalLM")
     )
-
-    assert not auto_enabled
-    assert breakable_enabled
-    assert compilation_config.mode == CompilationMode.VLLM_COMPILE
 
 
 def test_deepseek_v4_explicit_breakable_opt_out_preserves_compile(monkeypatch):
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
-    compilation_config = SimpleNamespace(mode=CompilationMode.VLLM_COMPILE)
 
-    auto_enabled, breakable_enabled = _configure_breakable_cudagraph(
-        _model_config("DeepseekV4ForCausalLM"),
-        compilation_config,
+    assert not VllmConfig._maybe_enable_breakable_cudagraph(
+        _config("DeepseekV4ForCausalLM")
     )
-
-    assert not auto_enabled
-    assert not breakable_enabled
-    assert compilation_config.mode == CompilationMode.VLLM_COMPILE
 
 
 def test_breakable_cudagraph_does_not_nest_piecewise_wrappers(monkeypatch):

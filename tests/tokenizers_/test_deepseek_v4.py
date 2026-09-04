@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm.entrypoints.chat_utils import parse_chat_messages
 from vllm.renderers.registry import RENDERER_REGISTRY
@@ -76,13 +77,16 @@ def test_deepseek_v4_tokenizer_registered():
     )
 
 
-def test_deepseek_v4_defaults_to_chat_mode():
+def test_deepseek_v4_defaults_to_thinking_with_high_effort():
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
     )
 
-    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
+    assert prompt.startswith(
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+    )
+    assert prompt.endswith("<｜Assistant｜><think>")
 
 
 @pytest.mark.parametrize("kwargs", [{"thinking": True}, {"enable_thinking": True}])
@@ -93,7 +97,109 @@ def test_deepseek_v4_enables_thinking_with_compatible_kwargs(kwargs):
         **kwargs,
     )
 
-    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜><think>")
+    assert prompt.startswith(
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+    )
+    assert prompt.endswith("<｜Assistant｜><think>")
+
+
+@pytest.mark.parametrize("kwargs", [{"thinking": False}, {"enable_thinking": False}])
+def test_deepseek_v4_explicitly_disables_thinking(kwargs):
+    prompt = _tokenizer().apply_chat_template(
+        [{"role": "user", "content": "Hello"}],
+        tokenize=False,
+        **kwargs,
+    )
+
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
+
+
+@pytest.mark.parametrize(
+    ("enable_thinking", "thinking_token"),
+    [(False, "</think>"), (True, "<think>")],
+)
+def test_deepseek_v4_appends_assistant_transition_after_trailing_system(
+    enable_thinking, thinking_token
+):
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "system", "content": "Be concise."},
+        ],
+        tokenize=False,
+        enable_thinking=enable_thinking,
+        reasoning_effort="low",
+    )
+
+    assert prompt == (
+        "<｜begin▁of▁sentence｜>You are helpful."
+        f"<｜User｜>What is 2+2?Be concise.<｜Assistant｜>{thinking_token}"
+    )
+
+
+def test_deepseek_v4_does_not_transition_after_mid_conversation_system():
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "user", "content": "What is 3+3?"},
+            {"role": "assistant", "content": "6"},
+            {"role": "system", "content": "Answer in French."},
+            {"role": "user", "content": "What is 5+5?"},
+        ],
+        tokenize=False,
+        enable_thinking=False,
+    )
+
+    assert prompt == (
+        "<｜begin▁of▁sentence｜><｜User｜>What is 3+3?"
+        "<｜Assistant｜></think>6<｜end▁of▁sentence｜>"
+        "Answer in French.<｜User｜>What is 5+5?"
+        "<｜Assistant｜></think>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("enable_thinking", "expected"),
+    [
+        (
+            False,
+            "<｜begin▁of▁sentence｜>rules<｜Assistant｜></think>answer"
+            "<｜end▁of▁sentence｜>",
+        ),
+        (
+            True,
+            "<｜begin▁of▁sentence｜>rules<｜Assistant｜><think>reason</think>answer"
+            "<｜end▁of▁sentence｜>",
+        ),
+    ],
+)
+def test_deepseek_v4_transitions_from_system_to_assistant(enable_thinking, expected):
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "system", "content": "rules"},
+            {
+                "role": "assistant",
+                "reasoning": "reason",
+                "content": "answer",
+            },
+        ],
+        tokenize=False,
+        enable_thinking=enable_thinking,
+        reasoning_effort="low",
+    )
+
+    assert prompt == expected
+
+
+def test_deepseek_v4_unknown_role_raises_value_error():
+    # Invalid roles are client errors: they must surface as ValueError
+    # (mapped to HTTP 400 by the OpenAI serving layer), not
+    # NotImplementedError (mapped to HTTP 501).
+    with pytest.raises(ValueError, match="Invalid role: SYSTEM"):
+        _tokenizer().apply_chat_template(
+            [{"role": "SYSTEM", "content": "Hello"}],
+            tokenize=False,
+        )
 
 
 def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
@@ -123,7 +229,10 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     assert "</｜DSML｜tool_calls>" in prompt
     assert "function_calls" not in prompt
     assert '"name": "get_weather"' in prompt
-    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
+    assert prompt.startswith(
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+    )
+    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜><think>")
 
 
 def test_deepseek_v4_attaches_tools_to_existing_system_message():
@@ -212,19 +321,20 @@ def test_deepseek_v4_renders_parsed_history_tool_arguments():
 
 
 @pytest.mark.parametrize(
-    ("reasoning_effort", "expect_preamble"),
+    ("reasoning_effort", "expected_prefix"),
     [
         # DeepSeek-V4-Flash-0731 gave "high" its own preamble (the text that
         # used to be "max"-only), so the low tier is now the ONLY one that
         # renders a bare thinking prompt.
-        ("minimal", False),
-        ("low", False),
-        ("medium", True),
-        ("high", True),
+        ("minimal", "<｜begin▁of▁sentence｜><｜User｜>Hello"),
+        ("low", "<｜begin▁of▁sentence｜><｜User｜>Hello"),
+        ("medium", "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"),
+        ("high", "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"),
+        ("max", "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"),
     ],
 )
-def test_deepseek_v4_accepts_openai_reasoning_effort_values(
-    reasoning_effort, expect_preamble
+def test_deepseek_v4_renders_0731_reasoning_effort_prompts(
+    reasoning_effort, expected_prefix
 ):
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
@@ -234,7 +344,7 @@ def test_deepseek_v4_accepts_openai_reasoning_effort_values(
     )
 
     assert prompt.endswith("<｜Assistant｜><think>")
-    assert ("Reasoning Effort: Absolute maximum" in prompt) is expect_preamble
+    assert prompt.startswith(expected_prefix)
 
 
 def test_deepseek_v4_none_reasoning_effort_disables_thinking():
@@ -295,7 +405,7 @@ def test_deepseek_v4_maps_compatible_thinking_reasoning_effort_values(
 
 
 @pytest.mark.parametrize("reasoning_effort", ["max", "xhigh"])
-def test_deepseek_v4_preserves_reference_max_reasoning_effort(reasoning_effort):
+def test_deepseek_v4_renders_0731_max_reasoning_effort(reasoning_effort):
     """The top tier renders 0731's "Beyond maximum" preamble.
 
     Pre-0731 this text did not exist and "max" rendered "Absolute maximum" --
@@ -318,10 +428,10 @@ def test_deepseek_v4_preserves_reference_max_reasoning_effort(reasoning_effort):
 @pytest.mark.parametrize(
     ("case_id", "kwargs"),
     [
-        (1, {"thinking": True}),
-        (2, {"thinking": True}),
-        (3, {"thinking": True}),
-        (4, {}),
+        (1, {"thinking": True, "reasoning_effort": "low"}),
+        (2, {"thinking": True, "reasoning_effort": "low"}),
+        (3, {"thinking": True, "reasoning_effort": "low"}),
+        (4, {"thinking": False}),
     ],
 )
 def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
@@ -331,3 +441,84 @@ def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
         (FIXTURES_DIR / f"test_output_{case_id}.txt").read_text().removesuffix("\n")
     )
     assert prompt == expected
+
+
+def test_deepseek_v4_rejects_empty_developer_content():
+    with pytest.raises(ValueError):
+        _tokenizer().apply_chat_template(
+            [{"role": "developer", "content": ""}],
+            tokenize=False,
+            enable_thinking=True,
+            reasoning_effort="low",
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"thinking_mode": "bogus"},
+        {"thinking_mode": "thinking", "reasoning_effort": "turbo"},
+    ],
+)
+def test_deepseek_v4_encode_messages_rejects_invalid_arguments(kwargs):
+    from vllm.tokenizers.deepseek_v4_encoding import encode_messages
+
+    with pytest.raises(ValueError):
+        encode_messages([{"role": "user", "content": "Hello"}], **kwargs)
+
+
+def test_deepseek_v4_image_blocks_become_placeholders():
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first:"},
+                    {"type": "image_url", "image_url": {"url": "file:///a.png"}},
+                    {"type": "text", "text": "second:"},
+                    {"type": "image", "source": {"data": "AAAA"}},
+                ],
+            }
+        ],
+        tokenize=False,
+        thinking=False,
+    )
+
+    assert "<｜User｜>first:<｜deepseek_image｜>second:<｜deepseek_image｜>" in prompt
+
+
+def test_deepseek_v4_image_sentinel_ids_match_tokenizer():
+    """The borrowed sentinel ids must line up with the reserved
+    ``<|place_holder_mm_span_XXXX|>`` tokens in the tokenizer."""
+    from vllm.models.deepseek_v4.common.mm_preprocess import (
+        IMAGE_SENTINEL_BASE_ID,
+        IMAGE_SENTINEL_TOKEN_NAMES,
+        image_sentinel_mask,
+        validate_image_sentinel_ids,
+    )
+
+    class FakeTokenizer:
+        def __init__(self, offset: int = 0) -> None:
+            self.offset = offset
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            return (
+                IMAGE_SENTINEL_BASE_ID
+                + self.offset
+                + (IMAGE_SENTINEL_TOKEN_NAMES.index(token))
+            )
+
+    validate_image_sentinel_ids(FakeTokenizer())  # no raise
+    with pytest.raises(ValueError, match="sentinel"):
+        validate_image_sentinel_ids(FakeTokenizer(offset=1))
+
+    ids = torch.tensor(
+        [
+            1,
+            IMAGE_SENTINEL_BASE_ID,
+            IMAGE_SENTINEL_BASE_ID + 4,
+            IMAGE_SENTINEL_BASE_ID + 5,
+            129264,
+        ]
+    )
+    assert image_sentinel_mask(ids).tolist() == [False, True, True, False, False]

@@ -156,6 +156,9 @@ def deep_gemm_fp8_o_proj(
         device=o.device,
         dtype=torch.bfloat16,
     )
+    weight_scale = (
+        wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
+    )
     # DeepGEMM fp8_einsum is Hopper/sm_100 only. On Ampere (sm_8x) and consumer
     # Blackwell (sm_12x) use the software fp8 einsum (triton on sm_89+, torch
     # fallback on sm_86), which computes the same "bhr,hdr->bhd" contraction.
@@ -171,14 +174,14 @@ def deep_gemm_fp8_o_proj(
         # Reshape wo_a (2D -> [groups, out_rank, hidden]) + unpack scales, then
         # run the software einsum (torch on sm_86, triton on sm_12x).
         a, a_scale, b, b_scale = _normalize_deepseek_v4_fp8_einsum_inputs(
-            o_fp8, o_scale, wo_a.weight, wo_a.weight_scale_inv, z
+            o_fp8, o_scale, wo_a.weight, weight_scale, z
         )
         deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, z)
     else:
         fp8_einsum(
             "bhr,hdr->bhd",
             (o_fp8, o_scale),
-            (wo_a.weight, wo_a.weight_scale_inv),
+            (wo_a.weight, weight_scale),
             z,
             recipe=einsum_recipe,
         )

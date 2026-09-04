@@ -79,7 +79,6 @@ def _has_int4_experts_int8_dense(config_groups: dict[str, Any]) -> bool:
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
     FusedMoEMethodBase,
     RoutedExperts,
 )
@@ -1152,7 +1151,7 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,

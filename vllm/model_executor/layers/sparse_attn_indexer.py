@@ -8,12 +8,11 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import get_current_vllm_config
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.attention.pcp import maybe_gather_indexer_k
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -40,6 +39,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -1188,7 +1188,7 @@ def sparse_attn_indexer(
     kv_cache: torch.Tensor,
     q_quant: torch.Tensor,
     q_scale: torch.Tensor | None,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -1199,6 +1199,7 @@ def sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor,
     skip_k_cache_insert: bool,
     use_pcp: bool,
+    dense_mha_metadata_layer_name: LayerNameType,
     use_fp4_cache: bool = False,
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
@@ -1206,7 +1207,8 @@ def sparse_attn_indexer(
     skip_topk_buffer_clear: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
-    attn_metadata = get_forward_context().attn_metadata
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
@@ -1245,6 +1247,7 @@ def sparse_attn_indexer(
             topk_indices_buffer,
             skip_k_cache_insert,
             use_pcp,
+            dense_mha_metadata_layer_name,
             use_fp4_cache,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
@@ -1309,6 +1312,24 @@ def sparse_attn_indexer(
             ops.indexer_k_quant_and_cache(
                 k, kv_cache, slot_mapping_for_cache, quant_block_size, scale_fmt
             )
+
+    # The indexer and main MLA may classify the same short extend differently
+    # because they use independent decode thresholds. Only the main MLA route
+    # can determine whether the top-k indices will be consumed.
+    if forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL:
+        dense_mha_layer = _resolve_layer_name(dense_mha_metadata_layer_name)
+        if dense_mha_layer:
+            mla_metadata = attn_metadata.get(dense_mha_layer)
+            prefill_metadata = getattr(mla_metadata, "prefill", None)
+            if (
+                getattr(prefill_metadata, "use_dense_mha", False)
+                and getattr(mla_metadata, "num_decode_tokens", -1) == 0
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                # Deliberately leave the buffer untouched. Dense MHA does not
+                # consume top-k indices for this batch; clearing it would be
+                # unnecessary work.
+                return topk_indices_buffer
 
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
@@ -1558,6 +1579,7 @@ def sparse_attn_indexer(
                     current_platform.is_cuda()
                     and current_platform.is_device_capability_family(120),
                 ),
+                indices=decode_metadata.indices,
             )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
@@ -1565,7 +1587,7 @@ def sparse_attn_indexer(
         use_cooperative_topk = (
             current_platform.is_cuda()
             and topk_tokens in (512, 1024, 2048)
-            and num_rows <= 32
+            and num_rows <= 64
             and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
@@ -1669,7 +1691,7 @@ def sparse_attn_indexer_fake(
     kv_cache: torch.Tensor,
     q_quant: torch.Tensor,
     q_scale: torch.Tensor | None,
-    k: torch.Tensor,
+    k: torch.Tensor | None,
     weights: torch.Tensor,
     quant_block_size: int,
     scale_fmt: str | None,
@@ -1680,6 +1702,7 @@ def sparse_attn_indexer_fake(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
     use_pcp: bool,
+    dense_mha_metadata_layer_name: LayerNameType,
     use_fp4_cache: bool = False,
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
@@ -1723,6 +1746,7 @@ class SparseAttnIndexer(CustomOp):
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
+        compress_ratio: int = 1,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -1735,14 +1759,17 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        self.compress_ratio = compress_ratio
+        self.dense_mha_metadata_layer_name = ""
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
         parallel_config = get_current_vllm_config().parallel_config
+        self._parallel_config = parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
-        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self._cp_kv_cache_interleave_size: int | None = None
         # DeepGEMM is Hopper-only. On Ampere (sm_8x) and consumer Blackwell
         # (sm_12x) the paged-MQA-logits path is served by the Triton fallback in
         # vllm.utils.deep_gemm.fp8_fp4_paged_mqa_logits (families 80/120), so the
@@ -1761,11 +1788,25 @@ class SparseAttnIndexer(CustomOp):
                 "the current vLLM environment."
             )
 
+    @property
+    def cp_kv_cache_interleave_size(self) -> int:
+        """With PD+DCP, the real value isn't known until block_size is finalized,
+        which happens after this layer is built. Safe to cache after the first access,
+        as long as the adjustment always runs before any forward pass
+        (it's set up in Worker.initialize_from_config, ahead of warmup/serving).
+        """
+        if self._cp_kv_cache_interleave_size is None:
+            value = self._parallel_config.cp_kv_cache_interleave_size
+            if isinstance(get_forward_context().attn_metadata, dict):
+                self._cp_kv_cache_interleave_size = value
+            return value
+        return self._cp_kv_cache_interleave_size
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         if current_platform.is_cuda() or current_platform.is_xpu():
@@ -1782,7 +1823,7 @@ class SparseAttnIndexer(CustomOp):
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         # FP8 path: single tensor (per-token scale is folded into `weights`).
@@ -1808,6 +1849,7 @@ class SparseAttnIndexer(CustomOp):
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
             self.use_pcp,
+            _encode_layer_name(self.dense_mha_metadata_layer_name),
             self.use_fp4_cache,
             self.dcp_rank,
             self.dcp_world_size,
@@ -1818,7 +1860,7 @@ class SparseAttnIndexer(CustomOp):
         self,
         hidden_states: torch.Tensor,
         q_fp8: torch.Tensor,
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         return self.forward_cuda(hidden_states, q_fp8, k, weights)
@@ -1827,14 +1869,20 @@ class SparseAttnIndexer(CustomOp):
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        k: torch.Tensor,
+        k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
-        if rocm_aiter_ops.is_enabled():
+        from vllm.platforms.rocm import on_gfx11
+
+        if (
+            rocm_aiter_ops.is_enabled()
+            or rocm_aiter_ops.is_rdna_aiter_enabled()
+            or on_gfx11()
+        ):
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
@@ -1850,6 +1898,7 @@ class SparseAttnIndexer(CustomOp):
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
+                compress_ratio=self.compress_ratio,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "

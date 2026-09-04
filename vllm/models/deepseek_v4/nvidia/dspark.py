@@ -17,6 +17,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -24,6 +25,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -46,6 +48,11 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_shard,
+)
 from vllm.models.deepseek_v4.attention import (
     fused_qnorm_rope_kv_int8_ds_mla_insert,
 )
@@ -55,6 +62,7 @@ from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Model,
+    _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
 )
 
@@ -83,9 +91,7 @@ def _remap_dspark_checkpoint_name(name: str) -> str | None:
         "markov_head.",
         "confidence_head.",
     )
-    if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
-        head_prefixes
-    ):
+    if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(head_prefixes):
         return f"model.{rest}"
     return f"model.layers.{stage}.{rest}"
 
@@ -149,6 +155,7 @@ class DSparkDeepseekV4Model(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.num_hidden_layers = config.num_hidden_layers
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or 3
 
@@ -208,6 +215,12 @@ class DSparkDeepseekV4Model(nn.Module):
             self.mhc_post = MHCPostOp()
             self.hc_head = HCHeadOp()
 
+            self.topk_indices_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                config.index_topk,
+                dtype=torch.int32,
+            )
+
             current_vllm_config = get_current_vllm_config()
             self.layers = nn.ModuleList(
                 [
@@ -216,13 +229,15 @@ class DSparkDeepseekV4Model(nn.Module):
                         prefix=maybe_prefix(
                             prefix, f"layers.{self.num_hidden_layers + i}"
                         ),
+                        topk_indices_buffer=self.topk_indices_buffer,
                     )
                     for i in range(self.num_dspark_layers)
                 ]
             )
 
-            # Heads: final norm + hc_head, and the Markov head. Loaded from
-            # the "final" MTP layer weights (mtp.*) in the target checkpoint.
+            # Heads: final norm + hc_head, and the Markov and confidence heads.
+            # Loaded from the "final" MTP layer weights (mtp.*) in the target
+            # checkpoint.
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             hc_dim = self.hc_mult * config.hidden_size
             self.hc_head_fn = nn.Parameter(
@@ -244,20 +259,23 @@ class DSparkDeepseekV4Model(nn.Module):
                 config.dspark_markov_rank,
                 prefix=maybe_prefix(prefix, "markov_head"),
             )
-            self.confidence_head: DSparkConfidenceHead | None = DSparkConfidenceHead(
-                config.hidden_size + config.dspark_markov_rank,
-                prefix=maybe_prefix(prefix, "confidence_head"),
-            )
-            # The head was added after the first DSpark checkpoints. The indexed
-            # source manifest still requires it when advertised, but checkpoints
-            # that genuinely omit it remain loadable.
-            for param in self.confidence_head.parameters():
-                param.is_checkpoint_optional = True
+            self.confidence_head: DSparkConfidenceHead | None = None
+            if getattr(config, "enable_confidence_head", True):
+                self.confidence_head = DSparkConfidenceHead(
+                    config.hidden_size + config.dspark_markov_rank,
+                    prefix=maybe_prefix(prefix, "confidence_head"),
+                )
+                # The head was added after the first DSpark checkpoints. The
+                # indexed source manifest still requires it when advertised,
+                # but checkpoints that genuinely omit it remain loadable.
+                for param in self.confidence_head.parameters():
+                    param.is_checkpoint_optional = True
         else:
             self.main_proj = PPMissingLayer()
             self.main_norm = PPMissingLayer()
             self.mhc_post = PPMissingLayer()
             self.hc_head = PPMissingLayer()
+            self.topk_indices_buffer = None
             self.layers = nn.ModuleList(
                 [PPMissingLayer() for _ in range(self.num_dspark_layers)]
             )
@@ -326,6 +344,15 @@ class DSparkDeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
+        full_num_tokens = positions.shape[0]
+        if self.use_sequence_parallel:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(
+                    forward_context.is_padding, inputs_embeds
+                )
+            inputs_embeds = sp_shard(inputs_embeds)
+            input_ids = sp_shard(input_ids)
         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
@@ -340,6 +367,8 @@ class DSparkDeepseekV4Model(nn.Module):
                 residual,
             )
         hidden_states = self.mhc_post(hidden_states, residual, post_mix, res_mix)
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         # hc_head reduces the hc copies; return the PRE-norm head hidden
         hidden_states = self.hc_head(
             hidden_states,
@@ -509,10 +538,9 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 self.allow_patterns_overrides = indexed_files
                 self._expected_dspark_checkpoint_names = expected_names
         self.quant_config = vllm_config.quant_config
-        self.pad_shared_expert = (
-            getattr(self.quant_config, "weight_block_size", None) is not None
-            and not vllm_config.parallel_config.use_sequence_parallel_moe
-        )
+        self.pad_shared_expert = getattr(
+            self.quant_config, "weight_block_size", None
+        ) is not None and not _use_sequence_parallel(vllm_config)
         self.model = DSparkDeepseekV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -681,6 +709,10 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
             seen_checkpoint_names.add(checkpoint_name)
             name = mapped
             if "confidence_head." in name:
+                if self.model.confidence_head is None:
+                    # Head disabled by config. The source tensor is recorded as
+                    # seen above, so the manifest check still accounts for it.
+                    continue
                 loaded_confidence_head = True
 
             # ``.scale`` -> per-method scale suffix.
@@ -724,8 +756,8 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 continue
 
             # Stacked rules only apply to decoder-layer weights. Head-stack params
-            # (main_proj/norm/hc_head/markov_head) load directly. Otherwise e.g.
-            # "markov_w1" would collide with the "w1" shard rule.
+            # (main_proj/norm/hc_head/markov_head/confidence_head) load directly.
+            # Otherwise e.g. "markov_w1" would collide with the "w1" shard rule.
             is_layer_param = name.startswith("model.layers.")
             for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
                 if not is_layer_param or weight_name not in name:
@@ -751,12 +783,9 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 loaded_params.add(name)
 
         self._validate_loaded_parameters(loaded_params, seen_checkpoint_names)
-        if (
-            getattr(self.model, "confidence_head", None) is not None
-            and not loaded_confidence_head
-        ):
+        if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
-        self._finalize_moe()
+        self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -803,6 +832,9 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
     def _finalize_moe(self) -> None:
         for layer in self.model.layers:
             layer.ffn.finalize_mega_moe_weights()
+
+    def process_weights_after_loading(self) -> None:
+        self._finalize_moe()
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.

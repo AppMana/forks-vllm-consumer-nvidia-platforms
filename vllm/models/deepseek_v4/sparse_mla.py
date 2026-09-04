@@ -9,6 +9,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
@@ -98,8 +99,8 @@ def c128a_decode_topk_width(
     )
 
 
-class DeepseekV4FlashMLABackend(AttentionBackend):
-    """DeepSeek-V4 sparse-MLA backend.
+class DeepseekV4SparseMLABackend(AttentionBackend):
+    """DeepSeek-V4 sparse-MLA backend base.
 
     Subclasses ``AttentionBackend`` directly (not the V3.2
     ``FlashMLASparseBackend``): DeepSeek-V4 runs its own attention layer
@@ -121,12 +122,8 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
         return [256]
 
     @staticmethod
-    def get_name() -> str:
-        return "FLASHMLA_SPARSE_DSV4"
-
-    @staticmethod
-    def get_builder_cls() -> type["DeepseekV4FlashMLAMetadataBuilder"]:
-        return DeepseekV4FlashMLAMetadataBuilder
+    def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
+        return DeepseekV4SparseMLAMetadataBuilder
 
     @staticmethod
     def get_impl_cls() -> type[Any]:
@@ -134,7 +131,7 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
         # not the generic ``Attention``/``MLAAttention`` layer, so the backend's
         # impl class is never instantiated.
         raise NotImplementedError(
-            "DeepseekV4FlashMLABackend has no separate impl class; DeepSeek-V4 "
+            "DeepseekV4SparseMLABackend has no separate impl class; DeepSeek-V4 "
             "attention runs through DeepseekV4Attention."
         )
 
@@ -168,25 +165,6 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
         # cp.async, which Turing does not have.
         return capability.major >= 8
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        if cache_dtype_str == "fp8_ds_mla":
-            # DeepseekV4 main MLA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
-            # head_size passed in is the semantic head_dim (512).
-            return (num_blocks, block_size, 584)
-        if cache_dtype_str == "int8_ds_mla":
-            # Experimental AppMana layout: 512 signed-int8 row bytes + one
-            # fp32 scale + 12B pad (16-byte-multiple token stride).
-            return (num_blocks, block_size, 528)
-        else:
-            return (num_blocks, block_size, head_size)
-
 
 @dataclass
 class DeepseekV4FlashMLAMetadata(AttentionMetadata):
@@ -211,7 +189,7 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
     c128a_prefill_topk_indices: torch.Tensor | None = None
 
 
-class DeepseekV4FlashMLAMetadataBuilder(
+class DeepseekV4SparseMLAMetadataBuilder(
     AttentionMetadataBuilder[DeepseekV4FlashMLAMetadata]
 ):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
@@ -235,8 +213,8 @@ class DeepseekV4FlashMLAMetadataBuilder(
             (max_num_batched_tokens,), dtype=torch.int32, device=device
         )
 
-        assert hasattr(self.kv_cache_spec, "compress_ratio")
-        self.compress_ratio = self.kv_cache_spec.compress_ratio
+        assert isinstance(self.kv_cache_spec.tokens_per_state, int)
+        self.compress_ratio = self.kv_cache_spec.tokens_per_state
 
         # Pre-allocate compressed slot mapping buffer for CUDA graph address
         # stability when compress_ratio > 1.
@@ -286,7 +264,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
                 cm.query_start_loc,
                 cm.seq_lens,
                 cm.block_table_tensor.clamp_(min=0),
-                int(self.kv_cache_spec.storage_block_size),
+                int(self.kv_cache_spec.num_states),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -371,6 +349,20 @@ class DeepseekV4FlashMLAMetadataBuilder(
         return result
 
 
+class DeepseekV4FlashMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+
+class DeepseekV4FlashMLABackend(DeepseekV4SparseMLABackend):
+    @staticmethod
+    def get_name() -> str:
+        return "FLASHMLA_SPARSE_DSV4"
+
+    @staticmethod
+    def get_builder_cls() -> type[DeepseekV4FlashMLAMetadataBuilder]:
+        return DeepseekV4FlashMLAMetadataBuilder
+
+
 def build_c128a_topk_metadata(
     positions: torch.Tensor,
     compress_ratio: int,
@@ -390,7 +382,7 @@ def build_c128a_topk_metadata(
     Prefill tokens: position → local indices [0, ..., n-1, -1, ...].
 
     Writes into pre-allocated buffers for CUDA graph address stability.
-    Returns slices of the buffers.
+    Returns views of the buffers.
     """
     num_tokens = positions.shape[0]
     num_prefill_tokens = num_tokens - num_decode_tokens
@@ -402,7 +394,13 @@ def build_c128a_topk_metadata(
     )
     assert global_decode_buffer.stride(-1) == prefill_buffer.stride(-1) == 1
 
-    global_decode = global_decode_buffer[:num_decode_tokens, :max_compressed_tokens]
+    # TODO: support adaptive-width decode on SM120 (needs the FlashInfer
+    # SM120 kernel to accept a real row stride for eidx).
+    capability = current_platform.get_device_capability()
+    if capability is not None and capability.major == 12:
+        global_decode = global_decode_buffer[:num_decode_tokens]
+    else:
+        global_decode = global_decode_buffer[:num_decode_tokens, :max_compressed_tokens]
     decode_lens = decode_lens_buffer[:num_decode_tokens]
     prefill_local = prefill_buffer[:num_prefill_tokens, :max_compressed_tokens]
     assert global_decode.stride(0) == global_decode_buffer.stride(0)

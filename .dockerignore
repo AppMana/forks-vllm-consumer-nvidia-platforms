@@ -11,6 +11,9 @@ docker/
 !docker/entrypoints/
 !docker/entrypoints/**
 cmake-build*/
+/artifacts/vllm-rocm-install/
+/bake-config-build-*.json
+/wheel-export/
 rust/target/
 vllm.egg-info/
 vllm/vllm-rs

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 import os
 
 import torch
@@ -397,6 +398,67 @@ def mhc_post(
     return torch.ops.vllm.mhc_post_tilelang(x, residual, post_layer_mix, comb_res_mix)
 
 
+def _has_aiter_mhc_fused() -> bool:
+    if not HAS_AITER_MHC:
+        return False
+    try:
+        from aiter.ops.mhc import mhc_fused_post_pre
+    except Exception:
+        return False
+    return callable(mhc_fused_post_pre)
+
+
+def _aiter_mhc_op_accepts_norm(op_name: str) -> bool:
+    if not HAS_AITER_MHC:
+        return False
+    try:
+        from aiter.ops import mhc as aiter_mhc
+
+        for candidate_name in (op_name, f"{op_name}_fake"):
+            op = getattr(aiter_mhc, candidate_name, None)
+            if op is None:
+                continue
+            parameters = inspect.signature(op).parameters
+            if "norm_weight" in parameters and "norm_eps" in parameters:
+                return True
+    except (AttributeError, ImportError, TypeError, ValueError):
+        pass
+    return False
+
+
+HAS_AITER_MHC_FUSED = _has_aiter_mhc_fused()
+HAS_AITER_MHC_PRE_NORM = _aiter_mhc_op_accepts_norm("mhc_pre")
+HAS_AITER_MHC_FUSED_NORM = _aiter_mhc_op_accepts_norm("mhc_fused_post_pre")
+
+
+def _aiter_mhc_supported(
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    *,
+    supports_norm: bool,
+) -> bool:
+    hidden_size = residual.shape[-1]
+    hc_mult = residual.shape[-2]
+    return (
+        HAS_AITER_MHC
+        and hidden_size % 256 == 0
+        and hc_mult == 4
+        and (norm_weight is None or supports_norm)
+    )
+
+
+def _apply_mhc_norm(
+    layer_input: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+) -> torch.Tensor:
+    if norm_weight is None:
+        return layer_input
+    from vllm import ir
+
+    return ir.ops.rms_norm(layer_input, norm_weight, norm_eps)
+
+
 # --8<-- [start:mhc_pre]
 @CustomOp.register("mhc_pre")
 class MHCPreOp(CustomOp):
@@ -478,9 +540,14 @@ class MHCPreOp(CustomOp):
         hc_post_mult_value: float,
         sinkhorn_repeat: int,
         n_splits: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_size = residual.shape[-1]
-        if HAS_AITER_MHC and hidden_size % 256 == 0:
+        if _aiter_mhc_supported(
+            residual,
+            norm_weight,
+            supports_norm=HAS_AITER_MHC_PRE_NORM,
+        ):
             return torch.ops.vllm.mhc_pre_aiter(
                 residual,
                 fn,
@@ -491,6 +558,9 @@ class MHCPreOp(CustomOp):
                 hc_sinkhorn_eps,
                 hc_post_mult_value,
                 sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
             )
         elif HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_pre_tilelang(
@@ -504,9 +574,11 @@ class MHCPreOp(CustomOp):
                 hc_post_mult_value,
                 sinkhorn_repeat,
                 n_splits,
+                norm_weight,
+                norm_eps,
             )
         else:
-            return self.forward_native(
+            post_mix, comb_mix, layer_input = self.forward_native(
                 residual,
                 fn,
                 hc_scale,
@@ -517,6 +589,13 @@ class MHCPreOp(CustomOp):
                 hc_post_mult_value,
                 sinkhorn_repeat,
                 n_splits,
+                norm_weight,
+                norm_eps,
+            )
+            return (
+                post_mix,
+                comb_mix,
+                _apply_mhc_norm(layer_input, norm_weight, norm_eps),
             )
 
     def forward_native(
@@ -602,8 +681,7 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_size = residual.shape[-1]
-        if HAS_AITER_MHC and hidden_size % 256 == 0:
+        if _aiter_mhc_supported(residual, None, supports_norm=True):
             return torch.ops.vllm.mhc_post_aiter(
                 x,
                 residual,
@@ -832,12 +910,134 @@ class MHCFusedPostPreOp(CustomOp):
             tile_n,
         )
 
-    def forward_hip(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Hip implementation of mhc_fused_post_pre is not available"
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        tile_n: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if HAS_AITER_MHC_FUSED and _aiter_mhc_supported(
+            residual,
+            norm_weight,
+            supports_norm=HAS_AITER_MHC_FUSED_NORM,
+        ):
+            return torch.ops.vllm.mhc_fused_post_pre_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
+        if HAS_TILELANG_MHC:
+            return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
+        residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = self.forward_native(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            tile_n,
+            norm_weight,
+            norm_eps,
+        )
+        return (
+            residual_cur,
+            post_mix_cur,
+            comb_mix_cur,
+            _apply_mhc_norm(layer_input_cur, norm_weight, norm_eps),
         )
 
-    def forward_native(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Native implementation of mhc_fused_post_pre is not available"
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        tile_n: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Decompose into post + pre (no fused kernel available).
+        residual_cur = mhc_kernels.mhc_post_torch(
+            x, residual, post_layer_mix, comb_res_mix
         )
+        post_mix_cur, comb_mix_cur, layer_input_cur = mhc_kernels.mhc_pre_torch(
+            residual_cur,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+
+
+def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+    """[s, hidden_size] -> [s, n * hidden_size] by replication."""
+    return x.unsqueeze(1).expand(-1, n, -1).contiguous()
+
+
+def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+    """[s, n * hidden_size] -> [s, hidden_size] by averaging."""
+    return x.mean(dim=1)

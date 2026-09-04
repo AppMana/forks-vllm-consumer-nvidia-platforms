@@ -133,7 +133,7 @@ def test_every_dsv4_backend_is_warmed():
     """Each DSV4 sparse-MLA backend reaches the same three Triton helper
     kernels, so each must be in the warmup's backend-name set; one missing
     means that arch JIT-compiles them on the first real request."""
-    from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
+    from vllm.models.deepseek_v4.attention import (
         _DEEPSEEK_V4_SPARSE_MLA_BACKENDS,
     )
     from vllm.models.deepseek_v4.nvidia_sm12x.attention import (

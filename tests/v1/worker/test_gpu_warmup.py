@@ -66,6 +66,13 @@ class _FakeModelRunner:
         hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
     )
     scheduler_config = SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=6)
+    max_model_len = 1024
+    kv_block_zeroer = None
+    vllm_config = SimpleNamespace(
+        num_lookahead_tokens=0,
+        is_mm_encoder_only=False,
+        speculative_config=None,
+    )
 
 
 def test_mixed_prefill_decode_warmup_drains_async_pp_slots():
@@ -156,6 +163,8 @@ def test_deepseek_v4_long_prefill_warmup_includes_scheduler_cap(monkeypatch):
         )
 
         uses_draft_model = SpeculativeConfig.uses_draft_model
+        use_dflash = SpeculativeConfig.use_dflash
+        use_dspark = SpeculativeConfig.use_dspark
         max_num_new_slots_for_drafting = (
             SpeculativeConfig.max_num_new_slots_for_drafting
         )
@@ -168,6 +177,8 @@ def test_deepseek_v4_long_prefill_warmup_includes_scheduler_cap(monkeypatch):
     vllm_config = SimpleNamespace(
         speculative_config=ParallelDraftSpec(),
         scheduler_config=scheduler_config,
+        num_lookahead_tokens=0,
+        is_mm_encoder_only=False,
     )
     VllmConfig._set_max_num_scheduled_tokens(vllm_config)
 
@@ -290,7 +301,11 @@ def test_deepseek_v4_long_prefill_warmup_replays_pure_prefill_boundary_shape():
         max_num_scheduled_tokens=1000,
         max_num_seqs=6,
     )
-    runner.vllm_config = SimpleNamespace(speculative_config=None)
+    runner.vllm_config = SimpleNamespace(
+        speculative_config=None,
+        num_lookahead_tokens=0,
+        is_mm_encoder_only=False,
+    )
     runner.model_config = SimpleNamespace(
         hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
     )
@@ -477,6 +492,7 @@ def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch)
         ),
         device=torch.device("cuda", 0),
         num_speculative_steps=0,
+        vllm_config=SimpleNamespace(is_mm_encoder_only=False),
     )
 
     monkeypatch.setattr(
@@ -530,6 +546,8 @@ def test_non_deepseek_v4_pp_warmup_kernels_keeps_generic_execute_model(monkeypat
     assert [output.total_num_scheduled_tokens for output in executed] == [
         12,
         6,
+        2,
+        1,
         0,
         2,
         0,
@@ -545,7 +563,7 @@ def test_non_deepseek_v4_pp_warmup_kernels_keeps_generic_execute_model(monkeypat
         0,
         0,
     ]
-    assert len(sampled) == 4
+    assert len(sampled) == 6
 
 
 def test_deepseek_v4_spec_warmup_uses_long_prefill_compile_class(monkeypatch):
