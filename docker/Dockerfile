@@ -1026,6 +1026,7 @@ RUN set -eux; \
     rm -f /tmp/libnccl.so.2.30.7; \
     cd "/usr/lib/${TRIPLET}"; \
     rm -f libnccl.so.2 libnccl.so; \
+    find . -maxdepth 1 -name 'libnccl.so.2.*' ! -name 'libnccl.so.2.30.7' -delete; \
     ln -sf libnccl.so.2.30.7 libnccl.so.2; \
     ln -sf libnccl.so.2 libnccl.so; \
     ldconfig; \
