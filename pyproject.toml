@@ -48,7 +48,13 @@ lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:regi
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
 
 [tool.setuptools_scm]
-# no extra settings needed, presence enables setuptools-scm
+# Only release tags carry a version. `git describe` otherwise matches any tag
+# containing a digit, so a repository that also tags things like archived
+# branches fails the build with "Can't parse version from tag" depending on
+# which tag happens to be nearest.
+git_describe_command = [
+  "git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
