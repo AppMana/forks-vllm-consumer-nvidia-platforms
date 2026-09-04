@@ -114,7 +114,9 @@ async def run_request(
 ) -> dict:
     t0 = time.perf_counter()
     ttft = None
+    ttft_any = None
     text = ""
+    reasoning = ""
     usage = {}
     finish = None
     # Arrival time of every content chunk after the first, relative to the
@@ -135,8 +137,20 @@ async def run_request(
             usage = chunk.usage.model_dump()
         for choice in chunk.choices:
             delta = choice.delta.content if choice.delta else None
+            # A reasoning chunk is a generated token like any other. Timing it
+            # separately is what lets a reasoning-only response report a real
+            # prefill rate instead of a nonsensical zero.
+            think = getattr(choice.delta, "reasoning", None) if choice.delta else None
+            if think is None and choice.delta is not None:
+                think = getattr(choice.delta, "reasoning_content", None)
+            if think:
+                if ttft_any is None:
+                    ttft_any = time.perf_counter() - t0
+                reasoning += think
             if delta:
                 now = time.perf_counter()
+                if ttft_any is None:
+                    ttft_any = now - t0
                 if ttft is None:
                     ttft = now - t0
                 else:
@@ -147,24 +161,39 @@ async def run_request(
                 finish = choice.finish_reason
     elapsed = time.perf_counter() - t0
     prompt_tokens = usage.get("prompt_tokens")
+    # The model spent its whole budget reasoning and never answered. That is
+    # not a recall result: scoring it as a 0.0 match makes it indistinguishable
+    # from the model reproducing the wrong text.
+    reasoning_only = not text and bool(reasoning)
     return {
         "ttft_s": ttft,
+        # First token of any kind, reasoning included. ttft_s stays
+        # content-only so it keeps meaning "time to the answer".
+        "ttft_any_s": ttft_any,
         "elapsed_s": elapsed,
         "finish_reason": finish,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": usage.get("completion_tokens"),
         # Single-stream prefill rate: the whole prompt is prefilled before the
-        # first token, so prompt_tokens / TTFT is the per-request rate.
+        # first token, so prompt_tokens / TTFT is the per-request rate. Uses
+        # the first token of any kind, so a reasoning-only response still
+        # reports the prefill it really achieved.
         "prefill_tok_s": (
-            prompt_tokens / ttft if ttft and prompt_tokens else None
+            prompt_tokens / ttft_any if ttft_any and prompt_tokens else None
         ),
         "itl_s": itl,
+        "reasoning_only": reasoning_only,
+        "reasoning_chars": len(reasoning),
         "needle_verbatim": needle in text,
         # autojunk=False: with a small word vocabulary every word is
         # "popular" and the default heuristic degenerates ratio() to 0.
-        "match_ratio": difflib.SequenceMatcher(
-            None, needle.split(), text.split(), autojunk=False
-        ).ratio(),
+        "match_ratio": (
+            None
+            if reasoning_only
+            else difflib.SequenceMatcher(
+                None, needle.split(), text.split(), autojunk=False
+            ).ratio()
+        ),
         "text": text,
         # Kept so a miss can be diffed token by token after the fact.
         "needle": needle,
@@ -239,7 +268,11 @@ async def main() -> int:
     wall_s = time.perf_counter() - bench_t0
 
     passed = sum(r["needle_verbatim"] for r in results)
-    ratios = [r["match_ratio"] for r in results]
+    # Requests that never emitted content are not recall evidence; keeping
+    # them out of the ratios stops a thinking-mode change from looking like a
+    # recall collapse. reasoning_only counts them so the run still says so.
+    reasoning_only = sum(r["reasoning_only"] for r in results)
+    ratios = [r["match_ratio"] for r in results if r["match_ratio"] is not None]
     ttfts = [r["ttft_s"] for r in results if r["ttft_s"] is not None]
     out_tokens = sum(r["completion_tokens"] or 0 for r in results)
     in_tokens = sum(r["prompt_tokens"] or 0 for r in results)
@@ -257,10 +290,12 @@ async def main() -> int:
         "target_needle_tokens": args.needle_tokens,
         "wall_s": round(wall_s, 2),
         "needle_verbatim_passed": passed,
+        "needle_scored": len(ratios),
+        "reasoning_only": reasoning_only,
         "match_ratio": {
-            "mean": round(statistics.mean(ratios), 4),
-            "p50": round(statistics.median(ratios), 4),
-            "min": round(min(ratios), 4),
+            "mean": round(statistics.mean(ratios), 4) if ratios else None,
+            "p50": round(statistics.median(ratios), 4) if ratios else None,
+            "min": round(min(ratios), 4) if ratios else None,
         },
         "prompt_tokens_total": in_tokens,
         "completion_tokens_total": out_tokens,
