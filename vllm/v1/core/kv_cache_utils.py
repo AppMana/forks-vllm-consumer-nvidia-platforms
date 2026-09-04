@@ -1721,12 +1721,19 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
+        # A group projected onto a pipeline stage that holds none of its
+        # layers keeps the unprojected spec, so read the layer list off the
+        # group rather than off the spec: taking it from the spec emits
+        # tensors for layers this worker does not own, and allocation then
+        # cannot find a group for them.
+        if not group.layer_names:
+            continue
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
-        elif group.layer_names:
+            for layer_name in group.layer_names:
+                layers_by_spec[group_spec.kv_cache_specs[layer_name]].append(layer_name)
+        else:
             layers_by_spec[group_spec].extend(group.layer_names)
 
         byte_offset = 0

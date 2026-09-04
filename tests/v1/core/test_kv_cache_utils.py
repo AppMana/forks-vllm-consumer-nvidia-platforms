@@ -1375,6 +1375,52 @@ def test_max_memory_usage_ignores_empty_projected_groups():
     )
 
 
+def test_packed_tensors_ignore_empty_projected_groups():
+    """The same phantom group must produce no KVCacheTensor.
+
+    _project_kv_cache_groups_to_worker keeps a group whose layers all live on
+    other pipeline stages, and that group keeps the global spec with every
+    remote layer inside it. Bucketing the tensors off the spec rather than off
+    layer_names emits tensors for layers this worker does not own; allocation
+    then looks each tensor's first layer up in the worker's groups, finds
+    nothing, and dies with a bare StopIteration.
+    """
+    model_config = ModelConfig(max_model_len=1024)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+
+    local_spec = new_kv_cache_spec()
+    local_group = KVCacheGroupSpec(
+        ["layer_local"],
+        UniformTypeKVCacheSpecs(
+            block_size=16, kv_cache_specs={"layer_local": local_spec}
+        ),
+    )
+    phantom_group = KVCacheGroupSpec(
+        [],
+        UniformTypeKVCacheSpecs(
+            block_size=16,
+            kv_cache_specs={
+                f"layer_remote_{i}": new_kv_cache_spec() for i in range(4)
+            },
+        ),
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        [local_group, phantom_group],
+        local_spec.page_size_bytes * 10,
+    )
+
+    owned = {name for group in config.kv_cache_groups for name in group.layer_names}
+    for tensor in config.kv_cache_tensors:
+        assert set(tensor.layers) <= owned, (
+            f"tensor for {tensor.layers} has no group on this worker"
+        )
+    assert owned == {"layer_local"}
+
+
 def test_dcp_world_size_for_kv_cache_spec_shards_full_attention_only():
     dcp = 8
     full = FullAttentionSpec(
@@ -3725,7 +3771,8 @@ def _c128a_only_grouped_specs() -> list[UniformTypeKVCacheSpecs]:
         dtype=torch.bfloat16,
         cache_dtype_str="fp8_ds_mla",
         alignment=576,
-        compress_ratio=128,
+        tokens_per_state=128,
+        state_content_bytes=584,
         model_version="deepseek_v4",
     )
     swa = SlidingWindowMLASpec(
@@ -3736,7 +3783,8 @@ def _c128a_only_grouped_specs() -> list[UniformTypeKVCacheSpecs]:
         sliding_window=128,
         cache_dtype_str="fp8_ds_mla",
         alignment=576,
-        compress_ratio=1,
+        tokens_per_state=1,
+        state_content_bytes=584,
         model_version="deepseek_v4",
     )
     mla_group = UniformTypeKVCacheSpecs.from_specs({"model.layers.0.attn": mla})
@@ -3746,21 +3794,38 @@ def _c128a_only_grouped_specs() -> list[UniformTypeKVCacheSpecs]:
     assert mla_group is not None and swa_group is not None
     # Precondition of the bug: the sliding-window companion page is strictly
     # larger than the latent-MLA (tiling-base) page.
-    assert max(swa_group.get_page_sizes()) > max(mla_group.get_page_sizes())
+    assert swa_group.page_size_bytes > mla_group.page_size_bytes
     return [mla_group, swa_group]
 
 
 def test_c128a_only_rank_kv_cache_group_init_succeeds():
-    """When fixed, a C128A-only rank must produce groups with correct page
-    geometry (the SWA companion tiling into aligned pages) instead of asserting.
+    """A C128A-only rank must produce groups with correct page geometry (the
+    SWA companion tiling into aligned pages) instead of asserting.
+
+    The fork's own _get_kv_cache_groups_uniform_groups was replaced by
+    upstream's packed grouping in the 2026-09 merge; this exercises the
+    replacement against the same real geometry.
     """
-    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(
-        _c128a_only_grouped_specs()
-    )
-    # Post-fix expectations: init returns groups covering both layers, and no
-    # padded page is smaller than the layer it must hold.
+    model_config = ModelConfig(max_model_len=1024)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "BLNHC"
+
+    specs: dict[str, KVCacheSpec] = {}
+    for group in _c128a_only_grouped_specs():
+        specs.update(group.kv_cache_specs)
+
+    groups = kv_cache_utils._get_packed_kv_cache_groups(vllm_config, specs)
+    assert groups is not None, "mixed page sizes must take the packed path"
     covered = {name for g in groups for name in g.layer_names}
     assert covered == {"model.layers.0.attn", "model.layers.0.attn.swa_cache"}
+    # No padded page may be smaller than the layer it has to hold.
+    for group in groups:
+        group_page = group.kv_cache_spec.page_size_bytes
+        for inner in iter_layer_specs(group.kv_cache_spec):
+            assert group_page >= inner.page_size_bytes, (
+                f"{group.layer_names} needs {inner.page_size_bytes} B but its "
+                f"group page is {group_page} B"
+            )
 
 
 def test_resolve_block_hashes_gate():
