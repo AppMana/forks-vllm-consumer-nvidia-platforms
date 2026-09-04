@@ -589,6 +589,13 @@ ARG TARGETPLATFORM
 ARG VLLM_SKIP_FLASH_ATTN_BUILD
 ENV VLLM_SKIP_FLASH_ATTN_BUILD=${VLLM_SKIP_FLASH_ATTN_BUILD}
 
+# ARGs do not cross stage boundaries, and this is the stage that builds the
+# wheel. Without redeclaring it the build falls back to deriving a version
+# from `git describe`, which fails outright in a repository whose nearest tag
+# is not a release tag.
+ARG VLLM_VERSION_OVERRIDE
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_VERSION_OVERRIDE}
+
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ARG PYTORCH_CUDA_INDEX_BASE_URL
