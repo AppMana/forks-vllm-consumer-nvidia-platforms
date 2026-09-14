@@ -29,6 +29,9 @@ import regex as re
 _LAYER_ID_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 _FIRST_STAGE_PREFIXES = (
+    "vision.",
+    "aligner.",
+    "image_",
     "embed.",
     "embed_tokens.",
     "model.embed.",
@@ -70,6 +73,8 @@ def should_skip_pp_weight(
     """
     if local_layer_range is None:
         return False
+    if weight_name.startswith(("vision.", "aligner.", "image_")):
+        return not is_first_pipeline_rank
     lid = parse_layer_id(weight_name)
     if lid is not None:
         start, end = local_layer_range

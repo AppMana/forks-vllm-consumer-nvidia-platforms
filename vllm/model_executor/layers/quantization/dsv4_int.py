@@ -21,7 +21,52 @@ import torch
 import torch.nn.functional as F
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.logger import init_logger as _dsv4_init_logger
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
+    RoutedExperts,
+)
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEQuantConfig,
+    int4_w4a16_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+    register_weight_loader_v2_supported_method,
+)
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from vllm.model_executor.layers.quantization.utils.allspark_utils import (
+    ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD,
+    is_allspark_supported_device_capability,
+)
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    get_marlin_input_dtype,
+    marlin_act_int8_process_scales,
+    marlin_make_workspace_new,
+    marlin_moe_permute_scales,
+)
+from vllm.model_executor.parameter import (
+    BlockQuantScaleParameter,
+    ChannelQuantScaleParameter,
+    ModelWeightParameter,
+)
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.configs.dsv4.kernel_config import (
     DENSE_EXPERTS_INT8_ACTIVATION,
     ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
@@ -29,6 +74,7 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     activate_kernel_config,
     resolve_int_quant_kernel_config,
 )
+from vllm.utils.platform_utils import num_compute_units
 
 _dsv4_logger = _dsv4_init_logger(__name__)
 _DSV4_KERNEL_PATHS: dict = {}
@@ -75,53 +121,6 @@ def _has_int4_experts_int8_dense(config_groups: dict[str, Any]) -> bool:
         and linear_weights.get("type") == "int"
     )
 
-
-from vllm import _custom_ops as ops
-from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoEMethodBase,
-    RoutedExperts,
-)
-from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig,
-    FusedMoEQuantConfig,
-    int4_w4a16_moe_quant_config,
-)
-from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
-from vllm.model_executor.layers.linear import (
-    LinearBase,
-    LinearMethodBase,
-    UnquantizedLinearMethod,
-    register_weight_loader_v2_supported_method,
-)
-from vllm.model_executor.layers.quantization import (
-    QuantizationMethods,
-    register_quantization_config,
-)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
-from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
-from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
-from vllm.model_executor.layers.quantization.utils.allspark_utils import (
-    ALLSPARK_AMPERE_M_CUBLAS_THRESHOLD,
-    is_allspark_supported_device_capability,
-)
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    get_marlin_input_dtype,
-    marlin_act_int8_process_scales,
-    marlin_make_workspace_new,
-    marlin_moe_permute_scales,
-)
-from vllm.model_executor.parameter import (
-    BlockQuantScaleParameter,
-    ChannelQuantScaleParameter,
-    ModelWeightParameter,
-)
-from vllm.model_executor.utils import replace_parameter, set_weight_attrs
-from vllm.scalar_type import scalar_types
-from vllm.utils.platform_utils import num_compute_units
 
 _E2M1_VALUES = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
@@ -519,7 +518,7 @@ def dequantize_allspark_uint8_w8a16(
 class Dsv4IntConfig(QuantizationConfig):
     """Quantization config for AOT-requantized DeepSeek V4 INT checkpoints."""
 
-    QUANT_METHOD_NAME = "dsv4_int"
+    QUANT_METHOD_NAME: QuantizationMethods = "dsv4_int"
     INT8_PARENT_PATTERNS = (
         ".attn.fused_wqa_wkv",
         ".attn.wq_b",
@@ -567,6 +566,17 @@ class Dsv4IntConfig(QuantizationConfig):
                 f"({ROLE_DENSE_EXPERTS_INT8_ACTIVATION}) requires a checkpoint "
                 "with INT4 experts and INT8 dense weight groups"
             )
+        vision_group = self.config_groups.get("vision_w8a8")
+        if (vision_group is not None) != resolved.has_role("vision_linear_int8"):
+            raise ValueError(
+                "Vision INT8 weight group and vision_linear_int8 kernel "
+                "must be selected together"
+            )
+        if (
+            vision_group is not None
+            and vision_group.get("weights", {}).get("group_size", 32) != 32
+        ):
+            raise ValueError("Vision IMMA requires group_size=32")
         self.experimental_int8_runtime = dense_enabled
         self.kernels_explicit = resolved.explicit
         if resolved.explicit or has_int_weights:
@@ -655,6 +665,14 @@ class Dsv4IntConfig(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             return Dsv4Int4MoEMethod(self, layer.moe_config)
         if isinstance(layer, LinearBase):
+            if "vision_w8a8" in self.config_groups and prefix.startswith(
+                ("vision.", "aligner.")
+            ):
+                from vllm.models.deepseek_v4.common.vision_int8 import (
+                    VisionInt8LinearMethod,
+                )
+
+                return VisionInt8LinearMethod()
             if any(pattern in prefix for pattern in self.INT8_PARENT_PATTERNS):
                 return Dsv4Int8LinearMethod(self, prefix)
             return UnquantizedLinearMethod()
@@ -673,7 +691,7 @@ class Dsv4Mxfp4Int8Config(Dsv4IntConfig):
     comparison point for ``mxfp4+fp8`` versus ``mxfp4+int8``.
     """
 
-    QUANT_METHOD_NAME = "dsv4_mxfp4_int8"
+    QUANT_METHOD_NAME: QuantizationMethods = "dsv4_mxfp4_int8"
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -704,6 +722,14 @@ class Dsv4Mxfp4Int8Config(Dsv4IntConfig):
         if isinstance(layer, RoutedExperts):
             return Mxfp4MoEMethod(layer.moe_config)
         if isinstance(layer, LinearBase):
+            if "vision_w8a8" in self.config_groups and prefix.startswith(
+                ("vision.", "aligner.")
+            ):
+                from vllm.models.deepseek_v4.common.vision_int8 import (
+                    VisionInt8LinearMethod,
+                )
+
+                return VisionInt8LinearMethod()
             if any(pattern in prefix for pattern in self.INT8_PARENT_PATTERNS):
                 return Dsv4Int8LinearMethod(self, prefix)
             return UnquantizedLinearMethod()
@@ -881,7 +907,7 @@ class Dsv4Int8LinearMethod(LinearMethodBase):
         device = layer.weight.device
         device_index = device.index
         if device_index is None:
-            device_index = torch.cuda.current_device()
+            device_index = torch.accelerator.current_device_index()
         properties = torch.cuda.get_device_properties(device_index)
         sm_version = properties.major * 10 + properties.minor
         if not _dsv4_allspark_supported_device_capability(sm_version):

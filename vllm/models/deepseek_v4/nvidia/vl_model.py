@@ -22,6 +22,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm.distributed import get_pp_group
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -72,8 +73,7 @@ def _make_deepseek_v4_vl_weights_mapper(
         },
         orig_to_new_substr={
             ".shared_experts.w2": ".shared_experts.down_proj",
-            # The MTP/DSpark draft heads are not supported for the vision
-            # variant; drop their weights.
+            # The separate DSpark model loads its own draft weights.
             "mtp.": None,
         },
     )
@@ -108,11 +108,13 @@ class DeepseekV4ForConditionalGeneration(
         model_config = vllm_config.model_config
         config = model_config.hf_config
         self.config = config
+        self.compute_dtype = model_config.dtype
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
 
         image_enabled = (
-            config.vision_n_layers > 0
+            get_pp_group().is_first_rank
+            and config.vision_n_layers > 0
             and self.multimodal_config.get_limit_per_prompt("image") > 0
         )
         with self._mark_tower_model(vllm_config, {"image"}):
@@ -138,8 +140,11 @@ class DeepseekV4ForConditionalGeneration(
                             torch.empty(config.hidden_size, dtype=torch.float32)
                         ),
                     )
-                self.vision.to(dtype=model_config.dtype)
-                self.aligner.to(dtype=model_config.dtype)
+                if "vision_w8a8" not in getattr(
+                    vllm_config.quant_config, "config_groups", {}
+                ):
+                    self.vision.to(dtype=model_config.dtype)
+                    self.aligner.to(dtype=model_config.dtype)
 
         with self._mark_language_model(vllm_config):
             # The arch convertor routes any config with a vision tower to
@@ -209,7 +214,7 @@ class DeepseekV4ForConditionalGeneration(
         perm: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         assert self.vision is not None and self.aligner is not None
-        patches = patches.to(self.aligner.w1.weight.dtype)
+        patches = patches.to(self.compute_dtype)
 
         embeds: list[torch.Tensor] = []
         vit_offset = 0

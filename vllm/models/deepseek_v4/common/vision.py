@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
@@ -29,7 +30,16 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
+
+
+def get_vision_quant_config() -> QuantizationConfig | None:
+    """Only explicit vision quantization applies to the BF16 source tower."""
+    quant_config = get_current_vllm_config().quant_config
+    if "vision_w8a8" in getattr(quant_config, "config_groups", {}):
+        return quant_config
+    return None
 
 
 @lru_cache(8)
@@ -71,7 +81,8 @@ class DeepseekV4PatchEmbed(nn.Module):
             3 * config.vision_patch_size**2,
             config.vision_dim,
             bias=True,
-            quant_config=None,
+            quant_config=get_vision_quant_config(),
+            prefix="vision.patch_embed.proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -96,7 +107,7 @@ class DeepseekV4VisionAttention(nn.Module):
             self.head_dim,
             config.vision_n_heads,
             bias=True,
-            quant_config=None,
+            quant_config=get_vision_quant_config(),
             prefix=f"{prefix}.wqkv",
             disable_tp=use_data_parallel,
         )
@@ -104,14 +115,25 @@ class DeepseekV4VisionAttention(nn.Module):
             config.vision_dim,
             config.vision_dim,
             bias=True,
-            quant_config=None,
+            quant_config=get_vision_quant_config(),
             prefix=f"{prefix}.wo",
             disable_tp=use_data_parallel,
         )
-        self.attn = MMEncoderAttention(
-            num_heads=self.n_heads,
-            head_size=self.head_dim,
-            prefix=f"{prefix}.attn",
+        from vllm.transformers_utils.configs.dsv4.kernel_config import (
+            resolve_kernel_config_from_hf_config,
+        )
+
+        self.use_int8_attention = resolve_kernel_config_from_hf_config(config).has_role(
+            "vision_attention_int8"
+        )
+        self.attn = (
+            None
+            if self.use_int8_attention
+            else MMEncoderAttention(
+                num_heads=self.n_heads,
+                head_size=self.head_dim,
+                prefix=f"{prefix}.attn",
+            )
         )
 
     def forward(
@@ -123,7 +145,13 @@ class DeepseekV4VisionAttention(nn.Module):
         q = apply_rotary(q, cos, sin).unsqueeze(0)  # (b=1, n, h, d)
         k = apply_rotary(k, cos, sin).unsqueeze(0)
         # One image per call: a dense batch, no varlen packing metadata.
-        o = self.attn(q, k, v.unsqueeze(0))
+        if self.use_int8_attention:
+            from .vision_int8 import vision_attention_int8
+
+            o = vision_attention_int8(q, k, v.unsqueeze(0))
+        else:
+            assert self.attn is not None
+            o = self.attn(q, k, v.unsqueeze(0))
         out, _ = self.wo(o.reshape(n, -1))
         return out
 
@@ -136,7 +164,7 @@ class DeepseekV4VisionMLP(nn.Module):
             config.vision_dim,
             [config.vision_inter_dim] * 2,
             bias=False,
-            quant_config=None,
+            quant_config=get_vision_quant_config(),
             prefix=f"{prefix}.w1",
             disable_tp=use_data_parallel,
         )
@@ -144,7 +172,7 @@ class DeepseekV4VisionMLP(nn.Module):
             config.vision_inter_dim,
             config.vision_dim,
             bias=False,
-            quant_config=None,
+            quant_config=get_vision_quant_config(),
             prefix=f"{prefix}.w2",
             disable_tp=use_data_parallel,
         )
@@ -181,7 +209,7 @@ class DeepseekV4ViT(nn.Module):
         self.patch_embed = DeepseekV4PatchEmbed(config)
         self.blocks = nn.ModuleList(
             [
-                DeepseekV4VisionBlock(config, prefix=f"blocks.{i}")
+                DeepseekV4VisionBlock(config, prefix=f"vision.blocks.{i}")
                 for i in range(config.vision_n_layers)
             ]
         )
@@ -211,15 +239,17 @@ class DeepseekV4Aligner(nn.Module):
             in_dim,
             config.hidden_size,
             bias=True,
-            quant_config=None,
+            quant_config=get_vision_quant_config(),
             disable_tp=use_data_parallel,
+            prefix="aligner.w1",
         )
         self.w2 = RowParallelLinear(
             config.hidden_size,
             config.hidden_size,
             bias=True,
-            quant_config=None,
+            quant_config=get_vision_quant_config(),
             disable_tp=use_data_parallel,
+            prefix="aligner.w2",
         )
 
     def forward(self, x: torch.Tensor, n_vit_h: int, n_vit_w: int) -> torch.Tensor:

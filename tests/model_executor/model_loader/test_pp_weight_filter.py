@@ -122,9 +122,7 @@ class TestShouldSkipPpWeight:
             "is_first_pipeline_rank": False,
             "is_last_pipeline_rank": False,
         }
-        assert should_skip_pp_weight(
-            "model.embed_tokens.weight", local_range, **middle
-        )
+        assert should_skip_pp_weight("model.embed_tokens.weight", local_range, **middle)
         assert should_skip_pp_weight("model.norm.weight", local_range, **middle)
         assert should_skip_pp_weight("lm_head.weight", local_range, **middle)
         assert should_skip_pp_weight(
@@ -241,9 +239,7 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
             tensors[f"model.layers.{layer_id}.self_attn.q_proj.weight"] = torch.randn(
                 64, 64
             )
-            tensors[f"model.layers.{layer_id}.input_layernorm.weight"] = torch.randn(
-                64
-            )
+            tensors[f"model.layers.{layer_id}.input_layernorm.weight"] = torch.randn(64)
 
         filepath = str(tmp_path / "model-00001-of-00001.safetensors")
         save_file(tensors, filepath)
@@ -303,9 +299,7 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
             assert all_layer_names.isdisjoint(layer_names)
             all_layer_names |= layer_names
 
-        expected_layer_names = {
-            n for n in expected if parse_layer_id(n) is not None
-        }
+        expected_layer_names = {n for n in expected if parse_layer_id(n) is not None}
         assert all_layer_names == expected_layer_names
 
     def test_global_weights_are_read_only_on_owning_rank(self, tmp_path):
@@ -335,9 +329,7 @@ class TestSafetensorsWeightsIteratorWithPpFilter:
         assert "model.norm.weight" in last
         assert "lm_head.weight" in last
 
-    def test_middle_rank_never_materializes_global_tensors(
-        self, tmp_path, monkeypatch
-    ):
+    def test_middle_rank_never_materializes_global_tensors(self, tmp_path, monkeypatch):
         files, _ = self._make_synthetic_files(tmp_path, num_layers=4)
         opened = []
         real_safe_open = weight_utils.safe_open
@@ -462,3 +454,24 @@ class TestSafetensorsWeightsIteratorNoModelPrefix:
         )
         assert "embed.weight" not in loaded
         assert "head.weight" not in loaded
+
+
+def test_vision_tensors_belong_only_to_first_pipeline_rank():
+    """The full tower must not be replicated or split as decoder layers."""
+    names = [
+        "vision.blocks.31.attn.wqkv.weight",
+        "vision.blocks.31.attn.wqkv.weight_scale",
+        "vision.layers.31.weight",
+        "aligner.w1.weight",
+        "image_start",
+    ]
+    for name in names:
+        assert not should_skip_pp_weight(
+            name, (0, 4), is_first_pipeline_rank=True, is_last_pipeline_rank=False
+        )
+        assert should_skip_pp_weight(
+            name, (4, 8), is_first_pipeline_rank=False, is_last_pipeline_rank=False
+        )
+        assert should_skip_pp_weight(
+            name, (42, 43), is_first_pipeline_rank=False, is_last_pipeline_rank=True
+        )

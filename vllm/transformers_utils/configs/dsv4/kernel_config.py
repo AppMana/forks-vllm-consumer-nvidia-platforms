@@ -74,6 +74,8 @@ ROLE_SPARSE_MLA_PREFILL = "sparse_mla_prefill"
 ROLE_MHC = "mhc"
 # Toggle roles: membership turns the path on. In an explicit block, absence
 # turns it off; family-aware blockless resolvers may add implied roles.
+ROLE_VISION_LINEAR_INT8 = "vision_linear_int8"
+ROLE_VISION_ATTENTION_INT8 = "vision_attention_int8"
 ROLE_INDEXER_CACHE_INT8 = "indexer_cache_int8"
 ROLE_INDEXER_QUERY_INT8 = "indexer_query_int8"
 ROLE_DENSE_EXPERTS_INT8_ACTIVATION = "dense_experts_int8_activation"
@@ -130,7 +132,14 @@ MHC_VLLM_AUTO = "vllm.model_executor.layers.mhc.MHCFusedPostPreOp"
 # run_post for collapse. Attention and MoE roles remain independent.
 MHC_SPARKINFER = "vllm.models.deepseek_v4.nvidia_sm12x.mhc.sparkinfer_mhc_post_pre"
 
+VISION_ATTENTION_INT8 = (
+    "vllm.models.deepseek_v4.common.vision_int8.vision_attention_int8"
+)
+VISION_LINEAR_INT8 = "vllm.models.deepseek_v4.common.vision_int8.VisionInt8LinearMethod"
+
 KERNEL_REGISTRY: dict[str, str] = {
+    VISION_ATTENTION_INT8: "vision_attention_int8",
+    VISION_LINEAR_INT8: "vision_linear_int8",
     SPARSE_MLA_DECODE_FP8_FLASH: ROLE_SPARSE_MLA_DECODE_FP8,
     SPARSE_MLA_DECODE_FP8_TRITON: ROLE_SPARSE_MLA_DECODE_FP8,
     SPARSE_MLA_DECODE_INT8_TRITON: ROLE_SPARSE_MLA_DECODE_INT8,
@@ -157,6 +166,8 @@ SELECTOR_ROLE_DEFAULTS: dict[str, str] = {
 
 TOGGLE_ROLES = frozenset(
     {
+        ROLE_VISION_LINEAR_INT8,
+        ROLE_VISION_ATTENTION_INT8,
         ROLE_INDEXER_CACHE_INT8,
         ROLE_INDEXER_QUERY_INT8,
         ROLE_DENSE_EXPERTS_INT8_ACTIVATION,
@@ -559,9 +570,7 @@ def dense_experts_int8_activation_enabled() -> bool:
     activate it from their weight family; no active config means OFF.
     """
     config = _ACTIVE_CONFIG
-    return config is not None and config.has_role(
-        ROLE_DENSE_EXPERTS_INT8_ACTIVATION
-    )
+    return config is not None and config.has_role(ROLE_DENSE_EXPERTS_INT8_ACTIVATION)
 
 
 def indexer_streaming_topk_prefill_enabled() -> bool:
@@ -572,9 +581,7 @@ def indexer_streaming_topk_prefill_enabled() -> bool:
     not implied by a blockless checkpoint; no active config means OFF.
     """
     config = _ACTIVE_CONFIG
-    return config is not None and config.has_role(
-        ROLE_INDEXER_STREAMING_TOPK_PREFILL
-    )
+    return config is not None and config.has_role(ROLE_INDEXER_STREAMING_TOPK_PREFILL)
 
 
 def indexer_prefill_topk_slab_rows_override() -> int | None:
@@ -642,7 +649,14 @@ def resolved_proof_line(resolved: ResolvedKernelConfig, *, kv_cache_dtype: str) 
     """Single stable-format line stating every active role -> symbol plus the
     resolved kv-cache dtype. This is the benchmark validity check."""
     parts = []
-    for role in _PROOF_ROLE_ORDER:
+    for role in (
+        *_PROOF_ROLE_ORDER,
+        *(
+            r
+            for r in (ROLE_VISION_LINEAR_INT8, ROLE_VISION_ATTENTION_INT8)
+            if resolved.has_role(r)
+        ),
+    ):
         if role in TOGGLE_ROLES:
             # Toggle roles carry a symbol iff active. Blockless INT checkpoint
             # resolution activates the weight-format-implied INT8 roles.

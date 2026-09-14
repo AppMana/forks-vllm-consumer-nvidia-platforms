@@ -18,12 +18,16 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import regex as re
 from safetensors import safe_open
+
+_VISION_LINEAR_RE = re.compile(
+    r"^(?:vision\.patch_embed\.proj|vision\.blocks\.\d+\.(?:attn\.(?:wqkv|wo)|mlp\.w[12])|aligner\.w[12])\.weight$"
+)
 
 _ROUTED_EXPERT_RE = re.compile(r"\.ffn\.experts\.\d+\.w[123]\.(weight|scale)$")
 _ROUTED_EXPERT_WEIGHT_RE = re.compile(r"\.ffn\.experts\.\d+\.w[123]\.weight$")
@@ -102,7 +106,7 @@ class TensorRecord:
 
 def matched_scale_name(name: str) -> str | None:
     if name.endswith(".weight"):
-        return f"{name[:-len('.weight')]}.scale"
+        return f"{name[: -len('.weight')]}.scale"
     return None
 
 
@@ -115,6 +119,12 @@ def _is_mtp_fp8_parent(name: str) -> bool:
 
 
 def classify_tensor(name: str, dtype: str) -> tuple[str, str]:
+    if _VISION_LINEAR_RE.match(name):
+        if dtype in _PRESERVE_DTYPE_NAMES:
+            return "vision_float_weight", "quantize_vision_int8_candidate"
+        if dtype in {"I8", "torch.int8"}:
+            return "vision_int8_weight", "preserve"
+        return "unknown", "manual_review"
     if _ROUTED_EXPERT_NVFP4_COMPANION_RE.search(name):
         # modelopt NVFP4 scale companions ride with their U8 packed weight
         # and are only ever preserved byte-for-byte (--expert-format nvfp4).
@@ -148,7 +158,11 @@ def classify_tensor(name: str, dtype: str) -> tuple[str, str]:
         and dtype in _FP8_SCALE_DTYPE_NAMES
     ):
         return "mtp_fp8_scale", "quantize_int8_w8a16_candidate"
-    if _is_fp8_parent(name) and name.endswith(".weight") and dtype in _FP8_WEIGHT_DTYPE_NAMES:
+    if (
+        _is_fp8_parent(name)
+        and name.endswith(".weight")
+        and dtype in _FP8_WEIGHT_DTYPE_NAMES
+    ):
         if any(parent in name for parent in _INDEXER_QK_PARENTS):
             return "indexer_qk_fp8_weight", "measure_recall_then_quantize"
         return "dense_fp8_weight", "quantize_int8_w8a16_candidate"

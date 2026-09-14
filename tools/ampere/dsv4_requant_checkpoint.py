@@ -8,7 +8,8 @@ The conservative Ampere baseline is ``dsv4_int``:
 * routed expert MXFP4 weights -> symmetric INT4 W4A16, group size 32
 * FP8 linears -> symmetric INT8 W8A16, 128x128 blocks by default, or
   channelwise biased UINT8 for the AllSpark Ampere W8A16 kernel
-* BF16/F32/etc. tensors -> passthrough
+* vision BF16 linears -> group-32 W8A8 IMMA when a vision tower is present
+* other BF16/F32/etc. tensors -> passthrough
 
 The hybrid comparison path is ``dsv4_mxfp4_int8``:
 
@@ -16,21 +17,22 @@ The hybrid comparison path is ``dsv4_mxfp4_int8``:
 * FP8 linears -> INT8 as above
 * BF16/F32/etc. tensors -> passthrough
 
-The converter preserves tensor names and shard names so the original
-``model.safetensors.index.json`` remains valid.
+The converter preserves tensor names and original shard ownership, rebuilding
+the index for added scales and shared draft tensors. Vision IMMA checkpoints
+split oversized shards to a 4 GiB tensor-data budget without mixing owners.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 import sys
 from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
 
+import regex as re
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -87,8 +89,8 @@ def _remap_tensor_name(name: str, layer_remap: dict[int, int] | None) -> str | N
     return f"layers.{layer_remap[source_idx]}.{match.group(2)}"
 
 
-_EXPERT_NAME_RE = re.compile(r"^layers\.\d+\.ffn\.experts\.(\d+)\.")
-_GATE_NAME_RE = re.compile(r"^layers\.\d+\.ffn\.gate\.(weight|bias)$")
+_EXPERT_NAME_RE = re.compile(r"^(?:layers|mtp)\.\d+\.ffn\.experts\.(\d+)\.")
+_GATE_NAME_RE = re.compile(r"^(?:layers|mtp)\.\d+\.ffn\.gate\.(weight|bias|bias_vl)$")
 _MTP_STAGE_RE = re.compile(r"^mtp\.(\d+)\.")
 
 
@@ -149,7 +151,16 @@ def _subset_slice(
         # outputs whose table entry is >= n_routed_experts, leaving the
         # torch.empty routing buffers uninitialized and crashing the MoE
         # kernel downstream. Remap into the kept-expert range.
-        return (tensor % keep_experts).contiguous()
+        if tensor.shape[-1] > keep_experts:
+            raise ValueError("Kept experts must accommodate every hash-routing slot")
+        remapped = (tensor % keep_experts).clone()
+        for column in range(1, remapped.shape[-1]):
+            value = remapped[..., column]
+            for _ in range(column):
+                occupied = (remapped[..., :column] == value[..., None]).any(dim=-1)
+                value = (value + occupied.to(value.dtype)) % keep_experts
+            remapped[..., column] = value
+        return remapped.contiguous()
     return tensor
 
 
@@ -173,9 +184,7 @@ def _discover_layer_remap(src: Path) -> dict[int, int] | None:
     if layer_ids == list(range(expected_layers)):
         return None
     if len(layer_ids) != expected_layers:
-        raise ValueError(
-            f"cannot auto-remap {layer_ids=} to {expected_layers=} layers"
-        )
+        raise ValueError(f"cannot auto-remap {layer_ids=} to {expected_layers=} layers")
     return {source: target for target, source in enumerate(layer_ids)}
 
 
@@ -442,6 +451,7 @@ def _write_config(
     expert_int4_scale_mode: str,
     keep_experts: int | None = None,
     drop_mtp: bool = False,
+    vision_format: str = "bf16",
 ) -> None:
     cfg = json.loads((src / "config.json").read_text())
     if layer_remap is not None:
@@ -585,6 +595,39 @@ def _write_config(
         ],
         "cache_type": "int8_ds_mla",
     }
+    if vision_format == "int8-imma":
+        cfg["quantization_config"]["config_groups"]["vision_w8a8"] = {
+            "weights": {
+                "num_bits": 8,
+                "type": "int",
+                "symmetric": True,
+                "strategy": "group",
+                "group_size": 32,
+            },
+            "input_activations": {
+                "num_bits": 8,
+                "type": "int",
+                "symmetric": True,
+                "strategy": "group",
+                "group_size": 32,
+                "dynamic": True,
+            },
+            "targets": [
+                "vision.patch_embed.proj",
+                "vision.blocks.*.attn.wqkv",
+                "vision.blocks.*.attn.wo",
+                "vision.blocks.*.mlp.w1",
+                "vision.blocks.*.mlp.w2",
+                "aligner.w1",
+                "aligner.w2",
+            ],
+        }
+        cfg["vllm"]["kernels"].extend(
+            [
+                "vllm.models.deepseek_v4.common.vision_int8.VisionInt8LinearMethod",
+                "vllm.models.deepseek_v4.common.vision_int8.vision_attention_int8",
+            ]
+        )
     (dst / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
 
 
@@ -608,6 +651,7 @@ def _classify_shard(
             if (
                 scale_name is not None
                 and action != "preserve"
+                and role != "vision_float_weight"
                 and scale_name not in keys
             ):
                 missing_scales.add(name)
@@ -627,6 +671,7 @@ def convert_shard(
     keep_experts: int | None = None,
     drop_mtp: bool = False,
     name_filter: Callable[[str], bool] | None = None,
+    vision_format: str = "bf16",
 ) -> dict[str, int]:
     roles, _dtypes, missing_scales = _classify_shard(src_shard)
     if missing_scales:
@@ -653,9 +698,7 @@ def convert_shard(
         paired_scales = {
             matched_scale_name(name)
             for name, role in roles.items()
-            if role
-            in ("routed_expert_mxfp4_weight",)
-            or role in _FP8_WEIGHT_ROLES
+            if role in ("routed_expert_mxfp4_weight",) or role in _FP8_WEIGHT_ROLES
         }
         paired_scales.discard(None)
 
@@ -677,6 +720,24 @@ def convert_shard(
                 ).cpu()
                 counts["preserve"] += 1
                 continue
+            if (
+                vision_format == "int8-imma"
+                and name.startswith(("vision.", "aligner."))
+                and name.endswith(".weight")
+            ):
+                weight = handle.get_tensor(name)
+                if weight.ndim == 2:
+                    from vllm.models.deepseek_v4.common.vision_int8 import (
+                        quantize_vision_weight,
+                    )
+
+                    qweight, scale = quantize_vision_weight(weight)
+                    out[out_name] = qweight.cpu()
+                    out[out_name.removesuffix(".weight") + ".weight_scale"] = (
+                        scale.cpu()
+                    )
+                    counts["int8"] += 1
+                    continue
             if role == "routed_expert_mxfp4_weight":
                 scale_name = matched_scale_name(name)
                 assert scale_name is not None
@@ -738,6 +799,57 @@ def convert_shard(
     return counts
 
 
+def bound_shard_sizes(checkpoint: Path, max_bytes: int = 4 * 1024**3) -> None:
+    """Split oversized files without mixing existing PP ownership groups."""
+    index_path = checkpoint / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    weight_map = index["weight_map"]
+    total_bytes = 0
+    for shard_name in sorted(set(weight_map.values())):
+        shard = checkpoint / shard_name
+        with shard.open("rb") as f:
+            metadata = json.loads(f.read(int.from_bytes(f.read(8), "little")))
+        entries = {k: v for k, v in metadata.items() if k != "__metadata__"}
+        sizes = {
+            k: v["data_offsets"][1] - v["data_offsets"][0] for k, v in entries.items()
+        }
+        total_bytes += sum(sizes.values())
+        if sum(sizes.values()) <= max_bytes:
+            continue
+        if max(sizes.values()) > max_bytes:
+            raise ValueError(f"A tensor in {shard_name} exceeds the shard budget")
+        part, used, pending = 0, 0, {}
+
+        def flush(stem: str = shard.stem) -> None:
+            nonlocal part, used, pending
+            name = f"{stem}-part-{part:03d}.safetensors"
+            destination = checkpoint / name
+            if destination.exists():
+                raise FileExistsError(destination)
+            save_file(pending, destination)
+            for tensor_name in pending:
+                weight_map[tensor_name] = name
+            part += 1
+            used, pending = 0, {}
+
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            for name in sorted(entries):
+                if pending and used + sizes[name] > max_bytes:
+                    flush()
+                pending[name] = f.get_tensor(name)
+                used += sizes[name]
+            if pending:
+                flush()
+        index.setdefault("metadata", {})["total_size"] = total_bytes
+        temporary_index = index_path.with_suffix(".json.tmp")
+        temporary_index.write_text(json.dumps(index, indent=2) + "\n")
+        temporary_index.replace(index_path)
+        shard.unlink()
+    index.setdefault("metadata", {})["total_size"] = total_bytes
+    index["metadata"]["max_shard_tensor_bytes"] = max_bytes
+    index_path.write_text(json.dumps(index, indent=2) + "\n")
+
+
 def convert_checkpoint(
     src: Path,
     dst: Path,
@@ -752,7 +864,23 @@ def convert_checkpoint(
     num_output_shards: int | None = None,
     keep_experts: int | None = None,
     drop_mtp: bool = False,
+    vision_format: str = "auto",
 ) -> None:
+    source_config = json.loads((src / "config.json").read_text())
+    if vision_format not in ("auto", "bf16", "int8-imma"):
+        raise ValueError(f"Unknown vision format: {vision_format}")
+    if vision_format == "auto":
+        vision_format = (
+            "int8-imma"
+            if source_config.get("vision_n_layers", 0) > 0 and expert_format == "int4"
+            else "bf16"
+        )
+    if vision_format == "int8-imma" and (
+        expert_format != "int4" or not source_config.get("vision_n_layers")
+    ):
+        raise ValueError(
+            "Vision IMMA requires a vision checkpoint and INT4 expert conversion"
+        )
     if dense_int8_strategy not in ("block", "channel"):
         raise ValueError(
             f"dense_int8_strategy must be 'block' or 'channel', got "
@@ -760,8 +888,7 @@ def convert_checkpoint(
         )
     if expert_format not in ("int4", "mxfp4", "nvfp4"):
         raise ValueError(
-            f"expert_format must be 'int4', 'mxfp4', or 'nvfp4', got "
-            f"{expert_format!r}"
+            f"expert_format must be 'int4', 'mxfp4', or 'nvfp4', got {expert_format!r}"
         )
     if expert_int4_scale_mode not in ("absmax7", "absmax8", "mse"):
         raise ValueError(
@@ -809,6 +936,7 @@ def convert_checkpoint(
             expert_int4_scale_mode=expert_int4_scale_mode,
             keep_experts=keep_experts,
             drop_mtp=drop_mtp,
+            vision_format=vision_format,
         )
         for key, value in counts.items():
             totals[key] += value
@@ -820,6 +948,27 @@ def convert_checkpoint(
 
     _copy_metadata(src, dst)
     _write_index(src, dst, layer_remap, keep_experts=keep_experts, drop_mtp=drop_mtp)
+    if vision_format == "int8-imma":
+        weight_map = {}
+        total_size = 0
+        for shard in sorted(dst.glob("*.safetensors")):
+            with shard.open("rb") as f:
+                header_size = int.from_bytes(f.read(8), "little")
+                header = json.loads(f.read(header_size))
+            for name, metadata in header.items():
+                if name == "__metadata__":
+                    continue
+                if name in weight_map:
+                    raise ValueError(f"Duplicate converted tensor: {name}")
+                weight_map[name] = shard.name
+                total_size += metadata["data_offsets"][1] - metadata["data_offsets"][0]
+        (dst / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {"metadata": {"total_size": total_size}, "weight_map": weight_map},
+                indent=2,
+            )
+            + "\n"
+        )
     _write_config(
         src,
         dst,
@@ -829,9 +978,12 @@ def convert_checkpoint(
         expert_int4_scale_mode=expert_int4_scale_mode,
         keep_experts=keep_experts,
         drop_mtp=drop_mtp,
+        vision_format=vision_format,
     )
     if not drop_mtp:
         _ensure_mtp_shared_tensors(dst)
+    if vision_format == "int8-imma":
+        bound_shard_sizes(dst)
     if num_output_shards is not None:
         cfg = json.loads((dst / "config.json").read_text())
         _log(f"resharding checkpoint to {num_output_shards} output shards")
@@ -849,6 +1001,9 @@ def convert_checkpoint(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--vision-format", choices=("auto", "bf16", "int8-imma"), default="auto"
+    )
     parser.add_argument("--src", required=True, type=Path)
     parser.add_argument("--dst", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
@@ -950,6 +1105,7 @@ def main() -> int:
         num_output_shards=args.num_output_shards,
         keep_experts=args.keep_experts,
         drop_mtp=args.drop_mtp,
+        vision_format=args.vision_format,
     )
     return 0
 

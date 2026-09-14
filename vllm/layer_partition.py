@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Helpers for deterministic PP layer ownership and shard localization.
 
 The shard selector must use the same uneven split policy as
@@ -18,11 +19,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 from collections import defaultdict
 from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
+import regex as re
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _MTP_STAGE_RE = re.compile(r"^mtp\.(\d+)\.")
@@ -65,7 +67,7 @@ def detect_mtp_cost(
 
     Returns 0.0 when the checkpoint carries no draft stages.
     """
-    declared = int(config.get("num_nextn_predict_layers") or 0)
+    declared = int(cast(int, config.get("num_nextn_predict_layers") or 0))
 
     stages: set[int] = set()
     mtp_tensors = 0
@@ -199,17 +201,15 @@ def _balanced_counts(
     # earlier pipeline boundary and keeps the maximum load unchanged.
     peak_cost = max(count + extra for count, extra in zip(counts, extras))
     seam_cost = mtp_cost + 1.0
-    if (num_layers >= pp_size and counts[-1] == 0
-            and seam_cost <= peak_cost):
+    if num_layers >= pp_size and counts[-1] == 0 and seam_cost <= peak_cost:
         donor = next(
-            (rank for rank in range(pp_size - 2, -1, -1)
-             if counts[rank] > 1),
+            (rank for rank in range(pp_size - 2, -1, -1) if counts[rank] > 1),
             None,
         )
         if donor is None:
             raise AssertionError(
-                f"balanced partition {counts} has no donor for its empty "
-                "final rank")
+                f"balanced partition {counts} has no donor for its empty final rank"
+            )
         counts[donor] -= 1
         counts[-1] = 1
 
@@ -239,8 +239,7 @@ def compute_layer_counts(
     effective_cost = 0.0 if mtp_cost is None else float(mtp_cost)
     if draft_zero_last:
         if pp_size < 2:
-            raise ValueError(
-                f"draft_zero_last requires pp_size >= 2, got {pp_size}")
+            raise ValueError(f"draft_zero_last requires pp_size >= 2, got {pp_size}")
         if effective_cost <= 0.0:
             effective_cost = DEFAULT_MTP_COST
 
@@ -252,7 +251,8 @@ def compute_layer_counts(
     if sum(counts) != num_layers or any(count < 0 for count in counts):
         raise AssertionError(
             f"balanced partition {counts} is not a valid split of "
-            f"{num_layers} layers over {pp_size} ranks")
+            f"{num_layers} layers over {pp_size} ranks"
+        )
     return counts
 
 
@@ -267,11 +267,9 @@ def compute_layer_range(
 ) -> tuple[int, int]:
     if not 0 <= pp_rank < pp_size:
         raise ValueError(f"pp_rank must be in [0, {pp_size}), got {pp_rank}")
-    counts = compute_layer_counts(num_layers,
-                                  pp_size,
-                                  draft_zero_last,
-                                  mtp_cost=mtp_cost,
-                                  embed_cost=embed_cost)
+    counts = compute_layer_counts(
+        num_layers, pp_size, draft_zero_last, mtp_cost=mtp_cost, embed_cost=embed_cost
+    )
     start = sum(counts[:pp_rank])
     return start, start + counts[pp_rank]
 
@@ -287,7 +285,8 @@ def rank_to_pp_rank(rank: int, tp_size: int, pp_size: int) -> int:
     pp_rank = rank // tp_size
     if not 0 <= pp_rank < pp_size:
         raise ValueError(
-            f"rank {rank} maps to PP rank {pp_rank}, outside [0, {pp_size})")
+            f"rank {rank} maps to PP rank {pp_rank}, outside [0, {pp_size})"
+        )
     return pp_rank
 
 
@@ -301,15 +300,18 @@ def select_shards(
 ) -> list[str]:
     pp_rank = rank_to_pp_rank(rank, tp_size, pp_size)
     mtp_cost = resolve_mtp_cost(config_path, index_path, draft_zero_last)
-    start, end = compute_layer_range(load_num_layers(config_path),
-                                     pp_size,
-                                     pp_rank,
-                                     mtp_cost=mtp_cost)
+    start, end = compute_layer_range(
+        load_num_layers(config_path), pp_size, pp_rank, mtp_cost=mtp_cost
+    )
     with index_path.open() as f:
         weights = json.load(f)["weight_map"]
 
     needed: set[str] = set()
     for name, shard in weights.items():
+        if name.startswith(("vision.", "aligner.", "image_")):
+            if pp_rank == 0:
+                needed.add(shard)
+            continue
         if name.startswith("mtp."):
             if pp_rank == pp_size - 1:
                 needed.add(shard)
@@ -332,17 +334,60 @@ def select_shards(
     return sorted(needed)
 
 
+def compute_memory_layer_counts(
+    layer_bytes: list[int],
+    rank_overhead_bytes: list[int],
+    max_rank_bytes: int,
+) -> list[int]:
+    """Find the minimum-peak contiguous partition within a measured byte budget.
+
+    Overhead includes all non-decoder weights, KV cache, encoder/draft buffers,
+    graph pools and runtime contexts on each rank. Every rank retains a decoder
+    layer. Ties are resolved deterministically.
+    """
+    ranks, layers = len(rank_overhead_bytes), len(layer_bytes)
+    if not ranks or layers < ranks or max_rank_bytes <= 0:
+        raise ValueError(
+            "Memory partition requires at least one layer per rank "
+            "and a positive budget"
+        )
+    if any(x < 0 for x in [*layer_bytes, *rank_overhead_bytes]):
+        raise ValueError("Memory costs must be nonnegative")
+    prefix = [0]
+    for size in layer_bytes:
+        prefix.append(prefix[-1] + size)
+    states: dict[int, tuple[int, tuple[int, ...]]] = {0: (0, ())}
+    for rank, overhead in enumerate(rank_overhead_bytes):
+        next_states: dict[int, tuple[int, tuple[int, ...]]] = {}
+        for end in range(rank + 1, layers - (ranks - rank - 1) + 1):
+            candidates = []
+            for start, (peak, counts) in states.items():
+                if start >= end:
+                    continue
+                cost = overhead + prefix[end] - prefix[start]
+                if cost <= max_rank_bytes:
+                    candidates.append((max(peak, cost), (*counts, end - start)))
+            if candidates:
+                next_states[end] = min(candidates)
+        states = next_states
+    if layers not in states:
+        raise ValueError("No contiguous PP partition fits the supplied memory budget")
+    return list(states[layers][1])
+
+
 def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
 
 
 def _add_draft_flags(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--draft-zero-last",
-                        action=argparse.BooleanOptionalAction,
-                        default=None,
-                        help="force draft-aware balancing on (--draft-zero-last) "
-                        "or off (--no-draft-zero-last); the default detects "
-                        "MTP/draft stages from the checkpoint")
+    parser.add_argument(
+        "--draft-zero-last",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="force draft-aware balancing on (--draft-zero-last) "
+        "or off (--no-draft-zero-last); the default detects "
+        "MTP/draft stages from the checkpoint",
+    )
 
 
 def main() -> None:
@@ -352,60 +397,76 @@ def main() -> None:
     partition = subparsers.add_parser("partition")
     partition.add_argument("--config", type=Path, required=True)
     partition.add_argument("--index", type=Path, default=None)
-    partition.add_argument("--pp-size",
-                           type=int,
-                           default=_env_int("VLLM_PIPELINE_PARALLEL_SIZE", 1))
+    partition.add_argument(
+        "--pp-size", type=int, default=_env_int("VLLM_PIPELINE_PARALLEL_SIZE", 1)
+    )
+    partition.add_argument(
+        "--memory-profile",
+        type=Path,
+        help=(
+            "JSON with layer_bytes, rank_overhead_bytes and max_rank_bytes; "
+            "overhead includes vision and draft allocations"
+        ),
+    )
     _add_draft_flags(partition)
 
     layers = subparsers.add_parser("layers")
     layers.add_argument("--config", type=Path, required=True)
     layers.add_argument("--index", type=Path, default=None)
-    layers.add_argument("--rank",
-                        type=int,
-                        default=_env_int("APPMANA_DSV4_RANK", 0))
-    layers.add_argument("--tp-size",
-                        type=int,
-                        default=_env_int("VLLM_TENSOR_PARALLEL_SIZE", 1))
-    layers.add_argument("--pp-size",
-                        type=int,
-                        default=_env_int("VLLM_PIPELINE_PARALLEL_SIZE", 1))
+    layers.add_argument("--rank", type=int, default=_env_int("APPMANA_DSV4_RANK", 0))
+    layers.add_argument(
+        "--tp-size", type=int, default=_env_int("VLLM_TENSOR_PARALLEL_SIZE", 1)
+    )
+    layers.add_argument(
+        "--pp-size", type=int, default=_env_int("VLLM_PIPELINE_PARALLEL_SIZE", 1)
+    )
     _add_draft_flags(layers)
 
     shards = subparsers.add_parser("shards")
     shards.add_argument("--index", type=Path, required=True)
     shards.add_argument("--config", type=Path, required=True)
-    shards.add_argument("--rank",
-                        type=int,
-                        default=_env_int("APPMANA_DSV4_RANK", 0))
-    shards.add_argument("--tp-size",
-                        type=int,
-                        default=_env_int("VLLM_TENSOR_PARALLEL_SIZE", 1))
-    shards.add_argument("--pp-size",
-                        type=int,
-                        default=_env_int("VLLM_PIPELINE_PARALLEL_SIZE", 1))
+    shards.add_argument("--rank", type=int, default=_env_int("APPMANA_DSV4_RANK", 0))
+    shards.add_argument(
+        "--tp-size", type=int, default=_env_int("VLLM_TENSOR_PARALLEL_SIZE", 1)
+    )
+    shards.add_argument(
+        "--pp-size", type=int, default=_env_int("VLLM_PIPELINE_PARALLEL_SIZE", 1)
+    )
     _add_draft_flags(shards)
 
     args = parser.parse_args()
-    if args.command == "partition":
-        mtp_cost = resolve_mtp_cost(args.config, args.index,
-                                    args.draft_zero_last)
-        counts = compute_layer_counts(load_num_layers(args.config),
-                                      args.pp_size,
-                                      mtp_cost=mtp_cost)
+    if args.command == "partition" and args.memory_profile:
+        profile = json.loads(args.memory_profile.read_text())
+        if len(profile["rank_overhead_bytes"]) != args.pp_size or len(
+            profile["layer_bytes"]
+        ) != load_num_layers(args.config):
+            raise ValueError(
+                "Memory profile dimensions do not match checkpoint and PP size"
+            )
+        counts = compute_memory_layer_counts(**profile)
+        print(",".join(str(count) for count in counts))
+    elif args.command == "partition":
+        mtp_cost = resolve_mtp_cost(args.config, args.index, args.draft_zero_last)
+        counts = compute_layer_counts(
+            load_num_layers(args.config), args.pp_size, mtp_cost=mtp_cost
+        )
         print(",".join(str(count) for count in counts))
     elif args.command == "layers":
         pp_rank = rank_to_pp_rank(args.rank, args.tp_size, args.pp_size)
-        mtp_cost = resolve_mtp_cost(args.config, args.index,
-                                    args.draft_zero_last)
-        start, end = compute_layer_range(load_num_layers(args.config),
-                                         args.pp_size,
-                                         pp_rank,
-                                         mtp_cost=mtp_cost)
+        mtp_cost = resolve_mtp_cost(args.config, args.index, args.draft_zero_last)
+        start, end = compute_layer_range(
+            load_num_layers(args.config), args.pp_size, pp_rank, mtp_cost=mtp_cost
+        )
         print(f"{start}:{end}")
     elif args.command == "shards":
-        for shard in select_shards(args.index, args.config, args.rank,
-                                   args.tp_size, args.pp_size,
-                                   args.draft_zero_last):
+        for shard in select_shards(
+            args.index,
+            args.config,
+            args.rank,
+            args.tp_size,
+            args.pp_size,
+            args.draft_zero_last,
+        ):
             print(shard)
 
 

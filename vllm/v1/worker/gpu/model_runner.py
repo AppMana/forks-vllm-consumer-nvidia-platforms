@@ -1173,6 +1173,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "initialized; building it on first use."
                 )
                 self._init_kv_zero_meta()
+            assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
@@ -1558,7 +1559,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             with record_function_or_nullcontext("gpu_model_runner: target_logits"):
                 logits = self.model.compute_logits(sample_hidden_states)
 
-
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -1881,7 +1881,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            if not requires_raw_input_tokens(self.model):
+                model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.
@@ -2114,24 +2115,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            with record_function_or_nullcontext("gpu_model_runner: draft"):
-                with use_workspace_lane(self._draft_workspace_lane):
-                    draft_tokens = self.speculator.propose(
-                        input_batch,
-                        attn_metadata,
-                        slot_mappings_by_layer,
-                        spec_hidden_states,
-                        aux_hidden_states,
-                        num_sampled,
-                        num_rejected,
-                        self.req_states.last_sampled_tokens,
-                        self.req_states.next_prefill_tokens,
-                        self.sampler.sampling_states.temperature.gpu,
-                        self.sampler.sampling_states.seeds.gpu,
-                        dp_sync=dp_sync,
-                        mm_inputs=mm_inputs,
-                        generate_draft=produces_sample,
-                    )
+            with (
+                record_function_or_nullcontext("gpu_model_runner: draft"),
+                use_workspace_lane(self._draft_workspace_lane),
+            ):
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    dp_sync=dp_sync,
+                    mm_inputs=mm_inputs,
+                    generate_draft=produces_sample,
+                )
             if produces_sample:
                 self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
                 proposed_token_ids = self.req_states.draft_tokens[

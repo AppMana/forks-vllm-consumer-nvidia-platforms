@@ -1,5 +1,8 @@
-import json
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -35,7 +38,16 @@ def test_compute_layer_counts_non_draft_unchanged_with_flag_default():
     # vllm.distributed.utils.get_pp_indices' default branch.
     assert compute_layer_counts(43, 12) == [3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 3]
     assert compute_layer_counts(43, 10, draft_zero_last=False) == [
-        4, 4, 4, 4, 4, 4, 5, 5, 5, 4
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        5,
+        5,
+        5,
+        4,
     ]
 
 
@@ -43,7 +55,18 @@ def test_compute_layer_counts_draft_zero_last_pp12_reference():
     # Keep one target block on the MTP/head rank so the ordinary transformer
     # pipeline and draft path do not become separate zero-layer stages.
     assert compute_layer_counts(43, 12, draft_zero_last=True) == [
-        3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 1
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        3,
+        1,
     ]
 
 
@@ -90,31 +113,40 @@ def test_select_shards_uses_pp_rank_after_tp_grouping(tmp_path):
     index = tmp_path / "model.safetensors.index.json"
     config.write_text(json.dumps({"num_hidden_layers": 7}))
     index.write_text(
-        json.dumps({
-            "weight_map": {
-                "embed_tokens.weight": "embed.safetensors",
-                "model.layers.0.weight": "l0.safetensors",
-                "model.layers.1.weight": "l1.safetensors",
-                "model.layers.2.weight": "l2.safetensors",
-                "model.layers.3.weight": "l3.safetensors",
-                "model.layers.4.weight": "l4.safetensors",
-                "model.layers.5.weight": "l5.safetensors",
-                "model.layers.6.weight": "l6.safetensors",
-                "model.norm.weight": "tail.safetensors",
-                "lm_head.weight": "tail.safetensors",
-                "mtp.layers.0.weight": "mtp.safetensors",
+        json.dumps(
+            {
+                "weight_map": {
+                    "embed_tokens.weight": "embed.safetensors",
+                    "model.layers.0.weight": "l0.safetensors",
+                    "model.layers.1.weight": "l1.safetensors",
+                    "model.layers.2.weight": "l2.safetensors",
+                    "model.layers.3.weight": "l3.safetensors",
+                    "model.layers.4.weight": "l4.safetensors",
+                    "model.layers.5.weight": "l5.safetensors",
+                    "model.layers.6.weight": "l6.safetensors",
+                    "model.norm.weight": "tail.safetensors",
+                    "lm_head.weight": "tail.safetensors",
+                    "mtp.layers.0.weight": "mtp.safetensors",
+                }
             }
-        }))
+        )
+    )
 
     assert select_shards(index, config, rank=0, tp_size=2, pp_size=3) == [
-        "embed.safetensors", "l0.safetensors", "l1.safetensors"
+        "embed.safetensors",
+        "l0.safetensors",
+        "l1.safetensors",
     ]
     assert select_shards(index, config, rank=2, tp_size=2, pp_size=3) == [
-        "l2.safetensors", "l3.safetensors", "l4.safetensors"
+        "l2.safetensors",
+        "l3.safetensors",
+        "l4.safetensors",
     ]
     assert select_shards(index, config, rank=4, tp_size=2, pp_size=3) == [
-        "l5.safetensors", "l6.safetensors", "mtp.safetensors",
-        "tail.safetensors"
+        "l5.safetensors",
+        "l6.safetensors",
+        "mtp.safetensors",
+        "tail.safetensors",
     ]
 
 
@@ -123,38 +155,34 @@ def test_select_shards_draft_zero_last_matches_partition(tmp_path):
     index = tmp_path / "model.safetensors.index.json"
     config.write_text(json.dumps({"num_hidden_layers": 7}))
     index.write_text(
-        json.dumps({
-            "weight_map": {
-                "embed_tokens.weight": "embed.safetensors",
-                **{
-                    f"model.layers.{i}.weight": f"l{i}.safetensors"
-                    for i in range(7)
-                },
-                "model.norm.weight": "tail.safetensors",
-                "lm_head.weight": "tail.safetensors",
-                "mtp.layers.0.weight": "mtp.safetensors",
+        json.dumps(
+            {
+                "weight_map": {
+                    "embed_tokens.weight": "embed.safetensors",
+                    **{
+                        f"model.layers.{i}.weight": f"l{i}.safetensors"
+                        for i in range(7)
+                    },
+                    "model.norm.weight": "tail.safetensors",
+                    "lm_head.weight": "tail.safetensors",
+                    "mtp.layers.0.weight": "mtp.safetensors",
+                }
             }
-        }))
+        )
+    )
 
     # Shards must follow the same draft partition as the partition subcommand.
     assert compute_layer_counts(7, 3, draft_zero_last=True) == [3, 3, 1]
     assert select_shards(
-        index, config, rank=0, tp_size=1, pp_size=3,
-        draft_zero_last=True) == [
-            "embed.safetensors", "l0.safetensors", "l1.safetensors",
-            "l2.safetensors"
-        ]
+        index, config, rank=0, tp_size=1, pp_size=3, draft_zero_last=True
+    ) == ["embed.safetensors", "l0.safetensors", "l1.safetensors", "l2.safetensors"]
     assert select_shards(
-        index, config, rank=1, tp_size=1, pp_size=3,
-        draft_zero_last=True) == [
-            "l3.safetensors", "l4.safetensors", "l5.safetensors"
-        ]
+        index, config, rank=1, tp_size=1, pp_size=3, draft_zero_last=True
+    ) == ["l3.safetensors", "l4.safetensors", "l5.safetensors"]
     # Last rank retains the target/draft seam plus the draft stages and head.
     assert select_shards(
-        index, config, rank=2, tp_size=1, pp_size=3,
-        draft_zero_last=True) == [
-            "l6.safetensors", "mtp.safetensors", "tail.safetensors"
-        ]
+        index, config, rank=2, tp_size=1, pp_size=3, draft_zero_last=True
+    ) == ["l6.safetensors", "mtp.safetensors", "tail.safetensors"]
 
 
 # ---------------------------------------------------------------------------
@@ -219,21 +247,38 @@ def test_last_rank_never_gets_mtp_plus_a_full_share(pp_size):
 
 def test_dsv4_reference_partitions_with_mtp():
     assert compute_layer_counts(DSV4_LAYERS, 11, mtp_cost=DSV4_MTP_COST) == [
-        4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 1
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        5,
+        5,
+        1,
     ]
     # The balancer independently reproduces the validated PP=12 partition.
     assert compute_layer_counts(DSV4_LAYERS, 12, mtp_cost=DSV4_MTP_COST) == [
-        3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 1
+        3,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        3,
+        1,
     ]
 
 
 def test_dsv4_reference_partitions_without_mtp():
-    assert compute_layer_counts(DSV4_LAYERS, 11) == [
-        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3
-    ]
-    assert compute_layer_counts(DSV4_LAYERS, 12) == [
-        3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 3
-    ]
+    assert compute_layer_counts(DSV4_LAYERS, 11) == [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3]
+    assert compute_layer_counts(DSV4_LAYERS, 12) == [3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 3]
 
 
 def test_detect_mtp_cost_from_config_num_nextn_predict_layers():
@@ -244,18 +289,24 @@ def test_detect_mtp_cost_from_config_num_nextn_predict_layers():
 def test_detect_mtp_cost_absent_without_signal():
     assert partition.detect_mtp_cost({"num_hidden_layers": 43}) == 0.0
     assert partition.detect_mtp_cost(_dsv4_config(0)) == 0.0
-    assert partition.detect_mtp_cost({"num_hidden_layers": 7},
-                                     {"layers.0.w": "a", "head.weight": "t"}) == 0.0
+    assert (
+        partition.detect_mtp_cost(
+            {"num_hidden_layers": 7}, {"layers.0.w": "a", "head.weight": "t"}
+        )
+        == 0.0
+    )
 
 
 def test_detect_mtp_cost_from_weight_index_overrides_declared_count():
     # DeepSeek-V4-Flash-0731 declares num_nextn_predict_layers: 1 while
     # shipping all three DSpark stages; the tensor counts are the truth.
     weight_map = _dsv4_weight_map(stages=3)
-    assert partition.detect_mtp_cost(_dsv4_config(1),
-                                     weight_map) == pytest.approx(3.0, abs=0.05)
-    assert partition.detect_mtp_cost(_dsv4_config(None),
-                                     weight_map) == pytest.approx(3.0, abs=0.05)
+    assert partition.detect_mtp_cost(_dsv4_config(1), weight_map) == pytest.approx(
+        3.0, abs=0.05
+    )
+    assert partition.detect_mtp_cost(_dsv4_config(None), weight_map) == pytest.approx(
+        3.0, abs=0.05
+    )
 
 
 def test_resolve_mtp_cost_precedence(tmp_path):
@@ -273,21 +324,24 @@ def test_resolve_mtp_cost_precedence(tmp_path):
     plain = tmp_path / "plain.json"
     plain.write_text(json.dumps({"num_hidden_layers": 43}))
     assert partition.resolve_mtp_cost(plain) == 0.0
-    assert partition.resolve_mtp_cost(
-        plain, draft_zero_last=True) == pytest.approx(partition.DEFAULT_MTP_COST)
+    assert partition.resolve_mtp_cost(plain, draft_zero_last=True) == pytest.approx(
+        partition.DEFAULT_MTP_COST
+    )
 
 
 def test_explicit_draft_zero_last_flag_still_forces_mtp_mode():
     flagged = compute_layer_counts(DSV4_LAYERS, 11, draft_zero_last=True)
-    detected = compute_layer_counts(DSV4_LAYERS, 11,
-                                    mtp_cost=partition.DEFAULT_MTP_COST)
+    detected = compute_layer_counts(
+        DSV4_LAYERS, 11, mtp_cost=partition.DEFAULT_MTP_COST
+    )
     assert flagged == detected
     assert flagged != compute_layer_counts(DSV4_LAYERS, 11)
 
 
 def test_explicit_mtp_cost_zero_forces_legacy_split():
-    assert compute_layer_counts(DSV4_LAYERS, 11, mtp_cost=0.0) == \
-        compute_layer_counts(DSV4_LAYERS, 11)
+    assert compute_layer_counts(DSV4_LAYERS, 11, mtp_cost=0.0) == compute_layer_counts(
+        DSV4_LAYERS, 11
+    )
 
 
 @pytest.mark.parametrize("pp_size", list(range(2, 17)))
@@ -303,7 +357,8 @@ def test_sum_and_non_negative_invariants(num_layers, pp_size):
 @pytest.mark.parametrize("pp_size", list(range(2, 17)))
 @pytest.mark.parametrize("num_layers", [7, 43, 61, 64])
 def test_cost_balance_no_rank_more_than_one_layer_over_the_lightest(
-        num_layers, pp_size):
+    num_layers, pp_size
+):
     counts = compute_layer_counts(num_layers, pp_size, mtp_cost=DSV4_MTP_COST)
     costs = _rank_costs(counts, DSV4_MTP_COST, partition.DEFAULT_EMBED_COST)
     if min(counts) >= 1:
@@ -313,12 +368,13 @@ def test_cost_balance_no_rank_more_than_one_layer_over_the_lightest(
 @pytest.mark.parametrize("pp_size", list(range(2, 17)))
 def test_cost_balance_beats_zero_last(pp_size):
     """The balancer's peak rank is never heavier than the zero-last policy's."""
-    balanced = compute_layer_counts(DSV4_LAYERS, pp_size,
-                                    mtp_cost=DSV4_MTP_COST)
+    balanced = compute_layer_counts(DSV4_LAYERS, pp_size, mtp_cost=DSV4_MTP_COST)
     zero_last = partition._legacy_draft_zero_last_counts(DSV4_LAYERS, pp_size)
     embed = partition.DEFAULT_EMBED_COST
-    assert max(_rank_costs(balanced, DSV4_MTP_COST, embed)) <= \
-        max(_rank_costs(zero_last, DSV4_MTP_COST, embed)) + 1e-9
+    assert (
+        max(_rank_costs(balanced, DSV4_MTP_COST, embed))
+        <= max(_rank_costs(zero_last, DSV4_MTP_COST, embed)) + 1e-9
+    )
 
 
 def test_pp11_peak_rank_is_lighter_than_zero_last():
@@ -327,7 +383,17 @@ def test_pp11_peak_rank_is_lighter_than_zero_last():
     assert balanced[-1] == 1
     # zero-last leaves the MTP rank at 3.0 while three ranks carry 5 layers.
     assert partition._legacy_draft_zero_last_counts(DSV4_LAYERS, 11) == [
-        4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 0
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        5,
+        5,
+        5,
+        0,
     ]
 
 
@@ -350,9 +416,9 @@ def test_compute_layer_range_tracks_the_balanced_counts():
     counts = compute_layer_counts(DSV4_LAYERS, 11, mtp_cost=DSV4_MTP_COST)
     start = 0
     for pp_rank, count in enumerate(counts):
-        assert compute_layer_range(DSV4_LAYERS, 11, pp_rank,
-                                   mtp_cost=DSV4_MTP_COST) == (start,
-                                                               start + count)
+        assert compute_layer_range(
+            DSV4_LAYERS, 11, pp_rank, mtp_cost=DSV4_MTP_COST
+        ) == (start, start + count)
         start += count
     assert start == DSV4_LAYERS
 
@@ -360,43 +426,47 @@ def test_compute_layer_range_tracks_the_balanced_counts():
 def test_select_shards_auto_detects_mtp(tmp_path):
     config = tmp_path / "config.json"
     index = tmp_path / "model.safetensors.index.json"
-    config.write_text(json.dumps({
-        "num_hidden_layers": 7,
-        "num_nextn_predict_layers": 3
-    }))
+    config.write_text(
+        json.dumps({"num_hidden_layers": 7, "num_nextn_predict_layers": 3})
+    )
     index.write_text(
-        json.dumps({
-            "weight_map": {
-                "embed_tokens.weight": "embed.safetensors",
-                **{f"model.layers.{i}.weight": f"l{i}.safetensors"
-                   for i in range(7)},
-                "model.norm.weight": "tail.safetensors",
-                "lm_head.weight": "tail.safetensors",
-                **{f"mtp.{s}.weight": "mtp.safetensors" for s in range(3)},
+        json.dumps(
+            {
+                "weight_map": {
+                    "embed_tokens.weight": "embed.safetensors",
+                    **{
+                        f"model.layers.{i}.weight": f"l{i}.safetensors"
+                        for i in range(7)
+                    },
+                    "model.norm.weight": "tail.safetensors",
+                    "lm_head.weight": "tail.safetensors",
+                    **{f"mtp.{s}.weight": "mtp.safetensors" for s in range(3)},
+                }
             }
-        }))
+        )
+    )
 
     # Auto-detection alone reproduces the draft partition: 7 layers, pp=3.
     counts = compute_layer_counts(7, 3, mtp_cost=3.0)
     assert counts == [3, 3, 1]
-    assert select_shards(index, config, rank=2, tp_size=1,
-                         pp_size=3) == [
-                             "l6.safetensors", "mtp.safetensors",
-                             "tail.safetensors"
-                         ]
+    assert select_shards(index, config, rank=2, tp_size=1, pp_size=3) == [
+        "l6.safetensors",
+        "mtp.safetensors",
+        "tail.safetensors",
+    ]
     # Explicitly off falls back to the plain split: last rank owns layers 5-6.
-    assert select_shards(index, config, rank=2, tp_size=1, pp_size=3,
-                         draft_zero_last=False) == [
-                             "l5.safetensors", "l6.safetensors",
-                             "mtp.safetensors", "tail.safetensors"
-                         ]
+    assert select_shards(
+        index, config, rank=2, tp_size=1, pp_size=3, draft_zero_last=False
+    ) == ["l5.safetensors", "l6.safetensors", "mtp.safetensors", "tail.safetensors"]
 
 
 def _cli(*args, cwd):
-    result = subprocess.run([sys.executable, str(MODULE_PATH), *args],
-                            capture_output=True,
-                            text=True,
-                            check=True)
+    result = subprocess.run(
+        [sys.executable, str(MODULE_PATH), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     return result.stdout.strip()
 
 
@@ -406,30 +476,74 @@ def test_cli_partition_auto_detect_and_overrides(tmp_path):
     config.write_text(json.dumps(_dsv4_config(3)))
     index.write_text(json.dumps({"weight_map": _dsv4_weight_map(stages=3)}))
 
-    auto = _cli("partition", "--config", str(config), "--pp-size", "11",
-                cwd=tmp_path)
+    auto = _cli("partition", "--config", str(config), "--pp-size", "11", cwd=tmp_path)
     assert auto == "4,4,4,4,4,4,4,4,5,5,1"
 
-    with_index = _cli("partition", "--config", str(config), "--index",
-                      str(index), "--pp-size", "11", cwd=tmp_path)
+    with_index = _cli(
+        "partition",
+        "--config",
+        str(config),
+        "--index",
+        str(index),
+        "--pp-size",
+        "11",
+        cwd=tmp_path,
+    )
     assert with_index == auto
 
-    forced_on = _cli("partition", "--config", str(config), "--pp-size", "11",
-                     "--draft-zero-last", cwd=tmp_path)
+    forced_on = _cli(
+        "partition",
+        "--config",
+        str(config),
+        "--pp-size",
+        "11",
+        "--draft-zero-last",
+        cwd=tmp_path,
+    )
     assert forced_on == auto
 
-    forced_off = _cli("partition", "--config", str(config), "--pp-size", "11",
-                      "--no-draft-zero-last", cwd=tmp_path)
+    forced_off = _cli(
+        "partition",
+        "--config",
+        str(config),
+        "--pp-size",
+        "11",
+        "--no-draft-zero-last",
+        cwd=tmp_path,
+    )
     assert forced_off == "4,4,4,4,4,4,4,4,4,4,3"
 
 
 def test_cli_layers_auto_detect(tmp_path):
     config = tmp_path / "config.json"
     config.write_text(json.dumps(_dsv4_config(3)))
-    assert _cli("layers", "--config", str(config), "--pp-size", "11", "--rank",
-                "10", cwd=tmp_path) == "42:43"
-    assert _cli("layers", "--config", str(config), "--pp-size", "11", "--rank",
-                "10", "--no-draft-zero-last", cwd=tmp_path) == "40:43"
+    assert (
+        _cli(
+            "layers",
+            "--config",
+            str(config),
+            "--pp-size",
+            "11",
+            "--rank",
+            "10",
+            cwd=tmp_path,
+        )
+        == "42:43"
+    )
+    assert (
+        _cli(
+            "layers",
+            "--config",
+            str(config),
+            "--pp-size",
+            "11",
+            "--rank",
+            "10",
+            "--no-draft-zero-last",
+            cwd=tmp_path,
+        )
+        == "40:43"
+    )
 
 
 def test_weight_index_cost_is_quantized_so_the_partition_is_stable(tmp_path):
@@ -451,11 +565,25 @@ def test_weight_index_cost_is_quantized_so_the_partition_is_stable(tmp_path):
     index = tmp_path / "model.safetensors.index.json"
     config.write_text(json.dumps(_dsv4_config(3)))
     index.write_text(json.dumps({"weight_map": weight_map}))
-    assert partition.resolve_mtp_cost(config, index) == \
-        partition.resolve_mtp_cost(config)
+    assert partition.resolve_mtp_cost(config, index) == partition.resolve_mtp_cost(
+        config
+    )
     for pp_size in range(2, 17):
         assert compute_layer_counts(
-            DSV4_LAYERS, pp_size,
-            mtp_cost=partition.resolve_mtp_cost(config, index)) == \
-            compute_layer_counts(DSV4_LAYERS, pp_size,
-                                 mtp_cost=partition.resolve_mtp_cost(config))
+            DSV4_LAYERS, pp_size, mtp_cost=partition.resolve_mtp_cost(config, index)
+        ) == compute_layer_counts(
+            DSV4_LAYERS, pp_size, mtp_cost=partition.resolve_mtp_cost(config)
+        )
+
+
+def test_memory_partition_accounts_for_vision_and_native_draft():
+    from vllm.layer_partition import compute_memory_layer_counts
+
+    # First stage has a vision tower; last stage carries the larger native draft.
+    counts = compute_memory_layer_counts([10] * 43, [8] + [0] * 9 + [35], 55)
+    assert sum(counts) == 43 and len(counts) == 11 and min(counts) >= 1
+    assert counts[0] <= 4 and counts[-1] <= 2
+    assert max(n * 10 + o for n, o in zip(counts, [8] + [0] * 9 + [35])) <= 55
+    assert counts == compute_memory_layer_counts([10] * 43, [8] + [0] * 9 + [35], 55)
+    with pytest.raises(ValueError, match="No contiguous"):
+        compute_memory_layer_counts([10] * 43, [8] + [0] * 9 + [35], 40)
