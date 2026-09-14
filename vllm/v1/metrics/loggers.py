@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import math
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -989,6 +990,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_decode_time_request, per_engine_labelvalues
         )
 
+        # Observe the rate of each completed sequence, not aggregate engine work.
+        self.histogram_sequence_throughput = {}
+        for phase in ("prefill", "decode"):
+            metric = self._histogram_cls(
+                name=f"vllm:request_{phase}_tokens_per_second",
+                documentation=(
+                    "Per completed sequence tokens/s; prefill excludes cached "
+                    "tokens, decode excludes the first token. Undefined rates "
+                    "and requests without generated tokens are omitted."
+                ),
+                buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
+                labelnames=labelnames,
+            )
+            self.histogram_sequence_throughput[phase] = create_metric_per_engine(
+                metric, per_engine_labelvalues
+            )
+
         histogram_request_num_preemptions = self._histogram_cls(
             name="vllm:request_num_preemptions",
             documentation="Histogram of the number of times a request was preempted.",
@@ -1289,6 +1307,26 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             prefill_kv_computed = finished_request.num_prompt_tokens - max(
                 finished_request.num_cached_tokens, 0
             )
+            if finished_request.num_generation_tokens > 0:
+                for phase, tokens, duration in (
+                    (
+                        "prefill",
+                        max(prefill_kv_computed, 0),
+                        finished_request.prefill_time,
+                    ),
+                    (
+                        "decode",
+                        finished_request.num_generation_tokens - 1,
+                        finished_request.decode_time,
+                    ),
+                ):
+                    if duration > 0 and math.isfinite(duration):
+                        # A one-token response has no decode interval.
+                        if phase == "decode" and tokens == 0:
+                            continue
+                        self.histogram_sequence_throughput[phase][engine_idx].observe(
+                            tokens / duration
+                        )
             self.histogram_prefill_kv_computed_request[engine_idx].observe(
                 prefill_kv_computed
             )

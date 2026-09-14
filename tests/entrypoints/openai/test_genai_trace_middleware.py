@@ -105,8 +105,12 @@ async def fake_chat_app(scope, receive, send):
         chunks.append(b"data: [DONE]\n\n")
         body = b"".join(chunks)
         cut = len(body) // 2
-        await send({"type": "http.response.body", "body": body[:cut], "more_body": True})
-        await send({"type": "http.response.body", "body": body[cut:], "more_body": False})
+        await send(
+            {"type": "http.response.body", "body": body[:cut], "more_body": True}
+        )
+        await send(
+            {"type": "http.response.body", "body": body[cut:], "more_body": False}
+        )
         return
 
     payload = {
@@ -147,7 +151,7 @@ def upload_dir(tmp_path, monkeypatch):
 
 def _stored(ref: str) -> Path:
     assert ref.startswith("file:"), ref
-    path = Path(ref[len("file:"):])
+    path = Path(ref[len("file:") :])
     # The hook uploads from a worker thread after the span ends.
     deadline = time.monotonic() + 10
     while not (path.is_file() and path.stat().st_size > 0):
@@ -198,15 +202,20 @@ async def test_streaming_chat_span_references_uploaded_messages(upload_dir):
     assert "gen_ai.input.messages" not in attrs
     assert "gen_ai.output.messages" not in attrs
 
-    inputs = json.load(open(_stored(attrs["gen_ai.input.messages_ref"])))
+    inputs = json.loads(_stored(attrs["gen_ai.input.messages_ref"]).read_text())
     assert inputs == [
-        {"role": "user", "parts": [{"content": "alpha beta gamma delta", "type": "text"}]}
+        {
+            "role": "user",
+            "parts": [{"content": "alpha beta gamma delta", "type": "text"}],
+        }
     ]
-    system = json.load(
-        open(_stored(attrs[gen_ai_attributes.GEN_AI_SYSTEM_INSTRUCTIONS + "_ref"]))
+    system = json.loads(
+        _stored(
+            attrs[gen_ai_attributes.GEN_AI_SYSTEM_INSTRUCTIONS + "_ref"]
+        ).read_text()
     )
     assert system == [{"content": "be brief", "type": "text"}]
-    outputs = json.load(open(_stored(attrs["gen_ai.output.messages_ref"])))
+    outputs = json.loads(_stored(attrs["gen_ai.output.messages_ref"]).read_text())
     assert outputs == [
         {
             "role": "assistant",
@@ -224,7 +233,10 @@ async def test_json_chat_response_joins_trace_and_records_reasoning(upload_dir):
     ) as client:
         response = await client.post(
             "/v1/chat/completions",
-            json={"model": "served", "messages": [{"role": "user", "content": "one two"}]},
+            json={
+                "model": "served",
+                "messages": [{"role": "user", "content": "one two"}],
+            },
         )
     assert response.status_code == 200
     span = _chat_span()
@@ -236,7 +248,7 @@ async def test_json_chat_response_joins_trace_and_records_reasoning(upload_dir):
     assert format(span.context.span_id, "016x") in traceparent
 
     assert list(attrs["gen_ai.response.finish_reasons"]) == ["length"]
-    outputs = json.load(open(_stored(attrs["gen_ai.output.messages_ref"])))
+    outputs = json.loads(_stored(attrs["gen_ai.output.messages_ref"]).read_text())
     assert outputs[0]["parts"] == [
         {"content": "hmm", "type": "reasoning"},
         {"content": "one two", "type": "text"},
@@ -256,3 +268,50 @@ async def test_other_paths_pass_through_untraced(upload_dir):
         response = await client.get("/health")
     assert response.text == "ok"
     assert _EXPORTER.get_finished_spans() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_direct_completion_endpoint_is_traced(upload_dir, stream):
+    async def completion_app(scope, receive, send):
+        request = json.loads(await _read_body(receive))
+        assert request["prompt"] == "alpha"
+        assert b"traceparent" in dict(scope["headers"])
+        payload = {
+            "id": "cmpl-direct",
+            "model": "served",
+            "choices": [{"index": 0, "text": "beta", "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (
+                        b"content-type",
+                        b"text/event-stream" if stream else b"application/json",
+                    )
+                ],
+            }
+        )
+        body = (
+            _sse(payload) + b"data: [DONE]\n\n"
+            if stream
+            else json.dumps(payload).encode()
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=GenAIContentTraceMiddleware(completion_app)),
+        base_url="http://lws",
+    ) as client:
+        response = await client.post(
+            "/v1/completions",
+            json={"model": "served", "prompt": "alpha", "stream": stream},
+        )
+    assert response.status_code == 200
+    spans = _EXPORTER.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].name.startswith("text_completion")
+    assert spans[0].attributes["gen_ai.usage.output_tokens"] == 1

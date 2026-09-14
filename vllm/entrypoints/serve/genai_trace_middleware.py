@@ -4,7 +4,7 @@
 
 An ASGI middleware for ``vllm serve --middleware
 vllm.entrypoints.serve.genai_trace_middleware.GenAIContentTraceMiddleware``.
-Every ``/v1/chat/completions`` request becomes an OpenTelemetry GenAI
+Every ``/v1/chat/completions`` or ``/v1/completions`` request becomes a GenAI
 inference span produced by ``opentelemetry-util-genai``: the request's
 sampling parameters, the response's finish reasons, ids and token usage
 (prompt, completion, prefix-cache hits), and the prompt and completion
@@ -42,7 +42,7 @@ Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
-TRACED_PATHS = frozenset({"/v1/chat/completions"})
+TRACED_PATHS = frozenset({"/v1/chat/completions", "/v1/completions"})
 
 
 def _text_of(content: Any) -> str:
@@ -117,7 +117,7 @@ class _ResponseCollector:
         for choice in chunk.get("choices") or []:
             state = self.choices.setdefault(int(choice.get("index", 0)), _ChoiceState())
             delta = choice.get("delta") or choice.get("message") or {}
-            state.text += _text_of(delta.get("content"))
+            state.text += _text_of(delta.get("content", choice.get("text")))
             state.reasoning += _text_of(
                 delta.get("reasoning") or delta.get("reasoning_content")
             )
@@ -137,9 +137,7 @@ class _ResponseCollector:
             return
         if self.status is not None and self.status >= 400:
             error = body.get("error") if isinstance(body, dict) else None
-            self._error = (
-                error.get("message") if isinstance(error, dict) else str(body)
-            )
+            self._error = error.get("message") if isinstance(error, dict) else str(body)
             return
         self._chunk(body)
 
@@ -164,7 +162,9 @@ class GenAIContentTraceMiddleware:
             from opentelemetry.util.genai.completion_hook import load_completion_hook
             from opentelemetry.util.genai.handler import get_telemetry_handler
 
-            self._handler = get_telemetry_handler(completion_hook=load_completion_hook())
+            self._handler = get_telemetry_handler(
+                completion_hook=load_completion_hook()
+            )
         return self._handler
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -231,7 +231,9 @@ class GenAIContentTraceMiddleware:
             logger.warning("GenAI trace middleware disabled", exc_info=True)
             return None
         invocation = handler.start_inference(
-            "vllm", request_model=request.get("model"), operation_name="chat"
+            "vllm",
+            request_model=request.get("model"),
+            operation_name="chat" if "messages" in request else "text_completion",
         )
         input_messages: list[Any] = []
         system_instruction: list[Any] = []
@@ -245,6 +247,12 @@ class GenAIContentTraceMiddleware:
                 input_messages.append(
                     InputMessage(role=str(message.get("role", "user")), parts=[part])
                 )
+        if "prompt" in request:
+            input_messages.append(
+                InputMessage(
+                    role="user", parts=[Text(content=_text_of(request["prompt"]))]
+                )
+            )
         invocation.input_messages = input_messages
         invocation.system_instruction = system_instruction
         invocation.temperature = request.get("temperature")

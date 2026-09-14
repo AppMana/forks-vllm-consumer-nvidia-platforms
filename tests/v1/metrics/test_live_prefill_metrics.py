@@ -86,3 +86,56 @@ def test_logging_stat_logger_idle_when_no_work(vllm_config):
     logger.log()
 
     assert logger.engine_is_idle
+
+
+def test_completed_sequence_throughput_is_mean_of_rates(vllm_config):
+    """Unequal durations must not turn arithmetic means into weighted rates."""
+    from vllm.v1.engine import FinishReason
+    from vllm.v1.metrics.stats import FinishedRequestStats, IterationStats
+
+    logger = PrometheusStatLogger(vllm_config, engine_indexes=[0])
+    stats = IterationStats()
+    stats.finished_requests = [
+        FinishedRequestStats(
+            FinishReason.STOP,
+            num_prompt_tokens=1100,
+            num_cached_tokens=1000,
+            prefill_time=1,
+            num_generation_tokens=11,
+            decode_time=1,
+        ),
+        FinishedRequestStats(
+            FinishReason.STOP,
+            num_prompt_tokens=300,
+            prefill_time=3,
+            num_generation_tokens=61,
+            decode_time=3,
+        ),
+    ]
+    logger.record(scheduler_stats=None, iteration_stats=stats, engine_idx=0)
+    assert _sample("vllm:request_prefill_tokens_per_second_sum") == 200
+    assert _sample("vllm:request_prefill_tokens_per_second_count") == 2
+    assert _sample("vllm:request_decode_tokens_per_second_sum") == 30
+    assert _sample("vllm:request_decode_tokens_per_second_count") == 2
+    # Decode mean is15, not70/4=17.5; prompt excludes1000cachehits.
+
+
+@pytest.mark.parametrize("duration", [0, -1, float("nan"), float("inf")])
+def test_sequence_throughput_omits_undefined_intervals(vllm_config, duration):
+    from vllm.v1.engine import FinishReason
+    from vllm.v1.metrics.stats import FinishedRequestStats, IterationStats
+
+    logger = PrometheusStatLogger(vllm_config, engine_indexes=[0])
+    stats = IterationStats()
+    stats.finished_requests = [
+        FinishedRequestStats(
+            FinishReason.STOP,
+            num_prompt_tokens=100,
+            prefill_time=duration,
+            num_generation_tokens=1,
+            decode_time=duration,
+        )
+    ]
+    logger.record(scheduler_stats=None, iteration_stats=stats, engine_idx=0)
+    assert _sample("vllm:request_prefill_tokens_per_second_count") == 0
+    assert _sample("vllm:request_decode_tokens_per_second_count") == 0
