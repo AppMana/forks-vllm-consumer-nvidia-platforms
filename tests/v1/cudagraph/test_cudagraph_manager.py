@@ -390,3 +390,70 @@ def test_divisor_query_len_dispatch_is_unchanged(
         assert desc.cg_mode == CUDAGraphMode.FULL, num_tokens
         assert desc.num_tokens == expected, num_tokens
         assert desc.num_reqs == expected // decode_query_len, num_tokens
+
+
+@pytest.mark.parametrize("requires_raw_ids", [False, True])
+def test_later_pipeline_capture_preserves_required_router_tokens(
+    monkeypatch, requires_raw_ids
+):
+    """Image-routing models must see sentinel IDs during graph capture too."""
+    from contextlib import nullcontext
+
+    from vllm.sequence import IntermediateTensors
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=False, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
+    )
+    manager = gpu_cudagraph_utils.ModelCudaGraphManager(
+        _create_vllm_config(), torch.device("cpu"), CUDAGraphMode.FULL, 1
+    )
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=4, num_reqs=4, uniform_token_count=1
+    )
+
+    def capture_forward(self, factory, progress_bar_desc):
+        factory(desc, False)(CUDAGraphMode.NONE)
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.CudaGraphManager, "capture", capture_forward
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils, "prepare_inputs_to_capture", lambda *a, **k: (None, {})
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils, "set_forward_context", lambda *a, **k: nullcontext()
+    )
+    tokens = torch.tensor([7, 128431, 128432, 9])
+    observed = []
+
+    class RouterModel(torch.nn.Module):
+        requires_raw_input_tokens = requires_raw_ids
+
+        def forward(self, input_ids, positions, inputs_embeds, intermediate_tensors):
+            observed.append(input_ids)
+            assert inputs_embeds is None
+            return intermediate_tensors["hidden_states"]
+
+    manager.capture(
+        RouterModel(),
+        SimpleNamespace(prepare_dummy_inputs=lambda *a: {}),
+        SimpleNamespace(
+            input_ids=tokens,
+            positions=torch.arange(4),
+            is_padding=torch.zeros(4, dtype=torch.bool),
+        ),
+        IntermediateTensors({"hidden_states": torch.zeros(4, 2)}),
+        MagicMock(),
+        [],
+        MagicMock(),
+    )
+    assert len(observed) == 1
+    if requires_raw_ids:
+        torch.testing.assert_close(observed[0], tokens)
+    else:
+        assert observed[0] is None
