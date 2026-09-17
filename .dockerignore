@@ -1,7 +1,6 @@
 **/__pycache__
 **/*.pyc
 **/*.so
-.git/
 .venv/
 .deps/
 .pytest_cache/

@@ -1,0 +1,7 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+COPY --chown=root:root vllm/distributed/parallel_state.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/distributed/parallel_state.py
+COPY --chown=root:root vllm/distributed/parallel_state.py \
+    /vllm-workspace/vllm/distributed/parallel_state.py
