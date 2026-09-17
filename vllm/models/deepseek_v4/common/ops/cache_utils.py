@@ -14,11 +14,13 @@ preparation.
   window indices for sparse prefill.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -30,13 +32,14 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import next_power_of_2
-from vllm.triton_utils import tl, triton
-from vllm.utils.import_utils import has_cutedsl
+
+logger = init_logger(__name__)
 from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
     cuda_supports_fp8e4nv_in_triton,
     fp8e4m3_decode_to_fp32,
 )
-
+from vllm.triton_utils import tl, triton
+from vllm.utils.import_utils import has_cutedsl
 
 _TOKEN_FP8_DIM = 448
 _TOKEN_BF16_DIM = 64  # elements (128 bytes)
@@ -158,6 +161,8 @@ def quantize_and_insert_int8_ds_mla_cache(
         "num_tokens_insert",
         "cache_block_size",
         "block_stride",
+        "num_slots",
+        "num_positions",
     ],
     do_not_specialize_on_alignment=[
         "q_ptr",
@@ -167,6 +172,7 @@ def quantize_and_insert_int8_ds_mla_cache(
         "slot_mapping_ptr",
         "positions_ptr",
         "cos_sin_ptr",
+        "guard_counter_ptr",
     ],
 )
 def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
@@ -177,10 +183,13 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
     slot_mapping_ptr,
     positions_ptr,
     cos_sin_ptr,
+    guard_counter_ptr,
     num_tokens_full,
     num_tokens_insert,
     cache_block_size,
     block_stride,
+    num_slots,
+    num_positions,
     eps,
     num_heads: tl.constexpr,
     num_heads_padded: tl.constexpr,
@@ -223,11 +232,16 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
         slot_idx = tl.load(slot_mapping_ptr + token)
         if slot_idx < 0:
             return
+        if slot_idx >= num_slots:
+            # A slot beyond the paged cache is corrupt scheduler state; a
+            # store through it is the illegal memory access this kernel has
+            # been dying with in production. Count it and drop the write --
+            # one stale cache row is recoverable, a dead engine is not.
+            tl.atomic_add(guard_counter_ptr, 1)
+            return
         x = tl.load(kv_ptr + token * head_dim + offs).to(tl.float32)
     else:
-        x = tl.load(
-            q_ptr + (token * num_heads + slot) * head_dim + offs
-        ).to(tl.float32)
+        x = tl.load(q_ptr + (token * num_heads + slot) * head_dim + offs).to(tl.float32)
         # Per-head RMSNorm (no weight), fp32 math.
         rms_rcp = tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + eps)
         x = x * rms_rcp
@@ -245,6 +259,13 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
     cs_idx = tl.maximum(rope_pair_local, 0)
 
     pos = tl.load(positions_ptr + token)
+    # Reading the cos/sin table at a corrupt position faults just like a
+    # corrupt slot. Clamp to a valid row (the RoPE values are wrong for this
+    # token, the addresses are not) and count it. Mask-style rather than a
+    # divergent reassignment, which trips Triton's type merge.
+    pos_oob = (pos < 0) | (pos >= num_positions)
+    tl.atomic_add(guard_counter_ptr + 1, 1, mask=pos_oob)
+    pos = tl.where(pos_oob, tl.zeros_like(pos), pos)
     cs_base = cos_sin_ptr + pos * rope_dim
     cos_v = tl.load(cs_base + cs_idx, mask=is_rope_pair, other=1.0)
     sin_v = tl.load(cs_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0)
@@ -276,6 +297,37 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
     else:
         out_row = q_out_ptr + (token * num_heads_padded + slot) * head_dim
         tl.store(out_row + offs, x.to(tl.bfloat16))
+
+
+# One [oob_slots, oob_positions] int32 pair per device. Created at the first
+# insert call, which happens during warmup -- before any CUDA graph capture,
+# so the captured graphs replay against a stable address. The guards in the
+# kernel accumulate here at zero steady-state cost; reading it back costs a
+# sync and is therefore gated behind VLLM_DSV4_INSERT_GUARD_REPORT=1.
+_INSERT_GUARD_COUNTERS: dict[torch.device, torch.Tensor] = {}
+_INSERT_GUARD_REPORT = os.environ.get("VLLM_DSV4_INSERT_GUARD_REPORT") == "1"
+
+
+def _insert_guard_counter(device: torch.device) -> torch.Tensor:
+    # Normalize: torch.device("cuda") and torch.device("cuda", 0) must key the
+    # same counter, or a caller and the kernel can end up on different ones.
+    if device.index is None and device.type == "cuda":
+        device = torch.device("cuda", torch.cuda.current_device())
+    counter = _INSERT_GUARD_COUNTERS.get(device)
+    if counter is None:
+        counter = torch.zeros(2, dtype=torch.int32, device=device)
+        _INSERT_GUARD_COUNTERS[device] = counter
+    return counter
+
+
+def int8_ds_mla_insert_guard_counts() -> dict[str, int]:
+    """Guard trips so far on every device this process has inserted on."""
+    out: dict[str, int] = {"oob_slots": 0, "oob_positions": 0}
+    for counter in _INSERT_GUARD_COUNTERS.values():
+        host = counter.cpu()
+        out["oob_slots"] += int(host[0])
+        out["oob_positions"] += int(host[1])
+    return out
 
 
 def fused_qnorm_rope_kv_int8_ds_mla_insert(
@@ -325,6 +377,7 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
     q_out = q.new_empty(num_tokens_full, num_heads_padded, head_dim)
     if num_tokens_full == 0:
         return q_out
+    guard_counter = _insert_guard_counter(q.device)
     _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel[
         (num_tokens_full, num_heads_padded + 1)
     ](
@@ -335,10 +388,13 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
         slot_mapping,
         positions,
         cos_sin_cache,
+        guard_counter,
         num_tokens_full,
         num_tokens_insert,
         block_size,
         flat_cache.stride(0),
+        flat_cache.shape[0] * block_size,
+        cos_sin_cache.shape[0],
         eps,
         num_heads=num_heads,
         num_heads_padded=num_heads_padded,
@@ -346,6 +402,18 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
         rope_dim=64,
         token_stride=_INT8_DS_MLA_TOKEN_BYTES,
     )
+    if _INSERT_GUARD_REPORT and not torch.cuda.is_current_stream_capturing():
+        host = guard_counter.cpu()
+        if int(host[0]) or int(host[1]):
+            logger.warning(
+                "int8_ds_mla insert guard tripped: oob_slots=%d oob_positions=%d "
+                "(num_slots=%d num_positions=%d num_tokens_insert=%d)",
+                int(host[0]),
+                int(host[1]),
+                flat_cache.shape[0] * block_size,
+                cos_sin_cache.shape[0],
+                num_tokens_insert,
+            )
     return q_out
 
 
@@ -424,9 +492,9 @@ def _dequantize_global_slots_int8_ds_mla_cache_kernel(
     )
     q_u8 = tl.load(cache_base + offsets, mask=valid, other=0)
     q = q_u8.to(tl.int8, bitcast=True).to(tl.float32)
-    scale = tl.load((cache_base + 512).to(tl.pointer_type(tl.float32)),
-                    mask=valid,
-                    other=0.0)
+    scale = tl.load(
+        (cache_base + 512).to(tl.pointer_type(tl.float32)), mask=valid, other=0.0
+    )
     tl.store(out_base, (q * scale).to(tl.bfloat16), mask=valid & (offsets < 512))
 
 
@@ -553,8 +621,10 @@ def _quantize_and_insert_k_cache_torch(
     raw_scale = block_max / _FP8_MAX
     exponent = torch.ceil(torch.log2(raw_scale))
     scale = torch.exp2(exponent)
-    x_quant = (blocks / scale.unsqueeze(-1)).clamp(-_FP8_MAX, _FP8_MAX).to(
-        torch.float8_e4m3fn
+    x_quant = (
+        (blocks / scale.unsqueeze(-1))
+        .clamp(-_FP8_MAX, _FP8_MAX)
+        .to(torch.float8_e4m3fn)
     )
     x_uint8 = x_quant.view(torch.uint8).contiguous().view(-1, _TOKEN_FP8_DIM)
     encoded_scale = (exponent + 127.0).clamp(0, 255).to(torch.uint8)
@@ -575,23 +645,20 @@ def _quantize_and_insert_k_cache_torch(
     )
 
     # ----- Scatter into cache via per-row scatter (works regardless of stride) -----
-    fp8_col = (
-        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
-        + torch.arange(_TOKEN_FP8_DIM, device=device, dtype=torch.int64).unsqueeze(0)
-    )
+    fp8_col = pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE + torch.arange(
+        _TOKEN_FP8_DIM, device=device, dtype=torch.int64
+    ).unsqueeze(0)
     bf16_col = (
         pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
         + _TOKEN_FP8_DIM
-        + torch.arange(
-            _TOKEN_BF16_DIM * 2, device=device, dtype=torch.int64
-        ).unsqueeze(0)
+        + torch.arange(_TOKEN_BF16_DIM * 2, device=device, dtype=torch.int64).unsqueeze(
+            0
+        )
     )
     scale_col = (
         block_size * _TOKEN_DATA_SIZE
         + pos_in_block.unsqueeze(1) * _TOKEN_SCALE_DIM
-        + torch.arange(
-            _TOKEN_SCALE_DIM, device=device, dtype=torch.int64
-        ).unsqueeze(0)
+        + torch.arange(_TOKEN_SCALE_DIM, device=device, dtype=torch.int64).unsqueeze(0)
     )
     flat_block_fp8 = block_idx.unsqueeze(1).expand(-1, _TOKEN_FP8_DIM)
     k_cache.index_put_((flat_block_fp8, fp8_col), x_uint8)
@@ -626,27 +693,24 @@ def _gather_token_bytes(
     safe_block_idx = block_idx.clamp(0, max(k_cache.shape[0] - 1, 0))
     selected = k_cache.index_select(0, safe_block_idx)  # (N, block_stride)
 
-    fp8_off = (
-        pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
-        + torch.arange(_TOKEN_FP8_DIM, device=device, dtype=torch.int64).unsqueeze(0)
-    )
+    fp8_off = pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE + torch.arange(
+        _TOKEN_FP8_DIM, device=device, dtype=torch.int64
+    ).unsqueeze(0)
     fp8_bytes = selected.gather(1, fp8_off)
 
     bf16_off = (
         pos_in_block.unsqueeze(1) * _TOKEN_DATA_SIZE
         + _TOKEN_FP8_DIM
-        + torch.arange(
-            _TOKEN_BF16_DIM * 2, device=device, dtype=torch.int64
-        ).unsqueeze(0)
+        + torch.arange(_TOKEN_BF16_DIM * 2, device=device, dtype=torch.int64).unsqueeze(
+            0
+        )
     )
     bf16_bytes = selected.gather(1, bf16_off)
 
     scale_off = (
         block_size * _TOKEN_DATA_SIZE
         + pos_in_block.unsqueeze(1) * _TOKEN_SCALE_DIM
-        + torch.arange(
-            _TOKEN_SCALE_DIM, device=device, dtype=torch.int64
-        ).unsqueeze(0)
+        + torch.arange(_TOKEN_SCALE_DIM, device=device, dtype=torch.int64).unsqueeze(0)
     )
     scale_bytes = selected.gather(1, scale_off)
     if not valid_block.all():
@@ -668,7 +732,9 @@ def _dequant_token_to_bf16(
     x_fp8 = fp8_bytes.contiguous().view(torch.float8_e4m3fn)
     x_fp32 = x_fp8.to(torch.float32).view(n, _N_REAL_QUANT_BLOCKS, _QUANT_BLOCK_SIZE)
     scale = torch.exp2(scale_bytes[:, :_N_REAL_QUANT_BLOCKS].to(torch.float32) - 127.0)
-    x_dequant = (x_fp32 * scale.unsqueeze(-1)).view(n, _TOKEN_FP8_DIM).to(torch.bfloat16)
+    x_dequant = (
+        (x_fp32 * scale.unsqueeze(-1)).view(n, _TOKEN_FP8_DIM).to(torch.bfloat16)
+    )
 
     # BF16 portion is uint8 bytes -> bf16 elements.
     bf16_part = bf16_bytes.contiguous().view(torch.bfloat16).view(n, _TOKEN_BF16_DIM)
@@ -698,7 +764,9 @@ def _dequantize_and_gather_k_cache_torch(
         if gl == 0:
             continue
         sp = int(start_pos[r].item())
-        positions = torch.arange(sp, sp + gl, device=block_table.device, dtype=torch.int64)
+        positions = torch.arange(
+            sp, sp + gl, device=block_table.device, dtype=torch.int64
+        )
         block_in_seq = positions // block_size
         pos_in_block = positions % block_size
         valid_block_in_seq = (block_in_seq >= 0) & (block_in_seq < block_table.shape[1])
@@ -1282,6 +1350,7 @@ def dequantize_combined_sparse_mla_decode_kv(
         offset=0,
     )
 
+
 def dequantize_and_gather_k_cache(
     # [num_reqs, max_num_tokens, head_size]
     out: torch.Tensor,
@@ -1615,7 +1684,8 @@ class CombineTopkSwaIndicesKernel(
         window_size = _hf_config_int(vllm_config, "sliding_window", 128)
         layer_inputs = _dsv4_combine_topk_swa_warmup_inputs(vllm_config)
         topk_widths = tuple(
-            int(row["topk_width"]) for row in layer_inputs.rows  # type: ignore[index]
+            int(row["topk_width"])
+            for row in layer_inputs.rows  # type: ignore[index]
         )
         return self._trace_dispatch(self.dispatch)(
             layer_inputs,
