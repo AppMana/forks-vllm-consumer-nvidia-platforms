@@ -41,9 +41,10 @@ else()
           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
           GIT_TAG 506341a143fcabd4bb79052a7605ada727d6b3f5
           GIT_PROGRESS TRUE
+          # Idempotent: a cached checkout (the .deps build mount) is already
+          # patched after any earlier configure, and a second apply fails.
           PATCH_COMMAND
-            git apply --ignore-space-change --ignore-whitespace
-            ${CMAKE_CURRENT_LIST_DIR}/../patches/vllm_flash_attn_arch_gating.patch
+            sh -c "git apply --reverse --check --ignore-space-change --ignore-whitespace ${CMAKE_CURRENT_LIST_DIR}/../patches/vllm_flash_attn_arch_gating.patch >/dev/null 2>&1 || git apply --ignore-space-change --ignore-whitespace ${CMAKE_CURRENT_LIST_DIR}/../patches/vllm_flash_attn_arch_gating.patch"
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )

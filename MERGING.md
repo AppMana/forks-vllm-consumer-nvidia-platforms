@@ -79,7 +79,9 @@ the per-area policy learned from the previous merges, and the gates.
 - Empty responses on the needle benchmark: thinking is on by default; the
   benchmark passes `chat_template_kwargs` explicitly.
 - `patch does not apply` during the flash-attention fetch: a previously
-  patched checkout under `.deps/`; reset or delete it.
+  patched checkout under `.deps/`. The patch step is idempotent now (it
+  checks whether the patch is already applied); if this message returns,
+  the patch itself no longer matches the pinned flash-attention tag.
 - `deepseek_v4_sparse_mla_attention_warmup` imported again in
   `kernel_warmup.py`: upstream keeps that warmup; the fork removed it because
   it drives `execute_model` from a per-rank gate and deadlocks a pipeline
