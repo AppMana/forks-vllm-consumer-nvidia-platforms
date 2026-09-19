@@ -1213,6 +1213,10 @@ class DequantizeAndGatherKCacheKernel(
         block_size = vllm_config.cache_config.block_size
         if max_model_len <= 0 or block_size <= 0:
             return []
+        # Below SM89 the kernel's fp8e4nv cast cannot compile and
+        # dequantize_and_gather_k_cache launches the native CUDA op instead.
+        if not _supports_fp8e4nv_in_triton():
+            return []
 
         compress_ratios = frozenset(
             max(1, int(compress_ratio))

@@ -1115,4 +1115,10 @@ class JitWarmupRegistry:
                     f"{kernel.__class__.__name__} ({len(compile_keys)} keys)",
                     refresh=False,
                 )
-                kernel.compile_many(compile_keys)
+                try:
+                    kernel.compile_many(compile_keys)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"JIT warmup failed for {kernel.__class__.__name__} "
+                        f"({len(compile_keys)} keys)"
+                    ) from exc

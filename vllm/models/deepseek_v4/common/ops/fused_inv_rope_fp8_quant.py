@@ -260,6 +260,11 @@ class FusedInvRopeFP8QuantKernel(
         capability = current_platform.get_device_capability()
         if capability is None:
             return []
+        # Below SM89 no variant of this kernel compiles (the fp8e4nv cast is
+        # visited even for QUANTIZE=False) and the wrapper routes the call to
+        # the torch fallback instead.
+        if not _supports_fp8e4nv_in_triton():
+            return []
 
         head_dim = int(getattr(hf_config, "head_dim", 512) or 512)
         rope_dim = int(getattr(hf_config, "qk_rope_head_dim", 64) or 64)

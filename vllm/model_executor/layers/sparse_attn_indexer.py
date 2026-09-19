@@ -1859,12 +1859,23 @@ class SparseAttnIndexer(CustomOp):
             )
 
         if vllm_config.kernel_config.enable_jit_warmup:
+            from vllm.transformers_utils.configs.dsv4.kernel_config import (
+                indexer_query_int8_enabled,
+            )
             from vllm.v1.attention.ops.common import (
                 _PACK_SEQ_TRITON_KERNEL,
                 _UNPACK_SEQ_TRITON_KERNEL,
             )
 
-            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
+            # Mirror the dtype the decode path packs: uint8 values (and ue8m0
+            # scales) for MXFP4, int8 for the integer-MMA query, else the
+            # platform's fp8.
+            if use_fp4_cache:
+                pack_dtype: torch.dtype = torch.uint8
+            elif indexer_query_int8_enabled():
+                pack_dtype = torch.int8
+            else:
+                pack_dtype = current_platform.fp8_dtype()
             _PACK_SEQ_TRITON_KERNEL.register_warmup(
                 dtype=pack_dtype,
                 pad_value=0 if use_fp4_cache else -float("inf"),

@@ -539,6 +539,11 @@ class Dsv4IntConfig(QuantizationConfig):
         # KeyError: model.main_proj.weight_scale_inv. Backbone layers have
         # no main_proj, so this cannot misclassify target-model linears.
         ".main_proj",
+        # Upstream stacks every draft layer's attn.wkv (U8 channelwise in the
+        # rebuilt checkpoint, with its .scale) into one cross-layer
+        # context_wkv_proj; it needs the same INT8 method or the stacked
+        # scales have no parameter to land in.
+        ".context_wkv_proj",
     )
 
     def __init__(
