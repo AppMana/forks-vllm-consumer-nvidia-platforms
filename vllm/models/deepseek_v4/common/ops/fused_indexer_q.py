@@ -1,8 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 
+from vllm.model_executor.warmup.jit_warmup import kernel_launcher
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    LaunchSpec,
+    TritonWarmupTensor,
+    VllmTritonJitKernel,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
@@ -79,244 +88,526 @@ def _round_clamp_int8(v):
     return r.to(tl.int8)
 
 
-@triton.jit
-def _fused_indexer_q_rope_quant_kernel(
-    pos_ptr,
-    # Index Q RoPE
-    index_q_ptr,
-    index_q_stride0,
-    index_q_stride1,
-    index_q_cos_sin_ptr,
-    index_q_cos_sin_stride,
-    INDEX_Q_HALF_ROT_DIM: tl.constexpr,
-    # Index Q Quantize
-    index_q_fp8_ptr,  # uint8 view of the float8 output tensor on sm_8x
-    index_q_fp8_stride0,
-    index_q_fp8_stride1,
-    INDEX_Q_HEAD_DIM: tl.constexpr,
-    # Index weights
-    index_weights_ptr,
-    index_weights_stride,
-    index_weights_softmax_scale,
-    index_weights_head_scale,
-    index_weights_out_ptr,
-    index_weights_out_stride,
-    FP8_MAX: tl.constexpr = 448.0,
-    USE_FNUZ: tl.constexpr = False,
-    USE_EXPLICIT_FMA: tl.constexpr = False,
-    QK_INT8: tl.constexpr = False,
+class FusedIndexerQRopeQuantTritonKernel(
+    VllmTritonJitKernel["FusedIndexerQRopeQuantTritonKernel.CompileKey"]
 ):
-    # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
-    # + per_token_group_quant_fp8): GPT-J interleaved RoPE applied to the
-    # LAST rope_dim dims of each head; the leading [0, NOPE_DIM) is passed
-    # through unchanged.
-    INDEX_Q_ROT_DIM: tl.constexpr = 2 * INDEX_Q_HALF_ROT_DIM
-    INDEX_Q_NOPE_DIM: tl.constexpr = INDEX_Q_HEAD_DIM - INDEX_Q_ROT_DIM
-    tl.static_assert(INDEX_Q_NOPE_DIM >= 0)
+    @dataclass(frozen=True)
+    class CompileKey:
+        dtype: torch.dtype
+        num_heads: int
+        index_q_half_rot_dim: int
+        index_q_head_dim: int
+        fp8_max: float
+        use_fnuz: bool
+        use_explicit_fma: bool
+        # Symmetric INT8 query (s8 x s8 integer-MMA indexer); the output
+        # tensor is int8 and the scale is absmax/127.
+        qk_int8: bool = False
+        # OCP e4m3fn stored through the fp8e4m3_arith software encoder into a
+        # uint8 view (sm_8x has no working tl.float8e4nv cast).
+        software_e4m3: bool = False
 
-    tok_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-
-    pos = tl.load(pos_ptr + tok_idx)
-    cos, sin = _get_cos_sin(
+    @staticmethod
+    @triton.jit
+    def kernel(
+        pos_ptr,
+        # Index Q RoPE
+        index_q_ptr,
+        index_q_stride0,
+        index_q_stride1,
         index_q_cos_sin_ptr,
         index_q_cos_sin_stride,
-        pos,
-        INDEX_Q_HALF_ROT_DIM,
-    )
-    half_offset = tl.arange(0, INDEX_Q_HALF_ROT_DIM)
-    base_ptr = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
+        INDEX_Q_HALF_ROT_DIM: tl.constexpr,
+        # Index Q Quantize
+        index_q_fp8_ptr,
+        index_q_fp8_stride0,
+        index_q_fp8_stride1,
+        INDEX_Q_HEAD_DIM: tl.constexpr,
+        # Index weights
+        index_weights_ptr,
+        index_weights_stride,
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        index_weights_out_ptr,
+        index_weights_out_stride,
+        FP8_MAX: tl.constexpr = 448.0,
+        USE_FNUZ: tl.constexpr = False,
+        USE_EXPLICIT_FMA: tl.constexpr = False,
+        QK_INT8: tl.constexpr = False,
+        SOFTWARE_E4M3: tl.constexpr = False,
+    ):
+        # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
+        # + per_token_group_quant_fp8): GPT-J interleaved RoPE applied to the
+        # LAST rope_dim dims of each head; the leading [0, NOPE_DIM) is passed
+        # through unchanged.
+        INDEX_Q_ROT_DIM: tl.constexpr = 2 * INDEX_Q_HALF_ROT_DIM
+        INDEX_Q_NOPE_DIM: tl.constexpr = INDEX_Q_HEAD_DIM - INDEX_Q_ROT_DIM
+        tl.static_assert(INDEX_Q_NOPE_DIM >= 0)
 
-    # Interleaved (GPT-J) RoPE on dims [NOPE_DIM, HEAD_DIM):
-    #   even = q[NOPE_DIM + 2*i],  odd = q[NOPE_DIM + 2*i + 1]
-    rot_base = base_ptr + INDEX_Q_NOPE_DIM
-    x_even = tl.load(rot_base + half_offset * 2).to(tl.float32)
-    x_odd = tl.load(rot_base + half_offset * 2 + 1).to(tl.float32)
-    if USE_EXPLICIT_FMA:
-        # Match HIP rotary_embedding contraction before bf16 materialization.
-        r_even = tl.fma(x_even, cos, -(x_odd * sin))
-        r_odd = tl.fma(x_odd, cos, x_even * sin)
-    else:
-        r_even = x_even * cos - x_odd * sin
-        r_odd = x_odd * cos + x_even * sin
+        tok_idx = tl.program_id(0)
+        head_idx = tl.program_id(1)
 
-    # Match reference numerics: fp32 → bf16 → fp32 before the ue8m0 absmax.
-    # Same pattern as the K-side compressor kernel (fused_compress_quant_cache.py).
-    r_even = r_even.to(tl.bfloat16).to(tl.float32)
-    r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
+        pos = tl.load(pos_ptr + tok_idx)
+        cos, sin = _get_cos_sin(
+            index_q_cos_sin_ptr,
+            index_q_cos_sin_stride,
+            pos,
+            INDEX_Q_HALF_ROT_DIM,
+        )
+        half_offset = tl.arange(0, INDEX_Q_HALF_ROT_DIM)
+        base_ptr = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
 
-    amax = tl.maximum(tl.max(tl.abs(r_even)), tl.max(tl.abs(r_odd)))
-    if INDEX_Q_NOPE_DIM > 0:
-        nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
-        x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
-        amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
-    if QK_INT8:
-        # Symmetric INT8 query for the s8 x s8 integer-MMA decode indexer.
-        # Plain absmax/127 (matches the prefill use_imma path in deep_gemm and the
-        # int8 K-cache writer's absmax scale); stored as int8 into an int8 tensor.
-        index_q_scale = tl.maximum(amax, 1e-4) / 127.0
-    else:
-        index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
-        index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
-
-    # Store quantized values to index_q: int8 (QK_INT8); FNUZ (e4m3fnuz) via a
-    # hardware tl.float8e4b8 cast on gfx942; OCP e4m3fn via the fp8e4m3_arith
-    # software encoder (sm_8x/Ampere has no working tl.float8e4nv cast in
-    # Triton, so this path is used instead of a direct .to(tl.float8e4nv)).
-    fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
-    fp8_base_ptr = (
-        index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
-    )
-    if INDEX_Q_NOPE_DIM > 0:
-        qn = tl.div_rn(x_nope, index_q_scale)
-        if QK_INT8:
-            tl.store(fp8_base_ptr + nope_offset, _round_clamp_int8(qn))
-        elif USE_FNUZ:
-            tl.store(fp8_base_ptr + nope_offset, qn.to(fp8_dtype))
+        # Interleaved (GPT-J) RoPE on dims [NOPE_DIM, HEAD_DIM):
+        #   even = q[NOPE_DIM + 2*i],  odd = q[NOPE_DIM + 2*i + 1]
+        rot_base = base_ptr + INDEX_Q_NOPE_DIM
+        x_even = tl.load(rot_base + half_offset * 2).to(tl.float32)
+        x_odd = tl.load(rot_base + half_offset * 2 + 1).to(tl.float32)
+        if USE_EXPLICIT_FMA:
+            # Match HIP rotary_embedding contraction before bf16 materialization.
+            r_even = tl.fma(x_even, cos, -(x_odd * sin))
+            r_odd = tl.fma(x_odd, cos, x_even * sin)
         else:
-            tl.store(fp8_base_ptr + nope_offset, fp8e4m3_encode_from_fp32(qn))
-    fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
-    qe = tl.div_rn(r_even, index_q_scale)
-    qo = tl.div_rn(r_odd, index_q_scale)
-    if QK_INT8:
-        tl.store(fp8_rot_base + half_offset * 2, _round_clamp_int8(qe))
-        tl.store(fp8_rot_base + half_offset * 2 + 1, _round_clamp_int8(qo))
-    elif USE_FNUZ:
-        tl.store(fp8_rot_base + half_offset * 2, qe.to(fp8_dtype))
-        tl.store(fp8_rot_base + half_offset * 2 + 1, qo.to(fp8_dtype))
-    else:
-        tl.store(fp8_rot_base + half_offset * 2, fp8e4m3_encode_from_fp32(qe))
-        tl.store(fp8_rot_base + half_offset * 2 + 1, fp8e4m3_encode_from_fp32(qo))
+            r_even = x_even * cos - x_odd * sin
+            r_odd = x_odd * cos + x_even * sin
 
-    # FP8 weight-fold contract:
-    #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
-    # The per-token-per-head q_scale (fp32) IS folded into the output weights
-    # here because FP8 Q is stored WITHOUT a companion scale tensor: the
-    # downstream fp8_fp4_mqa_logits/fp8_fp4_paged_mqa_logits kernels use `weights` to
-    # apply per-token Q scale inline. See the MXFP4 kernel below for the
-    # contrasting convention (scales live with the Q values, weights are NOT
-    # q-scaled).
-    index_weights = tl.load(
-        index_weights_ptr + tok_idx * index_weights_stride + head_idx
-    )
-    index_weights = index_weights.to(tl.float32)
-    index_weights *= index_q_scale
-    index_weights *= index_weights_softmax_scale
-    index_weights *= index_weights_head_scale
-    tl.store(
-        index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
-        index_weights,
-    )
-
-
-@triton.jit
-def _fused_indexer_q_rope_mxfp4_kernel(
-    pos_ptr,
-    # Index Q RoPE input (fp/bf16)
-    index_q_ptr,
-    index_q_stride0,
-    index_q_stride1,
-    index_q_cos_sin_ptr,
-    index_q_cos_sin_stride,
-    INDEX_Q_HALF_ROT_DIM: tl.constexpr,
-    # MXFP4 Q outputs
-    index_q_mxfp4_ptr,  # uint8, (T, H, HEAD_DIM // 2)
-    index_q_mxfp4_stride0,
-    index_q_mxfp4_stride1,
-    index_q_scale_ptr,  # uint8 ue8m0, (T, H, HEAD_DIM // BLOCK)
-    index_q_scale_stride0,
-    index_q_scale_stride1,
-    INDEX_Q_HEAD_DIM: tl.constexpr,
-    MXFP4_BLOCK: tl.constexpr,
-    # Weights (NO per-token q_scale fold for MXFP4; per-block scales stay
-    # with the Q values in the output scale tensor).
-    index_weights_ptr,
-    index_weights_stride,
-    index_weights_softmax_scale,
-    index_weights_head_scale,
-    index_weights_out_ptr,
-    index_weights_out_stride,
-):
-    INDEX_Q_ROT_DIM: tl.constexpr = 2 * INDEX_Q_HALF_ROT_DIM
-    INDEX_Q_NOPE_DIM: tl.constexpr = INDEX_Q_HEAD_DIM - INDEX_Q_ROT_DIM
-    NUM_NOPE_BLOCKS: tl.constexpr = INDEX_Q_NOPE_DIM // MXFP4_BLOCK
-    NUM_ROPE_BLOCKS: tl.constexpr = INDEX_Q_ROT_DIM // MXFP4_BLOCK
-    HALF_BLOCK: tl.constexpr = MXFP4_BLOCK // 2
-    tl.static_assert(INDEX_Q_NOPE_DIM >= 0)
-    tl.static_assert(INDEX_Q_NOPE_DIM % MXFP4_BLOCK == 0)
-    tl.static_assert(INDEX_Q_ROT_DIM % MXFP4_BLOCK == 0)
-    tl.static_assert(MXFP4_BLOCK % 2 == 0)
-
-    tok_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-
-    pos = tl.load(pos_ptr + tok_idx)
-
-    q_base = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
-    out_base = (
-        index_q_mxfp4_ptr
-        + tok_idx * index_q_mxfp4_stride0
-        + head_idx * index_q_mxfp4_stride1
-    )
-    scale_base = (
-        index_q_scale_ptr
-        + tok_idx * index_q_scale_stride0
-        + head_idx * index_q_scale_stride1
-    )
-
-    half_off = tl.arange(0, HALF_BLOCK)
-
-    # ---- NoPE blocks: direct load, pair as (even-index, odd-index) values ----
-    for b in tl.static_range(NUM_NOPE_BLOCKS):
-        base = b * MXFP4_BLOCK
-        x_lo = tl.load(q_base + base + half_off * 2).to(tl.float32)
-        x_hi = tl.load(q_base + base + half_off * 2 + 1).to(tl.float32)
-        packed, ue8m0 = _quantize_mxfp4_pair(x_lo, x_hi)
-        tl.store(out_base + base // 2 + half_off, packed)
-        tl.store(scale_base + b, ue8m0)
-
-    # ---- RoPE blocks: apply GPT-J interleaved RoPE to the block's 16 pairs,
-    # then quantize. Each block covers HALF_BLOCK (=16) cos/sin pairs. ----
-    rot_q_base = q_base + INDEX_Q_NOPE_DIM
-    for b in tl.static_range(NUM_ROPE_BLOCKS):
-        pair_off = b * HALF_BLOCK + half_off  # indices in [0, HALF_ROT_DIM)
-        cos_b = tl.load(
-            index_q_cos_sin_ptr + pos * index_q_cos_sin_stride + pair_off
-        ).to(tl.float32)
-        sin_b = tl.load(
-            index_q_cos_sin_ptr
-            + pos * index_q_cos_sin_stride
-            + pair_off
-            + INDEX_Q_HALF_ROT_DIM
-        ).to(tl.float32)
-        x_even = tl.load(rot_q_base + pair_off * 2).to(tl.float32)
-        x_odd = tl.load(rot_q_base + pair_off * 2 + 1).to(tl.float32)
-        r_even = x_even * cos_b - x_odd * sin_b
-        r_odd = x_odd * cos_b + x_even * sin_b
-        # bf16 roundtrip for parity with the FP8 kernel / reference numerics.
+        # Match reference numerics: fp32 → bf16 → fp32 before the ue8m0 absmax.
+        # Same pattern as the K-side compressor kernel (fused_compress_quant_cache.py).
         r_even = r_even.to(tl.bfloat16).to(tl.float32)
         r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
-        packed, ue8m0 = _quantize_mxfp4_pair(r_even, r_odd)
-        rope_byte_off = (INDEX_Q_NOPE_DIM + b * MXFP4_BLOCK) // 2
-        tl.store(out_base + rope_byte_off + half_off, packed)
-        tl.store(scale_base + NUM_NOPE_BLOCKS + b, ue8m0)
 
-    # MXFP4 weight-fold contract:
-    #   index_weights_out = index_weights * softmax_scale * head_scale
-    # NOTE: q_scale is NOT folded here (contrast with the FP8 kernel above).
-    # MXFP4 Q emits a separate ue8m0 scale tensor of shape
-    # (T, H, HEAD_DIM // MXFP4_BLOCK) alongside the packed values, so each
-    # per-block scale is applied by the downstream MXFP4 logits kernel when
-    # dequantizing Q: there is no per-token scalar to fold into `weights`.
-    index_weights = tl.load(
-        index_weights_ptr + tok_idx * index_weights_stride + head_idx
-    ).to(tl.float32)
-    index_weights *= index_weights_softmax_scale
-    index_weights *= index_weights_head_scale
-    tl.store(
-        index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
-        index_weights,
-    )
+        amax = tl.maximum(tl.max(tl.abs(r_even)), tl.max(tl.abs(r_odd)))
+        if INDEX_Q_NOPE_DIM > 0:
+            nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
+            x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
+            amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
+        if QK_INT8:
+            # Symmetric INT8 query for the s8 x s8 integer-MMA decode indexer.
+            # Plain absmax/127 (matches the prefill use_imma path in deep_gemm
+            # and the int8 K-cache writer's absmax scale); stored as int8 into
+            # an int8 tensor.
+            index_q_scale = tl.maximum(amax, 1e-4) / 127.0
+        else:
+            index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
+            index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+
+        # Store quantized values to index_q: int8 (QK_INT8); FNUZ (e4m3fnuz)
+        # via a hardware tl.float8e4b8 cast on gfx942; OCP e4m3fn via a
+        # hardware tl.float8e4nv cast where Triton supports it, otherwise the
+        # fp8e4m3_arith software encoder (sm_8x/Ampere has no working
+        # tl.float8e4nv cast, so index_q_fp8_ptr is a uint8 view there).
+        fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
+        fp8_base_ptr = (
+            index_q_fp8_ptr
+            + tok_idx * index_q_fp8_stride0
+            + head_idx * index_q_fp8_stride1
+        )
+        if INDEX_Q_NOPE_DIM > 0:
+            qn = tl.div_rn(x_nope, index_q_scale)
+            if QK_INT8:
+                tl.store(fp8_base_ptr + nope_offset, _round_clamp_int8(qn))
+            elif SOFTWARE_E4M3:
+                tl.store(fp8_base_ptr + nope_offset, fp8e4m3_encode_from_fp32(qn))
+            else:
+                tl.store(fp8_base_ptr + nope_offset, qn.to(fp8_dtype))
+        fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
+        qe = tl.div_rn(r_even, index_q_scale)
+        qo = tl.div_rn(r_odd, index_q_scale)
+        if QK_INT8:
+            tl.store(fp8_rot_base + half_offset * 2, _round_clamp_int8(qe))
+            tl.store(fp8_rot_base + half_offset * 2 + 1, _round_clamp_int8(qo))
+        elif SOFTWARE_E4M3:
+            tl.store(fp8_rot_base + half_offset * 2, fp8e4m3_encode_from_fp32(qe))
+            tl.store(fp8_rot_base + half_offset * 2 + 1, fp8e4m3_encode_from_fp32(qo))
+        else:
+            tl.store(fp8_rot_base + half_offset * 2, qe.to(fp8_dtype))
+            tl.store(fp8_rot_base + half_offset * 2 + 1, qo.to(fp8_dtype))
+
+        # FP8 weight-fold contract:
+        #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
+        # The per-token-per-head q_scale (fp32) IS folded into the output weights
+        # here because FP8 Q is stored WITHOUT a companion scale tensor — the
+        # downstream fp8_fp4_mqa_logits/fp8_fp4_paged_mqa_logits kernels use
+        # `weights` to apply per-token Q scale inline. See the MXFP4 kernel below for
+        # contrasting convention (scales live with the Q values, weights are NOT
+        # q-scaled).
+        index_weights = tl.load(
+            index_weights_ptr + tok_idx * index_weights_stride + head_idx
+        )
+        index_weights = index_weights.to(tl.float32)
+        index_weights *= index_q_scale
+        index_weights *= index_weights_softmax_scale
+        index_weights *= index_weights_head_scale
+        tl.store(
+            index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
+            index_weights,
+        )
+
+    def dispatch(  # type: ignore[override]
+        self,
+        *,
+        dtype: torch.dtype,
+        num_heads: int,
+        head_dim: int,
+        rope_dim: int,
+        use_fnuz: bool,
+        qk_int8: bool = False,
+        software_e4m3: bool = False,
+    ) -> CompileKey:
+        return self.CompileKey(
+            dtype=dtype,
+            num_heads=num_heads,
+            index_q_half_rot_dim=rope_dim // 2,
+            index_q_head_dim=head_dim,
+            fp8_max=224.0 if use_fnuz else 448.0,
+            use_fnuz=use_fnuz,
+            use_explicit_fma=current_platform.is_rocm(),
+            qk_int8=qk_int8,
+            software_e4m3=software_e4m3,
+        )
+
+    def get_warmup_keys(self, vllm_config: Any) -> list[CompileKey]:
+        from vllm.transformers_utils.configs.dsv4.kernel_config import (
+            indexer_query_int8_enabled,
+        )
+
+        hf_config = vllm_config.model_config.hf_config
+        num_heads = int(getattr(hf_config, "index_n_heads", 0) or 0)
+        head_dim = int(getattr(hf_config, "index_head_dim", 0) or 0)
+        rope_dim = int(getattr(hf_config, "qk_rope_head_dim", 0) or 0)
+        if num_heads <= 0 or head_dim <= 0 or rope_dim <= 0:
+            return []
+
+        use_fnuz = current_platform.fp8_dtype() == torch.float8_e4m3fnuz
+        # The INT8 query (AppMana kernel config role ``indexer_query_int8``)
+        # replaces the fp8 query on the serving path, so warm exactly the
+        # variant that serves: fp8 with the hardware or software E4M3 store,
+        # or the int8 store.
+        qk_int8 = indexer_query_int8_enabled()
+        return self._trace_dispatch(self.dispatch)(
+            dtype=vllm_config.model_config.dtype,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+            use_fnuz=use_fnuz,
+            qk_int8=qk_int8,
+            software_e4m3=(
+                not qk_int8 and not use_fnuz and not _supports_fp8e4nv_in_triton()
+            ),
+        )
+
+    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+        q_stride0 = compile_key.num_heads * compile_key.index_q_head_dim
+        if compile_key.qk_int8:
+            out_dtype = torch.int8
+        elif compile_key.software_e4m3:
+            out_dtype = torch.uint8
+        else:
+            out_dtype = current_platform.fp8_dtype()
+        return dict(
+            positions=TritonWarmupTensor(torch.int64),
+            index_q=TritonWarmupTensor(
+                compile_key.dtype,
+                shape=(1, compile_key.num_heads, compile_key.index_q_head_dim),
+                strides=(q_stride0, compile_key.index_q_head_dim, 1),
+            ),
+            index_q_cos_sin_cache=TritonWarmupTensor(
+                torch.float32,
+                shape=(1, compile_key.index_q_half_rot_dim * 2),
+            ),
+            index_weights=TritonWarmupTensor(
+                compile_key.dtype,
+                shape=(1, compile_key.num_heads),
+            ),
+            index_weights_softmax_scale=1.0,
+            index_weights_head_scale=1.0,
+            index_q_fp8=TritonWarmupTensor(
+                out_dtype,
+                shape=(1, compile_key.num_heads, compile_key.index_q_head_dim),
+                strides=(q_stride0, compile_key.index_q_head_dim, 1),
+            ),
+            index_weights_out=TritonWarmupTensor(
+                torch.float32,
+                shape=(1, compile_key.num_heads),
+            ),
+            fp8_max=compile_key.fp8_max,
+            use_fnuz=compile_key.use_fnuz,
+            qk_int8=compile_key.qk_int8,
+            software_e4m3=compile_key.software_e4m3,
+        )
+
+    @kernel_launcher
+    def __call__(
+        self,
+        positions: torch.Tensor,
+        index_q: torch.Tensor,
+        index_q_cos_sin_cache: torch.Tensor,
+        index_weights: torch.Tensor,
+        index_weights_softmax_scale: float,
+        index_weights_head_scale: float,
+        index_q_fp8: torch.Tensor,
+        index_weights_out: torch.Tensor,
+        *,
+        fp8_max: float,
+        use_fnuz: bool,
+        qk_int8: bool = False,
+        software_e4m3: bool = False,
+    ) -> LaunchSpec:
+        num_tokens = positions.shape[0]
+        num_index_q_heads = index_q.shape[1]
+        return (num_tokens, num_index_q_heads), dict(
+            pos_ptr=positions,
+            index_q_stride0=index_q.stride(0),
+            index_q_stride1=index_q.stride(1),
+            index_q_cos_sin_ptr=index_q_cos_sin_cache,
+            index_q_cos_sin_stride=index_q_cos_sin_cache.stride(0),
+            INDEX_Q_HALF_ROT_DIM=index_q_cos_sin_cache.shape[-1] // 2,
+            index_q_fp8_stride0=index_q_fp8.stride(0),
+            index_q_fp8_stride1=index_q_fp8.stride(1),
+            INDEX_Q_HEAD_DIM=index_q.shape[2],
+            index_weights_stride=index_weights.stride(0),
+            index_weights_out_stride=index_weights_out.stride(0),
+            FP8_MAX=fp8_max,
+            USE_FNUZ=use_fnuz,
+            USE_EXPLICIT_FMA=current_platform.is_rocm(),
+            QK_INT8=qk_int8,
+            SOFTWARE_E4M3=software_e4m3,
+            num_warps=1,
+        )
+
+
+def _indexer_weights_out_dtypes(vllm_config: Any) -> tuple[torch.dtype, ...]:
+    """Weights dtypes the model's indexer layers ask for: fp32 for the dense
+    scoring kernels, plus bf16 when the DeepSeek V4.1 sparse-logits indexer
+    (`SparseMQAIndexer`) is enabled."""
+    if vllm_config.attention_config.indexer_sparse_logits:
+        return (torch.float32, torch.bfloat16)
+    return (torch.float32,)
+
+
+class FusedIndexerQRopeMxFp4TritonKernel(
+    VllmTritonJitKernel["FusedIndexerQRopeMxFp4TritonKernel.CompileKey"]
+):
+    @dataclass(frozen=True)
+    class CompileKey:
+        dtype: torch.dtype
+        weights_out_dtype: torch.dtype
+        num_heads: int
+        index_q_half_rot_dim: int
+        index_q_head_dim: int
+        mxfp4_block: int
+
+    @staticmethod
+    @triton.jit
+    def kernel(
+        pos_ptr,
+        # Index Q RoPE input (fp/bf16)
+        index_q_ptr,
+        index_q_stride0,
+        index_q_stride1,
+        index_q_cos_sin_ptr,
+        index_q_cos_sin_stride,
+        INDEX_Q_HALF_ROT_DIM: tl.constexpr,
+        # MXFP4 Q outputs
+        index_q_mxfp4_ptr,  # uint8, (T, H, HEAD_DIM // 2)
+        index_q_mxfp4_stride0,
+        index_q_mxfp4_stride1,
+        index_q_scale_ptr,  # uint8 ue8m0, (T, H, HEAD_DIM // BLOCK)
+        index_q_scale_stride0,
+        index_q_scale_stride1,
+        INDEX_Q_HEAD_DIM: tl.constexpr,
+        MXFP4_BLOCK: tl.constexpr,
+        # Weights (NO per-token q_scale fold for MXFP4; per-block scales stay
+        # with the Q values in the output scale tensor).
+        index_weights_ptr,
+        index_weights_stride,
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        index_weights_out_ptr,
+        index_weights_out_stride,
+    ):
+        INDEX_Q_ROT_DIM: tl.constexpr = 2 * INDEX_Q_HALF_ROT_DIM
+        INDEX_Q_NOPE_DIM: tl.constexpr = INDEX_Q_HEAD_DIM - INDEX_Q_ROT_DIM
+        NUM_NOPE_BLOCKS: tl.constexpr = INDEX_Q_NOPE_DIM // MXFP4_BLOCK
+        NUM_ROPE_BLOCKS: tl.constexpr = INDEX_Q_ROT_DIM // MXFP4_BLOCK
+        HALF_BLOCK: tl.constexpr = MXFP4_BLOCK // 2
+        tl.static_assert(INDEX_Q_NOPE_DIM >= 0)
+        tl.static_assert(INDEX_Q_NOPE_DIM % MXFP4_BLOCK == 0)
+        tl.static_assert(INDEX_Q_ROT_DIM % MXFP4_BLOCK == 0)
+        tl.static_assert(MXFP4_BLOCK % 2 == 0)
+
+        tok_idx = tl.program_id(0)
+        head_idx = tl.program_id(1)
+
+        pos = tl.load(pos_ptr + tok_idx)
+
+        q_base = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
+        out_base = (
+            index_q_mxfp4_ptr
+            + tok_idx * index_q_mxfp4_stride0
+            + head_idx * index_q_mxfp4_stride1
+        )
+        scale_base = (
+            index_q_scale_ptr
+            + tok_idx * index_q_scale_stride0
+            + head_idx * index_q_scale_stride1
+        )
+
+        half_off = tl.arange(0, HALF_BLOCK)
+
+        # ---- NoPE blocks: direct load, pair as (even-index, odd-index) values ----
+        for b in tl.static_range(NUM_NOPE_BLOCKS):
+            base = b * MXFP4_BLOCK
+            x_lo = tl.load(q_base + base + half_off * 2).to(tl.float32)
+            x_hi = tl.load(q_base + base + half_off * 2 + 1).to(tl.float32)
+            packed, ue8m0 = _quantize_mxfp4_pair(x_lo, x_hi)
+            tl.store(out_base + base // 2 + half_off, packed)
+            tl.store(scale_base + b, ue8m0)
+
+        # ---- RoPE blocks: apply GPT-J interleaved RoPE to the block's 16 pairs,
+        # then quantize. Each block covers HALF_BLOCK (=16) cos/sin pairs. ----
+        rot_q_base = q_base + INDEX_Q_NOPE_DIM
+        for b in tl.static_range(NUM_ROPE_BLOCKS):
+            pair_off = b * HALF_BLOCK + half_off  # indices in [0, HALF_ROT_DIM)
+            cos_b = tl.load(
+                index_q_cos_sin_ptr + pos * index_q_cos_sin_stride + pair_off
+            ).to(tl.float32)
+            sin_b = tl.load(
+                index_q_cos_sin_ptr
+                + pos * index_q_cos_sin_stride
+                + pair_off
+                + INDEX_Q_HALF_ROT_DIM
+            ).to(tl.float32)
+            x_even = tl.load(rot_q_base + pair_off * 2).to(tl.float32)
+            x_odd = tl.load(rot_q_base + pair_off * 2 + 1).to(tl.float32)
+            r_even = x_even * cos_b - x_odd * sin_b
+            r_odd = x_odd * cos_b + x_even * sin_b
+            # bf16 roundtrip for parity with the FP8 kernel / reference numerics.
+            r_even = r_even.to(tl.bfloat16).to(tl.float32)
+            r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
+            packed, ue8m0 = _quantize_mxfp4_pair(r_even, r_odd)
+            rope_byte_off = (INDEX_Q_NOPE_DIM + b * MXFP4_BLOCK) // 2
+            tl.store(out_base + rope_byte_off + half_off, packed)
+            tl.store(scale_base + NUM_NOPE_BLOCKS + b, ue8m0)
+
+        # MXFP4 weight-fold contract:
+        #   index_weights_out = index_weights * softmax_scale * head_scale
+        # NOTE: q_scale is NOT folded here (contrast with the FP8 kernel above).
+        # MXFP4 Q emits a separate ue8m0 scale tensor of shape
+        # (T, H, HEAD_DIM // MXFP4_BLOCK) alongside the packed values, so each
+        # per-block scale is applied by the downstream MXFP4 logits kernel when
+        # dequantizing Q — there is no per-token scalar to fold into `weights`.
+        index_weights = tl.load(
+            index_weights_ptr + tok_idx * index_weights_stride + head_idx
+        ).to(tl.float32)
+        index_weights *= index_weights_softmax_scale
+        index_weights *= index_weights_head_scale
+        tl.store(
+            index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
+            index_weights,
+        )
+
+    def dispatch(  # type: ignore[override]
+        self,
+        *,
+        dtype: torch.dtype,
+        weights_out_dtype: torch.dtype,
+        num_heads: int,
+        head_dim: int,
+        rope_dim: int,
+    ) -> CompileKey:
+        return self.CompileKey(
+            dtype=dtype,
+            weights_out_dtype=weights_out_dtype,
+            num_heads=num_heads,
+            index_q_half_rot_dim=rope_dim // 2,
+            index_q_head_dim=head_dim,
+            mxfp4_block=MXFP4_BLOCK_SIZE,
+        )
+
+    def get_warmup_keys(self, vllm_config: Any) -> list[CompileKey]:
+        hf_config = vllm_config.model_config.hf_config
+        num_heads = int(getattr(hf_config, "index_n_heads", 0) or 0)
+        head_dim = int(getattr(hf_config, "index_head_dim", 0) or 0)
+        rope_dim = int(getattr(hf_config, "qk_rope_head_dim", 0) or 0)
+        if num_heads <= 0 or head_dim <= 0 or rope_dim <= 0:
+            return []
+
+        return self._trace_dispatch(self.dispatch)(
+            dtype=vllm_config.model_config.dtype,
+            weights_out_dtype=_indexer_weights_out_dtypes(vllm_config),
+            num_heads=num_heads,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+        )
+
+    def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+        q_stride0 = compile_key.num_heads * compile_key.index_q_head_dim
+        packed_head_dim = compile_key.index_q_head_dim // 2
+        scale_head_dim = compile_key.index_q_head_dim // compile_key.mxfp4_block
+        return dict(
+            positions=TritonWarmupTensor(torch.int64),
+            index_q=TritonWarmupTensor(
+                compile_key.dtype,
+                shape=(1, compile_key.num_heads, compile_key.index_q_head_dim),
+                strides=(q_stride0, compile_key.index_q_head_dim, 1),
+            ),
+            index_q_cos_sin_cache=TritonWarmupTensor(
+                torch.float32,
+                shape=(1, compile_key.index_q_half_rot_dim * 2),
+            ),
+            index_weights=TritonWarmupTensor(
+                compile_key.dtype,
+                shape=(1, compile_key.num_heads),
+            ),
+            index_weights_softmax_scale=1.0,
+            index_weights_head_scale=1.0,
+            index_q_packed=TritonWarmupTensor(
+                torch.uint8,
+                shape=(1, compile_key.num_heads, packed_head_dim),
+            ),
+            index_q_scale=TritonWarmupTensor(
+                torch.uint8,
+                shape=(1, compile_key.num_heads, scale_head_dim),
+            ),
+            index_weights_out=TritonWarmupTensor(
+                compile_key.weights_out_dtype,
+                shape=(1, compile_key.num_heads),
+            ),
+        )
+
+    @kernel_launcher
+    def __call__(
+        self,
+        positions: torch.Tensor,
+        index_q: torch.Tensor,
+        index_q_cos_sin_cache: torch.Tensor,
+        index_weights: torch.Tensor,
+        index_weights_softmax_scale: float,
+        index_weights_head_scale: float,
+        index_q_packed: torch.Tensor,
+        index_q_scale: torch.Tensor,
+        index_weights_out: torch.Tensor,
+    ) -> LaunchSpec:
+        num_tokens = positions.shape[0]
+        num_index_q_heads = index_q.shape[1]
+        return (num_tokens, num_index_q_heads), dict(
+            pos_ptr=positions,
+            index_q_stride0=index_q.stride(0),
+            index_q_stride1=index_q.stride(1),
+            index_q_cos_sin_ptr=index_q_cos_sin_cache,
+            index_q_cos_sin_stride=index_q_cos_sin_cache.stride(0),
+            INDEX_Q_HALF_ROT_DIM=index_q_cos_sin_cache.shape[-1] // 2,
+            index_q_mxfp4_ptr=index_q_packed,
+            index_q_mxfp4_stride0=index_q_packed.stride(0),
+            index_q_mxfp4_stride1=index_q_packed.stride(1),
+            index_q_scale_stride0=index_q_scale.stride(0),
+            index_q_scale_stride1=index_q_scale.stride(1),
+            INDEX_Q_HEAD_DIM=index_q.shape[2],
+            MXFP4_BLOCK=MXFP4_BLOCK_SIZE,
+            index_weights_stride=index_weights.stride(0),
+            index_weights_out_stride=index_weights_out.stride(0),
+            num_warps=1,
+        )
 
 
 def _supports_fp8e4nv_in_triton() -> bool:
@@ -377,9 +668,7 @@ def _fused_indexer_q_rope_fp8_torch(
     rope_rotated = torch.empty_like(q_rope)
     rope_rotated[..., 0::2] = r_even_bf16
     rope_rotated[..., 1::2] = r_odd_bf16
-    q_full = (
-        torch.cat([q_nope, rope_rotated], dim=-1) if nope_dim > 0 else rope_rotated
-    )
+    q_full = torch.cat([q_nope, rope_rotated], dim=-1) if nope_dim > 0 else rope_rotated
 
     # Per-token-per-head amax over full head_dim.
     fp8_max = 448.0
@@ -421,30 +710,22 @@ def fused_indexer_q_rope_quant_int8(
     in ``vllm.kernels`` activates the integer-MMA indexer query (and
     requires the INT8 indexer cache).
     """
-    num_tokens, num_index_q_heads, index_q_head_dim = index_q.shape
     if index_weights_out is None:
         index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
     index_q_int8 = torch.empty_like(index_q, dtype=torch.int8)
-    _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
+    _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL(
         positions,
         index_q,
-        index_q.stride(0),
-        index_q.stride(1),
         index_q_cos_sin_cache,
-        index_q_cos_sin_cache.stride(0),
-        index_q_cos_sin_cache.shape[-1] // 2,
-        index_q_int8,
-        index_q_int8.stride(0),
-        index_q_int8.stride(1),
-        index_q_head_dim,
         index_weights,
-        index_weights.stride(0),
         index_weights_softmax_scale,
         index_weights_head_scale,
+        index_q_int8,
         index_weights_out,
-        index_weights_out.stride(0),
-        QK_INT8=True,
-        num_warps=1,
+        fp8_max=448.0,
+        use_fnuz=False,
+        qk_int8=True,
+        software_e4m3=False,
     )
     return index_q_int8, index_weights_out
 
@@ -458,6 +739,7 @@ def fused_indexer_q_rope_quant(
     index_weights_softmax_scale: float,
     index_weights_head_scale: float,
     use_fp4: bool = False,
+    weights_out_dtype: torch.dtype = torch.float32,
     q_is_int8: bool = False,
     *,
     use_cutedsl: bool | None = None,
@@ -470,7 +752,11 @@ def fused_indexer_q_rope_quant(
 ]:
     """Fused RoPE + quantize Q for the sparse indexer.
 
-    Weight-fold semantics (important: the two paths differ):
+    ``weights_out_dtype`` is the dtype the downstream scoring kernel takes:
+    fp32 for the dense MQA-logits kernels, bf16 for DeepGEMM's sparse
+    MQA-logits kernels (CUDA MXFP4 path only).
+
+    Weight-fold semantics (important — the two paths differ):
 
     FP8 path (use_fp4=False, default):
         q_fp8      : (T, H, HEAD_DIM) platform fp8 (e4m3fnuz on gfx942,
@@ -509,7 +795,18 @@ def fused_indexer_q_rope_quant(
     num_index_q_heads = index_q.shape[1]
     index_q_head_dim = index_q.shape[2]
 
-    index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+    index_weights_out = torch.empty_like(index_weights, dtype=weights_out_dtype)
+
+    if q_is_int8:
+        return fused_indexer_q_rope_quant_int8(
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            index_weights_out=index_weights_out,
+        )
 
     if use_fp4:
         assert index_q_head_dim % MXFP4_BLOCK_SIZE == 0, (
@@ -530,21 +827,22 @@ def fused_indexer_q_rope_quant(
         if use_cutedsl:
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
-                fused_indexer_q_rope_quant_mxfp4_cutedsl,
+                _INDEXER_Q_MXFP4_KERNEL,
             )
 
-            fused_indexer_q_rope_quant_mxfp4_cutedsl(
-                positions,
-                index_q,
-                index_q_cos_sin_cache,
-                index_weights,
-                index_weights_softmax_scale,
-                index_weights_head_scale,
-                index_q_packed,
-                index_q_scale,
-                index_weights_out,
+            _INDEXER_Q_MXFP4_KERNEL(
+                positions=positions,
+                q=index_q,
+                cos_sin_cache=index_q_cos_sin_cache,
+                weights=index_weights,
+                weights_softmax_scale=index_weights_softmax_scale,
+                weights_head_scale=index_weights_head_scale,
+                q_packed=index_q_packed,
+                q_scale=index_q_scale,
+                weights_out=index_weights_out,
             )
-        elif is_xpu:
+        elif current_platform.is_xpu():
+            assert weights_out_dtype == torch.float32, weights_out_dtype
             torch.ops.vllm.xpu_deepseek_fused_indexer_q_rope_mxfp4(
                 index_q,
                 positions,
@@ -557,29 +855,16 @@ def fused_indexer_q_rope_quant(
                 index_weights_out,
             )
         else:
-            _fused_indexer_q_rope_mxfp4_kernel[(num_tokens, num_index_q_heads)](
+            _FUSED_INDEXER_Q_ROPE_MXFP4_TRITON_KERNEL(
                 positions,
                 index_q,
-                index_q.stride(0),
-                index_q.stride(1),
                 index_q_cos_sin_cache,
-                index_q_cos_sin_cache.stride(0),
-                index_q_cos_sin_cache.shape[-1] // 2,
-                index_q_packed,
-                index_q_packed.stride(0),
-                index_q_packed.stride(1),
-                index_q_scale,
-                index_q_scale.stride(0),
-                index_q_scale.stride(1),
-                index_q_head_dim,
-                MXFP4_BLOCK_SIZE,
                 index_weights,
-                index_weights.stride(0),
                 index_weights_softmax_scale,
                 index_weights_head_scale,
+                index_q_packed,
+                index_q_scale,
                 index_weights_out,
-                index_weights_out.stride(0),
-                num_warps=1,  # TODO: Tune this
             )
 
         # Values stay uint8 (2 E2M1 nibbles per byte). Scales are 4 ue8m0
@@ -592,17 +877,7 @@ def fused_indexer_q_rope_quant(
             index_q_scale.view(torch.int32).squeeze(-1),
         ), index_weights_out
 
-    if q_is_int8:
-        return fused_indexer_q_rope_quant_int8(
-            positions,
-            index_q,
-            index_q_cos_sin_cache,
-            index_weights,
-            index_weights_softmax_scale,
-            index_weights_head_scale,
-            index_weights_out=index_weights_out,
-        )
-
+    assert weights_out_dtype == torch.float32, weights_out_dtype
     if fp8_dtype is None:
         fp8_dtype = current_platform.fp8_dtype()
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
@@ -614,18 +889,18 @@ def fused_indexer_q_rope_quant(
     if supports_fp8e4nv_in_triton and use_cutedsl:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
-            fused_indexer_q_rope_quant_fp8_cutedsl,
+            _INDEXER_Q_FP8_KERNEL,
         )
 
-        fused_indexer_q_rope_quant_fp8_cutedsl(
-            positions,
-            index_q,
-            index_q_cos_sin_cache,
-            index_weights,
-            index_weights_softmax_scale,
-            index_weights_head_scale,
-            index_q_fp8,
-            index_weights_out,
+        _INDEXER_Q_FP8_KERNEL(
+            positions=positions,
+            q=index_q,
+            cos_sin_cache=index_q_cos_sin_cache,
+            weights=index_weights,
+            weights_softmax_scale=index_weights_softmax_scale,
+            weights_head_scale=index_weights_head_scale,
+            q_fp8=index_q_fp8.view(torch.uint8),
+            weights_out=index_weights_out,
         )
         return index_q_fp8, index_weights_out
 
@@ -640,61 +915,40 @@ def fused_indexer_q_rope_quant(
             index_q_fp8,
             index_weights_out,
         )
-        return index_q_fp8, index_weights_out
+    elif current_platform.is_cpu():
+        from vllm._custom_ops import fused_indexer_q_rope_quant_cpu
 
-    if use_fnuz:
-        # AMD gfx942: Triton has a native tl.float8e4b8 hardware cast, so the
-        # kernel writes directly into index_q_fp8 (no uint8 view needed).
-        _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
-            positions,
-            index_q,
-            index_q.stride(0),
-            index_q.stride(1),
-            index_q_cos_sin_cache,
-            index_q_cos_sin_cache.stride(0),
-            index_q_cos_sin_cache.shape[-1] // 2,
+        fused_indexer_q_rope_quant_cpu(
+            positions.contiguous(),
+            index_q.to(torch.float32),
+            index_q_cos_sin_cache.to(torch.float32).contiguous(),
             index_q_fp8,
-            index_q_fp8.stride(0),
-            index_q_fp8.stride(1),
-            index_q_head_dim,
-            index_weights,
-            index_weights.stride(0),
+            index_weights.to(torch.float32),
             index_weights_softmax_scale,
             index_weights_head_scale,
             index_weights_out,
-            index_weights_out.stride(0),
-            FP8_MAX=fp8_max,
-            USE_FNUZ=True,
-            USE_EXPLICIT_FMA=current_platform.is_rocm(),
-            num_warps=1,  # TODO: Tune this
         )
-        return index_q_fp8, index_weights_out
-
-    # OCP e4m3fn on sm_8x (Ampere) / non-cutedsl NVIDIA: the Triton kernel
-    # stores E4M3 bytes using the arithmetic encoder from fp8e4m3_arith
-    # (tl.float8e4nv casts are broken on sm_8x), so pass a uint8 view.
-    index_q_fp8_u8 = index_q_fp8.view(torch.uint8)
-    _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
-        positions,
-        index_q,
-        index_q.stride(0),
-        index_q.stride(1),
-        index_q_cos_sin_cache,
-        index_q_cos_sin_cache.stride(0),
-        index_q_cos_sin_cache.shape[-1] // 2,
-        index_q_fp8_u8,
-        index_q_fp8_u8.stride(0),
-        index_q_fp8_u8.stride(1),
-        index_q_head_dim,
-        index_weights,
-        index_weights.stride(0),
-        index_weights_softmax_scale,
-        index_weights_head_scale,
-        index_weights_out,
-        index_weights_out.stride(0),
-        FP8_MAX=fp8_max,
-        USE_FNUZ=False,
-        USE_EXPLICIT_FMA=current_platform.is_rocm(),
-        num_warps=1,  # TODO: Tune this
-    )
+    else:
+        # OCP e4m3fn on sm_8x (Ampere): tl.float8e4nv casts are broken there,
+        # so the kernel stores E4M3 bytes through the fp8e4m3_arith software
+        # encoder into a uint8 view of the output.
+        software_e4m3 = not use_fnuz and not supports_fp8e4nv_in_triton
+        _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL(
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            index_q_fp8.view(torch.uint8) if software_e4m3 else index_q_fp8,
+            index_weights_out,
+            fp8_max=fp8_max,
+            use_fnuz=use_fnuz,
+            qk_int8=False,
+            software_e4m3=software_e4m3,
+        )
     return index_q_fp8, index_weights_out
+
+
+_FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL = FusedIndexerQRopeQuantTritonKernel()
+_FUSED_INDEXER_Q_ROPE_MXFP4_TRITON_KERNEL = FusedIndexerQRopeMxFp4TritonKernel()

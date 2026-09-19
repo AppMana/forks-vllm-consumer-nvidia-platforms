@@ -81,8 +81,7 @@ try:
         rpc_rank: int
 
         def adjust_rank(self, rank_mapping: dict[int, int]) -> None:
-            """
-            Adjust the rpc_rank based on the given mapping.
+            """Adjust the rpc_rank based on the given mapping.
             It is only used during the initialization of the executor,
             to adjust the rpc_rank of workers after we create all workers.
             """
@@ -188,9 +187,6 @@ try:
                 if isinstance(output, AsyncModelRunnerOutput):
                     output = output.get_output()
             return output
-
-        def override_env_vars(self, vars: dict[str, str]):
-            os.environ.update(vars)
 
         def _is_intermediate_tensors(self, output) -> bool:
             return isinstance(output, IntermediateTensors)
@@ -379,8 +375,7 @@ def get_bundles_for_indices(
     bundle_indices: list[int],
     world_size: int,
 ) -> list[tuple[int, str, str]]:
-    """
-    Return GPU bundle indices paired with node IDs and node IPs for
+    """Return GPU bundle indices paired with node IDs and node IPs for
     explicit bundle indices specified via VLLM_RAY_BUNDLE_INDICES.
     """
     assert len(bundle_indices) == world_size, (
@@ -407,8 +402,7 @@ def get_bundles_for_indices(
 def get_bundles_sorted_by_node(
     placement_group: "PlacementGroup",
 ) -> list[tuple[int, str, str]]:
-    """
-    Return GPU bundle indices paired with node IDs and node IPs,
+    """Return GPU bundle indices paired with node IDs and node IPs,
     sorted driver-first.
 
     This utility has to be invoked from the driver node.
@@ -474,7 +468,7 @@ def get_bundles_sorted_by_node(
         if not missing_ips and len(ip_to_order) == len(worker_ip_order):
             bundle_to_node_id.sort(key=lambda item: ip_to_order[item[2]])
             final_ip_order = [node_ip for _, _, node_ip in bundle_to_node_id]
-            expected_ip_order = worker_ip_order[:len(final_ip_order)]
+            expected_ip_order = worker_ip_order[: len(final_ip_order)]
             if final_ip_order != expected_ip_order:
                 raise RuntimeError(
                     "Ray placement-group bundle order does not match "
@@ -484,8 +478,7 @@ def get_bundles_sorted_by_node(
                     f"bundle_to_node_id={bundle_to_node_id}"
                 )
             logger.info(
-                "Ray placement-group rank mapping from "
-                "VLLM_RAY_WORKER_IP_ORDER: %s",
+                "Ray placement-group rank mapping from VLLM_RAY_WORKER_IP_ORDER: %s",
                 [
                     {
                         "rank": rank,
@@ -599,6 +592,7 @@ def initialize_ray_cluster(
             on the current (driver) node and pin the first PG bundle to it.
             Set to False for executors like RayExecutorV2 where all GPU work
             is delegated to remote Ray actors.
+
     """
     assert_ray_available()
     from vllm.platforms import current_platform
@@ -726,29 +720,3 @@ def initialize_ray_cluster(
     )
     # Set the placement group in the parallel config
     parallel_config.placement_group = current_placement_group
-
-
-def get_num_tpu_nodes() -> int:
-    from ray._private.accelerators import TPUAcceleratorManager
-
-    cluster_resources = ray.cluster_resources()
-    total_tpus = int(cluster_resources["TPU"])
-    tpus_per_node = TPUAcceleratorManager.get_current_node_num_accelerators()
-    assert total_tpus % tpus_per_node == 0
-    return total_tpus // tpus_per_node
-
-
-def get_num_nodes_in_placement_group() -> int:
-    pg_table = ray.util.placement_group_table()
-    current_pg = ray.util.get_current_placement_group()
-    num_nodes = 0
-
-    if current_pg:
-        nodes_in_pg = set()
-        for pg_key, pg in pg_table.items():
-            if pg_key == current_pg.id.hex():
-                for _, node in pg["bundles_to_node_id"].items():
-                    nodes_in_pg.add(node)
-        num_nodes = len(nodes_in_pg)
-
-    return num_nodes

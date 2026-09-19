@@ -223,9 +223,7 @@ def warmup_topk_topp_sampler(model_runner: GPUModelRunner) -> bool:
     if vocab_size <= 0:
         return False
     batch_size = max(8, int(getattr(model_runner, "decode_query_len", 1)))
-    logits = torch.zeros(
-        (batch_size, vocab_size), dtype=torch.float32, device=device
-    )
+    logits = torch.zeros((batch_size, vocab_size), dtype=torch.float32, device=device)
     top_k = torch.full(
         (batch_size,), min(50, vocab_size), dtype=torch.int32, device=device
     )
@@ -468,8 +466,7 @@ def run_pure_prefill_warmup(
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
     block_counts = [
-        cdiv(num_tokens, group.kv_cache_spec.block_size)
-        for group in kv_cache_groups
+        cdiv(num_tokens, group.kv_cache_spec.block_size) for group in kv_cache_groups
     ]
     required_blocks = sum(block_counts)
     has_blocks = model_runner.kv_cache_config.num_blocks > required_blocks
@@ -633,7 +630,9 @@ def run_spec_verify_warmup(
         cached.req_ids = [req_id]
         cached.num_computed_tokens = [num_computed]
         cached.num_output_tokens = [num_output]
-        cached.new_block_ids = [new_blocks if (has_new_blocks and blocks_first) else None]
+        cached.new_block_ids = [
+            new_blocks if (has_new_blocks and blocks_first) else None
+        ]
         return cached
 
     # First verify after prefill: anchor position + T drafts (1 + T tokens).
@@ -760,7 +759,8 @@ def warmup_long_prefill_kernels(
     )
     if max_model_len > 0:
         pure_prefill_token_sizes = {
-            min(num_tokens, max_model_len - 1) for num_tokens in pure_prefill_token_sizes
+            min(num_tokens, max_model_len - 1)
+            for num_tokens in pure_prefill_token_sizes
         }
 
     warmed_mixed_sizes: list[int] = []
@@ -801,7 +801,9 @@ def warmup_block_table_slot_mapping_kernel(
     device: torch.device,
 ) -> bool:
     input_batch = getattr(model_runner, "input_batch", None)
-    block_tables = getattr(getattr(input_batch, "block_table", None), "block_tables", None)
+    block_tables = getattr(
+        getattr(input_batch, "block_table", None), "block_tables", None
+    )
     if not block_tables:
         return False
 
@@ -834,7 +836,9 @@ def warmup_block_table_slot_mapping_kernel(
         # max_num_blocks_per_req // blocks_per_kv_block, not
         # max_num_blocks_per_req directly.
         capacity = max(
-            1, block_table.max_num_blocks_per_req // max(1, block_table.blocks_per_kv_block)
+            1,
+            block_table.max_num_blocks_per_req
+            // max(1, block_table.blocks_per_kv_block),
         )
         block_counts.append(min(wanted, capacity))
 
@@ -947,7 +951,12 @@ def warmup_post_update_kernel(
     last_sampled_tokens = getattr(req_states, "last_sampled_tokens", None)
     if any(
         t is None
-        for t in (num_computed_tokens_gpu, all_token_ids_gpu, total_len_gpu, last_sampled_tokens)
+        for t in (
+            num_computed_tokens_gpu,
+            all_token_ids_gpu,
+            total_len_gpu,
+            last_sampled_tokens,
+        )
     ):
         return False
 
@@ -984,7 +993,9 @@ def warmup_post_update_kernel(
         )
     torch.accelerator.synchronize()
 
-    logger.info("post_update kernel warmup completed (both query_start_loc specializations).")
+    logger.info(
+        "post_update kernel warmup completed (both query_start_loc specializations)."
+    )
     return True
 
 
@@ -999,6 +1010,31 @@ def warmup_kernels(
     We must call the provided worker's execute_model for pipeline parallel
     coordination.
     """
+    # Adaptive costs are calibrated during capture, after this warmup. Exercise
+    # fixed draft counts here, then restore the manager for capture and serving.
+    adaptive_verification = model_runner.adaptive_verification
+    model_runner.adaptive_verification = None
+    rejection_sampler = model_runner.rejection_sampler
+    adaptive_sampling = (
+        rejection_sampler is not None and rejection_sampler.enable_adaptive_verification
+    )
+    if adaptive_sampling:
+        assert rejection_sampler is not None
+        rejection_sampler.enable_adaptive_verification = False
+    try:
+        _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
+    finally:
+        model_runner.adaptive_verification = adaptive_verification
+        if adaptive_sampling:
+            assert rejection_sampler is not None
+            rejection_sampler.enable_adaptive_verification = True
+
+
+def _warmup_kernels(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
 
@@ -1016,9 +1052,7 @@ def warmup_kernels(
         # With a speculator, the verify shapes (anchor+drafts and drafts-only)
         # and the draft-propose stack otherwise JIT-compile on the first live
         # request (observed: 19 distinct kernels, ~20s of first-request TTFT).
-        run_spec_verify_warmup(
-            model_runner, worker_execute_model, worker_sample_tokens
-        )
+        run_spec_verify_warmup(model_runner, worker_execute_model, worker_sample_tokens)
         warmup_topk_topp_sampler(model_runner)
         torch.accelerator.synchronize()
         return

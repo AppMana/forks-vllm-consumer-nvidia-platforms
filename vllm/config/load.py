@@ -40,6 +40,10 @@ class LoadConfig:
     - "instanttensor" will load the Safetensors weights on CUDA devices using
       InstantTensor, which enables distributed loading with pipelined prefetching
       and fast direct I/O.
+    - "ipc_cache" will map post-quantized weights from a local weight cache
+      daemon via CUDA IPC for fast engine restarts. See
+      `vllm/model_executor/model_loader/weight_cache/daemon.py` for how to
+      launch the daemon.
     - "flashpack" will load a manifest-sharded FlashPack checkpoint one
       pipeline-local part at a time while preserving model-specific weight
       loading behavior.
@@ -123,8 +127,7 @@ class LoadConfig:
     """
 
     def compute_hash(self) -> str:
-        """
-        WARNING: Whenever a new field is added to this config,
+        """WARNING: Whenever a new field is added to this config,
         ensure that it is included in the factors list if
         it affects the computation graph.
 

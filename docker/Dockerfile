@@ -180,6 +180,7 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
             git \
             curl \
             sudo \
+            elfutils-devel \
             rdma-core-devel \
         && dnf clean all \
         && rm -rf /var/cache/dnf; \
@@ -193,6 +194,8 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
             sudo \
             python3-pip \
             libibverbs-dev \
+            libelf-dev \
+            libdw-dev \
             # GCC 10 was previously pinned to suppress spurious -Wredundant-move warnings
             # from CUTLASS (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92519). That bug
             # was fixed in GCC 11. GCC >= 11.3 is now required because PyTorch's C++20 headers
@@ -308,10 +311,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         echo "Installing Rubin prerelease requirements..." \
         && /opt/venv/bin/python3 use_existing_torch.py --prefix \
         && uv pip install --python /opt/venv/bin/python3 \
+            --prerelease=allow --index-strategy unsafe-first-match \
             -r /tmp/vllm-requirements/rubin-prerelease.txt \
         && uv pip install --python /opt/venv/bin/python3 \
             -r requirements/cuda.txt \
         && uv pip install --python /opt/venv/bin/python3 \
+            --prerelease=allow --index-strategy unsafe-first-match \
             -r /tmp/vllm-requirements/rubin-prerelease.txt; \
     elif [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
@@ -804,7 +809,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         python3 use_existing_torch.py --prefix; \
     fi \
     && if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
-        sed -Ei '/^[[:space:]]*(flashinfer-python|nvidia-cutlass-dsl\[cu13\])[[:space:]]*==/Id' \
+        sed -Ei '/^[[:space:]]*(flashinfer-python|nvidia-cutlass-dsl\[cu13\]|quack-kernels)[[:space:]]*==/Id' \
             requirements/cuda.txt; \
     fi
 
@@ -998,6 +1003,9 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
         cuda-nvcc-${CUDA_VERSION_DASH} \
         cuda-cudart-${CUDA_VERSION_DASH} \
         cuda-nvrtc-${CUDA_VERSION_DASH} \
+        # FlashInfer's runtime JIT-compiled kernels (e.g. trtllm_fmha_kernel_launcher.cu)
+        # #include <nvrtc.h>, which only the -dev package ships.
+        cuda-nvrtc-dev-${CUDA_VERSION_DASH} \
         cuda-cuobjdump-${CUDA_VERSION_DASH} \
         libcurand-dev-${CUDA_VERSION_DASH} \
         libcublas-dev-${CUDA_VERSION_DASH} \
@@ -1066,10 +1074,21 @@ RUN --mount=type=cache,target=/var/cache/apt \
 # lives in the forked NCCL's internal NET/IB path. HCA lists and the rest of
 # the NCCL env are owned by the tb-chain webhook, never baked here.
 
+# Ensures nvcc/ptxas (installed above, needed at runtime for FlashInfer/
+# DeepGEMM/EP kernel JIT compilation) are reachable on PATH. Harmless no-op
+# if already set by FINAL_BASE_IMAGE.
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="${CUDA_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+
 # Apply the CUDA 13.4-only libcurand compatibility link described in the build
 # stage. CUDA 13.5 uses its native libcurand.so.11. DeepEP expects NCCL directly
 # under its configured /usr prefix, while Ubuntu installs it in a multiarch
-# subdirectory.
+# subdirectory - but that symlink is only possible when NCCL is already
+# present (e.g. nvcr.io/nvidia/cuda-dl-base bundles it; a bare-CUDA image
+# doesn't, and gets it later via the standard nvidia-nccl-cu* pip package,
+# UV_OVERRIDE below). Check reality (whether libnccl.so.2 is actually found)
+# and tolerate not finding it instead of failing the build.
 RUN if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1,2) \
         && if [ "${CUDA_MAJOR_MINOR}" = "13.4" ]; then \
@@ -1087,10 +1106,13 @@ RUN if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
             echo "Unsupported Rubin CUDA version: ${CUDA_MAJOR_MINOR}" >&2; \
             exit 1; \
         fi \
-        && NCCL_LIBRARY=$(find /usr/lib -name libnccl.so.2 -print -quit) \
-        && test -n "${NCCL_LIBRARY}" \
-        && ln -sf "${NCCL_LIBRARY}" /usr/lib/libnccl.so.2 \
-        && ln -sf libnccl.so.2 /usr/lib/libnccl.so \
+        && if NCCL_LIBRARY=$(find /usr/lib -name libnccl.so.2 -print -quit) \
+            && [ -n "${NCCL_LIBRARY}" ]; then \
+            if [ "${NCCL_LIBRARY}" != "/usr/lib/libnccl.so.2" ]; then \
+                ln -sf "${NCCL_LIBRARY}" /usr/lib/libnccl.so.2; \
+            fi \
+            && ln -sf libnccl.so.2 /usr/lib/libnccl.so; \
+        fi \
         && ldconfig; \
     fi
 
@@ -1183,11 +1205,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi && \
     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         uv pip install --system \
+            --prerelease=allow --index-strategy unsafe-first-match \
             -r /tmp/vllm-requirements/rubin-prerelease.txt \
         && sed -Ei '/^[[:space:]]*(torch|torchvision|torchaudio)[[:space:]]*==/Id' \
             /tmp/requirements-cuda.txt \
         && uv pip install --system -r /tmp/requirements-cuda.txt \
         && uv pip install --system \
+            --prerelease=allow --index-strategy unsafe-first-match \
             -r /tmp/vllm-requirements/rubin-prerelease.txt \
         && printf '%s\n' \
             "/usr/local/lib/python${PYTHON_VERSION}/dist-packages/nvpl/lib" \
@@ -1203,7 +1227,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
-ARG FLASHINFER_VERSION=0.6.18
+ARG FLASHINFER_VERSION=0.6.18.post1
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
         uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
@@ -1222,10 +1246,13 @@ ARG GDRCOPY_CUDA_VERSION=12.8
 ARG GDRCOPY_OS_VERSION=Ubuntu24_04
 ARG TARGETPLATFORM
 COPY tools/install_gdrcopy.sh /tmp/install_gdrcopy.sh
+# Some Rubin FINAL_BASE_IMAGE choices (internal Rubin CUDA images,
+# nvcr.io/nvidia/cuda-dl-base) already provide GDRCopy; others don't, so it
+# falls through to the normal install below. Check reality (ldconfig) rather
+# than inferring from which FINAL_BASE_IMAGE flag is set.
 RUN set -eux; \
-    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
-        # The Rubin CUDA image already provides GDRCopy. \
-        ldconfig -p | grep -q 'libgdrapi\.so'; \
+    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ] && ldconfig -p | grep -q 'libgdrapi\.so'; then \
+        true; \
     else \
         case "${TARGETPLATFORM}" in \
           linux/arm64) UUARCH="aarch64" ;; \
@@ -1464,7 +1491,7 @@ ARG INSTALL_KV_CONNECTORS=false
 ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
 ARG CUDA_VERSION
-ARG LMCACHE_GIT_REF=ba788ca87c89e80facb9ba4d417243dd74c707c4
+ARG LMCACHE_GIT_REF=7db3e268432eb619a9b1b9fa2ed5590d97b48177
 # FlashMLA (int8 + sparse MLA) comes from the fork's PEP 503 simple index, not
 # a pinned wheel URL: the URL baked in an x86_64 filename, so an aarch64 build
 # could not install it at all. The index lets pip resolve per platform.
@@ -1755,6 +1782,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         echo "Installing Rubin prerelease requirements..." \
         && uv pip install --system \
+            --prerelease=allow --index-strategy unsafe-first-match \
             -r /tmp/vllm-requirements/rubin-prerelease.txt; \
     fi
 

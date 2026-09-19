@@ -41,7 +41,16 @@ class _FakePPGroup:
 class _FakeDecoderLayer(nn.Module):
     """Stream-preserving stand-in: shifts hidden_states, passes MHC through."""
 
-    def forward(self, hidden_states, positions, input_ids, post_mix, res_mix, residual):
+    def forward(
+        self,
+        hidden_states,
+        positions,
+        input_ids,
+        post_mix,
+        res_mix,
+        residual,
+        mega_gate_metadata=None,
+    ):
         return hidden_states + 1.0, residual, post_mix, res_mix
 
 
@@ -53,9 +62,7 @@ def _make_model(
     aux_layers: tuple[int, ...],
     is_last_rank: bool = True,
 ):
-    monkeypatch.setattr(
-        m, "get_pp_group", lambda: _FakePPGroup(False, is_last_rank)
-    )
+    monkeypatch.setattr(m, "get_pp_group", lambda: _FakePPGroup(False, is_last_rank))
     inst = m.DeepseekV4Model.__new__(m.DeepseekV4Model)
     nn.Module.__init__(inst)
     inst.config = SimpleNamespace(hidden_size=H)
@@ -145,9 +152,7 @@ def test_zero_layer_last_rank_dspark_aux(monkeypatch):
     # Final hidden = norm(hc_head(collapse)).
     torch.testing.assert_close(hidden_states, 2.0 * expected_recon.mean(dim=1))
     # Pre-hc_head residual stashed for the MTP draft.
-    torch.testing.assert_close(
-        inst._mtp_hidden_buffer[:T], expected_recon.flatten(1)
-    )
+    torch.testing.assert_close(inst._mtp_hidden_buffer[:T], expected_recon.flatten(1))
     # The cut reconstruction doubles as the final collapse: exactly one call.
     assert calls["mhc_post"] == 1
 

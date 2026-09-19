@@ -72,14 +72,12 @@ async def build_async_engine_client_from_engine_args(
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
-    """
-    Create EngineClient, either:
+    """Create EngineClient, either:
         - in-process using the AsyncLLMEngine Directly
         - multiprocess using AsyncLLMEngine RPC
 
     Returns the Client or None if the creation failed.
     """
-
     record_startup_stage("engine_config")
 
     # Create the EngineConfig (determines if we can use V1).
@@ -133,7 +131,6 @@ async def build_and_serve(
 
     Returns the shutdown task for the caller to await.
     """
-
     # Get uvicorn log config (from file or with endpoint filter)
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
@@ -177,7 +174,6 @@ async def build_and_serve(
 
 async def run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server."""
-
     decorate_logs("APIServer", skip_if_decorated=True)
 
     # Interrupt initialization if SIGTERM arrives before uvicorn installs its
@@ -195,7 +191,6 @@ async def run_server_worker(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
     """Run a single API server worker."""
-
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
 

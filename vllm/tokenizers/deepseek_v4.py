@@ -34,9 +34,7 @@ _OPENAI_TO_DSV4_REASONING_EFFORT = {
 
 
 def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
-    """
-    Wraps a tokenizer to use the custom DeepSeek V4 chat template encoding.
-    """
+    """Wraps a tokenizer to use the custom DeepSeek V4 chat template encoding."""
     dsv4_tokenizer = copy.copy(tokenizer)
 
     added_vocab = tokenizer.get_added_vocab()
@@ -58,11 +56,18 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             conversation = kwargs.get("conversation", messages)
             messages = conversation.copy()
             if tools is not None and len(tools) > 0:
-                if messages and messages[0].get("role") == "system":
-                    messages[0] = dict(messages[0])
-                else:
+                # Match the Rust renderer: request tools attach to the first
+                # system message; synthesize one only when none exists.
+                system_idx = next(
+                    (i for i, m in enumerate(messages) if m.get("role") == "system"),
+                    None,
+                )
+                if system_idx is None:
                     messages.insert(0, {"role": "system"})
-                messages[0]["tools"] = tools  # type: ignore[typeddict-unknown-key]
+                    system_idx = 0
+                else:
+                    messages[system_idx] = copy.copy(messages[system_idx])
+                messages[system_idx]["tools"] = tools  # type: ignore[typeddict-unknown-key]
 
             reasoning_effort = kwargs.get("reasoning_effort")
             if not isinstance(reasoning_effort, str):

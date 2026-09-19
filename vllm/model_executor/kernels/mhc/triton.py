@@ -7,7 +7,6 @@ from torch import Tensor
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-
 _MHC_PRE_NUM_SPLIT_BUCKETS = (1, 2, 4, 8, 16, 32)
 
 
@@ -88,7 +87,7 @@ def _hc_head_reduce_store_kernel(
     out_stride_h: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    token_idx = tl.program_id(0).to(tl.int64)
     block_idx = tl.program_id(1)
     offsets = block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offsets < hidden_size
@@ -112,6 +111,165 @@ def _hc_head_reduce_store_kernel(
         out_ptr + token_idx * out_stride_t + offsets * out_stride_h,
         acc,
         mask=mask,
+    )
+
+
+def hc_collapse_triton(x: Tensor, pre_mix: Tensor) -> Tensor:
+    """Collapse BF16 residual streams with FP32 pre-mix coefficients."""
+    assert x.ndim == 3 and x.dtype == torch.bfloat16
+    num_tokens, hc_mult, hidden_size = x.shape
+    assert pre_mix.shape == (num_tokens, hc_mult)
+    assert pre_mix.dtype == torch.float32
+    out = torch.empty(num_tokens, hidden_size, dtype=x.dtype, device=x.device)
+    if num_tokens == 0:
+        return out
+
+    block_h = 1024
+    _hc_head_reduce_store_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
+        pre_mix,
+        x,
+        out,
+        hidden_size,
+        hc_mult,
+        pre_mix.stride(0),
+        pre_mix.stride(1),
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_H=block_h,
+        num_warps=4,
+        # Preserve the separate FP32 multiply and sum in the Torch reference.
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+def _hc_collapse_triton_fake(x: Tensor, pre_mix: Tensor) -> Tensor:
+    return torch.empty(x.shape[0], x.shape[2], dtype=x.dtype, device=x.device)
+
+
+@triton.jit
+def _mhc_pre_mix_kernel(
+    gemm_ptr,
+    sqrsum_ptr,
+    hc_scale_ptr,
+    hc_base_ptr,
+    out_ptr,
+    splitk,
+    hc_mult: tl.constexpr,
+    gemm_stride_k,
+    gemm_stride_t,
+    gemm_stride_j,
+    sqrsum_stride_k,
+    sqrsum_stride_t,
+    out_stride_t,
+    out_stride_j,
+    inv_hc_hidden,
+    rms_eps,
+    hc_pre_eps,
+    SPLITK_BLOCK: tl.constexpr,
+    HC_BLOCK: tl.constexpr,
+):
+    """Recover the pre-mix gate from a split-k mHC pre GEMM output."""
+    token_idx = tl.program_id(0).to(tl.int64)
+    ks = tl.arange(0, SPLITK_BLOCK)
+    js = tl.arange(0, HC_BLOCK)
+    kmask = ks < splitk
+    jmask = js < hc_mult
+
+    # Only the first hc_mult GEMM columns feed the pre gate.
+    gemm = tl.load(
+        gemm_ptr
+        + ks[:, None] * gemm_stride_k
+        + token_idx * gemm_stride_t
+        + js[None, :] * gemm_stride_j,
+        mask=kmask[:, None] & jmask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    mixes = tl.sum(gemm, 0)
+
+    sqrsum = tl.load(
+        sqrsum_ptr + ks * sqrsum_stride_k + token_idx * sqrsum_stride_t,
+        mask=kmask,
+        other=0.0,
+    ).to(tl.float32)
+    rstd = tl.rsqrt(tl.sum(sqrsum, 0) * inv_hc_hidden + rms_eps)
+
+    scale = tl.load(hc_scale_ptr).to(tl.float32)
+    base = tl.load(hc_base_ptr + js, mask=jmask, other=0.0).to(tl.float32)
+
+    pre = tl.sigmoid(mixes * rstd * scale + base) + hc_pre_eps
+    tl.store(out_ptr + token_idx * out_stride_t + js * out_stride_j, pre, mask=jmask)
+
+
+def mhc_pre_mix_triton(
+    gemm_out: Tensor,
+    sqrsum: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    hc_mult: int,
+    hc_hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+) -> Tensor:
+    """Pre-mix gate for the delayed mHC pre, from AITER's split-k GEMM output.
+
+    AITER's ``mhc_pre_big_fuse`` consumes the unreduced ``[splitk, tokens,
+    hc_mult3]`` GEMM output and the matching row square-sums, but only returns
+    the post and comb gates. The delayed formulation also needs the pre gate,
+    to carry into the next sublayer seam. It is the same slice of the same
+    numbers, so recover it here rather than repeating the projection.
+    """
+    assert gemm_out.ndim == 3 and gemm_out.dtype == torch.float32
+    assert sqrsum.ndim == 2 and sqrsum.dtype == torch.float32
+    splitk, num_tokens = gemm_out.shape[0], gemm_out.shape[1]
+    assert sqrsum.shape == (splitk, num_tokens)
+
+    out = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=gemm_out.device)
+    if num_tokens == 0:
+        return out
+
+    _mhc_pre_mix_kernel[(num_tokens,)](
+        gemm_out,
+        sqrsum,
+        hc_scale,
+        hc_base,
+        out,
+        splitk,
+        hc_mult,
+        gemm_out.stride(0),
+        gemm_out.stride(1),
+        gemm_out.stride(2),
+        sqrsum.stride(0),
+        sqrsum.stride(1),
+        out.stride(0),
+        out.stride(1),
+        1.0 / hc_hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        SPLITK_BLOCK=triton.next_power_of_2(splitk),
+        HC_BLOCK=triton.next_power_of_2(hc_mult),
+        num_warps=1,
+        # Match the separate FP32 multiply and add in the Torch reference.
+        enable_fp_fusion=False,
+    )
+    return out
+
+
+def _mhc_pre_mix_triton_fake(
+    gemm_out: Tensor,
+    sqrsum: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    hc_mult: int,
+    hc_hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+) -> Tensor:
+    return torch.empty(
+        gemm_out.shape[1], hc_mult, dtype=torch.float32, device=gemm_out.device
     )
 
 
@@ -204,9 +362,7 @@ def _compute_mhc_pre_num_split(
     return _bucket_mhc_pre_num_split(max(split_k, 1))
 
 
-@triton.jit(
-    do_not_specialize=["num_tokens", "gemm_stride_s", "sq_stride_s"]
-)
+@triton.jit(do_not_specialize=["num_tokens", "gemm_stride_s", "sq_stride_s"])
 def _mhc_pre_fuse_triton_kernel(
     gemm_out_ptr,
     sqrsum_ptr,
@@ -261,19 +417,17 @@ def _mhc_pre_fuse_triton_kernel(
             mask=mask_n,
             other=0.0,
         ).to(tl.float32)
-        sqsum += tl.load(
-            sqrsum_ptr + split * sq_stride_s + token * sq_stride_t
-        ).to(tl.float32)
+        sqsum += tl.load(sqrsum_ptr + split * sq_stride_s + token * sq_stride_t).to(
+            tl.float32
+        )
 
     mixes *= tl.rsqrt(sqsum / hc_hidden_size + rms_eps)
 
     if hidden_block == 0:
         for i in tl.static_range(0, hc):
-            post_logit = (
-                tl.sum(tl.where(offs_n == hc + i, mixes, 0.0), axis=0)
-                * tl.load(scale_ptr + 1)
-                + tl.load(base_ptr + hc + i)
-            )
+            post_logit = tl.sum(
+                tl.where(offs_n == hc + i, mixes, 0.0), axis=0
+            ) * tl.load(scale_ptr + 1) + tl.load(base_ptr + hc + i)
             tl.store(
                 post_ptr + token * post_stride_t + i * post_stride_i,
                 tl.sigmoid(post_logit) * hc_post_mult_value,
@@ -290,9 +444,7 @@ def _mhc_pre_fuse_triton_kernel(
                 tl.where(offs_n < hc, row_vals, -float("inf")), axis=0
             )
             row_vals = tl.exp(row_vals)
-            row_vals = row_vals / tl.sum(
-                tl.where(offs_n < hc, row_vals, 0.0), axis=0
-            )
+            row_vals = row_vals / tl.sum(tl.where(offs_n < hc, row_vals, 0.0), axis=0)
             row_vals = row_vals + hc_sinkhorn_eps
             for col in tl.static_range(0, hc):
                 row_col = tl.sum(tl.where(offs_n == col, row_vals, 0.0), axis=0)
@@ -407,8 +559,12 @@ def _mhc_pre_fuse_triton(
     num_splits, num_tokens, hc_mult3 = gemm_out_mul.shape
     hc = residual_flat.shape[1]
     hidden = residual_flat.shape[2]
-    post_mix = torch.empty(num_tokens, hc, dtype=torch.float32, device=residual_flat.device)
-    comb_mix = torch.empty(num_tokens, hc, hc, dtype=torch.float32, device=residual_flat.device)
+    post_mix = torch.empty(
+        num_tokens, hc, dtype=torch.float32, device=residual_flat.device
+    )
+    comb_mix = torch.empty(
+        num_tokens, hc, hc, dtype=torch.float32, device=residual_flat.device
+    )
     layer_input = torch.empty(
         num_tokens, hidden, dtype=torch.bfloat16, device=residual_flat.device
     )
@@ -484,9 +640,7 @@ def _mhc_pre_fuse_from_gemm_torch(
     pre_mix = torch.sigmoid(mixes[:, :hc] * hc_scale[0] + hc_base[:hc])
     pre_mix = pre_mix + hc_pre_eps
 
-    post_mix = torch.sigmoid(
-        mixes[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
-    )
+    post_mix = torch.sigmoid(mixes[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc])
     post_mix = post_mix * hc_post_mult_value
 
     comb_mix = mixes[:, 2 * hc :].view(num_tokens, hc, hc)
@@ -498,8 +652,10 @@ def _mhc_pre_fuse_from_gemm_torch(
         comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
 
     layer_input = (
-        pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32)
-    ).sum(dim=1).to(torch.bfloat16)
+        (pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32))
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
     return post_mix, comb_mix, layer_input
 
 
@@ -539,9 +695,19 @@ def mhc_pre_triton(
     num_tokens = residual_flat.shape[0]
     if num_tokens == 0:
         return (
-            torch.empty(*outer_shape, hc_mult, 1, dtype=torch.float32, device=residual.device),
-            torch.empty(*outer_shape, hc_mult, hc_mult, dtype=torch.float32, device=residual.device),
-            torch.empty(*outer_shape, hidden_size, dtype=torch.bfloat16, device=residual.device),
+            torch.empty(
+                *outer_shape, hc_mult, 1, dtype=torch.float32, device=residual.device
+            ),
+            torch.empty(
+                *outer_shape,
+                hc_mult,
+                hc_mult,
+                dtype=torch.float32,
+                device=residual.device,
+            ),
+            torch.empty(
+                *outer_shape, hidden_size, dtype=torch.bfloat16, device=residual.device
+            ),
         )
 
     requested_splits = max(1, int(n_splits))
@@ -700,9 +866,7 @@ def _mhc_post_triton_kernel(
         mask=mask_h,
         other=0.0,
     ).to(tl.float32)
-    post = tl.load(post_ptr + token * post_stride_t + j * post_stride_j).to(
-        tl.float32
-    )
+    post = tl.load(post_ptr + token * post_stride_t + j * post_stride_j).to(tl.float32)
     acc = post * x
 
     for i in tl.static_range(0, hc):
@@ -798,9 +962,7 @@ direct_register_custom_op(
 )
 
 
-@triton.jit(
-    do_not_specialize=["num_tokens", "gemm_stride_s", "sq_stride_s"]
-)
+@triton.jit(do_not_specialize=["num_tokens", "gemm_stride_s", "sq_stride_s"])
 def _mhc_fused_post_prenorm_gemm_triton_kernel(
     x_ptr,
     residual_ptr,
@@ -1148,4 +1310,20 @@ direct_register_custom_op(
     op_name="mhc_fused_post_pre_triton",
     op_func=_mhc_fused_post_pre_triton_op,
     fake_impl=_mhc_fused_post_pre_triton_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="hc_collapse_triton",
+    op_func=hc_collapse_triton,
+    mutates_args=[],
+    fake_impl=_hc_collapse_triton_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="mhc_pre_mix_triton",
+    op_func=mhc_pre_mix_triton,
+    mutates_args=[],
+    fake_impl=_mhc_pre_mix_triton_fake,
 )

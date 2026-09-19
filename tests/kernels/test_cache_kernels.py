@@ -15,12 +15,10 @@ except ImportError:
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="Need CUDA device")
 def test_gather_cache_oob():
-    """
-    Tests for OOB read in gather_and_maybe_dequant_cache (Issue #27909).
+    """Tests for OOB read in gather_and_maybe_dequant_cache (Issue #27909).
     This test constructs a boundary case identified in the issue where
     seq_starts causes the block_table offset to read out of bounds.
     """
-
     block_size = 64
     # The kernel only supports the MLA entry sizes.
     entry_size = 576
@@ -76,9 +74,7 @@ def test_int8_ds_mla_cache_insert_is_cudagraph_safe():
     block_size = 64
     num_blocks = 4
     num_tokens = 6
-    k = torch.randn(
-        (num_tokens, _INT8_DS_MLA_DIM), dtype=torch.bfloat16, device="cuda"
-    )
+    k = torch.randn((num_tokens, _INT8_DS_MLA_DIM), dtype=torch.bfloat16, device="cuda")
     slot_mapping = torch.tensor([0, 63, -1, 64, 130, -1], device="cuda")
     cache = torch.full(
         (num_blocks, block_size, _INT8_DS_MLA_TOKEN_BYTES),
@@ -94,8 +90,8 @@ def test_int8_ds_mla_cache_insert_is_cudagraph_safe():
     valid = slot_mapping >= 0
     k_valid = k[valid].to(torch.float32)
     ref_scales = (k_valid.abs().amax(dim=-1) / 127.0).clamp_min(1.0e-12)
-    ref_q = torch.round(k_valid / ref_scales.unsqueeze(-1)).clamp(-127, 127).to(
-        torch.int8
+    ref_q = (
+        torch.round(k_valid / ref_scales.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
     )
     slots = slot_mapping[valid].to(torch.int64)
     block_idx = slots // block_size

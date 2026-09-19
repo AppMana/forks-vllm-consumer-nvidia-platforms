@@ -80,6 +80,24 @@ the per-area policy learned from the previous merges, and the gates.
   benchmark passes `chat_template_kwargs` explicitly.
 - `patch does not apply` during the flash-attention fetch: a previously
   patched checkout under `.deps/`; reset or delete it.
+- `deepseek_v4_sparse_mla_attention_warmup` imported again in
+  `kernel_warmup.py`: upstream keeps that warmup; the fork removed it because
+  it drives `execute_model` from a per-rank gate and deadlocks a pipeline
+  chain. Drop the import and the call.
+- Two draft-token relays after a merge of `pp_utils.py` and
+  `model_runner.py`: upstream broadcasts drafts separately
+  (`broadcast_drafts`, `draft_tokens_to_update`) while the fork packs the
+  proposed block into the single payload broadcast. Keep the payload
+  contract, delete upstream's second broadcast, and keep
+  `get_prev_sampled_outputs()` argument-free.
+- `KeyError: aux_hidden_states_0` or a receive tensor nobody sends under PP:
+  upstream's runner-side aux relay (`EagleModelMixin` slot keys,
+  `reserve_aux_intermediate_tensor_slots`) counted slots for a model that
+  relays its own `aux_hidden_{j}` boundaries in `forward`; the DeepSeek V4
+  model pins its slot count to zero.
+- TileLang `register_warmup` calls in `nvidia/model.py` after a merge: the
+  fork's `MHC*Op` objects dispatch by platform and the fork's mHC warmup
+  covers them; the TileLang registrations import kernels Ampere never runs.
 
 ## Gates, in order
 

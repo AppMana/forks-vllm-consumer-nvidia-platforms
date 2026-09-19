@@ -49,10 +49,15 @@ def make_vllm_config(
         sliding_window=sliding_window,
     )
     return SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=max_model_len, hf_config=hf_config),
+        model_config=SimpleNamespace(
+            max_model_len=max_model_len,
+            hf_config=hf_config,
+            hf_text_config=hf_config,
+        ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
         ),
     )

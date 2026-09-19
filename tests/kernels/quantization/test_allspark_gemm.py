@@ -69,7 +69,7 @@ def test_gptq_allspark_gemm_ampere(mnk_factors, group_size, has_zp, dtype):
     input = rand_data((m, k), dtype=dtype)
     weight = rand_data((k, n), dtype=dtype)
 
-    # Quantize (and apply act_order if provided)
+    # Quantize weights.
     w_ref, qw, s, zp = quantize_weights(
         weight, scalar_types.uint8b128, group_size, has_zp
     )
@@ -144,18 +144,18 @@ def test_native_allspark_splitk_makes_progress_and_matches_reference():
         dtype=torch.uint8,
         generator=generator,
     ).to(device)
-    scales = (
-        torch.rand((1, n), dtype=torch.float32, generator=generator) * 0.01
-    ).to(dtype=torch.bfloat16, device=device)
+    scales = (torch.rand((1, n), dtype=torch.float32, generator=generator) * 0.01).to(
+        dtype=torch.bfloat16, device=device
+    )
     packed_weight, packed_scales, _ = ops.allspark_repack_weight(
         weight,
         scales,
         None,
         False,
     )
-    activation = torch.randn(
-        (m, k), dtype=torch.float32, generator=generator
-    ).to(dtype=torch.bfloat16, device=device)
+    activation = torch.randn((m, k), dtype=torch.float32, generator=generator).to(
+        dtype=torch.bfloat16, device=device
+    )
 
     for _ in range(256):
         output = ops.allspark_w8a16_gemm(

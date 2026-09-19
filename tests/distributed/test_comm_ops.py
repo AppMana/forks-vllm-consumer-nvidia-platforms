@@ -484,6 +484,21 @@ def test_flashinfer_all_reduce_precedes_nccl(monkeypatch: pytest.MonkeyPatch) ->
     nccl_selector.assert_not_called()
 
 
+def test_aiter_all_gather_precedes_pynccl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure can use aiter all_gather if available even if pynccl is not available."""
+    output = torch.empty(2)
+    aiter_comm = Mock()
+    aiter_comm.should_custom_ag.return_value = True
+    aiter_comm.custom_all_gather.return_value = output
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.world_size = 2
+    communicator.aiter_ar_comm = aiter_comm
+    communicator.pynccl_comm = Mock(disabled=True)
+    monkeypatch.setattr(communicator, "_can_use_aiter_ag_rs", Mock(return_value=True))
+
+    assert communicator.all_gatherv(torch.empty(1)) is output
+
+
 def test_isend_object_posts_size_then_object_and_releases_on_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -685,25 +700,26 @@ def _make_dsv4_intermediates(
 ) -> dict[str, torch.Tensor]:
     base = rank * 1000 + step * 100
     hidden_row = torch.arange(hidden_size, dtype=torch.float32, device=device)
-    hc_row = torch.arange(hc_mult * hidden_size, dtype=torch.float32,
-                          device=device).reshape(hc_mult, hidden_size)
-    mix_row = torch.arange(hc_mult * hc_mult, dtype=torch.float32,
-                           device=device).reshape(hc_mult, hc_mult)
+    hc_row = torch.arange(
+        hc_mult * hidden_size, dtype=torch.float32, device=device
+    ).reshape(hc_mult, hidden_size)
+    mix_row = torch.arange(
+        hc_mult * hc_mult, dtype=torch.float32, device=device
+    ).reshape(hc_mult, hc_mult)
 
     return {
-        "hidden_states":
-        (hidden_row + base).expand(num_tokens, hidden_size).to(torch.bfloat16),
-        "residual":
-        (hc_row + base + 1).expand(num_tokens, hc_mult,
-                                   hidden_size).to(torch.bfloat16),
-        "post_mix":
-        torch.full((num_tokens, hc_mult, 1),
-                   base + 2,
-                   dtype=torch.float32,
-                   device=device),
-        "res_mix":
-        (mix_row + base + 3).expand(num_tokens, hc_mult,
-                                    hc_mult).contiguous(),
+        "hidden_states": (hidden_row + base)
+        .expand(num_tokens, hidden_size)
+        .to(torch.bfloat16),
+        "residual": (hc_row + base + 1)
+        .expand(num_tokens, hc_mult, hidden_size)
+        .to(torch.bfloat16),
+        "post_mix": torch.full(
+            (num_tokens, hc_mult, 1), base + 2, dtype=torch.float32, device=device
+        ),
+        "res_mix": (mix_row + base + 3)
+        .expand(num_tokens, hc_mult, hc_mult)
+        .contiguous(),
     }
 
 
@@ -718,16 +734,16 @@ def dsv4_pp_intermediate_transport_worker(
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     device = torch.device(f"cuda:{rank}")
     torch.accelerator.set_device_index(device)
-    init_test_distributed_environment(tp_size, pp_size, rank,
-                                      distributed_init_port)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
 
     token_counts = [16_384, 1, 512, 2, 4096]
     hidden_size = 64
     hc_mult = 8
 
     if not get_pp_group().is_first_rank:
-        persistent = _make_dsv4_intermediates(max(token_counts), hidden_size,
-                                              hc_mult, 0, -1, device)
+        persistent = _make_dsv4_intermediates(
+            max(token_counts), hidden_size, hc_mult, 0, -1, device
+        )
 
     previous_send = []
     for step, num_tokens in enumerate(token_counts):
@@ -745,18 +761,19 @@ def dsv4_pp_intermediate_transport_worker(
                 fn()
 
             for key, recv in tensor_dict.items():
-                persistent[key][:num_tokens].copy_(recv[:num_tokens],
-                                                   non_blocking=True)
+                persistent[key][:num_tokens].copy_(recv[:num_tokens], non_blocking=True)
             torch.cuda.synchronize(device)
 
-            expected = _make_dsv4_intermediates(num_tokens, hidden_size, hc_mult,
-                                                0, step, device)
+            expected = _make_dsv4_intermediates(
+                num_tokens, hidden_size, hc_mult, 0, step, device
+            )
             for key, want in expected.items():
                 torch.testing.assert_close(persistent[key][:num_tokens], want)
 
         if not get_pp_group().is_last_rank:
-            payload = _make_dsv4_intermediates(num_tokens, hidden_size, hc_mult,
-                                               rank, step, device)
+            payload = _make_dsv4_intermediates(
+                num_tokens, hidden_size, hc_mult, rank, step, device
+            )
             previous_send = get_pp_group().isend_tensor_dict(payload)
 
     for handle in previous_send:
@@ -794,8 +811,7 @@ def test_multi_process_pipeline_parallel(
 def test_dsv4_pp_intermediate_transport_multiturn(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    multi_process_parallel(monkeypatch, 1, 2,
-                           dsv4_pp_intermediate_transport_worker)
+    multi_process_parallel(monkeypatch, 1, 2, dsv4_pp_intermediate_transport_worker)
 
 
 @multi_gpu_test(num_gpus=4)

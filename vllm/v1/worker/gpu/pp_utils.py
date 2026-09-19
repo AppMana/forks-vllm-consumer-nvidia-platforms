@@ -10,8 +10,9 @@ import torch
 
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
@@ -40,7 +41,6 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     that produce a sampled token this step, and therefore must have that token
     (and the draft block proposed from it) propagated to the earlier PP stages.
     Returns None if no request in the batch produces a sample."""
-
     old_computed = input_batch.num_computed_tokens_np
     prefill_len = input_batch.prefill_len_np
     # Exclude non-final prefill chunks (they don't produce a sample).
@@ -102,9 +102,33 @@ class PPHandler:
         self.broadcast_group = get_pp_group().make_sibling_device_group(
             group_desc="pp_broadcast"
         )
+        self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
+
+    def configure_aux_hidden_state_relay(self, model: torch.nn.Module) -> None:
+        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+            aux_hidden_state_relay_keys,
+        )
+
+        self.aux_hidden_state_relay_keys = aux_hidden_state_relay_keys(model)
+
+    def relay_aux_hidden_states(
+        self,
+        intermediate_tensors: IntermediateTensors | None,
+        output_intermediate_tensors: IntermediateTensors,
+    ) -> IntermediateTensors:
+        if not self.aux_hidden_state_relay_keys:
+            return output_intermediate_tensors
+        assert intermediate_tensors is not None
+        return IntermediateTensors(
+            output_intermediate_tensors.tensors
+            | {
+                key: intermediate_tensors[key]
+                for key in self.aux_hidden_state_relay_keys
+            }
+        )
 
     def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor | None] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
@@ -133,9 +157,9 @@ class PPHandler:
                 return None
             keep_mask = ~exclude_mask
             idx_mapping_np = slot.idx_mapping_np[keep_mask]
-            idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+            idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
             row_indices_np = np.flatnonzero(keep_mask).astype(np.int64)
-            row_indices = async_copy_to_gpu(row_indices_np, device=self.device)
+            row_indices = async_tensor_h2d(row_indices_np, device=self.device)
 
         self.main_stream.wait_event(slot.event)
         if exclude_mask.any():

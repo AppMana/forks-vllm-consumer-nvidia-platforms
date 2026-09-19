@@ -3,12 +3,12 @@
 import torch
 import torch.nn as nn
 
-from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
-    fused_inv_rope_fp8_quant,
-)
 from vllm.model_executor.layers.rotary_embedding.common import (
     rotate_gptj,
     rotate_neox,
+)
+from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+    fused_inv_rope_fp8_quant,
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
@@ -84,17 +84,18 @@ direct_register_custom_op(
 )
 
 
-def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
+def compute_fp8_einsum_recipe(
+    block_size: int = 128,
+) -> tuple[tuple[int, int, int], bool]:
     """fp8_einsum recipe + scale layout for the current GPU arch.
 
-    SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.
-    SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.
+    SM90 keeps block-row FP32 scales. SM100 uses packed per-row E8M0 scales.
 
     Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.
     """
     cap = _DSV4_DEVICE_CAP
     assert cap is not None, "DeepseekV4 attention requires a CUDA device"
-    einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
+    einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, block_size)
     tma_aligned_scales = cap.major >= 10
     return einsum_recipe, tma_aligned_scales
 
@@ -115,10 +116,10 @@ def deep_gemm_fp8_o_proj(
     tma_aligned_scales: bool,
     is_neox_style: bool = False,
 ) -> torch.Tensor:
-    """O projection: inverse RoPE + FP8 quant + einsum + wo_b.
+    """O projection: inverse RoPE + grouped wo_a + wo_b.
 
-    Shared by the FlashMLA and FlashInfer CUDA backends. ``einsum_recipe`` /
-    ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
+    Shared by the FlashMLA and FlashInfer CUDA backends. The attention
+    layer selects the recipe at initialization.
     """
     # dsv4_int stores wo_a as INT8 and dequantizes it to BF16 once at load
     # (`_dsv4_int_dequanted`); that path uses inverse-RoPE + a BF16 einsum, not
@@ -141,7 +142,8 @@ def deep_gemm_fp8_o_proj(
             is_neox_style,
         )
         return wo_b(z.flatten(1))
-    o_fp8, o_scale = fused_inv_rope_fp8_quant(
+    use_fp8 = wo_a.weight.dtype == torch.float8_e4m3fn
+    o_proj_input, o_scale = fused_inv_rope_fp8_quant(
         o,
         positions,
         cos_sin_cache,
@@ -149,40 +151,50 @@ def deep_gemm_fp8_o_proj(
         heads_per_group=heads_per_group,
         nope_dim=nope_dim,
         rope_dim=rope_dim,
+        quant_group_size=einsum_recipe[2],
         tma_aligned_scales=tma_aligned_scales,
+        quantize=use_fp8,
     )
     z = torch.empty(
         (o.shape[0], n_groups, o_lora_rank),
         device=o.device,
         dtype=torch.bfloat16,
     )
-    weight_scale = (
-        wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
-    )
-    # DeepGEMM fp8_einsum is Hopper/sm_100 only. On Ampere (sm_8x) and consumer
-    # Blackwell (sm_12x) use the software fp8 einsum (triton on sm_89+, torch
-    # fallback on sm_86), which computes the same "bhr,hdr->bhd" contraction.
-    cap = _DSV4_DEVICE_CAP
-    if cap is not None and cap.major in (8, 12):
-        from vllm.models.deepseek_v4.common.ops.fp8_einsum import (
-            deepseek_v4_sm12x_fp8_einsum,
+    if use_fp8:
+        weight_scale = (
+            wo_a.weight_scale
+            if hasattr(wo_a, "weight_scale")
+            else wo_a.weight_scale_inv
         )
-        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
-            _normalize_deepseek_v4_fp8_einsum_inputs,
-        )
+        # DeepGEMM fp8_einsum is Hopper/sm_100 only. On Ampere (sm_8x) and
+        # consumer Blackwell (sm_12x) use the software fp8 einsum (triton on
+        # sm_89+, torch fallback on sm_86), the same "bhr,hdr->bhd" contraction.
+        cap = _DSV4_DEVICE_CAP
+        if cap is not None and cap.major in (8, 12):
+            from vllm.models.deepseek_v4.common.ops.fp8_einsum import (
+                deepseek_v4_sm12x_fp8_einsum,
+            )
+            from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
+                _normalize_deepseek_v4_fp8_einsum_inputs,
+            )
 
-        # Reshape wo_a (2D -> [groups, out_rank, hidden]) + unpack scales, then
-        # run the software einsum (torch on sm_86, triton on sm_12x).
-        a, a_scale, b, b_scale = _normalize_deepseek_v4_fp8_einsum_inputs(
-            o_fp8, o_scale, wo_a.weight, weight_scale, z
-        )
-        deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, z)
+            a, a_scale, b, b_scale = _normalize_deepseek_v4_fp8_einsum_inputs(
+                o_proj_input, o_scale, wo_a.weight, weight_scale, z
+            )
+            deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, z)
+        else:
+            fp8_einsum(
+                "bhr,hdr->bhd",
+                (o_proj_input, o_scale),
+                (wo_a.weight, weight_scale),
+                z,
+                recipe=einsum_recipe,
+            )
     else:
-        fp8_einsum(
-            "bhr,hdr->bhd",
-            (o_fp8, o_scale),
-            (wo_a.weight, weight_scale),
-            z,
-            recipe=einsum_recipe,
+        grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
+        torch.bmm(
+            o_proj_input.transpose(0, 1),
+            grouped_weight.transpose(1, 2),
+            out=z.transpose(0, 1),
         )
     return wo_b(z.flatten(1))
