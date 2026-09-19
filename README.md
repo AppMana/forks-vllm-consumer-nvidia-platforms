@@ -196,6 +196,13 @@ recorded after each merge.
 bash docker/build-consumer-platforms.sh
 ```
 
+The script keeps three caches on by default and a build is only slow when
+one of them is missing: buildkit's layer cache on one fixed builder pod,
+the registry layer cache at `ghcr.io/appmana/vllm-consumer:buildcache`,
+and sccache for the native extensions. `USE_SCCACHE` does not change the
+base layers, so toggling it is cheap; the Rust and CUDA stages run
+separate sccache daemons.
+
 `docker/Dockerfile` builds one image with:
 
 - native vLLM extensions for RTX 30xx and GB10;

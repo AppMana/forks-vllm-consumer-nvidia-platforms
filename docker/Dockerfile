@@ -208,21 +208,20 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Install sccache once in base so Rust and CMake/CUDA build stages share the
-# same binary and remote cache configuration.
-RUN if [ "$USE_SCCACHE" = "1" ]; then \
-        echo "Installing sccache..." \
-        && case "${TARGETPLATFORM}" in \
-          linux/arm64) SCCACHE_ARCH="aarch64" ;; \
-          linux/amd64) SCCACHE_ARCH="x86_64" ;; \
-          *) echo "Unsupported TARGETPLATFORM for sccache: ${TARGETPLATFORM}" >&2; exit 1 ;; \
-        esac \
-        && export SCCACHE_DOWNLOAD_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
-        && curl -L -o sccache.tar.gz ${SCCACHE_DOWNLOAD_URL} \
-        && tar -xzf sccache.tar.gz \
-        && sudo mv sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
-        && rm -rf sccache.tar.gz sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl; \
-    fi
+# Install sccache once in base so the Rust and CMake/CUDA build stages share
+# the same binary. Installed unconditionally: USE_SCCACHE only decides whether
+# the build stages use it, so toggling it never invalidates the base layers.
+RUN echo "Installing sccache..." \
+    && case "${TARGETPLATFORM}" in \
+      linux/arm64) SCCACHE_ARCH="aarch64" ;; \
+      linux/amd64) SCCACHE_ARCH="x86_64" ;; \
+      *) echo "Unsupported TARGETPLATFORM for sccache: ${TARGETPLATFORM}" >&2; exit 1 ;; \
+    esac \
+    && export SCCACHE_DOWNLOAD_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
+    && curl -L -o sccache.tar.gz ${SCCACHE_DOWNLOAD_URL} \
+    && tar -xzf sccache.tar.gz \
+    && sudo mv sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
+    && rm -rf sccache.tar.gz sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl
 
 ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME}}
 ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION_NAME}}
@@ -414,9 +413,9 @@ COPY build_rust.sh build_rust.sh
 # (rustc spawns enough concurrent processes to hit RLIMIT_NOFILE otherwise).
 ENV CARGO_BUILD_JOBS=4
 
-# BuildKit can run this stage in parallel with csrc-build. Keep Rust on a
-# separate local sccache daemon while sharing the same remote cache backend.
-ENV SCCACHE_SERVER_PORT=4227
+# BuildKit can run this stage in parallel with csrc-build. Keep Rust on its
+# own sccache daemon (its own socket, outside the shared cache mount) while
+# sharing the same remote cache backend.
 
 # Build with a stable version so this target snapshot is keyed only by Rust
 # inputs. The child stage below relinks the crates that embed the exact version.
@@ -427,17 +426,19 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     mkdir -p /workspace/tmp /workspace/tmp/sccache \
     && export TMPDIR=/workspace/tmp \
     && export SCCACHE_DIR=/workspace/tmp/sccache \
-    && export SCCACHE_SERVER_UDS=/workspace/tmp/sccache/sccache.sock \
+    && export SCCACHE_SERVER_UDS=/workspace/tmp/sccache-rust.sock \
     && export SCCACHE_IDLE_TIMEOUT=0 \
     && \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi; \
         export RUSTC_WRAPPER=sccache; \
+        sccache --start-server; \
         sccache --show-stats; \
     fi \
     && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+docker.cache" bash build_rust.sh \
     && if [ "$USE_SCCACHE" = "1" ]; then \
         sccache --show-stats; \
+        sccache --stop-server; \
     fi
 
 # Relink with the exact Git-derived package version.
@@ -549,25 +550,14 @@ RUN --mount=type=cache,target=/workspace/tmp/sccache,sharing=shared \
     --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
     if [ "$USE_SCCACHE" = "1" ]; then \
-        echo "Installing sccache..." \
-        && case "${TARGETPLATFORM}" in \
-          linux/arm64) SCCACHE_ARCH="aarch64" ;; \
-          linux/amd64) SCCACHE_ARCH="x86_64" ;; \
-          *) echo "Unsupported TARGETPLATFORM for sccache: ${TARGETPLATFORM}" >&2; exit 1 ;; \
-        esac \
-        && export SCCACHE_DOWNLOAD_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
-        && curl -L -o sccache.tar.gz ${SCCACHE_DOWNLOAD_URL} \
-        && tar -xzf sccache.tar.gz \
-        && sudo mv sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
-        && rm -rf sccache.tar.gz sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl \
-        && mkdir -p /workspace/tmp /workspace/tmp/sccache \
+        mkdir -p /workspace/tmp /workspace/tmp/sccache \
         && if [ -n "${SCCACHE_ENDPOINT}" ] ; then export SCCACHE_ENDPOINT=${SCCACHE_ENDPOINT} ; fi \
         && export SCCACHE_BUCKET=${SCCACHE_BUCKET_NAME} \
         && export SCCACHE_REGION=${SCCACHE_REGION_NAME} \
         && export SCCACHE_S3_NO_CREDENTIALS=${SCCACHE_S3_NO_CREDENTIALS} \
         && if [ "${SCCACHE_RECACHE}" = "1" ]; then export SCCACHE_RECACHE=1; else unset SCCACHE_RECACHE; fi \
         && export SCCACHE_DIR=/workspace/tmp/sccache \
-        && export SCCACHE_SERVER_UDS=/workspace/tmp/sccache/sccache.sock \
+        && export SCCACHE_SERVER_UDS=/workspace/tmp/sccache-csrc.sock \
         && export SCCACHE_IDLE_TIMEOUT=0 \
         && export SCCACHE_BASEDIRS=/workspace:/workspace/tmp \
         && export CMAKE_C_COMPILER_LAUNCHER=sccache \
@@ -581,7 +571,6 @@ RUN --mount=type=cache,target=/workspace/tmp/sccache,sharing=shared \
         && export VLLM_MAIN_CUDA_VERSION="${VLLM_MAIN_CUDA_VERSION}" \
         && export VLLM_DOCKER_BUILD_CONTEXT=1 \
         && export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) \
-        && (sccache --stop-server >/dev/null 2>&1 || true) \
         && sccache --start-server \
         && sccache --zero-stats \
         && sccache --version \

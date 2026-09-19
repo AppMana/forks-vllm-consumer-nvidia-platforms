@@ -10,6 +10,12 @@
 # Usage:
 #   docker/build-consumer-platforms.sh [--platform linux/arm64] [--tag NAME]
 #
+# Caches: the build dials one fixed buildkitd pod (Service buildkitd-vllm) so
+# its local layer cache persists between runs, imports and exports the layer
+# cache at $CACHE_REF in GHCR, and compiles through sccache against the
+# cluster's S3 (credentials from the buildkit/seaweedfs-s3 Secret). Leave all
+# three on; a build without them recompiles vLLM for over an hour.
+#
 # Requires: kubectl context `remote` (appmana-cluster-03), gh auth, buildctl.
 
 set -euo pipefail
@@ -26,6 +32,12 @@ DOCKERFILE="${DOCKERFILE:-docker/Dockerfile}"
 # by single-stage overlay Dockerfiles.
 TARGET="${TARGET-vllm-openai}"
 BASE_IMAGE="${BASE_IMAGE:-}"
+BUILDKIT_SERVICE="${BUILDKIT_SERVICE:-buildkitd-vllm}"
+CACHE_REF="${CACHE_REF:-ghcr.io/appmana/vllm-consumer:buildcache}"
+USE_SCCACHE="${USE_SCCACHE:-1}"
+SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT:-http://10.152.184.210:8333}"
+SCCACHE_BUCKET_NAME="${SCCACHE_BUCKET_NAME:-appmana-private}"
+SCCACHE_REGION_NAME="${SCCACHE_REGION_NAME:-us-west-2}"
 
 # nvcc parallelism. The arm64 stages run under QEMU, so wall-clock is already
 # poor; oversubscribing turns it into OOM. Raise only with headroom measured on
@@ -87,7 +99,26 @@ fi
 gh auth token | tr -d '\n' > "$workdir/ghtoken"
 chmod 600 "$workdir/ghtoken"
 
-kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" svc/buildkitd \
+secret_options=(--secret "id=GIT_AUTH_TOKEN,src=$workdir/ghtoken")
+sccache_options=()
+if [ "$USE_SCCACHE" = "1" ]; then
+    access_key="$(kubectl --context "$KUBE_CONTEXT" -n "$CONTEXT_NS" get secret seaweedfs-s3 -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)"
+    secret_key="$(kubectl --context "$KUBE_CONTEXT" -n "$CONTEXT_NS" get secret seaweedfs-s3 -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)"
+    if [ -z "$access_key" ] || [ -z "$secret_key" ]; then
+        echo "USE_SCCACHE=1 but the $CONTEXT_NS/seaweedfs-s3 Secret has no S3 credentials" >&2
+        exit 1
+    fi
+    printf '[default]\naws_access_key_id=%s\naws_secret_access_key=%s\n' "$access_key" "$secret_key" > "$workdir/aws-credentials"
+    chmod 600 "$workdir/aws-credentials"
+    secret_options+=(--secret "id=aws-credentials,src=$workdir/aws-credentials")
+    sccache_options=(
+        --opt build-arg:USE_SCCACHE=1
+        --opt "build-arg:SCCACHE_ENDPOINT=$SCCACHE_ENDPOINT"
+        --opt "build-arg:SCCACHE_BUCKET_NAME=$SCCACHE_BUCKET_NAME"
+        --opt "build-arg:SCCACHE_REGION_NAME=$SCCACHE_REGION_NAME"
+    )
+fi
+kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" "svc/$BUILDKIT_SERVICE" \
     "$LOCAL_PORT:1234" >/dev/null 2>&1 &
 pf_pid=$!
 sleep 5
@@ -122,6 +153,9 @@ exec buildctl \
     build \
     --frontend dockerfile.v0 \
     "${build_options[@]}" \
-    --secret "id=GIT_AUTH_TOKEN,src=$workdir/ghtoken" \
+    "${sccache_options[@]}" \
+    "${secret_options[@]}" \
+    --import-cache "type=registry,ref=$CACHE_REF" \
+    --export-cache "type=registry,ref=$CACHE_REF,mode=max" \
     --output "type=image,name=$IMAGE,push=true" \
     --progress plain

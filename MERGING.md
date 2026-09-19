@@ -148,8 +148,10 @@ D. Serving on the mini checkpoints at PP=1 and PP=2 with CUDA graphs,
    cannot: two of the 2026-09 merge's five serving defects were import-time
    shadowing and warmup registrations, visible only at model construction.
 E. The full image build (`docker/Dockerfile`, target `vllm-openai`) for the
-   deployment architectures with the KV connector installed; its label must
-   name the merge commit and no overlay. Then the documented
+   deployment architectures with the KV connector installed, through the
+   build script with its caches left on (pinned builder, registry layer
+   cache, sccache); its label must name the merge commit and no overlay.
+   Then the documented
    multi-architecture build (`docker/build-consumer-platforms.sh`), which
    compiles the externals the deployment image skips, and gate D's PP=1
    recording served from each image: the multi-architecture image reaches
