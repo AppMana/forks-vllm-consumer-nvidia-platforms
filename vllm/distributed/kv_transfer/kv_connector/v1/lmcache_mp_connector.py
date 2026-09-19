@@ -700,9 +700,33 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
               block IDs must appear here no later than that same pass.
             - Sync loading: failed blocks should be reported in the forward
               pass in which they are detected.
+            - On a layout with several KV cache groups block IDs are only
+              unique within a group and the scheduler refuses them; failed
+              requests are then reported through ``get_transfer_results``
+              and this returns an empty set.
 
         """
-        return self.worker_adapter.get_block_ids_with_load_errors()
+        errors = self.worker_adapter.get_block_ids_with_load_errors()
+        if len(self._kv_cache_config.kv_cache_groups) > 1:
+            return set()
+        return errors
+
+    def get_transfer_results(self, finished_req_ids: set[str]):
+        """Completed sends and receives plus the receives that failed.
+
+        A failed receive is reported per request so the scheduler can
+        recompute it on any KV layout; it is also listed as finished
+        receiving, which releases the request from its transfer wait.
+        """
+        results = super().get_transfer_results(finished_req_ids)
+        get_failed = getattr(
+            self.worker_adapter, "get_request_ids_with_load_errors", None
+        )
+        failed = get_failed() if get_failed is not None else set()
+        if failed:
+            results.failed_recving |= failed
+            results.finished_recving |= failed
+        return results
 
     def shutdown(self):
         """Shutdown the connector. This is called when the worker process

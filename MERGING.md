@@ -115,6 +115,15 @@ the per-area policy learned from the previous merges, and the gates.
   venv or Harbor image ever evaluates it. Serve the mini from the
   multi-architecture image as well; a build with more optional extensions
   reaches more branches.
+- `RuntimeError: A KV connector reported block-level load failures
+  (invalid_block_ids) on a layout with multiple KV cache groups` killing
+  the engine on the first failed LMCache retrieve: upstream now refuses
+  block-level failure reports on multi-group layouts (DeepSeek V4 has
+  several) and expects `KVConnectorTransferResults.failed_recving`. The
+  LMCache fork's MP adapter records the failed request ids and its
+  connector reports them per request; the fallback class in
+  `lmcache_mp_connector.py` does the same. A load failure must lead to a
+  recompute, never to a dead engine.
 - TileLang `register_warmup` calls in `nvidia/model.py` after a merge: the
   fork's `MHC*Op` objects dispatch by platform and the fork's mHC warmup
   covers them; the TileLang registrations import kernels Ampere never runs.
