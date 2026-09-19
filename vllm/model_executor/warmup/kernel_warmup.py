@@ -206,6 +206,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     _deepseek_v4_sparse_mla_prefill_warmup(worker)
     _deepseek_v4_block_table_slot_mapping_warmup(worker)
     _deepseek_v4_marlin_moe_warmup(worker)
+    _deepseek_v4_vision_warmup(worker)
 
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
@@ -399,7 +400,7 @@ def _deepseek_v4_marlin_moe_warmup(worker: "Worker") -> None:
             topk_ids = expert_ids.expand(num_tokens, top_k).contiguous()
             weights = topk_weights.expand(num_tokens, top_k).contiguous()
             quant_method.apply(module, x, weights, topk_ids)
-            torch.cuda.synchronize(device)
+            torch.accelerator.synchronize(device)
 
     if warmed:
         logger.info(
@@ -475,7 +476,7 @@ def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
         block_size=block_size,
         offset=0,
     )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     # Combined C4A/C128A top-k + SWA index path. Use a single late-position row
     # so both the top-k and SWA portions are active while the launch stays small.
@@ -495,7 +496,7 @@ def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
         M=width,
         N=topk,
     )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     # Sparse attention proper: one query row, real local head count, full
     # top-k+SWA width. num_tokens is pinned off specialization in the Triton JIT,
@@ -519,7 +520,7 @@ def _deepseek_v4_sparse_mla_prefill_kernel_warmup(worker: "Worker") -> None:
         attn_sink=sink,
         out=out,
     )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
 
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
@@ -635,3 +636,37 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         world.barrier()
     if is_leader:
         tuner.save_configs(str(cache_path))
+
+
+def _deepseek_v4_vision_warmup(worker: "Worker") -> None:
+    """Compile the vision tower's kernels before the first image request.
+
+    Only the pipeline rank that owns the tower has one. Token counts are
+    runtime arguments of the INT8 vision kernels, so one small synthetic
+    image compiles every linear shape and the attention kernel for all
+    image sizes.
+    """
+    if not _is_deepseek_v4_worker(worker) or worker.model_runner is None:
+        return
+    model = worker.get_model()
+    vision = getattr(model, "vision", None)
+    aligner = getattr(model, "aligner", None)
+    if vision is None or aligner is None:
+        return
+    projection = vision.patch_embed.proj
+    grid = 2 * int(aligner.downsample_ratio)
+    device = projection.weight.device
+    dtype = getattr(model, "compute_dtype", worker.model_config.dtype)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0)
+    patches = torch.randn(
+        grid * grid,
+        projection.input_size,
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    ).to(dtype)
+    with torch.inference_mode():
+        aligner(vision(patches, grid, grid), grid, grid)
+    torch.accelerator.synchronize(device)
+    logger.info("DeepSeek V4 vision kernels warmed on a %dx%d patch grid.", grid, grid)

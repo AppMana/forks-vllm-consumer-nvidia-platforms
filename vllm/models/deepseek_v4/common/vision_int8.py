@@ -118,14 +118,14 @@ def _round_int8(x):
     return tl.minimum(tl.maximum(tl.floor(x + 0.5), -127.0), 127.0).to(tl.int8)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _vision_linear_int8(
     X,
     W,
     S,
     Bias,
     Out,
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
     BM: tl.constexpr,
@@ -164,13 +164,13 @@ def _vision_linear_int8(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N"])
 def _vision_attention_int8(
     Q,
     K,
     V,
     Out,
-    N: tl.constexpr,
+    N,
     H: tl.constexpr,
     D: tl.constexpr,
     BM: tl.constexpr,

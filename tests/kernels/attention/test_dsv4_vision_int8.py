@@ -128,3 +128,45 @@ def test_vision_int8_cuda_graph_replay_reads_new_inputs():
     graph.replay()
     expected = vision_attention_int8(q, k, v)
     torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+
+def _compiled_variants(kernel) -> int:
+    """Number of distinct specializations Triton has compiled for a kernel."""
+    return sum(len(entry[0]) for entry in kernel.device_caches.values())
+
+
+def test_vision_kernels_do_not_specialize_on_image_token_count():
+    """Image resolution varies per request; it must not recompile the kernels.
+
+    Triton specializes on every constexpr value and on divisibility by 16 of
+    every plain integer argument, so token counts that are constexpr (or
+    merely runtime) cost a fresh compile per novel image size: about 200 ms
+    per linear shape and 500 ms for attention on an A5000, which is the
+    whole of the vision latency gap against BF16. Sizes below mix multiples
+    of 16 with odd counts to cover both specialization keys.
+    """
+    torch.manual_seed(5)
+    w, scales = quantize_vision_weight(
+        torch.randn(1024, 588, device="cuda", dtype=torch.bfloat16)
+    )
+    layer = nn.Module()
+    layer.weight = nn.Parameter(w, requires_grad=False)
+    layer.weight_scale = nn.Parameter(scales, requires_grad=False)
+    method = VisionInt8LinearMethod()
+    method.process_weights_after_loading(layer)
+    before = _compiled_variants(_vision_linear_int8)
+    for tokens in (97, 331, 512, 529, 33):
+        x = torch.randn(1, tokens, 588, device="cuda", dtype=torch.bfloat16)
+        method.apply(layer, x, None)
+    torch.accelerator.synchronize()
+    assert _compiled_variants(_vision_linear_int8) - before <= 1
+
+    before = _compiled_variants(_vision_attention_int8)
+    for tokens in (97, 331, 512, 529, 33):
+        q, k, v = [
+            torch.randn(1, tokens, 16, 64, device="cuda", dtype=torch.bfloat16)
+            for _ in range(3)
+        ]
+        vision_attention_int8(q, k, v)
+    torch.accelerator.synchronize()
+    assert _compiled_variants(_vision_attention_int8) - before <= 1
