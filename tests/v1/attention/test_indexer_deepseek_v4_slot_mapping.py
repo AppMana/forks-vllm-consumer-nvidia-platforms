@@ -321,7 +321,7 @@ def test_indexer_phase_selects_runtime_path_and_capture_fallback(
     builder.dcp_rank = 0
     builder.cp_kv_cache_interleave_size = 1
     builder.max_prefill_buffer_size = seq_len
-    builder.use_fp4_indexer_cache = False
+    builder.indexer_uses_fp4 = False
     builder.num_speculative_tokens = 5
     builder.kv_cache_spec = SimpleNamespace(storage_block_size=256, block_size=256)
     builder.decode_lens_buffer = torch.zeros(1024, dtype=torch.int32)
@@ -591,3 +591,75 @@ def test_deepseek_v4_pp_mtp_forces_flattened_indexer_decode_metadata():
     )
 
     assert indexer.use_flattening
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_decode_build_with_deep_gemm_present_reads_builder_fp4_flag(monkeypatch):
+    """A build that vendors DeepGEMM (the sm86+sm121 image) reaches the
+    paged-MQA schedule gate on every CUDA device, consumer ones included, and
+    that gate reads the builder's fp4 flag. The sm86-only build never gets
+    there, so this is the only place the attribute name is checked."""
+    device = torch.device("cuda")
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+    )
+    vllm_config = create_vllm_config(
+        model_name="deepseek-ai/DeepSeek-V2-Lite-Chat",
+        max_model_len=1024,
+        hf_config_override={
+            "sliding_window": 128,
+            "index_topk": 4,
+            "compress_ratios": [4],
+        },
+    )
+    max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, 1024)
+    block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy"],
+        vllm_config=vllm_config,
+        device=device,
+        block_table_width=block_table_width,
+    )
+
+    metadata_calls: list[torch.Size] = []
+
+    def fake_metadata(seq_lens, num_states, num_sms, indices=None):
+        metadata_calls.append(seq_lens.shape)
+        return torch.zeros_like(builder.scheduler_metadata_buffer)
+
+    monkeypatch.setattr(indexer_module, "has_deep_gemm", lambda: True)
+    monkeypatch.setattr(indexer_module, "get_paged_mqa_logits_metadata", fake_metadata)
+
+    # Two single-token decode requests.
+    query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([280, 300], dtype=torch.int32, device=device)
+    block_table_tensor = torch.tensor(
+        [[5, 7], [9, 11]], dtype=torch.int32, device=device
+    )
+    slot_mapping = torch.full((2,), -123, dtype=torch.int64, device=device)
+    common = CommonAttentionMetadata(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=seq_lens,
+        seq_lens_cpu_upper_bound=seq_lens.cpu(),
+        num_reqs=2,
+        num_actual_tokens=2,
+        max_query_len=1,
+        max_seq_len=300,
+        block_table_tensor=block_table_tensor,
+        slot_mapping=slot_mapping,
+        causal=True,
+    )
+
+    md = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert md.decode is not None
+    expects_schedule = indexer_module.paged_mqa_logits_needs_deep_gemm_metadata(
+        builder.indexer_uses_fp4
+    )
+    assert bool(metadata_calls) == expects_schedule

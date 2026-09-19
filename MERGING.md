@@ -103,6 +103,16 @@ the per-area policy learned from the previous merges, and the gates.
   distro `gcc`/`g++` and never pins an older one. The sm86-only image does
   not build DeepGEMM and so cannot catch this; the documented
   `build-consumer-platforms.sh` path (`8.6 12.1a`) does.
+- `AttributeError: 'DeepseekV32IndexerMetadataBuilder' object has no
+  attribute ...` at the first decode step, only from the sm86+sm121 image:
+  that image vendors DeepGEMM, so `has_deep_gemm()` is true on every CUDA
+  device and the decode build reaches the paged-MQA schedule gate that the
+  sm86-only build short-circuits. An attribute upstream renamed in the
+  builder's constructor (`use_fp4_indexer_cache` became
+  `indexer_uses_fp4`) stays stale in a fork-only branch and no sm86 test,
+  venv or Harbor image ever evaluates it. Serve the mini from the
+  multi-architecture image as well; a build with more optional extensions
+  reaches more branches.
 - TileLang `register_warmup` calls in `nvidia/model.py` after a merge: the
   fork's `MHC*Op` objects dispatch by platform and the fork's mHC warmup
   covers them; the TileLang registrations import kernels Ampere never runs.
@@ -139,7 +149,12 @@ D. Serving on the mini checkpoints at PP=1 and PP=2 with CUDA graphs,
    shadowing and warmup registrations, visible only at model construction.
 E. The full image build (`docker/Dockerfile`, target `vllm-openai`) for the
    deployment architectures with the KV connector installed; its label must
-   name the merge commit and no overlay.
+   name the merge commit and no overlay. Then the documented
+   multi-architecture build (`docker/build-consumer-platforms.sh`), which
+   compiles the externals the deployment image skips, and gate D's PP=1
+   recording served from each image: the multi-architecture image reaches
+   branches on the deployment device that the deployment image never
+   evaluates.
 F. Chain acceptance on the deployment: same-day baseline against the
    previous image, needle recall and latency at C=1 through C=8, the vision
    fixture set, concurrency, cache isolation, Redis recovery and the

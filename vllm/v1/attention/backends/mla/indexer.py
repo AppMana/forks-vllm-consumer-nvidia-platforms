@@ -1591,9 +1591,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if (
                 current_platform.is_cuda()
                 and has_deep_gemm()
-                and paged_mqa_logits_needs_deep_gemm_metadata(
-                    self.use_fp4_indexer_cache
-                )
+                and paged_mqa_logits_needs_deep_gemm_metadata(self.indexer_uses_fp4)
             ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
