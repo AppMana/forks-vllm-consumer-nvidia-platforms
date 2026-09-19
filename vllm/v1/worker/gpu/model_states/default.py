@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -210,6 +211,15 @@ class DefaultModelState(ModelState):
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
             )
+        # The per-request state covers the real requests only; a FULL graph
+        # replay pads the rows to the captured size, and the builders index
+        # is_prefilling by padded row (split_decodes_and_prefills ORs it into
+        # a [num_reqs] mask). Padding rows are decodes.
+        is_prefilling_np = input_batch.is_prefilling_np
+        if num_reqs > is_prefilling_np.shape[0]:
+            is_prefilling_np = np.pad(
+                is_prefilling_np, (0, num_reqs - is_prefilling_np.shape[0])
+            )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -226,7 +236,7 @@ class DefaultModelState(ModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             dcp_local_seq_lens_cpu_upper_bound=input_batch.dcp_local_seq_lens_cpu_upper_bound,
             positions=input_batch.positions,
-            is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
+            is_prefilling=torch.from_numpy(is_prefilling_np),
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
