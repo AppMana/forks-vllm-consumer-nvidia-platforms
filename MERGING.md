@@ -95,6 +95,14 @@ the per-area policy learned from the previous merges, and the gates.
   `reserve_aux_intermediate_tensor_slots`) counted slots for a model that
   relays its own `aux_hidden_{j}` boundaries in `forward`; the DeepSeek V4
   model pins its slot count to zero.
+- `deep_jit/utils/exception.hpp: fatal error: format: No such file or
+  directory` while building DeepGEMM for the high-end architecture list:
+  the Ubuntu build stage selected a host compiler older than GCC 13.
+  DeepGEMM's `deep_jit` needs the C++20 `<format>` header; the CUDA 13
+  Ubuntu 24.04 base already ships GCC 13, so the Dockerfile installs the
+  distro `gcc`/`g++` and never pins an older one. The sm86-only image does
+  not build DeepGEMM and so cannot catch this; the documented
+  `build-consumer-platforms.sh` path (`8.6 12.1a`) does.
 - TileLang `register_warmup` calls in `nvidia/model.py` after a merge: the
   fork's `MHC*Op` objects dispatch by platform and the fork's mHC warmup
   covers them; the TileLang registrations import kernels Ampere never runs.

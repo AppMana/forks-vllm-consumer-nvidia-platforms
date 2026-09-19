@@ -196,13 +196,11 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
             libibverbs-dev \
             libelf-dev \
             libdw-dev \
-            # GCC 10 was previously pinned to suppress spurious -Wredundant-move warnings
-            # from CUTLASS (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92519). That bug
-            # was fixed in GCC 11. GCC >= 11.3 is now required because PyTorch's C++20 headers
-            # (pytorch/pytorch#167929) are not compatible with GCC < 11.3.
-            gcc-11 \
-            g++-11 \
-        && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 --slave /usr/bin/g++ g++ /usr/bin/g++-11 \
+            # The distro toolchain (GCC 13 on Ubuntu 24.04) is the host compiler:
+            # PyTorch's C++20 headers need GCC >= 11.3 and DeepGEMM's deep_jit needs
+            # <format>, which arrived in GCC 13.
+            gcc \
+            g++ \
         # Install python dev headers if available (needed for cmake FindPython on Ubuntu 24.04
         # which ships cmake 3.28 and requires Development.SABIModule; silently skipped on
         # Ubuntu 20.04/22.04 where python3.x-dev is not available without a PPA)
