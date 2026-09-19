@@ -118,10 +118,17 @@ C. The fork test set, defined as every test file the fork adds or modifies
    NVFP4/MXFP8 cache kernels, TileLang mHC, anything casting to fp8e4nv in
    Triton below SM89) are recorded as not applicable with their error
    signature, not fixed and not skipped in the shared test files.
-D. Serving on the mini checkpoints at PP=1 and PP=2 with CUDA graphs:
-   recorded token ids must match the pre-merge recordings for every image
-   count, and the JIT monitor must report no compiles on a second request at
-   a new context length or image size.
+D. Serving on the mini checkpoints at PP=1 and PP=2 with CUDA graphs,
+   prefix caching off (a hit moves the prefill chunk boundary and the mini
+   flips near-tied tokens on a 0.1 nat shift): two servers of the same tree
+   must record identical token ids for every image count; against the
+   pre-merge recordings, every row that differs is checked by top-3
+   log-probability margins before a kernel is suspected, since PP=2 with
+   graphs and PP=1 eager legitimately sit about 0.1 nat apart. The JIT
+   monitor must report no compiles on a second request at a new context
+   length or image size. Expect this gate to find defects the test set
+   cannot: two of the 2026-09 merge's five serving defects were import-time
+   shadowing and warmup registrations, visible only at model construction.
 E. The full image build (`docker/Dockerfile`, target `vllm-openai`) for the
    deployment architectures with the KV connector installed; its label must
    name the merge commit and no overlay.
