@@ -22,6 +22,9 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 )
 from vllm.model_executor.layers.indexer_topk import (  # noqa: F401
     RADIX_TOPK_WORKSPACE_SIZE,
+    SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH,
+    SM120_SHORT_ROW_TOPK_MAX_ROWS,
+    SM120_SHORT_ROW_TOPK_MAX_WIDTH,
     _should_use_sm120_short_row_topk_decode,
     _use_sm120_short_row_topk_decode,
     get_indexer_topk,

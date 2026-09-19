@@ -782,7 +782,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     QUANT_BLOCK: tl.constexpr,  # 128 for indexer
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
-    INT8_DS_MLA: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
@@ -978,7 +977,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     QUANT_BLOCK: tl.constexpr,  # 32 for MXFP4
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
-    INT8_DS_MLA: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.

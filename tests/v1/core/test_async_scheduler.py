@@ -755,19 +755,19 @@ def _assert_positions_consistent(req, engine: PipelinedEngine) -> None:
 
 @pytest.mark.parametrize("num_spec", [0, 3])
 def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
-    """KV-pressure preemption of requests with in-flight async output.
+    """KV-pressure preemption while async output is in flight.
 
     PP=3 + async scheduling (batch queue of 4), a block pool small enough
-    that decodes contend and preempt mid-flight, and staggered arrivals so
-    the batch queue actually pipelines. A preempted request's in-flight steps
-    still return: their tokens must be delivered exactly once, their stale
-    spec-rejection counts must not corrupt the rolled-back counters, and the
+    that decodes contend and preempt, and staggered arrivals so the batch
+    queue actually pipelines. With deferred block frees the scheduler never
+    preempts a request whose steps are still in flight (its blocks could not
+    be reused yet); it waits for the victim to drain, then preempts. Every
+    request's tokens must still be delivered exactly once, in order, and the
     resume must not resample a position that output later delivers.
 
-    Regression for the num_output_placeholders underflow EngineCore crash:
-    with the fix reverted, the num_spec=3 variant fails with exactly
-    ``assert request.num_output_placeholders >= 0`` when a stale spec output
-    returns after the preempted request was resumed and sampled.
+    The num_output_placeholders underflow (a stale spec output returning
+    after the preempted request was resumed and sampled) is exercised by the
+    reset_prefix_cache tests below, which preempt mid-flight on purpose.
     """
     max_tokens = 24
     scheduler = _create_async_pp_scheduler(num_spec)
@@ -779,11 +779,13 @@ def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
         scheduler.add_request(pending.pop(0))
 
     # Observe that the scenario under test actually occurs.
+    preempts = 0
     preempts_with_inflight_output = 0
     orig_preempt = scheduler._preempt_request
 
     def counting_preempt(request, timestamp, **kwargs):
-        nonlocal preempts_with_inflight_output
+        nonlocal preempts, preempts_with_inflight_output
+        preempts += 1
         if request.num_in_flight_tokens > 0:
             preempts_with_inflight_output += 1
         return orig_preempt(request, timestamp, **kwargs)
@@ -803,8 +805,13 @@ def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
     )
     engine.run(before_step=add_requests)
 
-    assert preempts_with_inflight_output > 0, (
-        "test did not exercise preemption with in-flight output"
+    assert preempts > 0, "test did not exercise KV-pressure preemption"
+    # A deferred block free cannot satisfy the allocation that triggered the
+    # preemption, so the scheduler waits for a victim's in-flight steps to
+    # drain instead of preempting it mid-flight. The stale-output rollback is
+    # exercised by the reset_prefix_cache tests below.
+    assert preempts_with_inflight_output == 0, (
+        "KV-pressure preemption picked a request with in-flight output"
     )
     for req in requests:
         assert req.is_finished()

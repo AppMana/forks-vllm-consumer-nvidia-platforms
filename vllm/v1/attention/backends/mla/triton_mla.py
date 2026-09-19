@@ -92,15 +92,20 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         )
 
 
+def _triton_mla_supported_kv_cache_dtypes() -> list[CacheDType]:
+    dtypes: list[CacheDType] = ["auto", "float16", "bfloat16"]
+    # The fp8 KV path casts through fp8e4nv inside Triton, which needs SM89+;
+    # TritonMLAImpl refuses it below that, so do not advertise it either.
+    if not current_platform.is_cuda() or current_platform.has_device_capability(89):
+        dtypes.extend(["fp8", "fp8_e4m3"])
+    return dtypes
+
+
 class TritonMLABackend(MLACommonBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto",
-        "float16",
-        "bfloat16",
-        "fp8",
-        "fp8_e4m3",
-    ]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = (
+        _triton_mla_supported_kv_cache_dtypes()
+    )
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:

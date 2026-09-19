@@ -94,7 +94,7 @@ def _make_layer(recorder: _Recorder, *, hc_attn_fn_broadcast=None):
     ffn_norm.weight = torch.ones(HIDDEN_SIZE)
     ffn_norm.variance_epsilon = 1e-6
     layer.ffn_norm = ffn_norm
-    layer.ffn = lambda x, input_ids: x
+    layer.ffn = lambda x, input_ids, mega_gate_metadata=None: x
     return layer
 
 

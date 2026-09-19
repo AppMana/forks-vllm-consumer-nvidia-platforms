@@ -39,7 +39,12 @@ class _FakeMultiGroupBlockTable:
 
     def compute_slot_mapping(self, num_reqs, query_start_loc, positions):
         self.calls.append(
-            ("compute_slot_mapping", num_reqs, tuple(query_start_loc.tolist()), len(positions))
+            (
+                "compute_slot_mapping",
+                num_reqs,
+                tuple(query_start_loc.tolist()),
+                len(positions),
+            )
         )
 
     def clear_row(self, row_idx):
@@ -68,6 +73,8 @@ class _FakeModelRunner:
     scheduler_config = SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=6)
     max_model_len = 1024
     kv_block_zeroer = None
+    adaptive_verification = None
+    rejection_sampler = None
     vllm_config = SimpleNamespace(
         num_lookahead_tokens=0,
         is_mm_encoder_only=False,
@@ -91,9 +98,7 @@ def test_mixed_prefill_decode_warmup_drains_async_pp_slots():
         16,
     )
 
-    scheduled_token_counts = [
-        output.total_num_scheduled_tokens for output in executed
-    ]
+    scheduled_token_counts = [output.total_num_scheduled_tokens for output in executed]
     assert scheduled_token_counts == [
         2,
         0,
@@ -281,9 +286,7 @@ def test_topk_topp_warmup_covers_each_triton_specialization(monkeypatch):
         )
         return logits
 
-    monkeypatch.setattr(
-        gpu_warmup, "apply_top_k_top_p_triton", apply, raising=False
-    )
+    monkeypatch.setattr(gpu_warmup, "apply_top_k_top_p_triton", apply, raising=False)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     assert gpu_warmup.warmup_topk_topp_sampler(runner)
@@ -492,6 +495,8 @@ def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch)
         ),
         device=torch.device("cuda", 0),
         num_speculative_steps=0,
+        adaptive_verification=None,
+        rejection_sampler=None,
         vllm_config=SimpleNamespace(is_mm_encoder_only=False),
     )
 

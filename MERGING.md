@@ -113,7 +113,11 @@ B. Native: `uv pip install -e . --no-build-isolation --no-deps` with the
 C. The fork test set, defined as every test file the fork adds or modifies
    (`git diff --name-only upstream/main HEAD -- tests/`), run on both A5000s
    against the recorded pre-merge baseline; the post-merge failure set must
-   be a subset of it, and every new failure gets a red-first fix.
+   be a subset of it, and every new failure gets a red-first fix. Tests that
+   upstream added for hardware the deployment does not have (DeepSeek V4.1
+   NVFP4/MXFP8 cache kernels, TileLang mHC, anything casting to fp8e4nv in
+   Triton below SM89) are recorded as not applicable with their error
+   signature, not fixed and not skipped in the shared test files.
 D. Serving on the mini checkpoints at PP=1 and PP=2 with CUDA graphs:
    recorded token ids must match the pre-merge recordings for every image
    count, and the JIT monitor must report no compiles on a second request at

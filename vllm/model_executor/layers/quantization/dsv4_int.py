@@ -1061,15 +1061,12 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         process_weights_after_loading does via replace_parameter.
         """
         num_experts = weight.shape[0]
-        device = weight.device
-        perm = torch.empty(0, dtype=torch.int, device=device)
 
         def pack_one(expert_weight: torch.Tensor) -> torch.Tensor:
             gptq_weight = expert_weight.view(torch.uint8).view(torch.int32)
             gptq_weight = gptq_weight.t().contiguous()
             return ops.gptq_marlin_repack(
                 gptq_weight,
-                perm,
                 size_k,
                 size_n,
                 4,
@@ -1150,17 +1147,6 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
 
-        empty_g_idx = torch.empty(self.num_experts, 0, dtype=torch.int32, device=device)
-        layer.w13_weight_g_idx = torch.nn.Parameter(empty_g_idx, requires_grad=False)
-        layer.w2_weight_g_idx = torch.nn.Parameter(
-            empty_g_idx.clone(), requires_grad=False
-        )
-        layer.w13_g_idx_sort_indices = torch.nn.Parameter(
-            empty_g_idx.clone(), requires_grad=False
-        )
-        layer.w2_g_idx_sort_indices = torch.nn.Parameter(
-            empty_g_idx.clone(), requires_grad=False
-        )
         layer.workspace = marlin_make_workspace_new(device, 4)
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
@@ -1200,12 +1186,7 @@ class Dsv4Int4MoEMethod(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             activation=layer.activation,
             expert_map=layer.expert_map,
-            g_idx1=layer.w13_weight_g_idx,
-            g_idx2=layer.w2_weight_g_idx,
-            sort_indices1=layer.w13_g_idx_sort_indices,
-            sort_indices2=layer.w2_g_idx_sort_indices,
             workspace=layer.workspace,
-            is_k_full=True,
             input_dtype=self.input_dtype,
             input_global_scale1=getattr(layer, "w13_input_global_scale", None),
             input_global_scale2=getattr(layer, "w2_input_global_scale", None),
