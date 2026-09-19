@@ -4,8 +4,8 @@
 
 This fork serves DeepSeek-V4-Flash and DeepSeek-V4-Flash-Vision-Exp on RTX
 30xx and DGX Spark GB10 GPUs from one image. Upstream vLLM is merged
-regularly; `MERGING.md` records the procedure and the invariants each merge
-has to preserve.
+regularly (last: upstream `729ebac498`, merged 2026-09-18); `MERGING.md`
+records the procedure and the invariants each merge has to preserve.
 
 ## Supported checkpoints
 
