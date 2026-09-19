@@ -163,3 +163,8 @@ F. Chain acceptance on the deployment: same-day baseline against the
    previous image, needle recall and latency at C=1 through C=8, the vision
    fixture set, concurrency, cache isolation, Redis recovery and the
    per-rank memory floor, as documented in the deployment repository.
+   Read the leader's `cuda_graph.py` runtime statistics during the C=8
+   rows: every decode forward must be a FULL replay. A `Runtime Mode NONE`
+   row at 24 tokens or more means the pinned `cudagraph_capture_sizes`
+   (tokens, multiples of the speculative step) no longer reach
+   max-num-seqs times the step, and those batches decode at half speed.
