@@ -1572,6 +1572,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         apt-get update -y && \
         apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
+        # LMCache's build_py regenerates its gRPC stubs (the generated
+        # *_pb2.py files are gitignored) with grpc_tools, which
+        # --no-build-isolation expects in the image; grpcio stays for the
+        # multiprocess transport at run time. Pinned to LMCache's build.txt.
+        uv pip install --system "grpcio==1.78.0" "grpcio-tools==1.78.0" && \
         CUDA_HOME=/usr/local/cuda \
         uv pip install --system --no-deps --no-build-isolation --force-reinstall \
             "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}" && \
