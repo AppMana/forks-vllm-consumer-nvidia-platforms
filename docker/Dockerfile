@@ -1482,7 +1482,7 @@ ARG INSTALL_KV_CONNECTORS=false
 ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
 ARG CUDA_VERSION
-ARG LMCACHE_GIT_REF=7db3e268432eb619a9b1b9fa2ed5590d97b48177
+ARG LMCACHE_GIT_REF=0982a7f901aa727b225513a8f526432887bfa4b2
 # FlashMLA (int8 + sparse MLA) comes from the fork's PEP 503 simple index, not
 # a pinned wheel URL: the URL baked in an x86_64 filename, so an aarch64 build
 # could not install it at all. The index lets pip resolve per platform.
