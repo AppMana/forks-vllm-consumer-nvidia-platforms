@@ -76,6 +76,9 @@
     "SCCACHE_S3_NO_CREDENTIALS": {
       "default": "0"
     },
+    "SCCACHE_VERSION": {
+      "default": "v0.16.0"
+    },
     "TORCH_CUDA_ARCH_LIST": {
       "default": "8.6 12.1a"
     },
@@ -84,9 +87,6 @@
     },
     "NVCC_THREADS": {
       "default": "8"
-    },
-    "SCCACHE_VERSION": {
-      "default": "v0.16.0"
     },
     "SCCACHE_RECACHE": {
       "default": "0"

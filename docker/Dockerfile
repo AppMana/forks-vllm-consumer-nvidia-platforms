@@ -211,17 +211,21 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
 # Install sccache once in base so the Rust and CMake/CUDA build stages share
 # the same binary. Installed unconditionally: USE_SCCACHE only decides whether
 # the build stages use it, so toggling it never invalidates the base layers.
+# The version must honour SCCACHE_SERVER_UDS (0.9 and later): rootless
+# buildkit runs parallel stages in one network namespace, so two daemons on
+# the default TCP port would be one daemon serving two mount namespaces.
+ARG SCCACHE_VERSION=v0.16.0
 RUN echo "Installing sccache..." \
     && case "${TARGETPLATFORM}" in \
       linux/arm64) SCCACHE_ARCH="aarch64" ;; \
       linux/amd64) SCCACHE_ARCH="x86_64" ;; \
       *) echo "Unsupported TARGETPLATFORM for sccache: ${TARGETPLATFORM}" >&2; exit 1 ;; \
     esac \
-    && export SCCACHE_DOWNLOAD_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
+    && export SCCACHE_DOWNLOAD_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
     && curl -L -o sccache.tar.gz ${SCCACHE_DOWNLOAD_URL} \
     && tar -xzf sccache.tar.gz \
-    && sudo mv sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
-    && rm -rf sccache.tar.gz sccache-v0.8.1-${SCCACHE_ARCH}-unknown-linux-musl
+    && sudo mv sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
+    && rm -rf sccache.tar.gz sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl
 
 ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME}}
 ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION_NAME}}
@@ -414,8 +418,10 @@ COPY build_rust.sh build_rust.sh
 ENV CARGO_BUILD_JOBS=4
 
 # BuildKit can run this stage in parallel with csrc-build. Keep Rust on its
-# own sccache daemon (its own socket, outside the shared cache mount) while
-# sharing the same remote cache backend.
+# own sccache daemon (its own socket outside the shared cache mount, and its
+# own TCP port in case the socket setting is ever ignored) while sharing the
+# same remote cache backend.
+ENV SCCACHE_SERVER_PORT=4227
 
 # Build with a stable version so this target snapshot is keyed only by Rust
 # inputs. The child stage below relinks the crates that embed the exact version.
@@ -432,7 +438,6 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi; \
         export RUSTC_WRAPPER=sccache; \
-        sccache --start-server; \
         sccache --show-stats; \
     fi \
     && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+docker.cache" bash build_rust.sh \
@@ -512,7 +517,6 @@ ENV NVCC_THREADS=$nvcc_threads
 
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
-ARG SCCACHE_VERSION=v0.16.0
 ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
