@@ -498,8 +498,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
                 _COMBINE_TOPK_SWA_INDICES_KERNEL.register_warmup()
 
-            from vllm.utils.import_utils import has_cutedsl
-
             _FUSED_Q_KV_RMSNORM_KERNEL.register_warmup()
 
             backend_name = self.backend_cls.get_name()
@@ -1151,21 +1149,20 @@ class DeepseekV4Indexer(nn.Module):
             _indexer_cache_fmt,
             _indexer_query_mode,
         )
-        if vllm_config.kernel_config.enable_jit_warmup:
-            from vllm.utils.import_utils import has_cutedsl
+        if (
+            vllm_config.kernel_config.enable_jit_warmup
+            and current_platform.is_cuda()
+            and has_cutedsl()
+        ):
+            from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (  # noqa: E501
+                _INDEXER_Q_FP8_KERNEL,
+                _INDEXER_Q_MXFP4_KERNEL,
+            )
 
-            if current_platform.is_cuda() and has_cutedsl():
-                from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (  # noqa: E501
-                    _INDEXER_Q_FP8_KERNEL,
-                    _INDEXER_Q_MXFP4_KERNEL,
-                )
-
-                indexer_q_kernel = (
-                    _INDEXER_Q_MXFP4_KERNEL
-                    if self.use_fp4_kv
-                    else _INDEXER_Q_FP8_KERNEL
-                )
-                indexer_q_kernel.register_warmup()
+            indexer_q_kernel = (
+                _INDEXER_Q_MXFP4_KERNEL if self.use_fp4_kv else _INDEXER_Q_FP8_KERNEL
+            )
+            indexer_q_kernel.register_warmup()
 
         # no tensor parallel, just replicated
         self.wq_b = ReplicatedLinear(
@@ -1249,20 +1246,21 @@ class DeepseekV4Indexer(nn.Module):
             torch.cuda.Event(),
         ]
 
-        if vllm_config.kernel_config.enable_jit_warmup:
-            from vllm.utils.import_utils import has_cutedsl
+        if (
+            vllm_config.kernel_config.enable_jit_warmup
+            and not has_cutedsl()
+            and not current_platform.is_xpu()
+        ):
+            from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
+                _FUSED_INDEXER_Q_ROPE_MXFP4_TRITON_KERNEL,
+                _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL,
+            )
 
-            if not has_cutedsl() and not current_platform.is_xpu():
-                from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
-                    _FUSED_INDEXER_Q_ROPE_MXFP4_TRITON_KERNEL,
-                    _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL,
-                )
-
-                (
-                    _FUSED_INDEXER_Q_ROPE_MXFP4_TRITON_KERNEL
-                    if self.use_fp4_kv
-                    else _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL
-                ).register_warmup()
+            (
+                _FUSED_INDEXER_Q_ROPE_MXFP4_TRITON_KERNEL
+                if self.use_fp4_kv
+                else _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL
+            ).register_warmup()
 
     def forward(
         self,
