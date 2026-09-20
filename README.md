@@ -169,26 +169,49 @@ overall 21.1%.
 
 Same chain, PP=11 with partition `4,4,4,4,4,4,4,4,5,5,1`, eight images per
 request, eight sequences, DSpark with seven probabilistic draft tokens,
-1,000,000-token window. A fixed set of 100 images (30 five-character OCR
+1,000,000-token window, FULL_DECODE_ONLY graphs at capture sizes
+`[8,16,32,64]` tokens. A fixed set of 100 images (30 five-character OCR
 codes, 30 coloured-square positions, 20 bar charts, 20 photographs) asked
-for an exact answer, four requests at a time, 2026-09-14:
+for an exact answer, four requests at a time:
 
-| Vision tower | Correct | Median request s | p95 request s |
-| --- | ---: | ---: | ---: |
-| INT8 IMMA (`65df4c51`) | 100/100 | 1.50 | 3.59 |
-| BF16 reference (`bee7f4e9`) | 99/100 | 1.01 | 1.89 |
+| Vision tower | Runtime | Date | Correct | Median request s | p95 request s |
+| --- | --- | --- | ---: | ---: | ---: |
+| INT8 IMMA (`65df4c51`) | `1d8b0eae46` | 2026-09-19 | 100/100 | 0.82 | 1.31 |
+| INT8 IMMA (`65df4c51`) | `b281385271` | 2026-09-14 | 100/100 | 1.50 | 3.59 |
+| BF16 reference (`bee7f4e9`) | `b281385271` | 2026-09-14 | 99/100 | 1.01 | 1.89 |
 
-The IMMA latency in that run was Triton recompiling the vision kernels for
-every new image size; the kernels no longer specialise on token count and a
-warmup compiles them at startup, so the table is refreshed with the next
-chain run. Also validated in that run: eight concurrent requests with eight
-distinct images each, all answered correctly; a 990,160-token image prompt
-answered correctly and reused 989,952 tokens on repeat through the KV
-connector; a different image at identical geometry reused none; at least
-1.16 GiB free on every GPU throughout.
+The 2026-09-14 IMMA latency was Triton recompiling the vision kernels for
+every new image size; the kernels no longer specialise on token count, a
+warmup compiles them at startup, and the 2026-09-19 run logged no
+compilation during inference. Also in that run: eight concurrent requests
+with eight distinct images each, all correct; the same image repeated
+reused 5,120 prompt tokens through the KV connector and a different image
+at identical geometry reused none; at least 0.74 GiB free on every GPU
+with the four capture sizes.
 
-Text-only rows on the vision checkpoint follow the same table format and are
-recorded after each merge.
+Text rows on the vision checkpoint, 8,000-token prompts, thinking off,
+DSpark on, 2026-09-19, cold (new to every cache):
+
+| Input tokens | C | TTFT s | Prefill tok/s per stream | Prefill tok/s aggregate | Output tok/s per stream | Output tok/s aggregate | Verbatim |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8,000 | 1 | 1.9 | 4,155 | 4,155 | 55.0 | 49.8 | 1/1 |
+| 8,000 | 2 | 2.7 | 3,361 | 4,508 | 53.6 | 92.9 | 2/2 |
+| 8,000 | 4 | 3.7 | 2,139 | 5,710 | 47.8 | 161.2 | 4/4 |
+| 8,000 | 8 | 5.6 | 1,444 | 6,860 | 33.0 | 218.4 | 8/8 |
+
+and warm (the same prompts again from the prefix cache; one C=1 repeat and
+four C=8 repeats):
+
+| Input tokens | C | TTFT s | Prefill tok/s per stream | Prefill tok/s aggregate | Output tok/s per stream | Output tok/s aggregate | Verbatim |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8,000 | 1 | 0.6 | 13,450 | 13,450 | 54.6 | 52.9 | 1/1 |
+| 8,000 | 8 | 0.4 | 18,736 | 118,812 | 41.0 | 315.8 | 8/8 |
+| 8,000 | 8 | 0.5 | 17,410 | 112,354 | 41.1 | 316.9 | 8/8 |
+| 8,000 | 8 | 0.5 | 15,178 | 99,286 | 40.6 | 312.1 | 8/8 |
+| 8,000 | 8 | 0.4 | 20,200 | 114,611 | 40.8 | 315.5 | 8/8 |
+
+The `appmana/deepseek-v4-int4-int8` tables above predate the 2026-09-18
+merge and are re-measured when that checkpoint next serves the chain.
 
 ## Build
 
