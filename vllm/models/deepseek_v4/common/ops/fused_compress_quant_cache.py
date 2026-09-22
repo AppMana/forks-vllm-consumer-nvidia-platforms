@@ -46,17 +46,12 @@ from .fused_indexer_q import _fp32x2_to_fp4x2
 
 def compress_norm_rope_store_triton(
     state_cache: torch.Tensor,
-    kv: torch.Tensor,
-    score: torch.Tensor,
-    ape: torch.Tensor,
     num_actual: int,
     token_to_req_indices: torch.Tensor,
     positions: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
     block_size: int,
-    query_start_loc: torch.Tensor,
-    is_circular: bool,
     state_width: int,
     cos_sin_cache: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -86,17 +81,12 @@ def compress_norm_rope_store_triton(
     else:
         _FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_TRITON_KERNEL(
             state_cache=state_cache,
-            kv=kv,
-            score=score,
-            ape=ape,
             num_actual=num_actual,
             token_to_req_indices=token_to_req_indices,
             positions=positions,
             slot_mapping=slot_mapping,
             block_table=block_table,
             block_size=block_size,
-            query_start_loc=query_start_loc,
-            is_circular=is_circular,
             state_width=state_width,
             cos_sin_cache=cos_sin_cache,
             kv_cache=kv_cache,
@@ -120,12 +110,6 @@ def compress_norm_rope_store_triton(
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
-        kv,
-        kv.stride(0),
-        score,
-        score.stride(0),
-        ape,
-        ape.stride(0),
         # metadata
         token_to_req_indices,
         positions,
@@ -133,7 +117,6 @@ def compress_norm_rope_store_triton(
         block_table,
         block_table.stride(0),
         block_size,
-        query_start_loc,
         # RMSNorm
         rms_norm_weight,
         rms_norm_eps,
@@ -157,7 +140,6 @@ def compress_norm_rope_store_triton(
         SCALE_DIM=scale_dim,
         INT8_DS_MLA=int8_ds_mla,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
-        CIRCULAR=is_circular,
         num_warps=num_warps,
         **kernel_kwargs,
         **pdl_kwargs,
@@ -185,12 +167,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
-    kv_ptr,
-    kv_stride,
-    score_ptr,
-    score_stride,
-    ape_ptr,
-    ape_stride,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -198,7 +174,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     block_table_ptr,
     block_table_stride,
     block_size,
-    query_start_loc_ptr,
     # ── RMSNorm ──
     rms_norm_weight_ptr,
     rms_norm_eps,
@@ -223,7 +198,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     INT8_DS_MLA: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
-    CIRCULAR: tl.constexpr,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -251,15 +225,12 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     pos = start + tokens
     mask_pos = pos >= 0
 
-    if CIRCULAR:
-        block_numbers = tl.load(block_table_ptr + req_idx * block_table_stride)
-    else:
-        block_indices = pos // block_size
-        block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
-            mask=mask_pos,
-            other=0,
-        )
+    block_indices = pos // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask_pos,
+        other=0,
+    )
     block_offsets = pos % block_size
     head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
 
@@ -278,53 +249,18 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     combined_mask = mask_pos[:, None] & mask[None, :]
 
     # ── Softmax + weighted sum ───────────────────────────────────────
-    if CIRCULAR:
-        query_start = tl.load(query_start_loc_ptr + req_idx)
-        chunk_start = tl.load(positions_ptr + query_start)
-        current = pos >= chunk_start
-        current_idx = query_start + pos - chunk_start
-        cached_score = tl.load(
-            row_base[:, None] + STATE_WIDTH + block[None, :],
-            mask=combined_mask & ~current[:, None],
-            other=0.0,
-        )
-        raw_score = tl.load(
-            score_ptr + current_idx[:, None] * score_stride + block[None, :],
-            mask=combined_mask & current[:, None],
-            other=0.0,
-        )
-        raw_ape = tl.load(
-            ape_ptr + (pos % COMPRESS_RATIO)[:, None] * ape_stride + block[None, :],
-            mask=combined_mask & current[:, None],
-            other=0.0,
-        )
-        score = cached_score + raw_score + raw_ape
-    else:
-        score = tl.load(
-            row_base[:, None] + STATE_WIDTH + block[None, :],
-            mask=combined_mask,
-            other=float("-inf"),
-        )
+    score = tl.load(
+        row_base[:, None] + STATE_WIDTH + block[None, :],
+        mask=combined_mask,
+        other=float("-inf"),
+    )
     score = tl.softmax(score, dim=0)
 
-    if CIRCULAR:
-        cached_kv = tl.load(
-            row_base[:, None] + block[None, :],
-            mask=combined_mask & ~current[:, None],
-            other=0.0,
-        )
-        raw_kv = tl.load(
-            kv_ptr + current_idx[:, None] * kv_stride + block[None, :],
-            mask=combined_mask & current[:, None],
-            other=0.0,
-        )
-        kv = cached_kv + raw_kv
-    else:
-        kv = tl.load(
-            row_base[:, None] + block[None, :],
-            mask=combined_mask,
-            other=0.0,
-        )
+    kv = tl.load(
+        row_base[:, None] + block[None, :],
+        mask=combined_mask,
+        other=0.0,
+    )
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -708,17 +644,12 @@ def _launch_two_stage_sparse_attn_compressor(
 
 def compress_norm_rope_store_two_stage_triton(
     state_cache: torch.Tensor,
-    kv: torch.Tensor,
-    score: torch.Tensor,
-    ape: torch.Tensor,
     num_actual: int,
     token_to_req_indices: torch.Tensor,
     positions: torch.Tensor,
     slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
     block_size: int,
-    query_start_loc: torch.Tensor,
-    is_circular: bool,
     state_width: int,
     cos_sin_cache: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -771,17 +702,12 @@ def compress_norm_rope_store_two_stage_triton(
     if num_decodes > 0:
         compress_norm_rope_store_triton(
             state_cache=state_cache,
-            kv=kv,
-            score=score,
-            ape=ape,
             num_actual=num_decodes,
             token_to_req_indices=token_to_req_indices,
             positions=positions,
             slot_mapping=slot_mapping,
             block_table=block_table,
             block_size=block_size,
-            query_start_loc=query_start_loc,
-            is_circular=is_circular,
             state_width=state_width,
             cos_sin_cache=cos_sin_cache,
             kv_cache=kv_cache,
@@ -828,12 +754,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
-    kv_ptr,
-    kv_stride,
-    score_ptr,
-    score_stride,
-    ape_ptr,
-    ape_stride,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -841,7 +761,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     block_table_ptr,
     block_table_stride,
     block_size,
-    query_start_loc_ptr,
     # ── RMSNorm ──
     rms_norm_weight_ptr,
     rms_norm_eps,
@@ -864,7 +783,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
-    CIRCULAR: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -896,15 +814,12 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     pos = start + tokens
     mask_pos = pos >= 0
 
-    if CIRCULAR:
-        block_numbers = tl.load(block_table_ptr + req_idx * block_table_stride)
-    else:
-        block_indices = pos // block_size
-        block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
-            mask=mask_pos,
-            other=0,
-        )
+    block_indices = pos // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask_pos,
+        other=0,
+    )
     block_offsets = pos % block_size
     head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
 
@@ -921,53 +836,18 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     combined_mask = mask_pos[:, None] & mask[None, :]
 
-    if CIRCULAR:
-        query_start = tl.load(query_start_loc_ptr + req_idx)
-        chunk_start = tl.load(positions_ptr + query_start)
-        current = pos >= chunk_start
-        current_idx = query_start + pos - chunk_start
-        cached_score = tl.load(
-            row_base[:, None] + STATE_WIDTH + block[None, :],
-            mask=combined_mask & ~current[:, None],
-            other=0.0,
-        )
-        raw_score = tl.load(
-            score_ptr + current_idx[:, None] * score_stride + block[None, :],
-            mask=combined_mask & current[:, None],
-            other=0.0,
-        )
-        raw_ape = tl.load(
-            ape_ptr + (pos % COMPRESS_RATIO)[:, None] * ape_stride + block[None, :],
-            mask=combined_mask & current[:, None],
-            other=0.0,
-        )
-        score = cached_score + raw_score + raw_ape
-    else:
-        score = tl.load(
-            row_base[:, None] + STATE_WIDTH + block[None, :],
-            mask=combined_mask,
-            other=float("-inf"),
-        )
+    score = tl.load(
+        row_base[:, None] + STATE_WIDTH + block[None, :],
+        mask=combined_mask,
+        other=float("-inf"),
+    )
     score = tl.softmax(score, dim=0)
 
-    if CIRCULAR:
-        cached_kv = tl.load(
-            row_base[:, None] + block[None, :],
-            mask=combined_mask & ~current[:, None],
-            other=0.0,
-        )
-        raw_kv = tl.load(
-            kv_ptr + current_idx[:, None] * kv_stride + block[None, :],
-            mask=combined_mask & current[:, None],
-            other=0.0,
-        )
-        kv = cached_kv + raw_kv
-    else:
-        kv = tl.load(
-            row_base[:, None] + block[None, :],
-            mask=combined_mask,
-            other=0.0,
-        )
+    kv = tl.load(
+        row_base[:, None] + block[None, :],
+        mask=combined_mask,
+        other=0.0,
+    )
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -1069,12 +949,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
-    kv_ptr,
-    kv_stride,
-    score_ptr,
-    score_stride,
-    ape_ptr,
-    ape_stride,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -1082,7 +956,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     block_table_ptr,
     block_table_stride,
     block_size,
-    query_start_loc_ptr,
     # ── RMSNorm ──
     rms_norm_weight_ptr,
     rms_norm_eps,
@@ -1105,7 +978,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
     KV_BLOCK_STRIDE: tl.constexpr,
-    CIRCULAR: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
 
@@ -1139,15 +1011,12 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     pos = start + tokens
     mask_pos = pos >= 0
 
-    if CIRCULAR:
-        block_numbers = tl.load(block_table_ptr + req_idx * block_table_stride)
-    else:
-        block_indices = pos // block_size
-        block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
-            mask=mask_pos,
-            other=0,
-        )
+    block_indices = pos // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask_pos,
+        other=0,
+    )
     block_offsets = pos % block_size
     head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
 
@@ -1164,53 +1033,18 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
 
     combined_mask = mask_pos[:, None] & mask[None, :]
 
-    if CIRCULAR:
-        query_start = tl.load(query_start_loc_ptr + req_idx)
-        chunk_start = tl.load(positions_ptr + query_start)
-        current = pos >= chunk_start
-        current_idx = query_start + pos - chunk_start
-        cached_score = tl.load(
-            row_base[:, None] + STATE_WIDTH + block[None, :],
-            mask=combined_mask & ~current[:, None],
-            other=0.0,
-        )
-        raw_score = tl.load(
-            score_ptr + current_idx[:, None] * score_stride + block[None, :],
-            mask=combined_mask & current[:, None],
-            other=0.0,
-        )
-        raw_ape = tl.load(
-            ape_ptr + (pos % COMPRESS_RATIO)[:, None] * ape_stride + block[None, :],
-            mask=combined_mask & current[:, None],
-            other=0.0,
-        )
-        score = cached_score + raw_score + raw_ape
-    else:
-        score = tl.load(
-            row_base[:, None] + STATE_WIDTH + block[None, :],
-            mask=combined_mask,
-            other=float("-inf"),
-        )
+    score = tl.load(
+        row_base[:, None] + STATE_WIDTH + block[None, :],
+        mask=combined_mask,
+        other=float("-inf"),
+    )
     score = tl.softmax(score, dim=0)
 
-    if CIRCULAR:
-        cached_kv = tl.load(
-            row_base[:, None] + block[None, :],
-            mask=combined_mask & ~current[:, None],
-            other=0.0,
-        )
-        raw_kv = tl.load(
-            kv_ptr + current_idx[:, None] * kv_stride + block[None, :],
-            mask=combined_mask & current[:, None],
-            other=0.0,
-        )
-        kv = cached_kv + raw_kv
-    else:
-        kv = tl.load(
-            row_base[:, None] + block[None, :],
-            mask=combined_mask,
-            other=0.0,
-        )
+    kv = tl.load(
+        row_base[:, None] + block[None, :],
+        mask=combined_mask,
+        other=0.0,
+    )
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -1441,17 +1275,12 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
         )
         return dict(
             state_cache=fp32_ptr,
-            kv=fp32_ptr,
-            score=fp32_ptr,
-            ape=fp32_ptr,
             num_actual=1,
             token_to_req_indices=int32_ptr,
             positions=int64_ptr,
             slot_mapping=int64_ptr,
             block_table=int32_ptr,
             block_size=compile_key.block_size,
-            query_start_loc=int32_ptr,
-            is_circular=False,
             state_width=compile_key.state_width,
             cos_sin_cache=fp32_ptr,
             kv_cache=kv_cache,
@@ -1477,17 +1306,12 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
         self,
         *,
         state_cache: torch.Tensor,
-        kv: torch.Tensor,
-        score: torch.Tensor,
-        ape: torch.Tensor,
         num_actual: int,
         token_to_req_indices: torch.Tensor,
         positions: torch.Tensor,
         slot_mapping: torch.Tensor,
         block_table: torch.Tensor,
         block_size: int,
-        query_start_loc: torch.Tensor,
-        is_circular: bool,
         state_width: int,
         cos_sin_cache: torch.Tensor,
         kv_cache: torch.Tensor,
@@ -1512,14 +1336,7 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
             ),
             state_cache_stride0=state_cache.stride(0),
             state_cache_stride1=state_cache.stride(1),
-            kv_ptr=kv,
-            kv_stride=kv.stride(0),
-            score_ptr=score,
-            score_stride=score.stride(0),
-            ape_ptr=ape,
-            ape_stride=ape.stride(0),
             block_table_stride=block_table.stride(0),
-            query_start_loc_ptr=query_start_loc,
             cos_sin_stride=cos_sin_cache.stride(0),
             k_cache_ptr=kv_cache,
             kv_slot_mapping_ptr=k_cache_metadata.slot_mapping,
@@ -1535,7 +1352,6 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
             TOKEN_STRIDE=token_stride,
             SCALE_DIM=scale_dim,
             KV_BLOCK_STRIDE=kv_cache.stride(0),
-            CIRCULAR=is_circular,
             num_warps=1,
             **pdl_kwargs,
         )
