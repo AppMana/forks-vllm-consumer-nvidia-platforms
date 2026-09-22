@@ -129,9 +129,6 @@ def _build_c128_ring_metadata(
     )
 
 
-_BUILD_C128_RING_METADATA_KERNEL = _build_c128_ring_metadata
-
-
 def build_c128_ring_metadata(
     slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
@@ -164,7 +161,7 @@ def build_c128_ring_metadata(
         ).to(torch.int32)
 
     if positions.is_cuda:
-        _BUILD_C128_RING_METADATA_KERNEL(
+        _build_c128_ring_metadata(
             block_table,
             query_start_loc,
             token_to_req_indices,
@@ -242,11 +239,10 @@ class CompressorMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     block_size: int
-
-    token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
-    tail_slot_mapping: torch.Tensor | None = None  # [num_tokens]
-    query_start_loc: torch.Tensor | None = None  # [num_reqs + 1]
-    is_circular: bool = False
+    token_to_req_indices: torch.Tensor  # [num_tokens]
+    tail_slot_mapping: torch.Tensor  # [num_tokens]
+    query_start_loc: torch.Tensor  # [num_reqs + 1]
+    is_circular: bool
     num_decode_tokens: int | None = None
     c128_boundary: bool | None = None
 
@@ -275,11 +271,15 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        self.slot_mapping_buffer = torch.empty(
-            max_num_batched_tokens, dtype=torch.int64, device=self.device
+        self.slot_mapping_buffer = (
+            torch.empty(max_num_batched_tokens, dtype=torch.int64, device=self.device)
+            if self.is_circular
+            else None
         )
-        self.tail_slot_mapping_buffer = torch.empty(
-            max_num_batched_tokens, dtype=torch.int64, device=self.device
+        self.tail_slot_mapping_buffer = (
+            torch.empty(max_num_batched_tokens, dtype=torch.int64, device=self.device)
+            if self.is_circular
+            else None
         )
 
     def build(
@@ -293,6 +293,8 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         )
         num_tokens = common_attn_metadata.slot_mapping.numel()
         if self.is_circular:
+            assert self.slot_mapping_buffer is not None
+            assert self.tail_slot_mapping_buffer is not None
             positions = common_attn_metadata.positions
             assert positions is not None
             slot_mapping, tail_slot_mapping = build_c128_ring_metadata(
@@ -380,11 +382,6 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         self.kv_cache = kv_cache.squeeze(1)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # This cache stores FP32 compressor state, not packed MLA KV rows.
-        # Keep the physical page aligned with the cache it overlays, but do
-        # not select that cache's packed row-size formula.
-        uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
-        uses_int8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "int8_ds_mla"
         if self.compress_ratio == 128 and current_platform.is_cuda():
             return CircularBufferSpec(
                 block_size=_c128_ring_capacity(vllm_config.num_speculative_tokens),
@@ -393,6 +390,11 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
                 head_size_v=0,
                 dtype=self.dtype,
             )
+        # This cache stores FP32 compressor state, not packed MLA KV rows.
+        # Keep the physical page aligned with the cache it overlays, but do
+        # not select that cache's packed row-size formula.
+        uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        uses_int8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "int8_ds_mla"
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
@@ -564,7 +566,7 @@ class DeepseekCompressor(nn.Module):
 
         if vllm_config.kernel_config.enable_jit_warmup:
             if self.compress_ratio == 128 and current_platform.is_cuda():
-                _BUILD_C128_RING_METADATA_KERNEL.register_warmup(
+                _build_c128_ring_metadata.register_warmup(
                     capacity=_c128_ring_capacity(vllm_config.num_speculative_tokens)
                 )
             _SAVE_PARTIAL_STATES_KERNEL.register_warmup(
@@ -632,8 +634,6 @@ class DeepseekCompressor(nn.Module):
         token_to_req_indices = state_metadata.token_to_req_indices
         slot_mapping = state_metadata.slot_mapping
         tail_slot_mapping = state_metadata.tail_slot_mapping
-        assert token_to_req_indices is not None
-        assert tail_slot_mapping is not None
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
@@ -712,13 +712,11 @@ class DeepseekCompressor(nn.Module):
             # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
             # layout and the plain full-cache layout. The full-cache flags
             # are consumed only here.
-            query_start_loc = state_metadata.query_start_loc
-            assert query_start_loc is not None
             extra_kwargs: dict[str, Any] = dict(
                 kv=kv,
                 score=score,
                 ape=self.ape,
-                query_start_loc=query_start_loc,
+                query_start_loc=state_metadata.query_start_loc,
                 is_circular=state_metadata.is_circular,
                 store_full_kv=store_full_kv,
                 store_full_fp8=store_full_fp8,
