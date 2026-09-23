@@ -50,6 +50,11 @@ BUILDKIT_SERVICE="${BUILDKIT_SERVICE:-buildkitd-vllm}"
 # What to port-forward to. A pod name pins the build to one node, which a
 # Service cannot do through kubectl port-forward.
 BUILDKIT_TARGET="${BUILDKIT_TARGET:-svc/$BUILDKIT_SERVICE}"
+# Dial BuildKit directly instead of through kubectl port-forward, e.g.
+# tcp://10.152.184.4:1234 (appmana's buildkitd-vllm ClusterIP, routed to the
+# LAN over BGP). The session then does not depend on the API server staying
+# responsive for the whole build. Requires the mTLS client certificate.
+BUILDKIT_ADDR="${BUILDKIT_ADDR:-}"
 # Per-architecture layer cache: two mode=max exports to one ref overwrite each
 # other. amd64 keeps the historical `buildcache` ref, which is the warm one.
 CACHE_REF="${CACHE_REF:-}"
@@ -169,37 +174,46 @@ if [ "$USE_SCCACHE" = "1" ]; then
         --opt "build-arg:SCCACHE_REGION_NAME=$SCCACHE_REGION_NAME"
     )
 fi
-# Let kubectl pick a free local port and read it back, so a stale forward left
-# on a fixed port by another run can never be reused silently. The API server
-# can stall a single request past kubectl's own 32 s timeout (a control-plane
-# node with a slow disk), so each attempt gets 45 s and the forward is retried.
-start_port_forward() {
-    kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" "$BUILDKIT_TARGET" \
-        ":1234" > "$workdir/port-forward.log" 2>&1 < /dev/null &
-    pf_pid=$!
-    local_port=""
-    for _ in $(seq 1 45); do
-        if ! kill -0 "$pf_pid" 2>/dev/null; then
-            return 1
-        fi
-        local_port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 1234$/\1/p' "$workdir/port-forward.log" | head -n 1)"
-        [ -n "$local_port" ] && return 0
-        sleep 1
-    done
-    kill "$pf_pid" 2>/dev/null || true
-    wait "$pf_pid" 2>/dev/null || true
-    return 1
-}
-for attempt in 1 2 3; do
-    start_port_forward && break
-    echo "port-forward to $BUILDKIT_TARGET attempt $attempt failed:" >&2
-    cat "$workdir/port-forward.log" >&2
-    pf_pid=""
-    if [ "$attempt" = 3 ]; then
+if [ -n "$BUILDKIT_ADDR" ]; then
+    if [ "${#tls_options[@]}" -eq 0 ]; then
+        echo "BUILDKIT_ADDR needs the $CONTEXT_NS/buildkit-client-tls mTLS certificate" >&2
         exit 1
     fi
-done
-buildctl --addr "tcp://127.0.0.1:$local_port" "${tls_options[@]}" debug workers >/dev/null
+    buildkit_addr="$BUILDKIT_ADDR"
+else
+    # Let kubectl pick a free local port and read it back, so a stale forward left
+    # on a fixed port by another run can never be reused silently. The API server
+    # can stall a single request past kubectl's own 32 s timeout (a control-plane
+    # node with a slow disk), so each attempt gets 45 s and the forward is retried.
+    start_port_forward() {
+        kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" "$BUILDKIT_TARGET" \
+            ":1234" > "$workdir/port-forward.log" 2>&1 < /dev/null &
+        pf_pid=$!
+        local_port=""
+        for _ in $(seq 1 45); do
+            if ! kill -0 "$pf_pid" 2>/dev/null; then
+                return 1
+            fi
+            local_port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 1234$/\1/p' "$workdir/port-forward.log" | head -n 1)"
+            [ -n "$local_port" ] && return 0
+            sleep 1
+        done
+        kill "$pf_pid" 2>/dev/null || true
+        wait "$pf_pid" 2>/dev/null || true
+        return 1
+    }
+    for attempt in 1 2 3; do
+        start_port_forward && break
+        echo "port-forward to $BUILDKIT_TARGET attempt $attempt failed:" >&2
+        cat "$workdir/port-forward.log" >&2
+        pf_pid=""
+        if [ "$attempt" = 3 ]; then
+            exit 1
+        fi
+    done
+    buildkit_addr="tcp://127.0.0.1:$local_port"
+fi
+buildctl --addr "$buildkit_addr" "${tls_options[@]}" debug workers >/dev/null
 
 echo "building $IMAGE for $PLATFORM from $REF at $resolved_commit (cache $CACHE_REF)"
 
@@ -227,7 +241,7 @@ fi
 # Dockerfile bind-mounts it for tools/check_repo.sh, which otherwise fails with
 # 'failed to calculate checksum of ref ...: "/.git": not found'.
 buildctl \
-    --addr "tcp://127.0.0.1:$local_port" \
+    --addr "$buildkit_addr" \
     "${tls_options[@]}" \
     build \
     --frontend dockerfile.v0 \
