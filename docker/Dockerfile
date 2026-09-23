@@ -612,6 +612,24 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 #################### EXTENSIONS BUILD IMAGE ####################
 # Build DeepEP - runs in PARALLEL with csrc-build
 # This stage is independent and doesn't affect csrc cache
+# Kernel symbol map for CI test selection: which source file produced each GPU
+# kernel symbol, read from the objects this stage just compiled. Only when
+# VLLM_KERNEL_SYMBOL_MAP=1 (nightly), and placed after the compile layers so
+# their cache is untouched. Never fails the build; an empty map is a signal.
+ARG VLLM_KERNEL_SYMBOL_MAP=""
+ARG buildkite_commit=""
+COPY tools/ci/kernel_symbol_map.py tools/ci/kernel_symbol_map.py
+RUN if [ "${VLLM_KERNEL_SYMBOL_MAP}" = "1" ]; then \
+        mkdir -p dist && python3 tools/ci/kernel_symbol_map.py \
+            --build-root build --source-root . --commit "${buildkite_commit}" \
+            --out dist/kernel_symbol_map.json.gz; \
+    else echo "Skipping kernel symbol map (VLLM_KERNEL_SYMBOL_MAP != 1)"; fi
+
+# Exported on its own by the CI bake target of the same name (ci-infra
+# docker/ci.hcl) with output=type=local, so the map becomes a build artifact.
+FROM scratch AS kernel-symbol-map
+COPY --from=csrc-build /workspace/dist/kernel_symbol_map.json.gz /kernel_symbol_map.json.gz
+
 FROM base AS extensions-build
 ARG TARGETARCH
 ARG BUILD_OS
@@ -922,6 +940,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 FROM ${FINAL_BASE_IMAGE} AS vllm-runtime-base
 
 ARG INSTALL_RUBIN_PRERELEASE
+ARG TARGETPLATFORM
+ARG max_jobs=2
 ARG CUDA_VERSION
 ARG BUILD_DEEPEP
 ARG PYTHON_VERSION
@@ -1106,6 +1126,20 @@ RUN if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         fi \
         && ldconfig; \
     fi
+
+# Install the initialized-snapshot runtime on the architecture supported by
+# `vllm snapshot`. CRIU and its CUDA plugin are built from the same pinned
+# source. The `cuda-checkpoint`-compatible helper is built from NVIDIA Dynamo's
+# Apache-2.0 source against the public CUDA Driver checkpoint APIs instead of
+# redistributing NVIDIA's proprietary cuda-checkpoint binary.
+COPY tools/install_snapshot_runtime.sh /usr/local/bin/install_snapshot_runtime.sh
+RUN if [ "${TARGETPLATFORM}" = "linux/amd64" ]; then \
+        MAX_JOBS="${max_jobs}" /usr/local/bin/install_snapshot_runtime.sh; \
+    else \
+        echo "Initialized snapshots are not installed for ${TARGETPLATFORM}"; \
+    fi
+
+ENV CRIU_CUDA_PLUGIN_DIR=/usr/local/lib/criu
 
 # Install uv for faster pip installs
 RUN python3 -m pip install uv
@@ -1315,6 +1349,10 @@ RUN if [ "${REPLACE_TORCH_BUNDLED_NCCL}" = "true" ]; then \
       fi; \
       ln -sf "${SYSTEM_NCCL}" "${TORCH_NCCL_DIR}/libnccl.so.2"; \
     fi
+
+# Expose the Rust frontend bundled in the wheel on the container's PATH.
+RUN ln -s "$(python3 -c 'import sysconfig; print(sysconfig.get_path("platlib"))')/vllm/vllm-rs" /usr/local/bin/vllm-rs \
+    && vllm-rs --version
 
 RUN --mount=type=cache,target=/opt/uv/cache \
 . /etc/environment && \
@@ -1527,18 +1565,27 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 ARG torch_cuda_arch_list='8.6 12.1a'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
-    set -e; \
+    --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
+    set -eu; \
+    CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
     CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-'); \
     BUILD_PKGS="libcusparse-dev-${CUDA_VERSION_DASH} \
                 libcublas-dev-${CUDA_VERSION_DASH} \
                 libcusolver-dev-${CUDA_VERSION_DASH}"; \
     if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
-        uv pip freeze --system | grep -E '^(opentelemetry-|prometheus[-_]client==)' > /tmp/otel-pins.txt; \
-        uv pip install --system -r /tmp/kv_connectors.txt --no-build || ( \
+        KV_REQUIREMENTS=/tmp/vllm-requirements/kv_connectors.txt; \
+        if [ "${CUDA_MAJOR}" = "12" ]; then \
+            KV_REQUIREMENTS=/tmp/vllm-requirements/kv_connectors_cu12.txt; \
+        fi; \
+        # Preserve the stack used to compile vLLM when resolving optional dependencies. \
+        uv pip freeze --system > /tmp/kv-installed.txt; \
+        grep -E '^(torch|torchaudio|torchvision|triton|cuda-bindings|cuda-python|cuda-toolkit)==' \
+            /tmp/kv-installed.txt > /tmp/kv-constraints.txt; \
+        grep -E '^(opentelemetry-|prometheus[-_]client==)' /tmp/kv-installed.txt > /tmp/otel-pins.txt; \
+        uv pip install --system -c /tmp/kv-constraints.txt -r "${KV_REQUIREMENTS}" --no-build || ( \
             apt-get update -y && \
             apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
-            uv pip install --system -r /tmp/kv_connectors.txt --no-build-isolation && \
+            uv pip install --system -c /tmp/kv-constraints.txt -r "${KV_REQUIREMENTS}" --no-build-isolation && \
             apt-get purge -y --allow-change-held-packages ${BUILD_PKGS} && \
             rm -rf /var/lib/apt/lists/* \
         ); \
@@ -1592,8 +1639,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         MOONCAKE_VERSION=$(python3 -c "import importlib.metadata as m; print(m.version('mooncake-transfer-engine'))" 2>/dev/null || true); \
         if [ "${CUDA_MAJOR}" = "13" ] && [ -n "${MOONCAKE_VERSION}" ]; then \
             uv pip uninstall --system mooncake-transfer-engine 2>/dev/null || true; \
-            uv pip install --system "mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"; \
+            uv pip install --system -c /tmp/kv-constraints.txt "mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"; \
         fi; \
+        rm -f /tmp/kv-installed.txt /tmp/kv-constraints.txt; \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \

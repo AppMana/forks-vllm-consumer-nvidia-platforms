@@ -10,7 +10,6 @@
 #include "core/registration.h"
 #include "libtorch_stable/torch_utils.h"
 
-
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
 torch::stable::Tensor allspark_w8a16_gemm(
@@ -765,8 +764,7 @@ size_t allspark_qgemm_w8a16_perc_n32k16_ampere_workspace_size(
   // earlier partition that has not been scheduled yet. Keep the direct fused
   // store for a single K partition only; the existing separate reduction is
   // the progress-safe path when the launch actually splits K.
-  bool enable_fuse =
-      grid_z == 1 && float(grid_x * grid_y) / sm_count >= 0.5;
+  bool enable_fuse = grid_z == 1 && float(grid_x * grid_y) / sm_count >= 0.5;
 
   size_t ws_size;
   if (enable_fuse) {

@@ -104,6 +104,14 @@ class PPHandler:
         )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
 
+        # Warmup steps run the pipeline with synthetic batches whose outputs are
+        # discarded; the sampled-token broadcast is disabled there so its
+        # side-stream NCCL ops cannot overlap the next step's activation p2p.
+        self.disabled = False
+
+    def set_disabled(self, disabled: bool) -> None:
+        self.disabled = disabled
+
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
 
@@ -164,6 +172,24 @@ class PPHandler:
         self.main_stream.wait_event(slot.event)
         if exclude_mask.any():
             payload = payload.index_select(0, row_indices)
+        return self._unpack_payload(payload, idx_mapping)
+
+    def warmup_sampled_outputs(self) -> dict[str, torch.Tensor | None]:
+        """Outputs shaped like a received payload for one masked (-1) row.
+
+        Used to JIT-compile the deferred consume path before serving: the
+        views are sliced from a payload of the real width, so every kernel
+        downstream sees the strides and alignment of a live receive.
+        """
+        payload = torch.zeros(
+            1, self.payload_width, dtype=torch.int64, device=self.device
+        )
+        idx_mapping = torch.full((1,), -1, dtype=torch.int64, device=self.device)
+        return self._unpack_payload(payload, idx_mapping)
+
+    def _unpack_payload(
+        self, payload: torch.Tensor, idx_mapping: torch.Tensor
+    ) -> dict[str, torch.Tensor | None]:
         sampled_tokens = payload[:, : self.max_sample_len]
         proposed_tokens = (
             payload[:, self.max_sample_len : self.tokens_width]
@@ -184,6 +210,8 @@ class PPHandler:
         """Returns True iff sampled tokens need to be gathered from *all*
         requests in the batch."""
         assert not self.is_last_rank
+        if self.disabled:
+            return False
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
             # Leave this step's reserved slot as None.
@@ -233,6 +261,8 @@ class PPHandler:
         proposed_token_ids: torch.Tensor | None = None,
     ) -> None:
         assert self.is_last_rank
+        if self.disabled:
+            return
         if compute_need_sampled_mask(input_batch) is None:
             # No request needs sampled outputs for a subsequent decode step.
             return
