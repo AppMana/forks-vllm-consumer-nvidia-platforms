@@ -25,7 +25,8 @@ quantization and kernel configuration.
 - Packed INT8 attention and sparse-indexer cache paths.
 - FlashMLA INT8 sparse attention for the checkpoint's decode and prefill
   selectors.
-- SparkInfer INT8 sparse-indexer scoring on GB10.
+- Integer-tensor-core (IMMA) sparse-indexer scoring over the INT8 indexer
+  cache, in Triton, on both RTX 30xx and GB10.
 - Checkpoint-configured kernel selection with fail-closed symbol validation.
 - Pipeline parallelism greater than one, including a rank that holds only the
   DSpark draft stages, and a first rank that owns the vision tower, aligner
@@ -38,7 +39,8 @@ quantization and kernel configuration.
 
 One image contains the RTX 30xx and GB10 implementations. The checkpoint's
 `vllm` block selects cache and kernel roles at startup; device capability then
-selects the platform implementation for shared roles such as indexer scoring.
+selects the platform implementation where one differs, such as the dense
+linear path.
 
 ## INT4/INT8 kernel map
 
@@ -49,15 +51,15 @@ cache first and selects those rows.
 | Function | RTX 30xx | DGX Spark GB10 |
 | --- | --- | --- |
 | Routed-expert MoE | Marlin W4A8-INT8 with INT4 weights | Marlin W4A8-INT8 with INT4 weights |
-| Dense, shared-expert and attention linears | AllSpark W8A16 for supported channel-INT8 shapes; BF16 dequantization fallback | INT8 weights dequantized once to BF16, then `F.linear`; SM12x AllSpark is disabled by default |
+| Dense, shared-expert and attention linears | AllSpark W8A16 for supported channel-INT8 shapes; BF16 dequantization fallback | AllSpark W8A16 for supported channel-INT8 shapes (`VLLM_DSV4_ALLSPARK_SM12X=0` turns it off for diagnosis); BF16 dequantization fallback |
 | `wo_a` projection | BF16 weight or one-time INT8-to-BF16 dequantization for its inverse-RoPE einsum | BF16 weight or one-time INT8-to-BF16 dequantization for its inverse-RoPE einsum |
 | Sparse-MLA attention decode | `flash_mla.sparse_mla_decode_int8` | `flash_mla.sparse_mla_decode_int8` |
 | Sparse-MLA attention prefill | `flash_mla.sparse_mla_prefill_int8` | `flash_mla.sparse_mla_prefill_int8` |
 | Indexer K cache write | vLLM INT8 quantize-and-cache kernel | vLLM INT8 quantize-and-cache kernel |
 | Indexer Q RoPE and quantization | vLLM fused INT8 kernel | vLLM fused INT8 kernel |
-| Indexer decode scoring over paged cache | vLLM Triton IMMA | SparkInfer native INT8 paged kernel |
-| Indexer prefill scoring over contiguous cache | vLLM Triton IMMA | SparkInfer native INT8 contiguous kernel |
-| Indexer long-prefill scoring | Triton IMMA per slab plus native CUDA candidate selection and merge | SparkInfer contiguous INT8 scoring per slab plus native CUDA candidate selection and merge |
+| Indexer decode scoring over paged cache | vLLM Triton IMMA (`fp8_paged_mqa_logits_triton`, INT8 query and cache) | vLLM Triton IMMA (`fp8_paged_mqa_logits_triton`, INT8 query and cache) |
+| Indexer prefill scoring over contiguous cache | vLLM Triton IMMA (`mqa_logits_workspace_triton`, `qk_int8`) | vLLM Triton IMMA (`mqa_logits_workspace_triton`, `qk_int8`) |
+| Indexer long-prefill scoring | Triton IMMA per slab plus native CUDA candidate selection and merge | Triton IMMA per slab plus native CUDA candidate selection and merge |
 | Indexer top-k | native CUDA row and persistent selectors | native CUDA row and persistent selectors |
 | Attention KV cache | packed `int8_ds_mla`, 528 bytes per token | packed `int8_ds_mla`, 528 bytes per token |
 | DSpark speculative decoding | three MTP draft stages in model runner v2 | three MTP draft stages in model runner v2 |
@@ -66,9 +68,17 @@ cache first and selects those rows.
 
 The FlashMLA INT8 kernels are provided by
 [`AppMana/forks-flash-mla-int`](https://github.com/AppMana/forks-flash-mla-int).
-SparkInfer provides the native GB10 paged and contiguous INT8 indexer kernels.
-The streaming path calls the same contiguous scoring implementation once per
-slab and merges candidates without materializing full-context logits.
+Indexer scoring is the same Triton integer-MMA code on both platforms
+(`vllm/models/deepseek_v4/nvidia_imma/triton_kernels.py`). SparkInfer's
+native INT8 indexer kernels are not used: its contiguous kernel faulted
+(Xid 13) on long prefills and was slower at serving shapes (`e73a131c55`),
+and its paged wrapper allocates per layer instead of taking caller-owned
+buffers (`bf753bb3e9`). `int8_mqa_logits_sparkinfer` in
+`vllm/utils/deep_gemm.py` is reached only by a test, and the routing
+experiment is kept under the tag
+`archive/appmana-wip/int8-sparkinfer-indexer-sm121`. The streaming path calls
+the same contiguous scoring implementation once per slab and merges
+candidates without materializing full-context logits.
 
 ## Checkpoint configuration
 
@@ -226,12 +236,18 @@ and sccache for the native extensions. `USE_SCCACHE` does not change the
 base layers, so toggling it is cheap; the Rust and CUDA stages run
 separate sccache daemons.
 
+The script builds one platform per run. Released images are tagged
+`sm86-sm121-<commit10>-amd64` and `-arm64` and joined into
+`sm86-sm121-<commit10>` with `docker/merge-consumer-platforms.sh`; the
+release gate in `MERGING.md` gives the steps.
+
 `docker/Dockerfile` builds one image with:
 
 - native vLLM extensions for RTX 30xx and GB10;
 - the AppMana NCCL fork;
 - the external FlashMLA wheel;
-- SparkInfer, including its GB10 INT8 indexer kernels;
+- SparkInfer, for the FP8/NVFP4 checkpoint's GB10 attention and MoE kernels
+  and the selectable SparkInfer mHC;
 - optionally the AppMana LMCache fork (`INSTALL_KV_CONNECTORS=true`,
   `LMCACHE_GIT_REF`), with OpenTelemetry pinned back afterwards.
 
@@ -255,12 +271,25 @@ Optional network settings come from the `dsv4-network` ConfigMap. The vision
 checkpoint uses the PP=11 example with `VLLM_PP_LAYER_PARTITION` set to the
 partition above and `--limit-mm-per-prompt '{"image":8}'`.
 
+## Fork documentation
+
+- [`MERGING.md`](MERGING.md): upstream merge rules, procedure, per-area
+  policy, gates and the image release gate.
+- [`docs/appmana/new-models.md`](docs/appmana/new-models.md): bringing a new
+  model or checkpoint variant onto RTX 30xx and GB10: conversion, the `vllm`
+  kernel block, quantization method, pipeline planning and gates.
+- [`docs/appmana/triton-to-cuda.md`](docs/appmana/triton-to-cuda.md):
+  translating Triton kernels to native CUDA, integer tensor-core rules, and
+  compiling vLLM, FlashMLA, SparkInfer and the image.
+- [`tools/ampere/DSV4_VISION.md`](tools/ampere/DSV4_VISION.md): converting and
+  serving the vision checkpoint.
+
 ## Related repositories
 
 - [`AppMana/forks-flash-mla-int`](https://github.com/AppMana/forks-flash-mla-int):
   native sparse-MLA kernels for the INT8 cache.
 - [`AppMana/forks-sparkinfer`](https://github.com/AppMana/forks-sparkinfer):
-  GB10 FP8/NVFP4 kernels, mHC and native INT8 sparse-indexer kernels.
+  GB10 FP8/NVFP4 attention and MoE kernels and mHC.
 - [`AppMana/forks-nccl-rdma-routing`](https://github.com/AppMana/forks-nccl-rdma-routing):
   NCCL rail and fallback routing.
 - [`AppMana/forks-lmcache`](https://github.com/AppMana/forks-lmcache):
