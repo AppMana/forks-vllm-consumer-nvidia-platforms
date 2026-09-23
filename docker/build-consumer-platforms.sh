@@ -2,10 +2,20 @@
 # Build the consumer-NVIDIA-platform image (sm_86 + sm_121) on the appmana
 # cluster's buildkitd and push it to GHCR.
 #
-# Why this builder: arm64 is emulated via appmana's binfmt DaemonSet. The
-# alternatives fail: GitHub's hosted arm64 runners OOM under nvcc, hilton's
-# buildkitd has no CNI (no RUN egress), and a hand build on a serving Spark
-# exhausts the unified-memory pool and wedges the node.
+# Default builder: appmana's buildkitd-vllm, with arm64 emulated via its binfmt
+# DaemonSet. Native arm64 alternative: hilton's buildkitd DaemonSet on the
+# Sparks (RUN steps use the host network), only while no model is serving
+# there; a build on a serving Spark exhausts the unified-memory pool. GitHub's
+# hosted arm64 runners OOM under nvcc.
+#
+#   KUBE_CONTEXT=Default KUBECONFIG=<hilton kubeconfig> \
+#   BUILDKIT_TARGET=pod/<buildkitd pod on the idle Spark> USE_SCCACHE=0 \
+#   CACHE_REF=ghcr.io/appmana/vllm-consumer:buildcache-arm64 \
+#     docker/build-consumer-platforms.sh --platform linux/arm64 --tag ...
+#
+# USE_SCCACHE=0 there because hilton cannot reach appmana's S3; the GHCR layer
+# cache still applies. Combine per-platform tags with
+# docker/merge-consumer-platforms.sh.
 #
 # Usage:
 #   docker/build-consumer-platforms.sh [--platform linux/arm64] [--tag NAME]
@@ -33,6 +43,9 @@ DOCKERFILE="${DOCKERFILE:-docker/Dockerfile}"
 TARGET="${TARGET-vllm-openai}"
 BASE_IMAGE="${BASE_IMAGE:-}"
 BUILDKIT_SERVICE="${BUILDKIT_SERVICE:-buildkitd-vllm}"
+# What to port-forward to. A pod name pins the build to one node, which a
+# Service cannot do through kubectl port-forward.
+BUILDKIT_TARGET="${BUILDKIT_TARGET:-svc/$BUILDKIT_SERVICE}"
 CACHE_REF="${CACHE_REF:-ghcr.io/appmana/vllm-consumer:buildcache}"
 USE_SCCACHE="${USE_SCCACHE:-1}"
 SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT:-http://10.152.184.210:8333}"
@@ -118,7 +131,7 @@ if [ "$USE_SCCACHE" = "1" ]; then
         --opt "build-arg:SCCACHE_REGION_NAME=$SCCACHE_REGION_NAME"
     )
 fi
-kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" "svc/$BUILDKIT_SERVICE" \
+kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" "$BUILDKIT_TARGET" \
     "$LOCAL_PORT:1234" >/dev/null 2>&1 &
 pf_pid=$!
 sleep 5
