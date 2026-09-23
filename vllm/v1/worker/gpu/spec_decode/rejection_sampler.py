@@ -467,6 +467,7 @@ class RejectionSampler:
                 input_batch.idx_mapping_np,
                 expanded_idx_mapping,
                 expanded_local_pos,
+                input_batch.seq_lens_cpu_upper_bound.numpy(),
             )
             logprobs_tensors = None
         else:

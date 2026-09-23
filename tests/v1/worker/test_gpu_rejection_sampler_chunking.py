@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 from types import MethodType, SimpleNamespace
 from typing import get_args
 
@@ -40,6 +41,7 @@ def test_real_pp_anchor_is_verified_and_caps_emission_at_k() -> None:
         num_draft_tokens_per_req=np.array([5], dtype=np.int32),
         replayed_pp_anchor=torch.tensor([True], device=device),
         replayed_pp_anchor_np=np.array([True]),
+        seq_lens_cpu_upper_bound=torch.tensor([8], dtype=torch.int32),
     )
     rejection_sampler = object.__new__(RejectionSampler)
     rejection_sampler.num_speculative_steps = 5
@@ -58,15 +60,17 @@ def test_real_pp_anchor_is_verified_and_caps_emission_at_k() -> None:
         ),
     )
 
-    def fake_verify(
-        self,
-        logits,
-        _draft_logits,
-        draft_sampled,
-        pos,
-        cu_num_logits,
-        *_mappings,
-    ):
+    # Bind to the real signature: the deferred path is a call only this fork
+    # makes, so an argument upstream adds to _verify must fail here.
+    verify_signature = inspect.signature(RejectionSampler._verify)
+
+    def fake_verify(self, *args):
+        bound = verify_signature.bind(self, *args).arguments
+        logits = bound["logits"]
+        draft_sampled = bound["draft_sampled"]
+        pos = bound["pos"]
+        cu_num_logits = bound["cu_num_logits"]
+        assert bound["seq_lens_upper_bound_np"].tolist() == [8]
         assert logits.shape[0] == 6
         assert draft_sampled.tolist() == input_ids.tolist()
         assert pos.tolist() == positions.tolist()
