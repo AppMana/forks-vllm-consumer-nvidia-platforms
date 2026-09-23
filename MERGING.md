@@ -5,7 +5,8 @@ GB10) from one image. Upstream vLLM restructures the same code paths every
 few weeks, so a merge is a re-port of a known set of invariants into
 wherever upstream moved them, followed by build and serving gates that the
 unit tests cannot stand in for. This file records the rules, the procedure,
-the per-area policy learned from the previous merges, and the gates.
+the per-area policy learned from the previous merges, the gates, the
+commits worth reading before a merge, and the release gate for images.
 
 ## Rules
 
@@ -16,9 +17,11 @@ the per-area policy learned from the previous merges, and the gates.
 - Fetch first and merge the upstream tip, not the commit that happens to
   carry the one fix you want; the tip contains it and the sync cost is paid
   once either way.
-- Tag the pre-merge tip (`pre-upstream-merge-<date>`) before merging. Fixes
-  go on top of the merge as separate commits with their reasoning in the
-  body; the merge is never reverted.
+- Tag the pre-merge tip before merging with an annotated tag named
+  `pre-upstream-merge-<YYYY-MM-DD>` and push it. The tag is the merge's first
+  parent (`pre-upstream-merge-2026-09-18` is `53873c6c4d^1`) and the baseline
+  every gate compares against. Fixes go on top of the merge as separate
+  commits with their reasoning in the body; the merge is never reverted.
 - Take upstream's structure; re-port the fork's data and invariants into the
   new home. When upstream deletes a fork helper, decide whether it was
   superseded (say by what) or merely dropped (reinstate it). Never resolve a
@@ -27,19 +30,106 @@ the per-area policy learned from the previous merges, and the gates.
   grouped by the areas below, including what superseded any dropped fork
   code.
 
-## Procedure
+## Git settings
 
-1. `git fetch upstream`; record `git merge-base upstream/main HEAD`, both
-   tips, and the overlap between the fork's file set
-   (`git diff --name-only upstream/main HEAD`) and the files upstream
-   changed since the base. The overlap is the conflict-risk set; read the
-   policy rows for every area it touches before starting.
-2. Rebuild the editable venv and record the fork test set's baseline on the
-   pre-merge tip (gate C) so post-merge failures can be classified.
-3. `git merge --no-commit upstream/main`. Resolve area by area, reading
-   both sides of every conflicted or both-sides-changed file in full.
-4. Commit with the area-organised body. Then run the gates in order; every
-   failure becomes a fix commit on top.
+Set these once in the fork's checkout. They are what make a merge of
+several hundred upstream commits reviewable:
+
+```console
+git -C <fork> config merge.renames true
+git -C <fork> config merge.directoryRenames true
+git -C <fork> config merge.renameLimit 999999
+git -C <fork> config diff.renameLimit 999999
+git -C <fork> config merge.conflictStyle zdiff3
+git -C <fork> config rerere.enabled true
+git -C <fork> config rerere.autoUpdate true
+```
+
+`merge.directoryRenames` carries the fork's edits into a directory upstream
+moved instead of leaving them as added files in the old location. The rename
+limits stop Git from giving up on rename detection when upstream touches
+thousands of files. `zdiff3` shows the merge base in every conflict hunk,
+which is the only way to tell an upstream rewrite from a fork change.
+`rerere` replays resolutions recorded in earlier merge attempts; with
+`autoUpdate` it also stages them, so read `git rerere diff` before
+committing. Run every command with `git -C <fork>` rather than changing
+directory.
+
+## Before the merge
+
+Work from a clean tree on the working branch. Record the numbers below in
+the merge commit body.
+
+```console
+git -C <fork> fetch upstream --prune
+git -C <fork> fetch origin --prune
+git -C <fork> status --short --branch
+git -C <fork> log --oneline --decorate -8
+git -C <fork> merge-base upstream/main HEAD
+git -C <fork> rev-list --count <merge-base>..upstream/main
+git -C <fork> diff --name-only upstream/main HEAD > fork-files.txt
+git -C <fork> diff --name-only <merge-base> upstream/main > upstream-files.txt
+comm -12 <(sort fork-files.txt) <(sort upstream-files.txt) > overlap.txt
+git -C <fork> tag -a pre-upstream-merge-<YYYY-MM-DD> -m "Pre-merge tip before upstream <tip>"
+git -C <fork> push origin pre-upstream-merge-<YYYY-MM-DD>
+```
+
+`overlap.txt` is the conflict-risk set: every file the fork changed that
+upstream also changed since the base, conflicted or not. Read the policy
+row for every area it touches before starting.
+
+## Rename rule
+
+A file move and an edit of the moved file never share a commit. When the
+fork moves one of its own files, including following upstream to a new
+location, commit the move alone first:
+
+```console
+git -C <fork> mv vllm/old/path.py vllm/new/path.py
+git -C <fork> commit -m "Move path.py to vllm/new"
+git -C <fork> show -M --summary HEAD   # must print "rename ... (100%)"
+```
+
+Only then edit the file in a separate commit. A 100% rename is what lets
+`merge.directoryRenames` and the next upstream merge follow the file.
+
+Two consequences specific to this fork:
+
+- Kernel modules are named by fully qualified name in published
+  checkpoints, and a published checkpoint cannot be edited. Moving or
+  renaming a module that a `vllm.kernels` entry names keeps the old import
+  path importable and adds the old prefix to `_LEGACY_SYMBOL_PREFIXES` in
+  `vllm/transformers_utils/configs/dsv4/kernel_config.py`, as
+  `e83e939b73` did for `nvidia_sm86` to `nvidia_imma`.
+- When upstream moves a file the fork modifies, let the merge carry the
+  fork's hunks to the new path. Never resolve a moved file by deleting it
+  and re-adding the fork's old copy; that drops upstream's changes and
+  breaks rename detection for every later merge.
+
+## Merge and parity checklist
+
+1. Complete "Before the merge" and tag the pre-merge tip.
+2. Rebuild the editable venv (gate B) and record the fork test set's
+   baseline on the pre-merge tip (gate C) so post-merge failures can be
+   classified.
+3. `git -C <fork> merge --no-commit --no-ff upstream/main`. Resolve area by
+   area, reading both sides of every conflicted or both-sides-changed file
+   in full, with the policy table open.
+4. For every fork helper upstream deleted, decide superseded (name the
+   replacement) or dropped (reinstate it). For every upstream function the
+   fork calls or extends, check for added or removed parameters; Marlin
+   dropping its act-order arguments broke only the fork's caller
+   (`7ebcd12028`).
+5. Regenerate derived files only from their sources:
+   `tools/generate_versions_json.py` for `docker/versions.json`. Inspect the
+   final diff for dependency moves (torch, CUDA, OpenTelemetry, LMCache,
+   FlashMLA, SparkInfer pins).
+6. Commit with the area-organised body, then run the gates in order. Every
+   failure becomes a fix commit on top, red test first where a test can
+   reach it.
+7. Update the "last merged" line in `README.md` and any row of this file
+   that the merge changed.
+8. Pass the release gate before any deployment references the new tree.
 
 ## Policy by area
 
@@ -79,9 +169,10 @@ the per-area policy learned from the previous merges, and the gates.
 - Empty responses on the needle benchmark: thinking is on by default; the
   benchmark passes `chat_template_kwargs` explicitly.
 - `patch does not apply` during the flash-attention fetch: a previously
-  patched checkout under `.deps/`. The patch step is idempotent now (it
-  checks whether the patch is already applied); if this message returns,
-  the patch itself no longer matches the pinned flash-attention tag.
+  patched checkout under `.deps/`. The patch step checks whether the patch
+  is already applied (`git apply --reverse --check`, `262e67e0f5`), so this
+  message means the patch itself no longer matches the pinned
+  flash-attention tag.
 - `deepseek_v4_sparse_mla_attention_warmup` imported again in
   `kernel_warmup.py`: upstream keeps that warmup; the fork removed it because
   it drives `execute_model` from a per-rank gate and deadlocks a pipeline
@@ -155,9 +246,11 @@ D. Serving on the mini checkpoints at PP=1 and PP=2 with CUDA graphs,
    log-probability margins before a kernel is suspected, since PP=2 with
    graphs and PP=1 eager legitimately sit about 0.1 nat apart. The JIT
    monitor must report no compiles on a second request at a new context
-   length or image size. Expect this gate to find defects the test set
-   cannot: two of the 2026-09 merge's five serving defects were import-time
-   shadowing and warmup registrations, visible only at model construction.
+   length or image size. This gate finds defects the test set cannot reach:
+   a local import that shadows a module-level name (`de305121ae`), a warmup
+   registration that imports a kernel the device cannot load
+   (`696fb46fa4`), and a new upstream linear that needs the fork's
+   quantization method (`15497cc32b`) all fail only at model construction.
 E. The full image build (`docker/Dockerfile`, target `vllm-openai`) for the
    deployment architectures with the KV connector installed, through the
    build script with its caches left on (pinned builder, registry layer
@@ -177,3 +270,56 @@ F. Chain acceptance on the deployment: same-day baseline against the
    row at 24 tokens or more means the pinned `cudagraph_capture_sizes`
    (tokens, multiples of the speculative step) no longer reach
    max-num-seqs times the step, and those batches decode at half speed.
+
+## Informative merge and integration commits
+
+Read the body of each before a merge; the body carries the evidence, this
+table carries the rule.
+
+| Commit | Lesson |
+| --- | --- |
+| `53873c6c4d` | Merge of upstream `729ebac498` (773 commits). The model for a merge body: the conflict count, then resolutions grouped by the policy areas, each naming what superseded any dropped fork code. Its first parent is `pre-upstream-merge-2026-09-18`. |
+| `334894183a` | Merge of upstream `e35298628f` (1798 commits). When upstream replaces a subsystem, re-express the fork's invariant in the new structure (the 528-byte `int8_ds_mla` page became spec `state_content_bytes`; 16-byte alignment moved into spec alignment) and say in the body which resolution still needs hardware validation. |
+| `883eea2c3c` | Merging back two lines that had each rebased the same shared history: 13 conflicts, and about 90 files that merged cleanly only because both sides replayed identical commits, to find 7 files of new content. Source of the one-branch, merge-never-rebase rules. |
+| `7ebcd12028` | Gate C catches upstream signature changes in calls only the fork makes (Marlin dropped its act-order arguments) and renamed fixtures in fork tests. Upstream tests for hardware the deployment lacks are recorded as not applicable, not skipped. |
+| `de305121ae`, `696fb46fa4`, `15497cc32b` | Gate D (serving the mini) is where import-time and construction-time defects appear; no unit test constructs the full model. |
+| `c2d0444322` | When upstream deletes a warmup module, check whether the kernels it warmed still run. The JIT monitor names every kernel compiled on the first request. |
+| `e0463fcd3e` | The multi-architecture build compiles DeepGEMM, which needs GCC 13 for `<format>`. An sm86-only build cannot catch a toolchain regression in a component it does not build. |
+| `4f8a9b2f94` | An upstream attribute rename inside a `has_deep_gemm()` branch was only evaluated by the multi-architecture image. Serve the mini from that image on every merge. |
+| `6e66a3c681`, `35eedd3557` | Upstream changed the KV connector failure contract for multi-group layouts. Fix the fallback connector here and the LMCache fork, then pin the fork commit in the Dockerfile and regenerate `versions.json`. |
+| `eb2f08f109`, `1d8b0eae46` | Model runner v2 sizes every per-row tensor to the padded row count of a FULL graph replay. Any per-row tensor built from the real request count crashes the first padded decode; which batch sizes pad depends on the capture-size list, so test 3, 5, 6 and 7 sequence decodes. |
+| `c6a462f90c` | Capture sizes are tokens, not sequences. Confirm coverage from the `cuda_graph.py` runtime statistics, not from the configuration. |
+| `96df8994a7` | Mini recordings are compared with prefix caching off and judged by log-probability margins. |
+| `b4dac1e335`, `074e224edd` | One sccache daemon per build stage on its own socket, one sccache version in every stage, sccache installed unconditionally so `USE_SCCACHE` never invalidates base layers. |
+| `262e67e0f5` | Every patch step over `.deps/` is idempotent, because the source lives in a shared cache mount that survives interrupted builds. |
+| `e46526fc9f` | Moving the LMCache pin can change its build requirements (`grpcio-tools`); gate E is where that shows. |
+| `5636629b95` | Build each platform separately, then join the two digests into one manifest list; a single-platform tag on a multi-platform deployment is a defect. |
+
+## Release gate
+
+An image is released per commit, never per branch. `<commit10>` is the first
+ten hex digits of the commit the build script resolved (it prints
+`building ... at <sha>` and stamps the wheel version
+`0.0.0+consumer.<commit10>`).
+
+1. Build each platform from the same commit with its caches on:
+   - `linux/amd64` on appmana's pinned `buildkitd-vllm` pod:
+     `docker/build-consumer-platforms.sh --platform linux/amd64 --tag ghcr.io/appmana/vllm-consumer:sm86-sm121-<commit10>-amd64`
+   - `linux/arm64` natively on hilton's BuildKit on a Spark that is not
+     serving, with the variables in the script header (`USE_SCCACHE=0`,
+     `CACHE_REF=ghcr.io/appmana/vllm-consumer:buildcache-arm64`), tag
+     `sm86-sm121-<commit10>-arm64`.
+2. Read each pushed digest (`docker buildx imagetools inspect <tag>`) and
+   combine the digests, not the tags:
+   `docker/merge-consumer-platforms.sh ghcr.io/appmana/vllm-consumer:sm86-sm121-<commit10> <amd64 image>@sha256:... <arm64 image>@sha256:...`.
+   The script fails unless both `linux/amd64` and `linux/arm64` are present.
+3. Check the labels: `org.opencontainers.image.revision` is the full commit
+   and the FlashMLA, SparkInfer, LMCache and NCCL labels match
+   `docker/versions.json`. An overlay image is never a release.
+4. Serve gate D's PP=1 mini recording from the multi-architecture tag,
+   pulled from GHCR by digest, on every merge. The token ids must match the
+   recording from the editable venv.
+5. The deployment change references the image by digest, and its commit
+   body records the digest, the tag and the source commit.
+6. Never push to a tag that already exists. A rebuild with different
+   content, even from the same commit, gets a new tag name.
