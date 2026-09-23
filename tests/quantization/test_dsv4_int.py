@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.dsv4_int import (
     dequantize_uint4_asym_w4a16,
     quantize_fp32_to_uint4_asym_w4a16,
     requantize_fp8_to_allspark_uint8_w8a16,
+    requantize_fp8_to_humming_uint8_channel,
     requantize_fp8_to_int8_w8a16,
     requantize_mxfp4_to_humming_uint,
     requantize_mxfp4_to_int4_w4a16,
@@ -285,7 +286,7 @@ def test_mxfp4_to_humming_uint_roundtrips_through_humming(bits):
         result["weight"],
         weight_scale=result["weight_scale"].cuda(),
         zero_point=None,
-        global_scale=None,
+        weight_scale_2=None,
         dtype=dtypes.DataType.from_str(f"uint{bits}"),
         packed=True,
     ).cpu()
@@ -316,6 +317,42 @@ def test_mxfp4_to_humming_uint4_matches_int4_w4a16_codes():
     w4a16 = requantize_mxfp4_to_int4_w4a16(packed, scale_bytes, scale_mode="mse")
     torch.testing.assert_close(humming["weight_scale"], w4a16["scales"])
     assert torch.equal(humming["codes"], _unpack_int4_pairs(w4a16["qweight_packed"]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp8_block32_to_humming_uint8_channel_roundtrips_through_humming():
+    """V4.1 FP8 linears (32x32 E8M0 blocks) become Humming uint8 per-channel
+    weights whose codes are the AllSpark UINT8 codes (both bias 128)."""
+    humming_weight = pytest.importorskip("humming.utils.weight")
+    from humming import dtypes
+
+    torch.manual_seed(0)
+    n, k = 256, 512
+    weight = (torch.randn(n, k) * 0.5).to(torch.float8_e4m3fn)
+    scale = torch.randint(120, 130, (n // 32, k // 32), dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+
+    result = requantize_fp8_to_humming_uint8_channel(weight, scale, block_size=(32, 32))
+    assert result["weight"].dtype == torch.int32
+    assert result["weight"].shape == (n, k // 4)
+    assert result["weight_scale"].shape == (n, 1)
+
+    allspark = requantize_fp8_to_allspark_uint8_w8a16(
+        weight, scale, block_size=(32, 32)
+    )
+    humming_dequant = humming_weight.dequantize_weight(
+        result["weight"],
+        weight_scale=result["weight_scale"].cuda(),
+        zero_point=None,
+        weight_scale_2=None,
+        dtype=dtypes.uint8,
+        packed=True,
+    ).cpu()
+    expected = (allspark["qweight"].to(torch.float32) - 128.0) * allspark["scales"].to(
+        torch.float32
+    ).reshape(-1, 1)
+    torch.testing.assert_close(humming_dequant, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

@@ -532,6 +532,36 @@ def requantize_fp8_to_allspark_uint8_w8a16(
     }
 
 
+def requantize_fp8_to_humming_uint8_channel(
+    weight_fp8: torch.Tensor,
+    scale_block: torch.Tensor,
+    *,
+    block_size: tuple[int, int] = (128, 128),
+    out_scale_dtype: torch.dtype = torch.bfloat16,
+) -> dict[str, torch.Tensor]:
+    """Convert one FP8 e4m3 linear to Humming `uint8` per-channel format.
+
+    The codes are exactly the AllSpark UINT8 codes: both formats store the
+    signed INT8 value plus 128 with one scale per output channel. Only the
+    packing differs, and it goes through Humming's own `ops.pack_weight`
+    (int32 words along K), so the layout is the one its kernels read.
+    """
+    from humming import ops as humming_ops
+
+    allspark = requantize_fp8_to_allspark_uint8_w8a16(
+        weight_fp8,
+        scale_block,
+        block_size=block_size,
+        out_scale_dtype=out_scale_dtype,
+    )
+    codes = allspark["qweight"]
+    assert isinstance(codes, torch.Tensor)
+    scales = allspark["scales"]
+    assert isinstance(scales, torch.Tensor)
+    weight = humming_ops.pack_weight(codes.to(torch.int32).cuda(), 8).cpu()
+    return {"weight": weight, "weight_scale": scales.reshape(-1, 1)}
+
+
 def dequantize_int4_w4a16(
     weight_packed: torch.Tensor,
     scale: torch.Tensor,
