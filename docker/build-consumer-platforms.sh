@@ -170,26 +170,35 @@ if [ "$USE_SCCACHE" = "1" ]; then
     )
 fi
 # Let kubectl pick a free local port and read it back, so a stale forward left
-# on a fixed port by another run can never be reused silently.
-kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" "$BUILDKIT_TARGET" \
-    ":1234" > "$workdir/port-forward.log" 2>&1 &
-pf_pid=$!
-local_port=""
-for _ in $(seq 1 30); do
-    if ! kill -0 "$pf_pid" 2>/dev/null; then
-        echo "port-forward to $BUILDKIT_TARGET exited:" >&2
-        cat "$workdir/port-forward.log" >&2
+# on a fixed port by another run can never be reused silently. The API server
+# can stall a single request past kubectl's own 32 s timeout (a control-plane
+# node with a slow disk), so each attempt gets 45 s and the forward is retried.
+start_port_forward() {
+    kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" "$BUILDKIT_TARGET" \
+        ":1234" > "$workdir/port-forward.log" 2>&1 < /dev/null &
+    pf_pid=$!
+    local_port=""
+    for _ in $(seq 1 45); do
+        if ! kill -0 "$pf_pid" 2>/dev/null; then
+            return 1
+        fi
+        local_port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 1234$/\1/p' "$workdir/port-forward.log" | head -n 1)"
+        [ -n "$local_port" ] && return 0
+        sleep 1
+    done
+    kill "$pf_pid" 2>/dev/null || true
+    wait "$pf_pid" 2>/dev/null || true
+    return 1
+}
+for attempt in 1 2 3; do
+    start_port_forward && break
+    echo "port-forward to $BUILDKIT_TARGET attempt $attempt failed:" >&2
+    cat "$workdir/port-forward.log" >&2
+    pf_pid=""
+    if [ "$attempt" = 3 ]; then
         exit 1
     fi
-    local_port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 1234$/\1/p' "$workdir/port-forward.log" | head -n 1)"
-    [ -n "$local_port" ] && break
-    sleep 1
 done
-if [ -z "$local_port" ]; then
-    echo "port-forward to $BUILDKIT_TARGET did not come up:" >&2
-    cat "$workdir/port-forward.log" >&2
-    exit 1
-fi
 buildctl --addr "tcp://127.0.0.1:$local_port" "${tls_options[@]}" debug workers >/dev/null
 
 echo "building $IMAGE for $PLATFORM from $REF at $resolved_commit (cache $CACHE_REF)"
