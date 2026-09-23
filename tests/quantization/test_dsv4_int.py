@@ -261,8 +261,8 @@ def test_mxfp4_to_int4_mse_scale_mode_beats_absmax7():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("bits", [3, 4])
-def test_mxfp4_to_humming_uint_roundtrips_through_humming(bits):
+@pytest.mark.parametrize("bits,group_size", [(3, 32), (4, 32), (3, 64), (3, 128)])
+def test_mxfp4_to_humming_uint_roundtrips_through_humming(bits, group_size):
     """Codes packed for Humming unpack, through Humming's own dequantizer, to
     exactly the tool's reference dequant, and beat absmax scaling."""
     humming_weight = pytest.importorskip("humming.utils.weight")
@@ -277,10 +277,12 @@ def test_mxfp4_to_humming_uint_roundtrips_through_humming(bits):
     scale = _e8m0_to_fp32_scale(scale_bytes)
     truth = (fp4.reshape(rows, -1, 32) * scale.unsqueeze(-1)).reshape(rows, cols)
 
-    result = requantize_mxfp4_to_humming_uint(packed, scale_bytes, bits=bits)
+    result = requantize_mxfp4_to_humming_uint(
+        packed, scale_bytes, bits=bits, group_size=group_size
+    )
     assert result["weight"].dtype == torch.int32
     assert result["weight"].shape == (rows, cols * bits // 32)
-    assert result["weight_scale"].shape == (rows, cols // 32)
+    assert result["weight_scale"].shape == (rows, cols // group_size)
 
     humming_dequant = humming_weight.dequantize_weight(
         result["weight"],
@@ -291,15 +293,15 @@ def test_mxfp4_to_humming_uint_roundtrips_through_humming(bits):
         packed=True,
     ).cpu()
     reference = dequantize_humming_uint(
-        result["codes"], result["weight_scale"], bits=bits, group_size=32
+        result["codes"], result["weight_scale"], bits=bits, group_size=group_size
     )
     torch.testing.assert_close(humming_dequant, reference, rtol=0, atol=0)
 
     absmax = requantize_mxfp4_to_humming_uint(
-        packed, scale_bytes, bits=bits, scale_mode="absmax"
+        packed, scale_bytes, bits=bits, group_size=group_size, scale_mode="absmax"
     )
     absmax_dequant = dequantize_humming_uint(
-        absmax["codes"], absmax["weight_scale"], bits=bits, group_size=32
+        absmax["codes"], absmax["weight_scale"], bits=bits, group_size=group_size
     )
     assert _snr_db(truth, reference) > _snr_db(truth, absmax_dequant) + 0.5
 

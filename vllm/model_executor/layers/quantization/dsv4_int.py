@@ -299,22 +299,28 @@ def requantize_mxfp4_to_humming_uint(
     scale_e8m0: torch.Tensor,
     *,
     bits: int,
+    group_size: int = 32,
     scale_mode: str = "mse",
     out_scale_dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, torch.Tensor | int]:
-    """Convert one MXFP4 tensor to Humming's `uint{bits}` group-32 format.
+    """Convert one MXFP4 tensor to Humming's `uint{bits}` group format.
 
     Humming stores unsigned codes with a bias of 2**(bits - 1), packed along K
     into int32 words by its own `ops.pack_weight`, plus one scale per group of
-    32. Packing goes through Humming so the layout is by construction the one
-    its kernels read. Returns the packed `weight` [N, K * bits // 32], the
-    `weight_scale` [N, K // 32] and the unpacked `codes` for verification.
+    `group_size` (a multiple of MXFP4's 32). Packing goes through Humming so
+    the layout is by construction the one its kernels read. Returns the packed
+    `weight` [N, K * bits // 32], the `weight_scale` [N, K // group_size] and
+    the unpacked `codes` for verification.
     """
     if not 2 <= bits <= 8:
         raise ValueError(f"bits must be in 2..8, got {bits}")
+    if group_size % 32:
+        raise ValueError(f"group_size must be a multiple of 32, got {group_size}")
     from humming import ops as humming_ops
 
-    grouped = _mxfp4_grouped_values(weight_packed, scale_e8m0)
+    mx_grouped = _mxfp4_grouped_values(weight_packed, scale_e8m0)
+    values = mx_grouped.reshape(*mx_grouped.shape[:-2], -1)
+    grouped = values.reshape(*values.shape[:-1], -1, group_size)
     qmax = (1 << (bits - 1)) - 1
     new_scale = _search_group_scale(grouped, qmax, scale_mode, out_scale_dtype)
     signed = torch.round(grouped / new_scale.unsqueeze(-1)).clamp(-qmax - 1, qmax)
@@ -324,7 +330,7 @@ def requantize_mxfp4_to_humming_uint(
         "weight": weight,
         "weight_scale": new_scale.to(out_scale_dtype),
         "codes": codes,
-        "group_size": 32,
+        "group_size": group_size,
     }
 
 
