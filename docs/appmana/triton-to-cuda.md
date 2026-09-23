@@ -254,6 +254,21 @@ The image installs `SPARKINFER_SPEC` from the fork's index and asserts that
 the PCIe extensions are inside the wheel; without them the first collective
 compiles with nvcc inside a live request.
 
+### Local build
+
+Build the native extensions on the workstation with ccache, not sccache:
+
+```bash
+VLLM_DISABLE_SCCACHE=1 uv pip install --no-build-isolation --no-deps -e .
+```
+
+`setup.py` prefers sccache whenever it is on `PATH`, and sccache keys CUDA
+objects on absolute source paths, so every worktree or second checkout
+recompiles from scratch. ccache shares objects across checkouts when
+`~/.config/ccache/ccache.conf` sets `base_dir` to the directory holding them
+(for example `~/Documents`) and `hash_dir = false`; give it a `max_size` that
+holds several sm86+sm121 builds (200G here).
+
 ### Image build
 
 ```bash
