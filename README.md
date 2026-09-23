@@ -248,8 +248,9 @@ release gate in `MERGING.md` gives the steps.
 - the external FlashMLA wheel;
 - SparkInfer, for the FP8/NVFP4 checkpoint's GB10 attention and MoE kernels
   and the selectable SparkInfer mHC;
-- optionally the AppMana LMCache fork (`INSTALL_KV_CONNECTORS=true`,
-  `LMCACHE_GIT_REF`), with OpenTelemetry pinned back afterwards.
+- the KV connectors: the AppMana LMCache fork (`LMCACHE_GIT_REF`), NIXL and
+  Mooncake, with OpenTelemetry pinned back afterwards. The Dockerfile default
+  is `INSTALL_KV_CONNECTORS=false`; both build scripts pass `true`.
 
 `docker/versions.json` records the pinned component revisions used by the
 build. An editable install for development is

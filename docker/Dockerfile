@@ -1612,8 +1612,11 @@ assert callable(flash_mla.sparse_mla_decode_int8); \
 assert callable(flash_mla.sparse_mla_prefill_int8); \
 print('flash_mla 2.0.1.dev1 native INT8 decode/prefill importable')"
 
-# sparkinfer supplies SM12x kernels for FP8/NVFP4 and the native INT8
-# sparse-indexer decode and prefill paths used by the int4-int8 checkpoint.
+# sparkinfer supplies SM12x CuTe-DSL kernels: mHC (sparkinfer.norm.mhc), the
+# compressed sparse MLA and NVFP4 fused MoE of the nvfp4-fp8 checkpoint, and
+# its PCIe collectives. The int4-int8 checkpoint's INT8 indexer runs the Triton
+# IMMA kernels on both families, not sparkinfer. SPARKINFER_REF is the fork
+# commit (AppMana/forks-sparkinfer appmana/main) the wheel was built from.
 # Install order matters -- it pins nvidia-cutlass-dsl, which quack must not
 # drag backwards; requirements/cuda.txt already pins 4.6.0 for both.
 ARG SPARKINFER_INDEX_URL=https://appmana.github.io/forks-sparkinfer/

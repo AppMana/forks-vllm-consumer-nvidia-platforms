@@ -48,6 +48,9 @@ BUILDKIT_SERVICE="${BUILDKIT_SERVICE:-buildkitd-vllm}"
 BUILDKIT_TARGET="${BUILDKIT_TARGET:-svc/$BUILDKIT_SERVICE}"
 CACHE_REF="${CACHE_REF:-ghcr.io/appmana/vllm-consumer:buildcache}"
 USE_SCCACHE="${USE_SCCACHE:-1}"
+# LMCache, NIXL and Mooncake, as in the Harbor sm86 image; every one of them
+# ships aarch64 wheels, so both platforms carry the same connectors.
+INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS:-true}"
 SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT:-http://10.152.184.210:8333}"
 SCCACHE_BUCKET_NAME="${SCCACHE_BUCKET_NAME:-appmana-private}"
 SCCACHE_REGION_NAME="${SCCACHE_REGION_NAME:-us-west-2}"
@@ -149,6 +152,7 @@ build_options=(
     --opt "build-arg:VLLM_IMAGE_TAG=$IMAGE"
     --opt "build-arg:VLLM_VERSION_OVERRIDE=$wheel_version"
     --opt build-arg:RUN_WHEEL_CHECK=false
+    --opt "build-arg:INSTALL_KV_CONNECTORS=$INSTALL_KV_CONNECTORS"
 )
 if [ -n "$TARGET" ]; then
     build_options+=(--opt "target=$TARGET")
