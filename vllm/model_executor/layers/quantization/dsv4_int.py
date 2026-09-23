@@ -200,6 +200,56 @@ def _block_scale_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     raise TypeError(f"unsupported block scale dtype: {scale.dtype}")
 
 
+def _mxfp4_grouped_values(
+    weight_packed: torch.Tensor, scale_e8m0: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize an MXFP4 tensor exactly, grouped as [..., K // 32, 32]."""
+    fp4 = _e2m1_nibble_to_fp32(_unpack_int4_pairs(weight_packed))
+    scale = _e8m0_to_fp32_scale(scale_e8m0)
+    if fp4.shape[-1] != scale.shape[-1] * 32:
+        raise ValueError(
+            f"weight last dim {fp4.shape[-1]} != scale groups {scale.shape[-1]} * 32"
+        )
+    return fp4.reshape(*fp4.shape[:-1], -1, 32) * scale.unsqueeze(-1)
+
+
+def _search_group_scale(
+    grouped: torch.Tensor,
+    qmax: int,
+    scale_mode: str,
+    out_scale_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Per-group scale for signed codes in [-qmax - 1, qmax].
+
+    "absmax" maps each group's largest magnitude to qmax. "mse" searches 19
+    divisors in [5/7 * qmax, 9.5/7 * qmax] (5.0..9.5 at 4 bits) and keeps the
+    one with the smallest round-trip error, measured after rounding the scale
+    to the stored dtype.
+    """
+    abs_max = grouped.abs().amax(dim=-1).clamp(min=torch.finfo(torch.float32).tiny)
+    if scale_mode == "absmax":
+        return abs_max / float(qmax)
+    if scale_mode != "mse":
+        raise ValueError(f"unsupported scale mode: {scale_mode}")
+    best_scale = abs_max / float(qmax)
+    best_err = None
+    divisors = torch.linspace(
+        5.0 * qmax / 7.0, 9.5 * qmax / 7.0, 19, device=grouped.device
+    )
+    for div in divisors:
+        cand = (abs_max / div).to(out_scale_dtype).to(torch.float32)
+        q = torch.round(grouped / cand.unsqueeze(-1)).clamp(-qmax - 1, qmax)
+        err = (q * cand.unsqueeze(-1) - grouped).pow(2).sum(dim=-1)
+        if best_err is None:
+            best_err = err
+            best_scale = cand
+        else:
+            mask = err < best_err
+            best_err = torch.where(mask, err, best_err)
+            best_scale = torch.where(mask, cand, best_scale)
+    return best_scale.clamp(min=torch.finfo(torch.float32).tiny)
+
+
 def requantize_mxfp4_to_int4_w4a16(
     weight_packed: torch.Tensor,
     scale_e8m0: torch.Tensor,
@@ -218,33 +268,19 @@ def requantize_mxfp4_to_int4_w4a16(
         )
 
     grouped = fp4.reshape(*fp4.shape[:-1], -1, 32) * scale.unsqueeze(-1)
-    abs_max = grouped.abs().amax(dim=-1)
-    abs_max = abs_max.clamp(min=torch.finfo(torch.float32).tiny)
     if scale_mode == "absmax7":
-        new_scale = abs_max / 7.0
+        new_scale = _search_group_scale(grouped, 7, "absmax", out_scale_dtype)
     elif scale_mode == "absmax8":
         # MXFP4's largest magnitude is usually an outlier level (6.0).
         # Dividing by 8 sacrifices the positive +6 endpoint, but aligns the
         # common 1.5/3.0 levels better for signed INT4's -8..7 codebook.
-        new_scale = abs_max / 8.0
+        abs_max = grouped.abs().amax(dim=-1)
+        new_scale = abs_max.clamp(min=torch.finfo(torch.float32).tiny) / 8.0
     elif scale_mode == "mse":
         # Per-group scale search minimizing round-trip MSE vs the dequantized
         # MXFP4 values: +5.5 to +6.1 dB SNR over absmax7 on real V4-Flash
         # shards; same layout and kernels.
-        best_scale = abs_max / 7.0
-        best_err = None
-        for div in torch.linspace(5.0, 9.5, 19, device=grouped.device):
-            cand = (abs_max / div).to(out_scale_dtype).to(torch.float32)
-            q = torch.round(grouped / cand.unsqueeze(-1)).clamp(-8, 7)
-            err = (q * cand.unsqueeze(-1) - grouped).pow(2).sum(dim=-1)
-            if best_err is None:
-                best_err = err
-                best_scale = cand
-            else:
-                mask = err < best_err
-                best_err = torch.where(mask, err, best_err)
-                best_scale = torch.where(mask, cand, best_scale)
-        new_scale = best_scale.clamp(min=torch.finfo(torch.float32).tiny)
+        new_scale = _search_group_scale(grouped, 7, "mse", out_scale_dtype)
     else:
         raise ValueError(f"unsupported MXFP4->INT4 scale mode: {scale_mode}")
 
@@ -256,6 +292,55 @@ def requantize_mxfp4_to_int4_w4a16(
         "scales": new_scale.to(out_scale_dtype),
         "group_size": 32,
     }
+
+
+def requantize_mxfp4_to_humming_uint(
+    weight_packed: torch.Tensor,
+    scale_e8m0: torch.Tensor,
+    *,
+    bits: int,
+    scale_mode: str = "mse",
+    out_scale_dtype: torch.dtype = torch.bfloat16,
+) -> dict[str, torch.Tensor | int]:
+    """Convert one MXFP4 tensor to Humming's `uint{bits}` group-32 format.
+
+    Humming stores unsigned codes with a bias of 2**(bits - 1), packed along K
+    into int32 words by its own `ops.pack_weight`, plus one scale per group of
+    32. Packing goes through Humming so the layout is by construction the one
+    its kernels read. Returns the packed `weight` [N, K * bits // 32], the
+    `weight_scale` [N, K // 32] and the unpacked `codes` for verification.
+    """
+    if not 2 <= bits <= 8:
+        raise ValueError(f"bits must be in 2..8, got {bits}")
+    from humming import ops as humming_ops
+
+    grouped = _mxfp4_grouped_values(weight_packed, scale_e8m0)
+    qmax = (1 << (bits - 1)) - 1
+    new_scale = _search_group_scale(grouped, qmax, scale_mode, out_scale_dtype)
+    signed = torch.round(grouped / new_scale.unsqueeze(-1)).clamp(-qmax - 1, qmax)
+    codes = (signed + (qmax + 1)).to(torch.uint8).reshape(*grouped.shape[:-2], -1)
+    weight = humming_ops.pack_weight(codes.to(torch.int32).cuda(), bits).cpu()
+    return {
+        "weight": weight,
+        "weight_scale": new_scale.to(out_scale_dtype),
+        "codes": codes,
+        "group_size": 32,
+    }
+
+
+def dequantize_humming_uint(
+    codes: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    bits: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Reference dequant of unpacked Humming `uint{bits}` codes."""
+    signed = codes.to(torch.float32) - float(1 << (bits - 1))
+    grouped = signed.reshape(*signed.shape[:-1], -1, group_size)
+    return (grouped * weight_scale.to(torch.float32).unsqueeze(-1)).reshape(
+        signed.shape
+    )
 
 
 def quantize_fp32_to_uint4_asym_w4a16(

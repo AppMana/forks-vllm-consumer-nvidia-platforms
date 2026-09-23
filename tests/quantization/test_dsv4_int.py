@@ -26,12 +26,14 @@ from vllm.model_executor.layers.quantization.dsv4_int import (
     _unpack_int4_pairs,
     dequantize_allspark_uint8_w8a16,
     dequantize_fp8_block_to_bf16,
+    dequantize_humming_uint,
     dequantize_int4_w4a16,
     dequantize_int8_w8a16,
     dequantize_uint4_asym_w4a16,
     quantize_fp32_to_uint4_asym_w4a16,
     requantize_fp8_to_allspark_uint8_w8a16,
     requantize_fp8_to_int8_w8a16,
+    requantize_mxfp4_to_humming_uint,
     requantize_mxfp4_to_int4_w4a16,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -255,6 +257,65 @@ def test_mxfp4_to_int4_mse_scale_mode_beats_absmax7():
     # nibbles exercise the search less (~+1.7 dB), so the regression floor
     # here is +1.0 dB.
     assert snrs["mse"] > snrs["absmax7"] + 1.0, snrs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits", [3, 4])
+def test_mxfp4_to_humming_uint_roundtrips_through_humming(bits):
+    """Codes packed for Humming unpack, through Humming's own dequantizer, to
+    exactly the tool's reference dequant, and beat absmax scaling."""
+    humming_weight = pytest.importorskip("humming.utils.weight")
+    from humming import dtypes
+
+    torch.manual_seed(0)
+    rows, cols = 64, 1024
+    nibbles = torch.randint(0, 16, (rows, cols), dtype=torch.uint8)
+    packed = _pack_nibbles(nibbles)
+    scale_bytes = torch.randint(120, 134, (rows, cols // 32), dtype=torch.uint8)
+    fp4 = _e2m1_nibble_to_fp32(_unpack_int4_pairs(packed))
+    scale = _e8m0_to_fp32_scale(scale_bytes)
+    truth = (fp4.reshape(rows, -1, 32) * scale.unsqueeze(-1)).reshape(rows, cols)
+
+    result = requantize_mxfp4_to_humming_uint(packed, scale_bytes, bits=bits)
+    assert result["weight"].dtype == torch.int32
+    assert result["weight"].shape == (rows, cols * bits // 32)
+    assert result["weight_scale"].shape == (rows, cols // 32)
+
+    humming_dequant = humming_weight.dequantize_weight(
+        result["weight"],
+        weight_scale=result["weight_scale"].cuda(),
+        zero_point=None,
+        global_scale=None,
+        dtype=dtypes.DataType.from_str(f"uint{bits}"),
+        packed=True,
+    ).cpu()
+    reference = dequantize_humming_uint(
+        result["codes"], result["weight_scale"], bits=bits, group_size=32
+    )
+    torch.testing.assert_close(humming_dequant, reference, rtol=0, atol=0)
+
+    absmax = requantize_mxfp4_to_humming_uint(
+        packed, scale_bytes, bits=bits, scale_mode="absmax"
+    )
+    absmax_dequant = dequantize_humming_uint(
+        absmax["codes"], absmax["weight_scale"], bits=bits, group_size=32
+    )
+    assert _snr_db(truth, reference) > _snr_db(truth, absmax_dequant) + 0.5
+
+
+def test_mxfp4_to_humming_uint4_matches_int4_w4a16_codes():
+    """At 4 bits the Humming path picks the same MSE scales and codes as the
+    existing W4A16 path (bias 8), so the two formats agree on the values."""
+    torch.manual_seed(1)
+    rows, cols = 16, 256
+    nibbles = torch.randint(0, 16, (rows, cols), dtype=torch.uint8)
+    packed = _pack_nibbles(nibbles)
+    scale_bytes = torch.randint(120, 134, (rows, cols // 32), dtype=torch.uint8)
+
+    humming = requantize_mxfp4_to_humming_uint(packed, scale_bytes, bits=4)
+    w4a16 = requantize_mxfp4_to_int4_w4a16(packed, scale_bytes, scale_mode="mse")
+    torch.testing.assert_close(humming["weight_scale"], w4a16["scales"])
+    assert torch.equal(humming["codes"], _unpack_int4_pairs(w4a16["qweight_packed"]))
 
 
 @pytest.mark.skipif(
