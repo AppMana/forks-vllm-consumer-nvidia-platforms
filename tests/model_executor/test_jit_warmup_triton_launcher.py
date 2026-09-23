@@ -509,3 +509,30 @@ def test_triton_launcher_first_launch_can_be_traced_by_dynamo() -> None:
     traced = torch.compile(run, fullgraph=True, backend="eager")
     actual = traced(FusedQKVRMSNormKernel())
     torch.testing.assert_close(actual, expected)
+
+
+def test_triton_launcher_constructs_with_placeholder_triton_kernel() -> None:
+    """Kernel owners are built at import time, also where Triton is absent.
+
+    vllm.triton_utils then substitutes a placeholder whose ``triton.jit``
+    returns the undecorated Python function, so constructing the owner must
+    read that function's parameters instead of failing the import.
+    """
+    from vllm.triton_utils.importing import TritonPlaceholder
+
+    class _PlaceholderKernel(VllmTritonJitKernel["_PlaceholderKernel.CompileKey"]):
+        @TritonPlaceholder().jit(do_not_specialize=["value"])
+        def kernel(x, value, BLOCK: tl.constexpr):
+            pass
+
+        @dataclass(frozen=True)
+        class CompileKey:
+            value: int
+
+        def get_warmup_keys(self) -> list[CompileKey]:
+            return []
+
+        def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
+            return {}
+
+    assert _PlaceholderKernel()._kernel_arg_names == ("x", "value", "BLOCK")

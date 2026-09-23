@@ -227,6 +227,9 @@ def _triton_kernel_arg_names(kernel: Any) -> tuple[str, ...]:
     wrapped = getattr(kernel, "func", None)
     if wrapped is not None:
         return tuple(inspect.signature(wrapped).parameters)
+    if inspect.isfunction(kernel):
+        # The TritonPlaceholder's triton.jit returns the bare function.
+        return tuple(inspect.signature(kernel).parameters)
     raise TypeError(f"Cannot inspect kernel parameters for {type(kernel).__name__}")
 
 
