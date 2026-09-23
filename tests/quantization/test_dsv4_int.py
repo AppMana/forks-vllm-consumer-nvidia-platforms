@@ -1087,6 +1087,67 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
         assert handle.get_tensor("mtp.1.e_proj.scale").dtype is torch.bfloat16
 
 
+def test_requant_checkpoint_keep_layers_rewrites_per_layer_config(tmp_path):
+    """A layer subset keeps compress_ratios and DSpark targets consistent.
+
+    The source mirrors 0731's layout: one compress ratio per backbone layer
+    followed by one per MTP stage, and DSpark targets that are the last
+    backbone layers.
+    """
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+
+    shard_name = "model-00001-of-00001.safetensors"
+    tensors = {
+        f"layers.{i}.attn.attn_sink": torch.ones(4, dtype=torch.bfloat16)
+        for i in range(6)
+    }
+    tensors.update(
+        {
+            f"mtp.{i}.attn.attn_sink": torch.ones(4, dtype=torch.bfloat16)
+            for i in range(3)
+        }
+    )
+    tensors["embed.weight"] = torch.ones(8, 4, dtype=torch.bfloat16)
+    tensors["head.weight"] = torch.ones(8, 4, dtype=torch.bfloat16)
+    save_file(tensors, str(src / shard_name))
+    (src / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "num_hidden_layers": 6,
+                "num_nextn_predict_layers": 3,
+                "expert_dtype": "fp4",
+                "compress_ratios": [0, 0, 4, 128, 4, 128, 1, 2, 3],
+                "dspark_target_layer_ids": [3, 4, 5],
+            }
+        )
+    )
+    (src / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": "0"},
+                "weight_map": {name: shard_name for name in tensors},
+            }
+        )
+    )
+
+    convert_checkpoint(
+        src,
+        dst,
+        device="cpu",
+        out_scale_dtype=torch.bfloat16,
+        overwrite=False,
+        layer_remap={i: i for i in range(4)},
+    )
+
+    cfg = json.loads((dst / "config.json").read_text())
+    assert cfg["num_hidden_layers"] == 4
+    assert cfg["compress_ratios"] == [0, 0, 4, 128, 1, 2, 3]
+    assert cfg["dspark_target_layer_ids"] == [1, 2, 3]
+
+
 @pytest.mark.skipif(
     not hasattr(torch, "float8_e4m3fn") or not hasattr(torch, "float8_e8m0fnu"),
     reason="requires torch float8 dtypes",
