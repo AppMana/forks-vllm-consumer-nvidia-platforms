@@ -479,3 +479,33 @@ def test_compute_slot_mapping_uses_named_launcher_inputs(monkeypatch) -> None:
         "PAD_ID": PAD_SLOT_ID,
         "BLOCK_SIZE": owner.triton_block_size,
     }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_triton_launcher_first_launch_can_be_traced_by_dynamo() -> None:
+    """A launcher whose first call happens inside torch.compile must trace.
+
+    Model forward passes are compiled with fullgraph, and a Triton launcher
+    may never have run eagerly before the first traced forward (the profiling
+    run is the first forward). Inspecting the kernel's argument names lazily
+    at that point made Dynamo trace hasattr() on a Triton kernel object, which
+    it cannot ("Unsupported hasattr call"), and engine init failed.
+    """
+    from vllm.models.common.ops.fused_qk_rmsnorm import FusedQKVRMSNormKernel
+
+    torch.manual_seed(0)
+    qr = torch.randn(4, 1536, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(4, 512, dtype=torch.bfloat16, device="cuda")
+    q_weight = torch.randn(1536, dtype=torch.bfloat16, device="cuda")
+    kv_weight = torch.randn(512, dtype=torch.bfloat16, device="cuda")
+
+    def run(kernel):
+        qr_out = torch.empty_like(qr)
+        kv_out = torch.empty_like(kv)
+        kernel(qr, kv, qr_out, kv_out, q_weight, kv_weight, 1e-6)
+        return qr_out, kv_out
+
+    expected = run(FusedQKVRMSNormKernel())
+    traced = torch.compile(run, fullgraph=True, backend="eager")
+    actual = traced(FusedQKVRMSNormKernel())
+    torch.testing.assert_close(actual, expected)
