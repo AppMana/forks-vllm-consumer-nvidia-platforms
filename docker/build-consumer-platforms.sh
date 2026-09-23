@@ -55,6 +55,11 @@ BUILDKIT_TARGET="${BUILDKIT_TARGET:-svc/$BUILDKIT_SERVICE}"
 # LAN over BGP). The session then does not depend on the API server staying
 # responsive for the whole build. Requires the mTLS client certificate.
 BUILDKIT_ADDR="${BUILDKIT_ADDR:-}"
+# Set to 1 only when this script itself runs inside the cluster next to
+# BuildKit (e.g. a Job in the buildkit namespace): BUILDKIT_ADDR is then a
+# cluster-local Service without mTLS, and the BuildKit session never crosses
+# a WAN or tailnet link.
+BUILDKIT_IN_CLUSTER="${BUILDKIT_IN_CLUSTER:-0}"
 # Per-architecture layer cache: two mode=max exports to one ref overwrite each
 # other. amd64 keeps the historical `buildcache` ref, which is the warm one.
 CACHE_REF="${CACHE_REF:-}"
@@ -130,7 +135,7 @@ wheel_version="${VLLM_VERSION_OVERRIDE:-0.0.0+consumer.${resolved_commit:0:10}}"
 # cluster-local BuildKit can instead rely on the authenticated Kubernetes
 # port-forward and does not need a second secret.
 tls_options=()
-if kubectl --context "$KUBE_CONTEXT" get secret buildkit-client-tls \
+if [ "$BUILDKIT_IN_CLUSTER" != 1 ] && kubectl --context "$KUBE_CONTEXT" get secret buildkit-client-tls \
     -n "$CONTEXT_NS" -o json > "$workdir/buildkit-client-tls.json" 2>/dev/null; then
   python3 -c "
 import base64, json, pathlib, sys
@@ -152,7 +157,11 @@ fi
 # GIT_AUTH_TOKEN authenticates the private git context. The token must not carry
 # a trailing newline: `gh auth token` emits one and it corrupts the auth header,
 # which surfaces as "could not read Username for 'https://github.com'".
-gh auth token | tr -d '\n' > "$workdir/ghtoken"
+if [ -n "${GIT_AUTH_TOKEN:-}" ]; then
+    printf '%s' "$GIT_AUTH_TOKEN" | tr -d '\n' > "$workdir/ghtoken"
+else
+    gh auth token | tr -d '\n' > "$workdir/ghtoken"
+fi
 chmod 600 "$workdir/ghtoken"
 
 secret_options=(--secret "id=GIT_AUTH_TOKEN,src=$workdir/ghtoken")
@@ -175,8 +184,8 @@ if [ "$USE_SCCACHE" = "1" ]; then
     )
 fi
 if [ -n "$BUILDKIT_ADDR" ]; then
-    if [ "${#tls_options[@]}" -eq 0 ]; then
-        echo "BUILDKIT_ADDR needs the $CONTEXT_NS/buildkit-client-tls mTLS certificate" >&2
+    if [ "${#tls_options[@]}" -eq 0 ] && [ "$BUILDKIT_IN_CLUSTER" != 1 ]; then
+        echo "BUILDKIT_ADDR needs the $CONTEXT_NS/buildkit-client-tls mTLS certificate (or BUILDKIT_IN_CLUSTER=1 inside the cluster)" >&2
         exit 1
     fi
     buildkit_addr="$BUILDKIT_ADDR"
