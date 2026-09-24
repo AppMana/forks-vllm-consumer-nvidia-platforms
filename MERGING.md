@@ -182,7 +182,20 @@ Two consequences specific to this fork:
   (`broadcast_drafts`, `draft_tokens_to_update`) while the fork packs the
   proposed block into the single payload broadcast. Keep the payload
   contract, delete upstream's second broadcast, and keep
-  `get_prev_sampled_outputs()` argument-free.
+  `get_prev_sampled_outputs()` argument-free. Upstream's version of this
+  (#56956) also moved the relay after `propose()`, added draft adoption
+  arguments to `post_update` and a `warmup_pp_decode_update` for them; the
+  fork passes no draft arguments, so that warmup is re-ported to
+  `PPHandler.warmup_sampled_outputs()` (the live payload slicing), guarded
+  by `test_warmup_pp_decode_update_matches_serving_specialization`.
+- `torch._dynamo.exc.Unsupported: Unsupported hasattr call` at startup with
+  CUDA graphs: a Triton JIT owner resolved its kernel's argument names for
+  the first time inside the model's trace. The fork compiles DeepSeek V4,
+  upstream does not; `VllmTritonJitKernel.__init__` resolves them eagerly
+  (`31d143c7c5`).
+- AllSpark deleted upstream (#58001): the fork's `dsv4_int` dense path calls
+  its ops directly, so the kernels, schemas, `_custom_ops` wrappers and
+  `allspark_utils.py` are reinstated on every merge that drops them.
 - `KeyError: aux_hidden_states_0` or a receive tensor nobody sends under PP:
   upstream's runner-side aux relay (`EagleModelMixin` slot keys,
   `reserve_aux_intermediate_tensor_slots`) counted slots for a model that
@@ -278,6 +291,7 @@ table carries the rule.
 
 | Commit | Lesson |
 | --- | --- |
+| `9c9d5077ef` | Merge of upstream `f9ad9dd6b4` (218 commits), from `pre-upstream-merge-2026-09-23`. AllSpark reinstated after upstream deleted it; upstream's DSpark PP draft relay folded into the single payload. Gate D then needed `31d143c7c5` (PP=1 CUDA graphs had not started on the pre-merge tree either). |
 | `53873c6c4d` | Merge of upstream `729ebac498` (773 commits). The model for a merge body: the conflict count, then resolutions grouped by the policy areas, each naming what superseded any dropped fork code. Its first parent is `pre-upstream-merge-2026-09-18`. |
 | `334894183a` | Merge of upstream `e35298628f` (1798 commits). When upstream replaces a subsystem, re-express the fork's invariant in the new structure (the 528-byte `int8_ds_mla` page became spec `state_content_bytes`; 16-byte alignment moved into spec alignment) and say in the body which resolution still needs hardware validation. |
 | `883eea2c3c` | Merging back two lines that had each rebased the same shared history: 13 conflicts, and about 90 files that merged cleanly only because both sides replayed identical commits, to find 7 files of new content. Source of the one-branch, merge-never-rebase rules. |
