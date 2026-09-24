@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import vllm.model_executor.layers.activation as activation_layers
 from tests.kernels.allclose_default import get_default_atol, get_default_rtol
 from tests.kernels.utils import opcheck
 from vllm.model_executor.layers.activation import (
@@ -293,6 +294,11 @@ def test_silu_and_mul_with_clamp(
         else:
             native_spy.assert_called_once()
             cuda_spy.assert_not_called()
+    elif activation_layers._use_native_clamped_silu_on_cuda():
+        # sm86 routes the clamped SiLU through torch ops rather than the
+        # compiled op (activation.py); the CUDA kernel is not dispatched there.
+        assert layer._forward_method == layer.forward_native
+        out = layer(x)
     else:
         assert layer._forward_method == layer.forward_cuda
         out = layer(x)
@@ -578,6 +584,7 @@ HUMMING_ACTIVATION_CASES += [
 @pytest.mark.parametrize(("num_tokens", "d"), [(1, 512), (7, 768), (83, 512)])
 @torch.inference_mode()
 def test_humming_activation_matches_framework(
+    monkeypatch: pytest.MonkeyPatch,
     activation: MoEActivation,
     activation_config: ApplyMoEActivationConfig,
     dtype: torch.dtype,
@@ -586,6 +593,12 @@ def test_humming_activation_matches_framework(
 ) -> None:
     """Compare activation math/layouts without quantization or Hadamard error."""
     pytest.importorskip("humming")
+    # The reference is the framework's CUDA activation kernel. sm86 otherwise
+    # routes the clamped SiLU through bf16 torch ops, which differ from the
+    # kernel's fp32 intermediates by one bf16 ulp; that path has its own test.
+    monkeypatch.setattr(
+        activation_layers, "_use_native_clamped_silu_on_cuda", lambda: False
+    )
     from humming.ops import process_input
 
     from vllm.model_executor.layers.quantization.utils.humming.activation import (
