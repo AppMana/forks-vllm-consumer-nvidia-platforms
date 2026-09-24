@@ -57,10 +57,11 @@ def test_full_graph_padding_extends_is_prefilling(
     length makes ``split_decodes_and_prefills`` fail with a size mismatch on
     the first three-, five- or seven-sequence decode step."""
     state = object.__new__(DefaultModelState)
-    state.max_model_len = 8192
     state.supports_mm_inputs = False
     state.encoder_cache = None
-    state.model_config = SimpleNamespace(is_mm_prefix_lm=False, rswa_window=None)
+    state.model_config = SimpleNamespace(
+        is_mm_prefix_lm=False, rswa_window=None, max_model_len=8192
+    )
 
     input_batch = _padded_decode_batch(num_reqs, num_reqs_padded, query_len=8)
     build_attn_metadata = Mock(return_value={})
@@ -89,10 +90,11 @@ def test_unpadded_batch_passes_is_prefilling_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = object.__new__(DefaultModelState)
-    state.max_model_len = 8192
     state.supports_mm_inputs = False
     state.encoder_cache = None
-    state.model_config = SimpleNamespace(is_mm_prefix_lm=False, rswa_window=None)
+    state.model_config = SimpleNamespace(
+        is_mm_prefix_lm=False, rswa_window=None, max_model_len=8192
+    )
 
     input_batch = _padded_decode_batch(3, 3, query_len=8)
     build_attn_metadata = Mock(return_value={})

@@ -75,6 +75,7 @@ class _FakeModelRunner:
     kv_block_zeroer = None
     adaptive_verification = None
     rejection_sampler = None
+    pp_handler = None
     vllm_config = SimpleNamespace(
         num_lookahead_tokens=0,
         is_mm_encoder_only=False,

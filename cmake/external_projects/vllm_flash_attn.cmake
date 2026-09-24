@@ -39,7 +39,7 @@ else()
   FetchContent_Declare(
           vllm-flash-attn
           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
-          GIT_TAG 506341a143fcabd4bb79052a7605ada727d6b3f5
+          GIT_TAG 9cd61de38763d712bb6ce56e2a02cc2bf718c89f
           GIT_PROGRESS TRUE
           # Idempotent: a cached checkout (the .deps build mount) is already
           # patched after any earlier configure, and a second apply fails.
