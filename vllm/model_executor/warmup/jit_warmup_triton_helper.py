@@ -219,6 +219,20 @@ class TritonWarmupTensor:
         return result if dim is None else result[dim]
 
 
+def _triton_kernel_arg_names(kernel: Any) -> tuple[str, ...]:
+    """Parameter names of a Triton kernel or a Python launcher wrapper."""
+    arg_names = getattr(kernel, "arg_names", None)
+    if arg_names is not None:
+        return tuple(arg_names)
+    wrapped = getattr(kernel, "func", None)
+    if wrapped is not None:
+        return tuple(inspect.signature(wrapped).parameters)
+    if inspect.isfunction(kernel):
+        # The TritonPlaceholder's triton.jit returns the bare function.
+        return tuple(inspect.signature(kernel).parameters)
+    raise TypeError(f"Cannot inspect kernel parameters for {type(kernel).__name__}")
+
+
 class VllmTritonJitKernel(VllmJitKernel[CompileKeyT], Generic[CompileKeyT]):
     """Triton owner whose runtime launch specification is reused for warmup."""
 
@@ -229,13 +243,16 @@ class VllmTritonJitKernel(VllmJitKernel[CompileKeyT], Generic[CompileKeyT]):
 
     def __init__(self) -> None:
         super().__init__()
-        # Resolve the Triton argument names now. The first launch can run
-        # inside a torch.compile trace, where probing the Triton kernel's
-        # attributes is untraceable ("Unsupported hasattr call"). A kernel that
-        # cannot be inspected keeps failing at launch, as before.
-        if getattr(self, "kernel", None) is not None:
-            with suppress(TypeError):
-                _ = self._kernel_arg_names
+        kernel = getattr(type(self), "kernel", None)
+        if kernel is not None:
+            self._cache_kernel_arg_names(kernel)
+
+    def _cache_kernel_arg_names(self, kernel: Any) -> None:
+        # The first launch can happen inside a fullgraph-compiled model forward
+        # (the profiling run is the first forward), where Dynamo cannot trace
+        # hasattr() on a Triton kernel object ("Unsupported hasattr call").
+        # Filling the cached_property here means tracing reads a plain tuple.
+        self.__dict__["_kernel_arg_names"] = _triton_kernel_arg_names(kernel)
 
     @abstractmethod
     def warmup_inputs(self, compile_key: CompileKeyT) -> dict[str, Any]:
@@ -254,15 +271,7 @@ class VllmTritonJitKernel(VllmJitKernel[CompileKeyT], Generic[CompileKeyT]):
 
     @cached_property
     def _kernel_arg_names(self) -> tuple[str, ...]:
-        arg_names = getattr(self.kernel, "arg_names", None)
-        if arg_names is not None:
-            return tuple(arg_names)
-        wrapped = getattr(self.kernel, "func", None)
-        if wrapped is not None:
-            return tuple(inspect.signature(wrapped).parameters)
-        raise TypeError(
-            f"Cannot inspect kernel parameters for {type(self.kernel).__name__}"
-        )
+        return _triton_kernel_arg_names(self.kernel)
 
     def _prepare_launch_kwargs(
         self,
@@ -528,6 +537,7 @@ class _DecoratedTritonJitKernel(_AutomaticTritonJitKernel):
         dispatch: Callable[..., DispatchSpec] | None,
     ) -> None:
         self.kernel = kernel
+        self._cache_kernel_arg_names(kernel)
         self._run_autotune = _is_autotuned(kernel)
         self._warmup_inputs_fn = warmup_inputs
         self._dispatch_fn = dispatch

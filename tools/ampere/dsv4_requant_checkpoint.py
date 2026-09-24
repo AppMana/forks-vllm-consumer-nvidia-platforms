@@ -265,7 +265,6 @@ def _ensure_mtp_shared_tensors(dst: Path) -> None:
     names that the loader maps into ``model.embed_tokens`` and
     ``shared_head.head``.
     """
-
     stage_ids = _mtp_stage_ids(dst)
     if not stage_ids:
         return
@@ -441,6 +440,36 @@ def _reshard_safetensors(
             shutil.rmtree(tmp_dir)
 
 
+def _remap_per_layer_config(
+    cfg: dict, layer_remap: dict[int, int], *, drop_mtp: bool
+) -> None:
+    """Rewrite config fields indexed by backbone layer for a layer subset.
+
+    ``compress_ratios`` holds one entry per backbone layer followed by one
+    per MTP stage. ``dspark_target_layer_ids`` are the last backbone layers
+    of the target model, so a subset that drops them retargets the last
+    kept layers.
+    """
+    num_layers = int(cfg["num_hidden_layers"])
+    kept_sources = sorted(layer_remap, key=layer_remap.__getitem__)
+    ratios = cfg.get("compress_ratios")
+    if ratios is not None:
+        mtp_ratios = [] if drop_mtp else ratios[num_layers:]
+        cfg["compress_ratios"] = [ratios[s] for s in kept_sources] + mtp_ratios
+    targets = cfg.get("dspark_target_layer_ids")
+    if targets is not None:
+        if all(t in layer_remap for t in targets):
+            cfg["dspark_target_layer_ids"] = [layer_remap[t] for t in targets]
+        elif list(targets) == list(range(num_layers - len(targets), num_layers)):
+            kept = len(layer_remap)
+            cfg["dspark_target_layer_ids"] = list(range(kept - len(targets), kept))
+        else:
+            raise ValueError(
+                f"cannot remap dspark_target_layer_ids={targets} with "
+                f"layer_remap={layer_remap}"
+            )
+
+
 def _write_config(
     src: Path,
     dst: Path,
@@ -455,6 +484,7 @@ def _write_config(
 ) -> None:
     cfg = json.loads((src / "config.json").read_text())
     if layer_remap is not None:
+        _remap_per_layer_config(cfg, layer_remap, drop_mtp=drop_mtp)
         cfg["num_hidden_layers"] = len(layer_remap)
     if keep_experts is not None:
         cfg["n_routed_experts"] = keep_experts

@@ -19,6 +19,10 @@
 #
 # Usage:
 #   docker/build-consumer-platforms.sh [--platform linux/arm64] [--tag NAME]
+#       [--ref BRANCH|TAG|COMMIT]
+#
+# The default tag is sm86-sm121-<commit10>-<arch>; tags are never reused for
+# different content (MERGING.md, release gate).
 #
 # Caches: the build dials one fixed buildkitd pod (Service buildkitd-vllm) so
 # its local layer cache persists between runs, imports and exports the layer
@@ -26,17 +30,17 @@
 # cluster's S3 (credentials from the buildkit/seaweedfs-s3 Secret). Leave all
 # three on; a build without them recompiles vLLM for over an hour.
 #
-# Requires: kubectl context `remote` (appmana-cluster-03), gh auth, buildctl.
+# Requires: kubectl context `local` (appmana-cluster-03), gh auth, buildctl.
 
 set -euo pipefail
 
 PLATFORM="${PLATFORM:-linux/arm64}"
-IMAGE="${IMAGE:-ghcr.io/appmana/vllm-consumer:sm86-sm121}"
+IMAGE_REPO="${IMAGE_REPO:-ghcr.io/appmana/vllm-consumer}"
+IMAGE="${IMAGE:-}"
 REPO_URL="${REPO_URL:-https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms.git}"
 REF="${REF:-appmana/vllm-consumer-nvidia-platforms}"
 CONTEXT_NS="${CONTEXT_NS:-buildkit}"
-KUBE_CONTEXT="${KUBE_CONTEXT:-remote}"
-LOCAL_PORT="${LOCAL_PORT:-11234}"
+KUBE_CONTEXT="${KUBE_CONTEXT:-local}"
 DOCKERFILE="${DOCKERFILE:-docker/Dockerfile}"
 # An explicitly empty TARGET builds the Dockerfile's final stage. This is used
 # by single-stage overlay Dockerfiles.
@@ -46,7 +50,19 @@ BUILDKIT_SERVICE="${BUILDKIT_SERVICE:-buildkitd-vllm}"
 # What to port-forward to. A pod name pins the build to one node, which a
 # Service cannot do through kubectl port-forward.
 BUILDKIT_TARGET="${BUILDKIT_TARGET:-svc/$BUILDKIT_SERVICE}"
-CACHE_REF="${CACHE_REF:-ghcr.io/appmana/vllm-consumer:buildcache}"
+# Dial BuildKit directly instead of through kubectl port-forward, e.g.
+# tcp://10.152.184.4:1234 (appmana's buildkitd-vllm ClusterIP, routed to the
+# LAN over BGP). The session then does not depend on the API server staying
+# responsive for the whole build. Requires the mTLS client certificate.
+BUILDKIT_ADDR="${BUILDKIT_ADDR:-}"
+# Set to 1 only when this script itself runs inside the cluster next to
+# BuildKit (e.g. a Job in the buildkit namespace): BUILDKIT_ADDR is then a
+# cluster-local Service without mTLS, and the BuildKit session never crosses
+# a WAN or tailnet link.
+BUILDKIT_IN_CLUSTER="${BUILDKIT_IN_CLUSTER:-0}"
+# Per-architecture layer cache: two mode=max exports to one ref overwrite each
+# other. amd64 keeps the historical `buildcache` ref, which is the warm one.
+CACHE_REF="${CACHE_REF:-}"
 USE_SCCACHE="${USE_SCCACHE:-1}"
 # LMCache, NIXL and Mooncake, as in the Harbor sm86 image; every one of them
 # ships aarch64 wheels, so both platforms carry the same connectors.
@@ -72,17 +88,46 @@ done
 
 command -v buildctl >/dev/null || { echo "buildctl not on PATH" >&2; exit 1; }
 
+case "$PLATFORM" in
+    linux/amd64) arch=amd64 ;;
+    linux/arm64) arch=arm64 ;;
+    *) echo "unsupported platform: $PLATFORM" >&2; exit 2 ;;
+esac
+
+# The workdir holds the GitHub token and S3 credentials, and the port-forward
+# must not outlive the build, so buildctl runs as a child (not exec) and this
+# trap always fires.
 workdir="$(mktemp -d)"
-trap 'rm -rf "$workdir"; [ -n "${pf_pid:-}" ] && kill "$pf_pid" 2>/dev/null || true' EXIT
+cleanup() {
+    if [ -n "${pf_pid:-}" ]; then
+        kill "$pf_pid" 2>/dev/null || true
+        wait "$pf_pid" 2>/dev/null || true
+    fi
+    rm -rf "$workdir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 chmod 700 "$workdir"
 
-resolved_commit="$(git ls-remote "$REPO_URL" "refs/heads/$REF" | awk 'NR == 1 { print $1 }')"
-if [ -z "$resolved_commit" ]; then
-    resolved_commit="$(git ls-remote "$REPO_URL" "refs/tags/$REF^{}" "refs/tags/$REF" | awk 'NR == 1 { print $1 }')"
+if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+    resolved_commit="$REF"
+else
+    resolved_commit="$(git ls-remote "$REPO_URL" "refs/heads/$REF" | awk 'NR == 1 { print $1 }')"
+    if [ -z "$resolved_commit" ]; then
+        resolved_commit="$(git ls-remote "$REPO_URL" "refs/tags/$REF^{}" "refs/tags/$REF" | awk 'NR == 1 { print $1 }')"
+    fi
 fi
 if ! [[ "$resolved_commit" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "could not resolve $REF to an exact commit" >&2
+    echo "could not resolve $REF to an exact commit (branch, tag or full 40-hex SHA)" >&2
     exit 1
+fi
+IMAGE="${IMAGE:-$IMAGE_REPO:sm86-sm121-${resolved_commit:0:10}-$arch}"
+if [ -z "$CACHE_REF" ]; then
+    if [ "$arch" = amd64 ]; then
+        CACHE_REF="$IMAGE_REPO:buildcache"
+    else
+        CACHE_REF="$IMAGE_REPO:buildcache-$arch"
+    fi
 fi
 wheel_version="${VLLM_VERSION_OVERRIDE:-0.0.0+consumer.${resolved_commit:0:10}}"
 
@@ -90,7 +135,7 @@ wheel_version="${VLLM_VERSION_OVERRIDE:-0.0.0+consumer.${resolved_commit:0:10}}"
 # cluster-local BuildKit can instead rely on the authenticated Kubernetes
 # port-forward and does not need a second secret.
 tls_options=()
-if kubectl --context "$KUBE_CONTEXT" get secret buildkit-client-tls \
+if [ "$BUILDKIT_IN_CLUSTER" != 1 ] && kubectl --context "$KUBE_CONTEXT" get secret buildkit-client-tls \
     -n "$CONTEXT_NS" -o json > "$workdir/buildkit-client-tls.json" 2>/dev/null; then
   python3 -c "
 import base64, json, pathlib, sys
@@ -112,7 +157,11 @@ fi
 # GIT_AUTH_TOKEN authenticates the private git context. The token must not carry
 # a trailing newline: `gh auth token` emits one and it corrupts the auth header,
 # which surfaces as "could not read Username for 'https://github.com'".
-gh auth token | tr -d '\n' > "$workdir/ghtoken"
+if [ -n "${GIT_AUTH_TOKEN:-}" ]; then
+    printf '%s' "$GIT_AUTH_TOKEN" | tr -d '\n' > "$workdir/ghtoken"
+else
+    gh auth token | tr -d '\n' > "$workdir/ghtoken"
+fi
 chmod 600 "$workdir/ghtoken"
 
 secret_options=(--secret "id=GIT_AUTH_TOKEN,src=$workdir/ghtoken")
@@ -134,12 +183,48 @@ if [ "$USE_SCCACHE" = "1" ]; then
         --opt "build-arg:SCCACHE_REGION_NAME=$SCCACHE_REGION_NAME"
     )
 fi
-kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" "$BUILDKIT_TARGET" \
-    "$LOCAL_PORT:1234" >/dev/null 2>&1 &
-pf_pid=$!
-sleep 5
+if [ -n "$BUILDKIT_ADDR" ]; then
+    if [ "${#tls_options[@]}" -eq 0 ] && [ "$BUILDKIT_IN_CLUSTER" != 1 ]; then
+        echo "BUILDKIT_ADDR needs the $CONTEXT_NS/buildkit-client-tls mTLS certificate (or BUILDKIT_IN_CLUSTER=1 inside the cluster)" >&2
+        exit 1
+    fi
+    buildkit_addr="$BUILDKIT_ADDR"
+else
+    # Let kubectl pick a free local port and read it back, so a stale forward left
+    # on a fixed port by another run can never be reused silently. The API server
+    # can stall a single request past kubectl's own 32 s timeout (a control-plane
+    # node with a slow disk), so each attempt gets 45 s and the forward is retried.
+    start_port_forward() {
+        kubectl --context "$KUBE_CONTEXT" port-forward -n "$CONTEXT_NS" "$BUILDKIT_TARGET" \
+            ":1234" > "$workdir/port-forward.log" 2>&1 < /dev/null &
+        pf_pid=$!
+        local_port=""
+        for _ in $(seq 1 45); do
+            if ! kill -0 "$pf_pid" 2>/dev/null; then
+                return 1
+            fi
+            local_port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 1234$/\1/p' "$workdir/port-forward.log" | head -n 1)"
+            [ -n "$local_port" ] && return 0
+            sleep 1
+        done
+        kill "$pf_pid" 2>/dev/null || true
+        wait "$pf_pid" 2>/dev/null || true
+        return 1
+    }
+    for attempt in 1 2 3; do
+        start_port_forward && break
+        echo "port-forward to $BUILDKIT_TARGET attempt $attempt failed:" >&2
+        cat "$workdir/port-forward.log" >&2
+        pf_pid=""
+        if [ "$attempt" = 3 ]; then
+            exit 1
+        fi
+    done
+    buildkit_addr="tcp://127.0.0.1:$local_port"
+fi
+buildctl --addr "$buildkit_addr" "${tls_options[@]}" debug workers >/dev/null
 
-echo "building $IMAGE for $PLATFORM from $REF at $resolved_commit"
+echo "building $IMAGE for $PLATFORM from $REF at $resolved_commit (cache $CACHE_REF)"
 
 build_options=(
     --opt "context=${REPO_URL}#${resolved_commit}"
@@ -164,8 +249,8 @@ fi
 # BUILDKIT_CONTEXT_KEEP_GIT_DIR: a git context strips .git by default, but the
 # Dockerfile bind-mounts it for tools/check_repo.sh, which otherwise fails with
 # 'failed to calculate checksum of ref ...: "/.git": not found'.
-exec buildctl \
-    --addr "tcp://127.0.0.1:$LOCAL_PORT" \
+buildctl \
+    --addr "$buildkit_addr" \
     "${tls_options[@]}" \
     build \
     --frontend dockerfile.v0 \

@@ -26,12 +26,15 @@ from vllm.model_executor.layers.quantization.dsv4_int import (
     _unpack_int4_pairs,
     dequantize_allspark_uint8_w8a16,
     dequantize_fp8_block_to_bf16,
+    dequantize_humming_uint,
     dequantize_int4_w4a16,
     dequantize_int8_w8a16,
     dequantize_uint4_asym_w4a16,
     quantize_fp32_to_uint4_asym_w4a16,
     requantize_fp8_to_allspark_uint8_w8a16,
+    requantize_fp8_to_humming_uint8_channel,
     requantize_fp8_to_int8_w8a16,
+    requantize_mxfp4_to_humming_uint,
     requantize_mxfp4_to_int4_w4a16,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -255,6 +258,103 @@ def test_mxfp4_to_int4_mse_scale_mode_beats_absmax7():
     # nibbles exercise the search less (~+1.7 dB), so the regression floor
     # here is +1.0 dB.
     assert snrs["mse"] > snrs["absmax7"] + 1.0, snrs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("bits,group_size", [(3, 32), (4, 32), (3, 64), (3, 128)])
+def test_mxfp4_to_humming_uint_roundtrips_through_humming(bits, group_size):
+    """Codes packed for Humming unpack, through Humming's own dequantizer, to
+    exactly the tool's reference dequant, and beat absmax scaling."""
+    humming_weight = pytest.importorskip("humming.utils.weight")
+    from humming import dtypes
+
+    torch.manual_seed(0)
+    rows, cols = 64, 1024
+    nibbles = torch.randint(0, 16, (rows, cols), dtype=torch.uint8)
+    packed = _pack_nibbles(nibbles)
+    scale_bytes = torch.randint(120, 134, (rows, cols // 32), dtype=torch.uint8)
+    fp4 = _e2m1_nibble_to_fp32(_unpack_int4_pairs(packed))
+    scale = _e8m0_to_fp32_scale(scale_bytes)
+    truth = (fp4.reshape(rows, -1, 32) * scale.unsqueeze(-1)).reshape(rows, cols)
+
+    result = requantize_mxfp4_to_humming_uint(
+        packed, scale_bytes, bits=bits, group_size=group_size
+    )
+    assert result["weight"].dtype == torch.int32
+    assert result["weight"].shape == (rows, cols * bits // 32)
+    assert result["weight_scale"].shape == (rows, cols // group_size)
+
+    humming_dequant = humming_weight.dequantize_weight(
+        result["weight"],
+        weight_scale=result["weight_scale"].cuda(),
+        zero_point=None,
+        weight_scale_2=None,
+        dtype=dtypes.DataType.from_str(f"uint{bits}"),
+        packed=True,
+    ).cpu()
+    reference = dequantize_humming_uint(
+        result["codes"], result["weight_scale"], bits=bits, group_size=group_size
+    )
+    torch.testing.assert_close(humming_dequant, reference, rtol=0, atol=0)
+
+    absmax = requantize_mxfp4_to_humming_uint(
+        packed, scale_bytes, bits=bits, group_size=group_size, scale_mode="absmax"
+    )
+    absmax_dequant = dequantize_humming_uint(
+        absmax["codes"], absmax["weight_scale"], bits=bits, group_size=group_size
+    )
+    assert _snr_db(truth, reference) > _snr_db(truth, absmax_dequant) + 0.5
+
+
+def test_mxfp4_to_humming_uint4_matches_int4_w4a16_codes():
+    """At 4 bits the Humming path picks the same MSE scales and codes as the
+    existing W4A16 path (bias 8), so the two formats agree on the values."""
+    torch.manual_seed(1)
+    rows, cols = 16, 256
+    nibbles = torch.randint(0, 16, (rows, cols), dtype=torch.uint8)
+    packed = _pack_nibbles(nibbles)
+    scale_bytes = torch.randint(120, 134, (rows, cols // 32), dtype=torch.uint8)
+
+    humming = requantize_mxfp4_to_humming_uint(packed, scale_bytes, bits=4)
+    w4a16 = requantize_mxfp4_to_int4_w4a16(packed, scale_bytes, scale_mode="mse")
+    torch.testing.assert_close(humming["weight_scale"], w4a16["scales"])
+    assert torch.equal(humming["codes"], _unpack_int4_pairs(w4a16["qweight_packed"]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp8_block32_to_humming_uint8_channel_roundtrips_through_humming():
+    """V4.1 FP8 linears (32x32 E8M0 blocks) become Humming uint8 per-channel
+    weights whose codes are the AllSpark UINT8 codes (both bias 128)."""
+    humming_weight = pytest.importorskip("humming.utils.weight")
+    from humming import dtypes
+
+    torch.manual_seed(0)
+    n, k = 256, 512
+    weight = (torch.randn(n, k) * 0.5).to(torch.float8_e4m3fn)
+    scale = torch.randint(120, 130, (n // 32, k // 32), dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )
+
+    result = requantize_fp8_to_humming_uint8_channel(weight, scale, block_size=(32, 32))
+    assert result["weight"].dtype == torch.int32
+    assert result["weight"].shape == (n, k // 4)
+    assert result["weight_scale"].shape == (n, 1)
+
+    allspark = requantize_fp8_to_allspark_uint8_w8a16(
+        weight, scale, block_size=(32, 32)
+    )
+    humming_dequant = humming_weight.dequantize_weight(
+        result["weight"],
+        weight_scale=result["weight_scale"].cuda(),
+        zero_point=None,
+        weight_scale_2=None,
+        dtype=dtypes.uint8,
+        packed=True,
+    ).cpu()
+    expected = (allspark["qweight"].to(torch.float32) - 128.0) * allspark["scales"].to(
+        torch.float32
+    ).reshape(-1, 1)
+    torch.testing.assert_close(humming_dequant, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(
@@ -985,6 +1085,67 @@ def test_requant_checkpoint_rewrites_remapped_layers_and_quant_config(tmp_path):
         assert handle.get_tensor("layers.1.attn.wq_a.scale").dtype is torch.bfloat16
         assert handle.get_tensor("mtp.1.e_proj.weight").dtype is torch.int8
         assert handle.get_tensor("mtp.1.e_proj.scale").dtype is torch.bfloat16
+
+
+def test_requant_checkpoint_keep_layers_rewrites_per_layer_config(tmp_path):
+    """A layer subset keeps compress_ratios and DSpark targets consistent.
+
+    The source mirrors 0731's layout: one compress ratio per backbone layer
+    followed by one per MTP stage, and DSpark targets that are the last
+    backbone layers.
+    """
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+
+    shard_name = "model-00001-of-00001.safetensors"
+    tensors = {
+        f"layers.{i}.attn.attn_sink": torch.ones(4, dtype=torch.bfloat16)
+        for i in range(6)
+    }
+    tensors.update(
+        {
+            f"mtp.{i}.attn.attn_sink": torch.ones(4, dtype=torch.bfloat16)
+            for i in range(3)
+        }
+    )
+    tensors["embed.weight"] = torch.ones(8, 4, dtype=torch.bfloat16)
+    tensors["head.weight"] = torch.ones(8, 4, dtype=torch.bfloat16)
+    save_file(tensors, str(src / shard_name))
+    (src / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "num_hidden_layers": 6,
+                "num_nextn_predict_layers": 3,
+                "expert_dtype": "fp4",
+                "compress_ratios": [0, 0, 4, 128, 4, 128, 1, 2, 3],
+                "dspark_target_layer_ids": [3, 4, 5],
+            }
+        )
+    )
+    (src / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": "0"},
+                "weight_map": {name: shard_name for name in tensors},
+            }
+        )
+    )
+
+    convert_checkpoint(
+        src,
+        dst,
+        device="cpu",
+        out_scale_dtype=torch.bfloat16,
+        overwrite=False,
+        layer_remap={i: i for i in range(4)},
+    )
+
+    cfg = json.loads((dst / "config.json").read_text())
+    assert cfg["num_hidden_layers"] == 4
+    assert cfg["compress_ratios"] == [0, 0, 4, 128, 1, 2, 3]
+    assert cfg["dspark_target_layer_ids"] == [1, 2, 3]
 
 
 @pytest.mark.skipif(
