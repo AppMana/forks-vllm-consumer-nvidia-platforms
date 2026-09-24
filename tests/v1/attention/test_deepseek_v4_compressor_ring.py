@@ -73,6 +73,7 @@ def test_c128_spec_is_circular_only_on_cuda(monkeypatch, platform: str) -> None:
         assert c128_spec.prefix_cacheable is False
         assert c128_spec.uses_slot_mapping is False
         assert c128_spec.ring_capacity == 256
+        assert c128_spec.prefix_replay_tokens == 0
         if platform == "cutedsl":
             # Upstream layout: one block holding the whole ring.
             assert (c128_spec.block_size, c128_spec.num_ring_blocks) == (256, 1)
@@ -80,10 +81,43 @@ def test_c128_spec_is_circular_only_on_cuda(monkeypatch, platform: str) -> None:
             # Rings of paged-state-sized blocks keep the pool slot unchanged.
             assert (c128_spec.block_size, c128_spec.num_ring_blocks) == (8, 32)
 
+
+@pytest.mark.parametrize("platform", ["cutedsl", "triton", "cpu"])
+def test_c4_spec_is_circular_on_the_triton_kernels(monkeypatch, platform: str) -> None:
+    _platform(monkeypatch, platform)
     c4_spec = _state_cache(4).get_kv_cache_spec(_config(5))
-    assert isinstance(c4_spec, SlidingWindowMLASpec)
-    assert c4_spec.block_size == 4
-    assert c4_spec.sliding_window == 8
+    indexer_c4_spec = _state_cache(4, head_dim=128).get_kv_cache_spec(_config(5))
+    if platform == "cpu":
+        for spec in (c4_spec, indexer_c4_spec):
+            assert isinstance(spec, SlidingWindowMLASpec)
+            assert spec.block_size == 4
+            assert spec.sliding_window == 8
+        return
+    # The indexer compressor always runs the Triton kernels; the head-512 C4
+    # compressor only off the CuTe DSL platforms.
+    rings = [indexer_c4_spec]
+    if platform == "cutedsl":
+        assert isinstance(c4_spec, SlidingWindowMLASpec)
+    else:
+        rings.append(c4_spec)
+    for spec in rings:
+        assert isinstance(spec, CircularBufferSpec)
+        assert (spec.block_size, spec.num_ring_blocks) == (4, 4)
+        # The first group after a prefix hit also compresses the one before.
+        assert spec.prefix_replay_tokens == 4
+
+
+def test_c4_ring_needs_v2_replay_with_prefix_caching(monkeypatch) -> None:
+    _platform(monkeypatch, "triton")
+    for enable_prefix_caching, use_v2, circular in (
+        (False, False, True),
+        (True, True, True),
+        (True, False, False),
+    ):
+        spec = _state_cache(4).get_kv_cache_spec(
+            _config(5, enable_prefix_caching, use_v2)
+        )
+        assert isinstance(spec, CircularBufferSpec) is circular
 
 
 def test_c128_capacity_covers_one_speculative_step() -> None:

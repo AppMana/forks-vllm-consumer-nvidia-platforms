@@ -107,6 +107,13 @@ class DeepseekV4ForConditionalGeneration(
     requires_raw_input_tokens = True
     supports_tower_connector_lora = True
 
+    @staticmethod
+    def get_model_state_cls():
+        # Prefix replay for the circular C4 compressor state.
+        from vllm.models.deepseek_v4.common.model_state import DeepseekV4ModelState
+
+        return DeepseekV4ModelState
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality == "image":

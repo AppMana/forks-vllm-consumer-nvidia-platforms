@@ -883,10 +883,19 @@ class CircularBufferSpec(AttentionSpec):
     """
 
     num_ring_blocks: int = 1
+    replay_tokens: int = 0
+    """Tokens before a prefix-cache hit whose rows the ring must hold (the
+    previous group of an overlapping compressor). The ring is not cached, so
+    the scheduler recomputes them after a hit (``prefix_replay_tokens``) and
+    the worker keeps their cached KV (the replayed slots are padded)."""
 
     @property
     def ring_capacity(self) -> int:
         return self.block_size * self.num_ring_blocks
+
+    @property
+    def prefix_replay_tokens(self) -> int:
+        return self.replay_tokens
 
     @property
     def block_table_token_alignment(self) -> int | None:
@@ -907,6 +916,7 @@ class CircularBufferSpec(AttentionSpec):
         return all(
             isinstance(spec, CircularBufferSpec)
             and spec.num_ring_blocks == self.num_ring_blocks
+            and spec.replay_tokens == self.replay_tokens
             for spec in kv_cache_specs.values()
         )
 

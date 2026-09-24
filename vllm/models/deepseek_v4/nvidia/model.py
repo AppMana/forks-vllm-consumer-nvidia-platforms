@@ -2150,6 +2150,13 @@ class DeepseekV4ForCausalLM(
     # The MTP draft head is not LoRA-adapted.
     lora_skip_prefixes = ["mtp."]
 
+    @staticmethod
+    def get_model_state_cls():
+        # Prefix replay for the circular C4 compressor state.
+        from vllm.models.deepseek_v4.common.model_state import DeepseekV4ModelState
+
+        return DeepseekV4ModelState
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 

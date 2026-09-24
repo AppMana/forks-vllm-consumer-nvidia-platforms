@@ -24,6 +24,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
 from vllm.models.deepseek_v4.compressor import (
     _STAGE_PAD,
     RingStage,
+    _c4_ring_capacity,
     _c128_ring_capacity,
     _ring_stage_num_blocks,
     _ring_stage_table_width,
@@ -62,6 +63,8 @@ class _Layer:
 
     @property
     def capacity(self) -> int:
+        if self.compress_ratio == 4:
+            return _c4_ring_capacity(NUM_SPEC)
         return _c128_ring_capacity(NUM_SPEC)
 
     @property
@@ -324,7 +327,9 @@ STEPS = [
 ]
 
 LAYERS = [
+    pytest.param(_Layer(512, 4), id="c4-main"),
     pytest.param(_Layer(512, 128), id="c128-main"),
+    pytest.param(_Layer(128, 4), id="c4-indexer"),
 ]
 
 

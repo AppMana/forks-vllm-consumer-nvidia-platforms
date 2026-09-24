@@ -45,11 +45,20 @@ from vllm.v1.kv_cache_interface import (
 )
 
 _C128_RATIO = 128
+# The C4 overlap compresses the previous group together with the open one, so
+# its window (and ring span) is two groups.
+_C4_WINDOW = 8
 
 
 def _c128_ring_capacity(num_speculative_tokens: int) -> int:
     span = _C128_RATIO + num_speculative_tokens
     return _C128_RATIO * ((span + _C128_RATIO - 1) // _C128_RATIO)
+
+
+def _c4_ring_capacity(num_speculative_tokens: int) -> int:
+    # Same rule as C128: the window plus one speculative step, whole windows.
+    span = _C4_WINDOW + num_speculative_tokens
+    return _C4_WINDOW * ((span + _C4_WINDOW - 1) // _C4_WINDOW)
 
 
 def _compressor_ring_capacity(
@@ -58,8 +67,11 @@ def _compressor_ring_capacity(
     """Rows of the per-request circular compressor state, or None for the
     paged sliding-window state.
 
-    CUDA keeps a ring for C128: the upstream CuTe DSL kernels, and the Triton
-    kernels of sm_8x / sm_12x, which need one micro-batch at a time.
+    CUDA keeps a ring for C128 (the upstream CuTe DSL kernels, and the Triton
+    kernels of sm_8x / sm_12x). C4 gets one on the Triton kernels only. The
+    ring is not prefix cached, so a hit replays the C4 group before it, which
+    takes the model runner V2 replay path when prefix caching is on. The
+    Triton ring needs one micro-batch at a time.
     """
     if not current_platform.is_cuda():
         return None
@@ -73,7 +85,12 @@ def _compressor_ring_capacity(
         return None
     if compress_ratio == _C128_RATIO:
         return _c128_ring_capacity(num_speculative_tokens)
-    return None
+    if (
+        vllm_config.cache_config.enable_prefix_caching
+        and not vllm_config.use_v2_model_runner
+    ):
+        return None
+    return _c4_ring_capacity(num_speculative_tokens)
 
 
 def _state_block_size(compress_ratio: int) -> int:
@@ -791,10 +808,12 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             # The ring is spread over blocks of the paged state's size, so it
             # packs into the pool slot the attention groups already need; a
             # single-block C128 ring (1 MiB with a speculative step) would
-            # widen every block of a few-layer rank.
+            # widen every block of a few-layer rank. The C4 overlap reads the
+            # group before a prefix hit, which the scheduler replays.
             return CircularBufferSpec(
                 block_size=self.block_size,
                 num_ring_blocks=capacity // self.block_size,
+                replay_tokens=self.sliding_window - self.compress_ratio,
                 num_kv_heads=1,
                 head_size=self.state_dim,
                 head_size_v=0,
