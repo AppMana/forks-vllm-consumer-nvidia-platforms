@@ -28,6 +28,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -51,6 +52,55 @@ def _c128_ring_capacity(num_speculative_tokens: int) -> int:
     return _C128_RATIO * ((span + _C128_RATIO - 1) // _C128_RATIO)
 
 
+def _compressor_ring_capacity(
+    compress_ratio: int, head_dim: int, vllm_config: VllmConfig
+) -> int | None:
+    """Rows of the per-request circular compressor state, or None for the
+    paged sliding-window state.
+
+    CUDA keeps a ring for C128: the upstream CuTe DSL kernels, and the Triton
+    kernels of sm_8x / sm_12x, which need one micro-batch at a time.
+    """
+    if not current_platform.is_cuda():
+        return None
+    num_speculative_tokens = vllm_config.num_speculative_tokens
+    cutedsl = _uses_cutedsl_compressor(head_dim)
+    if compress_ratio == _C128_RATIO and cutedsl:
+        return _c128_ring_capacity(num_speculative_tokens)
+    if cutedsl or vllm_config.parallel_config.use_ubatching:
+        # The Triton ring stages each step's rows in one shared buffer, which
+        # overlapping micro-batches would both write.
+        return None
+    if compress_ratio == _C128_RATIO:
+        return _c128_ring_capacity(num_speculative_tokens)
+    return None
+
+
+def _state_block_size(compress_ratio: int) -> int:
+    # Block size is constrained by tensor sharing between compressor states
+    # and KV blocks: the states pack into the same pool slot, so a block of
+    # state rows must fit the slot the MLA pages need.
+    # - C4 compressor block shape [4, 2*512*2*4] -> block_size = 4
+    # - C128 compressor block shape [8, 512*2*4] -> block_size = 8
+    if compress_ratio == 4:
+        return 4
+    if compress_ratio == _C128_RATIO:
+        return 8
+    raise ValueError(f"Invalid compress ratio: {compress_ratio}")
+
+
+def _uses_cutedsl_compressor(head_dim: int) -> bool:
+    # The CuTe DSL compressor module cannot import on sm_8x and sm_12x; those
+    # platforms run the Triton compressor kernels.
+    return (
+        current_platform.is_cuda()
+        and head_dim == 512
+        and has_cutedsl()
+        and not current_platform.is_device_capability_family(80)
+        and not current_platform.is_device_capability_family(120)
+    )
+
+
 @triton.jit(
     do_not_specialize=[
         "block_table_stride",
@@ -72,6 +122,7 @@ def _build_c128_ring_metadata_kernel(
     num_tokens,
     num_reqs,
     CAPACITY: tl.constexpr,
+    RING_BLOCK_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -80,16 +131,25 @@ def _build_c128_ring_metadata_kernel(
     req = tl.load(token_to_req_ptr + offsets, mask=valid, other=0).to(tl.int64)
     query_end = tl.load(query_start_loc_ptr + req + 1, mask=valid, other=0)
     position = tl.load(positions_ptr + offsets, mask=valid, other=0)
-    block = tl.load(block_table_ptr + req * block_table_stride, mask=valid, other=-1)
+    # Ring row -> (ring block, row in block); one block when the ring is a
+    # single block of CAPACITY rows.
+    row = position % CAPACITY
+    block = tl.load(
+        block_table_ptr + req * block_table_stride + row // RING_BLOCK_SIZE,
+        mask=valid,
+        other=-1,
+    )
     valid &= block >= 0
-    slot = block.to(tl.int64) * CAPACITY + position % CAPACITY
+    slot = block.to(tl.int64) * RING_BLOCK_SIZE + row % RING_BLOCK_SIZE
     keep_tail = valid & (offsets + CAPACITY >= query_end)
     store = offsets < num_tokens
     tl.store(slot_mapping_ptr + offsets, tl.where(valid, slot, -1), mask=store)
     tl.store(tail_slot_mapping_ptr + offsets, tl.where(keep_tail, slot, -1), mask=store)
 
 
-def _build_c128_ring_metadata_warmup_inputs(*, capacity: int) -> dict[str, Any]:
+def _build_c128_ring_metadata_warmup_inputs(
+    *, capacity: int, block_size: int | None = None
+) -> dict[str, Any]:
     int32 = TritonWarmupTensor(torch.int32)
     int64 = TritonWarmupTensor(torch.int64)
     return dict(
@@ -103,6 +163,7 @@ def _build_c128_ring_metadata_warmup_inputs(*, capacity: int) -> dict[str, Any]:
         num_tokens=2,
         num_reqs=1,
         capacity=capacity,
+        block_size=capacity if block_size is None else block_size,
     )
 
 
@@ -121,10 +182,12 @@ def _build_c128_ring_metadata(
     num_tokens: int,
     num_reqs: int,
     capacity: int,
+    block_size: int,
 ) -> DispatchSpec:
     return (triton.cdiv(num_tokens, 256),), dict(
         block_table_stride=block_table.stride(0),
         CAPACITY=capacity,
+        RING_BLOCK_SIZE=block_size,
         BLOCK=256,
     )
 
@@ -140,10 +203,20 @@ def build_c128_ring_metadata(
     token_to_req_indices: torch.Tensor | None = None,
     out_slots: torch.Tensor | None = None,
     out_tail_slots: torch.Tensor | None = None,
+    block_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map C128 rows to a per-request ring and select the saved suffix."""
-    if capacity < _C128_RATIO or capacity % _C128_RATIO != 0:
-        raise ValueError("C128 ring capacity must be a positive multiple of 128")
+    """Map compressor rows to a per-request ring and select the saved suffix.
+
+    The ring holds ``capacity`` rows in ``capacity // block_size`` blocks of
+    the request's block table row (one block by default).
+    """
+    if block_size is None:
+        block_size = capacity
+    if capacity < block_size or capacity % block_size != 0:
+        raise ValueError(
+            f"Ring capacity {capacity} must be a multiple of its block size "
+            f"{block_size}"
+        )
     if out_slots is None:
         out_slots = torch.empty_like(slot_mapping)
     if out_tail_slots is None:
@@ -172,6 +245,7 @@ def build_c128_ring_metadata(
             num_tokens,
             num_reqs,
             capacity,
+            block_size,
         )
         return out_slots, out_tail_slots
 
@@ -181,15 +255,243 @@ def build_c128_ring_metadata(
     query_batch_end = query_start_loc[num_reqs]
     valid_rows = rows < query_batch_end
     req = token_to_req_indices[:num_actual_tokens].long().clamp(max=num_reqs - 1)
-    pos = positions[:num_actual_tokens].long()
-    blocks = block_table[:num_reqs, 0].index_select(0, req).long()
+    ring_rows = positions[:num_actual_tokens].long().remainder(capacity)
+    blocks = block_table[req, ring_rows // block_size].long()
     valid = valid_rows & (blocks >= 0)
-    slots = blocks * capacity + pos.remainder(capacity)
+    slots = blocks * block_size + ring_rows.remainder(block_size)
     out_slots[:num_actual_tokens] = torch.where(valid, slots, -1)
     query_ends = query_start_loc[1 : num_reqs + 1].index_select(0, req)
     keep_tail = valid & (rows + capacity >= query_ends)
     out_tail_slots[:num_actual_tokens] = torch.where(keep_tail, slots, -1)
     return out_slots, out_tail_slots
+
+
+def _ring_stage_num_blocks(
+    max_num_tokens: int, max_num_reqs: int, window: int, block_size: int
+) -> int:
+    """Stage blocks for one step: each request stages its chunk and the
+    ``window - 1`` rows before it, from the block holding the first of them."""
+    return cdiv(max_num_tokens + max_num_reqs * (window - 1), block_size) + (
+        2 * max_num_reqs
+    )
+
+
+# Stage block stride pad: keeps a stage block stride off a multiple of 16
+# floats when the ring's is.
+_STAGE_PAD = 4
+_RING_STAGE_STORAGE: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _shared_ring_stage_storage(
+    num_floats: int, device_type: str, row_width: int
+) -> torch.Tensor:
+    """fp32 stage shared by the compressor layers of one row width. Layers run
+    one after another; the main and indexer compressors of a layer may overlap
+    on separate streams, and their row widths differ."""
+    device = torch.device(device_type, torch.accelerator.current_device_index())
+    key = (device, row_width)
+    storage = _RING_STAGE_STORAGE.get(key)
+    if storage is None or storage.numel() < num_floats:
+        storage = torch.empty(num_floats, dtype=torch.float32, device=device)
+        _RING_STAGE_STORAGE[key] = storage
+    return storage
+
+
+def _ring_stage_table_width(vllm_config: VllmConfig, block_size: int) -> int:
+    # The width the paged state's block table has, so the paged kernels see
+    # the same block-table stride (and specialize the same way) on the stage.
+    from vllm.v1.worker.block_table import get_block_table_width
+
+    return get_block_table_width(
+        cdiv(vllm_config.model_config.max_model_len, block_size), block_size
+    )
+
+
+@triton.jit
+def _fill_ring_stage_kernel(
+    query_start_loc_ptr,
+    positions_ptr,
+    stage_base_ptr,
+    stage_lo_ptr,
+    stage_count_ptr,
+    stage_block_table_ptr,
+    stage_block_table_stride,
+    stage_slot_mapping_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0)
+    base = tl.load(stage_base_ptr + req)
+    lo = tl.load(stage_lo_ptr + req)
+    count = tl.load(stage_count_ptr + req)
+    row = stage_block_table_ptr + req.to(tl.int64) * stage_block_table_stride
+    for j in range(0, count, BLOCK):
+        offs = j + tl.arange(0, BLOCK)
+        tl.store(row + lo + offs, (base + offs).to(tl.int32), mask=offs < count)
+    query_start = tl.load(query_start_loc_ptr + req)
+    query_end = tl.load(query_start_loc_ptr + req + 1)
+    for t in range(query_start, query_end, BLOCK):
+        offs = t + tl.arange(0, BLOCK)
+        mask = offs < query_end
+        pos = tl.load(positions_ptr + offs, mask=mask, other=0).to(tl.int64)
+        slot = (base + pos // BLOCK_SIZE - lo) * BLOCK_SIZE + pos % BLOCK_SIZE
+        tl.store(stage_slot_mapping_ptr + offs, slot, mask=mask)
+
+
+def build_ring_stage_metadata(
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    num_reqs: int,
+    window: int,
+    block_size: int,
+    out_block_table: torch.Tensor,
+    out_slots: torch.Tensor,
+    out_base: torch.Tensor,
+    out_lo: torch.Tensor,
+) -> None:
+    """Paged-state addressing of one step's staged rows.
+
+    Request ``r`` stages logical blocks ``[lo, lo + count)`` (its chunk and the
+    ``window - 1`` rows before it) at stage blocks ``[base, base + count)``;
+    ``out_block_table[r, lo + j] = base + j``, and ``out_slots`` maps each
+    chunk row to its stage slot (-1 for padding). The compressor kernels then
+    read the stage exactly as they read the paged state.
+    """
+    out_slots.fill_(-1)
+    if num_reqs == 0:
+        return
+    qsl = query_start_loc[: num_reqs + 1].long()
+    lens = qsl[1:] - qsl[:-1]
+    has_rows = lens > 0
+    last_token = max(positions.numel() - 1, 0)
+    first = positions[qsl[:-1].clamp(max=last_token)].long()
+    last = positions[(qsl[1:] - 1).clamp(min=0, max=last_token)].long()
+    lo = (first - (window - 1)).clamp(min=0) // block_size
+    hi = (last + block_size) // block_size
+    count = torch.where(has_rows, hi - lo, 0)
+    out_base[:num_reqs] = torch.cumsum(count, 0) - count
+    out_lo[:num_reqs] = lo
+    stage_count = count.to(torch.int64)
+    _fill_ring_stage_kernel[(num_reqs,)](
+        query_start_loc,
+        positions,
+        out_base,
+        out_lo,
+        stage_count,
+        out_block_table,
+        out_block_table.stride(0),
+        out_slots,
+        BLOCK_SIZE=block_size,
+        BLOCK=256,
+    )
+
+
+@triton.jit
+def _stage_ring_history_kernel(
+    ring_ptr,
+    ring_stride0,
+    ring_stride1,
+    stage_ptr,
+    stage_stride0,
+    stage_stride1,
+    ring_block_table_ptr,
+    ring_block_table_stride,
+    query_start_loc_ptr,
+    positions_ptr,
+    stage_base_ptr,
+    stage_lo_ptr,
+    ROW_WIDTH: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    WINDOW: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    COLS: tl.constexpr,
+):
+    """Copy the ``WINDOW - 1`` ring rows before a chunk into its stage."""
+    req = tl.program_id(0)
+    offset = tl.program_id(1)
+    query_start = tl.load(query_start_loc_ptr + req)
+    query_end = tl.load(query_start_loc_ptr + req + 1)
+    if query_start >= query_end:
+        return
+    start = tl.load(positions_ptr + query_start).to(tl.int64)
+    end = tl.load(positions_ptr + query_end - 1).to(tl.int64) + 1
+    # Only compression boundaries inside the chunk read history rows.
+    if start % COMPRESS_RATIO + (end - start) < COMPRESS_RATIO:
+        return
+    pos = start - (WINDOW - 1) + offset
+    if pos < 0:
+        return
+    ring_row = pos % CAPACITY
+    ring_block = tl.load(
+        ring_block_table_ptr
+        + req.to(tl.int64) * ring_block_table_stride
+        + ring_row // BLOCK_SIZE
+    )
+    if ring_block < 0:
+        return
+    stage_block = (
+        tl.load(stage_base_ptr + req) + pos // BLOCK_SIZE - tl.load(stage_lo_ptr + req)
+    )
+    src = (
+        ring_ptr
+        + ring_block.to(tl.int64) * ring_stride0
+        + (ring_row % BLOCK_SIZE) * ring_stride1
+    )
+    dst = stage_ptr + stage_block * stage_stride0 + (pos % BLOCK_SIZE) * stage_stride1
+    for c in range(0, ROW_WIDTH, COLS):
+        cols = c + tl.arange(0, COLS)
+        mask = cols < ROW_WIDTH
+        tl.store(dst + cols, tl.load(src + cols, mask=mask), mask=mask)
+
+
+def stage_ring_history(
+    ring_cache: torch.Tensor,
+    stage_cache: torch.Tensor,
+    ring_block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    ring_stage: "RingStage",
+    capacity: int,
+    block_size: int,
+    compress_ratio: int,
+) -> None:
+    """Copy each request's ``window - 1`` ring rows before its chunk into the
+    stage, for requests whose chunk holds a compression boundary."""
+    row_width = ring_cache.shape[-1]
+    _stage_ring_history_kernel[(ring_stage.lo.shape[0], ring_stage.window - 1)](
+        ring_cache,
+        ring_cache.stride(0),
+        ring_cache.stride(1),
+        stage_cache,
+        stage_cache.stride(0),
+        stage_cache.stride(1),
+        ring_block_table,
+        ring_block_table.stride(0),
+        query_start_loc,
+        positions,
+        ring_stage.base,
+        ring_stage.lo,
+        ROW_WIDTH=row_width,
+        CAPACITY=capacity,
+        BLOCK_SIZE=block_size,
+        WINDOW=ring_stage.window,
+        COMPRESS_RATIO=compress_ratio,
+        COLS=min(1024, triton.next_power_of_2(row_width)),
+    )
+
+
+@dataclass
+class RingStage:
+    """One step's staged rows for the Triton compressor kernels (see
+    ``CompressorStateCache.stage``): the stage is addressed like the paged
+    state, so the unchanged paged kernels compress from it."""
+
+    block_table: torch.Tensor  # [num_reqs, width] stage block per logical block
+    slot_mapping: torch.Tensor  # [num_tokens] stage slot of each chunk row
+    base: torch.Tensor  # [num_reqs] first stage block of each request
+    lo: torch.Tensor  # [num_reqs] first staged logical block of each request
+    window: int
 
 
 def _prefer_two_stage_compressor() -> bool:
@@ -245,6 +547,10 @@ class CompressorMetadata:
     is_circular: bool
     num_decode_tokens: int | None = None
     c128_boundary: bool | None = None
+    # Rows of the circular state (``block_size`` rows per ring block).
+    ring_capacity: int | None = None
+    # Multi-block (Triton) rings compress from a per-step stage.
+    ring_stage: RingStage | None = None
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -262,7 +568,9 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         )
         self.block_size = mla_spec.block_size
         self.is_circular = isinstance(mla_spec, CircularBufferSpec)
-
+        self.ring_capacity = (
+            mla_spec.ring_capacity if isinstance(mla_spec, CircularBufferSpec) else None
+        )
         max_num_batched_tokens = (
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
@@ -281,6 +589,33 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             if self.is_circular
             else None
         )
+        # A ring spread over several blocks is the Triton layout: the step's
+        # rows are staged and compressed by the paged kernels.
+        self.stage_window: int | None = None
+        if isinstance(mla_spec, CircularBufferSpec) and mla_spec.num_ring_blocks > 1:
+            forward_context = self.vllm_config.compilation_config.static_forward_context
+            windows = {
+                forward_context[name].sliding_window for name in self.layer_names
+            }
+            assert len(windows) == 1, windows
+            self.stage_window = windows.pop()
+            scheduler_config = self.vllm_config.scheduler_config
+            max_num_reqs = scheduler_config.max_num_seqs
+            self.stage_block_table = torch.zeros(
+                max_num_reqs,
+                _ring_stage_table_width(self.vllm_config, self.block_size),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.stage_slot_mapping = torch.empty(
+                max_num_batched_tokens, dtype=torch.int64, device=self.device
+            )
+            self.stage_base = torch.zeros(
+                max_num_reqs, dtype=torch.int64, device=self.device
+            )
+            self.stage_lo = torch.zeros(
+                max_num_reqs, dtype=torch.int64, device=self.device
+            )
 
     def build(
         self,
@@ -295,6 +630,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         if self.is_circular:
             assert self.slot_mapping_buffer is not None
             assert self.tail_slot_mapping_buffer is not None
+            assert self.ring_capacity is not None
             positions = common_attn_metadata.positions
             assert positions is not None
             slot_mapping, tail_slot_mapping = build_c128_ring_metadata(
@@ -304,10 +640,11 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
                 positions,
                 common_attn_metadata.num_actual_tokens,
                 common_attn_metadata.num_reqs,
-                self.block_size,
+                self.ring_capacity,
                 token_to_req_indices=token_to_req_indices,
                 out_slots=self.slot_mapping_buffer[:num_tokens],
                 out_tail_slots=self.tail_slot_mapping_buffer[:num_tokens],
+                block_size=self.block_size,
             )
         else:
             slot_mapping = common_attn_metadata.slot_mapping
@@ -342,6 +679,35 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
                 if self.is_circular and not async_spec_decode
                 else None
             ),
+            ring_capacity=self.ring_capacity,
+            ring_stage=self._build_ring_stage(common_attn_metadata, num_tokens),
+        )
+
+    def _build_ring_stage(
+        self, common_attn_metadata: CommonAttentionMetadata, num_tokens: int
+    ) -> RingStage | None:
+        if self.stage_window is None:
+            return None
+        positions = common_attn_metadata.positions
+        assert positions is not None
+        num_reqs = common_attn_metadata.num_reqs
+        build_ring_stage_metadata(
+            common_attn_metadata.query_start_loc,
+            positions,
+            num_reqs,
+            self.stage_window,
+            self.block_size,
+            out_block_table=self.stage_block_table,
+            out_slots=self.stage_slot_mapping[:num_tokens],
+            out_base=self.stage_base,
+            out_lo=self.stage_lo,
+        )
+        return RingStage(
+            block_table=self.stage_block_table[:num_reqs],
+            slot_mapping=self.stage_slot_mapping[:num_tokens],
+            base=self.stage_base[:num_reqs],
+            lo=self.stage_lo[:num_reqs],
+            window=self.stage_window,
         )
 
 
@@ -368,23 +734,67 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         self.compress_ratio = compress_ratio
         coff = 1 + (compress_ratio == 4)
         self.sliding_window = coff * compress_ratio
-        # C4 keeps the legacy paged layout and block size 4. CUDA circular C128
-        # replaces this value with its per-request ring capacity in the cache spec.
-        if compress_ratio == 4:
-            self.block_size = 4
-        elif compress_ratio == 128:
-            self.block_size = 8
-        else:
-            raise ValueError(f"Invalid compress ratio: {compress_ratio}")
+        self.head_dim = state_dim // (2 * coff)
+        # Rows per block of the paged state, and of each block of a Triton ring.
+        # The CuTe DSL C128 ring is one block of its whole capacity instead.
+        self.block_size = _state_block_size(compress_ratio)
+
+        self.stage = torch.tensor([])
+        self._stage_storage: torch.Tensor | None = None
+
+    def allocate_stage(self, vllm_config: VllmConfig) -> None:
+        """A Triton ring keeps only the rows later steps read. The step's own
+        rows go to a stage addressed like the paged state, so the paged kernels
+        compress from it unchanged (see ``RingStage``). Allocated with the
+        model, so memory profiling counts it."""
+        scheduler_config = vllm_config.scheduler_config
+        self._stage_blocks = _ring_stage_num_blocks(
+            scheduler_config.max_num_batched_tokens,
+            scheduler_config.max_num_seqs,
+            self.sliding_window,
+            self.block_size,
+        )
+        self._stage_storage = _shared_ring_stage_storage(
+            self._stage_blocks * (self.block_size * self.state_dim + _STAGE_PAD),
+            current_platform.device_type,
+            self.state_dim,
+        )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
+        if self._stage_storage is not None:
+            # Block stride as divisible by 16 as the ring's, so the paged
+            # kernels specialize (and round) on the stage as on the paged state.
+            block_stride = self.block_size * self.state_dim
+            if self.kv_cache.stride(0) % 16 != 0:
+                block_stride += _STAGE_PAD
+            self.stage = torch.as_strided(
+                self._stage_storage,
+                (self._stage_blocks, self.block_size, self.state_dim),
+                (block_stride, self.state_dim, 1),
+            )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        if self.compress_ratio == 128 and current_platform.is_cuda():
+        capacity = _compressor_ring_capacity(
+            self.compress_ratio, self.head_dim, vllm_config
+        )
+        if capacity is not None and _uses_cutedsl_compressor(self.head_dim):
             return CircularBufferSpec(
-                block_size=_c128_ring_capacity(vllm_config.num_speculative_tokens),
+                block_size=capacity,
+                num_kv_heads=1,
+                head_size=self.state_dim,
+                head_size_v=0,
+                dtype=self.dtype,
+            )
+        if capacity is not None:
+            # The ring is spread over blocks of the paged state's size, so it
+            # packs into the pool slot the attention groups already need; a
+            # single-block C128 ring (1 MiB with a speculative step) would
+            # widen every block of a few-layer rank.
+            return CircularBufferSpec(
+                block_size=self.block_size,
+                num_ring_blocks=capacity // self.block_size,
                 num_kv_heads=1,
                 head_size=self.state_dim,
                 head_size_v=0,
@@ -500,6 +910,13 @@ class DeepseekCompressor(nn.Module):
             compress_ratio=compress_ratio,
             prefix=f"{prefix}.state_cache",
         )
+        self._use_cutedsl_compressor = _uses_cutedsl_compressor(self.head_dim)
+        if (
+            not self._use_cutedsl_compressor
+            and _compressor_ring_capacity(compress_ratio, head_dim, vllm_config)
+            is not None
+        ):
+            self.state_cache.allocate_stage(vllm_config)
 
         # Save reference to static_forward_context for forward-time KV cache lookup.
         # get_current_vllm_config() is only available during __init__, not forward.
@@ -517,13 +934,6 @@ class DeepseekCompressor(nn.Module):
             current_platform.is_cuda()
             and self.head_dim == 512
             and self.compress_ratio == 128
-        )
-        self._use_cutedsl_compressor = (
-            current_platform.is_cuda()
-            and self.head_dim == 512
-            and has_cutedsl()
-            and not current_platform.is_device_capability_family(80)
-            and not current_platform.is_device_capability_family(120)
         )
         if self._use_cutedsl_compressor:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
@@ -565,14 +975,27 @@ class DeepseekCompressor(nn.Module):
             )
 
         if vllm_config.kernel_config.enable_jit_warmup:
-            if self.compress_ratio == 128 and current_platform.is_cuda():
-                _build_c128_ring_metadata.register_warmup(
-                    capacity=_c128_ring_capacity(vllm_config.num_speculative_tokens)
-                )
-            _SAVE_PARTIAL_STATES_KERNEL.register_warmup(
-                head_dim=self.head_dim,
-                compress_ratio=self.compress_ratio,
+            ring_capacity = _compressor_ring_capacity(
+                self.compress_ratio, self.head_dim, vllm_config
             )
+            if self._use_cutedsl_compressor:
+                if ring_capacity is not None:
+                    _build_c128_ring_metadata.register_warmup(capacity=ring_capacity)
+                _SAVE_PARTIAL_STATES_KERNEL.register_warmup(
+                    head_dim=self.head_dim,
+                    compress_ratio=self.compress_ratio,
+                )
+            else:
+                if ring_capacity is not None:
+                    _build_c128_ring_metadata.register_warmup(
+                        capacity=ring_capacity,
+                        block_size=_state_block_size(self.compress_ratio),
+                    )
+                _SAVE_PARTIAL_STATES_KERNEL.register_warmup(
+                    head_dim=self.head_dim,
+                    compress_ratio=self.compress_ratio,
+                    block_size=_state_block_size(self.compress_ratio),
+                )
             # Same gate as the live kernel above: the CuTe DSL module cannot
             # even import on sm_8x and sm_12x, let alone warm up.
             if self._use_cutedsl_compressor:
@@ -642,15 +1065,48 @@ class DeepseekCompressor(nn.Module):
         state_cache = self.state_cache.kv_cache
         # kv_state stored in first half, score_state stored in second half
         state_width = state_cache.shape[-1] // 2
-        # C4 stores before compression. CUDA circular C128 reads current-chunk
-        # rows directly and saves only the ring tail after compression, so a long
-        # chunk cannot overwrite an earlier group before it is consumed.
+        # The ring the tail is saved into after compression.
+        ring_cache = state_cache
+        ring_stage = state_metadata.ring_stage
+
+        # full graph cannot branch on per-step CPU metadata after capture
+        skip_compress = (
+            self._cuda_c128_boundary_shortcut
+            and forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
+            and state_metadata.c128_boundary is False
+        )
+        if ring_stage is not None and not skip_compress:
+            # Triton ring: stage the rows the step's boundaries read (the
+            # ring rows before the chunk, then the chunk) and compress from
+            # the stage with the paged kernels.
+            assert state_metadata.ring_capacity is not None
+            state_cache = self.state_cache.stage
+            stage_ring_history(
+                ring_cache,
+                state_cache,
+                block_table,
+                state_metadata.query_start_loc,
+                positions,
+                ring_stage,
+                state_metadata.ring_capacity,
+                block_size,
+                self.compress_ratio,
+            )
+            slot_mapping = ring_stage.slot_mapping
+            block_table = ring_stage.block_table
+
+        # Paged state (and the stage) stores before compression. The CuTe DSL
+        # ring reads current-chunk rows directly. Circular state saves only the
+        # ring tail after compression, so a long chunk cannot overwrite an
+        # earlier group before it is consumed.
         # NOTE: PDL is disabled: both this kernel and the compress kernels
         # below depend on preceding kernel outputs (kv/score from the cublas
         # GEMM; state_cache from this kernel) but neither emits/waits on PDL
         # grid dependency primitives, so launch_pdl=True caused a
         # read-after-write race and non-deterministic output.
-        if not state_metadata.is_circular:
+        if not state_metadata.is_circular or (
+            ring_stage is not None and not skip_compress
+        ):
             _SAVE_PARTIAL_STATES_KERNEL(
                 kv=kv,
                 score=score,
@@ -664,12 +1120,7 @@ class DeepseekCompressor(nn.Module):
                 pdl_kwargs=self._pdl_kwargs,
             )
 
-        # full graph cannot branch on per-step CPU metadata after capture
-        if (
-            self._cuda_c128_boundary_shortcut
-            and forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
-            and state_metadata.c128_boundary is False
-        ):
+        if skip_compress:
             _SAVE_PARTIAL_STATES_KERNEL(
                 kv=kv,
                 score=score,
@@ -726,12 +1177,13 @@ class DeepseekCompressor(nn.Module):
             # head=512 cr>=128 (no overlap): two-pass split compressor on the
             # prefill suffix, single-pass on the decode prefix.
             assert state_metadata.num_decode_tokens is not None
+            assert not state_metadata.is_circular
             extra_kwargs = {
                 "num_decode_tokens": state_metadata.num_decode_tokens,
                 "compress_scratch": self._compress_scratch,
             }
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer path (head_dim == 128), sm_8x / sm_12x, or non-CUDA GPUs.
             extra_kwargs = {}
 
         self._compress_norm_rope_store_fn(
@@ -766,7 +1218,7 @@ class DeepseekCompressor(nn.Module):
                 score=score,
                 ape=self.ape,
                 positions=positions,
-                state_cache=state_cache,
+                state_cache=ring_cache,
                 slot_mapping=tail_slot_mapping,
                 block_size=block_size,
                 state_width=state_width,

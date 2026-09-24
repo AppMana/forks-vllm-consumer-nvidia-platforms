@@ -105,12 +105,14 @@ class SavePartialStatesKernel(
         *,
         head_dim: int,
         compress_ratio: int,
+        block_size: int | None = None,
     ) -> list[CompileKey]:
         if head_dim <= 0 or compress_ratio not in (4, 128):
             return []
 
         coefficient = 2 if compress_ratio == 4 else 1
-        block_size = 4 if compress_ratio == 4 else 128
+        if block_size is None:
+            block_size = 4 if compress_ratio == 4 else 128
         state_width = coefficient * head_dim
         return self._trace_dispatch(self.dispatch)(
             head_size=coefficient * head_dim,

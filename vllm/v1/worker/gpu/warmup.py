@@ -254,8 +254,8 @@ def _reserved_block_count(
     if isinstance(kvcache_spec, UniformTypeKVCacheSpecs):
         kvcache_spec = kvcache_spec.first_spec
     if isinstance(kvcache_spec, CircularBufferSpec):
-        # Circular caches keep one physical ring block for the request lifetime.
-        return 1
+        # Circular caches keep their ring blocks for the request lifetime.
+        return kvcache_spec.num_ring_blocks
     if isinstance(kvcache_spec, CrossAttentionSpec):
         # Cross-attention blocks cover the encoder sequence only.
         return cdiv(max_encoder_len, kvcache_spec.block_size)

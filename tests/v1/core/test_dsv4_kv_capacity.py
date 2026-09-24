@@ -68,6 +68,7 @@ def _config(
     config.model_config.max_model_len = MAX_MODEL_LEN
     config.parallel_config.decode_context_parallel_size = 1
     config.parallel_config.pipeline_parallel_size = 1
+    config.parallel_config.use_ubatching = False
     config.compilation_config.static_forward_context = {}
     return config
 

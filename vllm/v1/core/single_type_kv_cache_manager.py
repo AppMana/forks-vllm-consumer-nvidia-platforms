@@ -1194,15 +1194,19 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
 
 class CircularBufferManager(FullAttentionManager):
-    """Claims the ring's single block per request; prefix caching disabled."""
+    """Claims the ring's blocks once per request; prefix caching disabled."""
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+
+    @property
+    def _num_ring_blocks(self) -> int:
+        return getattr(self.kv_cache_spec, "num_ring_blocks", 1)
 
     def _claim_ring_block(self, request_id: str) -> list[KVCacheBlock]:
         req_blocks = self.req_to_blocks[request_id]
         if req_blocks:
             return []
-        new_blocks = self.block_pool.get_new_blocks(1)
+        new_blocks = self.block_pool.get_new_blocks(self._num_ring_blocks)
         req_blocks.extend(new_blocks)
         if self._record_new_block_ids:
             self.new_block_ids.extend(block.block_id for block in new_blocks)
@@ -1218,7 +1222,7 @@ class CircularBufferManager(FullAttentionManager):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
     ) -> int:
-        return 0 if self.req_to_blocks.get(request_id) else 1
+        return 0 if self.req_to_blocks.get(request_id) else self._num_ring_blocks
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int

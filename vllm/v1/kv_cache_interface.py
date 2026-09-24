@@ -874,26 +874,40 @@ class CircularBufferSpec(AttentionSpec):
     by the speculative lookahead: a speculative step stores all of its rows,
     drafts included, before acceptance is known, while the next step still
     reads the open group's committed keys from the ring.
+
+    ``num_ring_blocks > 1`` spreads the ring over that many blocks of
+    ``block_size`` rows (ring capacity ``block_size * num_ring_blocks``, row
+    ``r`` in block ``r // block_size``). A ring page larger than the pool slot
+    the other groups need would widen every block of the shared pool, so a
+    layer stack with few layers per rank splits its rings instead.
     """
+
+    num_ring_blocks: int = 1
+
+    @property
+    def ring_capacity(self) -> int:
+        return self.block_size * self.num_ring_blocks
 
     @property
     def block_table_token_alignment(self) -> int | None:
         return None
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        # The ring occupies one block per request for its whole lifetime.
+        # The ring occupies its blocks for the whole request lifetime.
         del vllm_config
-        return self.page_size_bytes
+        return self.num_ring_blocks * self.page_size_bytes
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         del vllm_config, max_len
-        return 1
+        return self.num_ring_blocks
 
     def is_uniform_with_collection(
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
         return all(
-            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
+            isinstance(spec, CircularBufferSpec)
+            and spec.num_ring_blocks == self.num_ring_blocks
+            for spec in kv_cache_specs.values()
         )
 
     @property

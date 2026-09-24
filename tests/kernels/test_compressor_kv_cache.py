@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.models.deepseek_v4 import compressor as compressor_module
 from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
@@ -126,7 +127,8 @@ def _make_c128_raw_or_ring_case(device: str = "cuda"):
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="CuTe DSL C128 gather requires CUDA"
+    not compressor_module._uses_cutedsl_compressor(512),
+    reason="CuTe DSL C128 gather requires CUDA outside sm_8x / sm_12x",
 )
 def test_c128_cutedsl_gather_reads_raw_chunk_before_ring_tail_write() -> None:
     from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
@@ -1250,12 +1252,17 @@ def test_get_c128_boundary(starts, query_start_loc, expected):
     [(4, 2048), (8, 1024)],
 )
 def test_compressor_state_spec_uses_fp32_page_geometry(
+    monkeypatch,
     cache_dtype: str,
     alignment: int,
     block_size: int,
     state_dim: int,
 ):
+    # The paged state; CUDA keeps a circular one (test_deepseek_v4_compressor_ring).
+    monkeypatch.setattr(compressor_module.current_platform, "is_cuda", lambda: False)
     cache = object.__new__(CompressorStateCache)
+    cache.compress_ratio = 4 if block_size == 4 else 128
+    cache.head_dim = 512
     cache.block_size = block_size
     cache.state_dim = state_dim
     cache.dtype = torch.float32
@@ -1271,8 +1278,11 @@ def test_compressor_state_spec_uses_fp32_page_geometry(
     assert spec.page_size_bytes % alignment == 0
 
 
-def test_packed_compressor_state_pages_do_not_overlap():
+def test_packed_compressor_state_pages_do_not_overlap(monkeypatch):
+    monkeypatch.setattr(compressor_module.current_platform, "is_cuda", lambda: False)
     cache = object.__new__(CompressorStateCache)
+    cache.compress_ratio = 4
+    cache.head_dim = 512
     cache.block_size = 4
     cache.state_dim = 2048
     cache.dtype = torch.float32
