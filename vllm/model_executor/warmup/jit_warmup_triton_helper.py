@@ -227,6 +227,16 @@ class VllmTritonJitKernel(VllmJitKernel[CompileKeyT], Generic[CompileKeyT]):
     _warming_compile_key: CompileKeyT | None = None
     _run_autotune = False
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Resolve the Triton argument names now. The first launch can run
+        # inside a torch.compile trace, where probing the Triton kernel's
+        # attributes is untraceable ("Unsupported hasattr call"). A kernel that
+        # cannot be inspected keeps failing at launch, as before.
+        if getattr(self, "kernel", None) is not None:
+            with suppress(TypeError):
+                _ = self._kernel_arg_names
+
     @abstractmethod
     def warmup_inputs(self, compile_key: CompileKeyT) -> dict[str, Any]:
         """Return runtime-shaped inputs that reproduce one compile key."""

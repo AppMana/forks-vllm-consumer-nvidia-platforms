@@ -92,3 +92,28 @@ def test_attn_input_gemm_overlap_is_disabled_while_compiling(
         1024,
     )
     assert use_compilation_safe_attn_gemm_overlap(6) is expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fused_q_kv_rmsnorm_traces_fullgraph_from_a_fresh_kernel(monkeypatch):
+    """The first launch of a Triton JIT owner can happen inside the model's
+    torch.compile trace. Resolving the kernel's argument names there probes
+    attributes of the Triton kernel, which Dynamo cannot trace ("Unsupported
+    hasattr call"); PP=1 serving with CUDA graphs failed at startup on it."""
+    from vllm.models.common.ops import fused_qk_rmsnorm
+
+    fresh = fused_qk_rmsnorm.FusedQKVRMSNormKernel()
+    monkeypatch.setattr(fused_qk_rmsnorm, "_FUSED_Q_KV_RMSNORM_KERNEL", fresh)
+
+    def norm(q, kv, q_weight, kv_weight):
+        return fused_qk_rmsnorm.fused_q_kv_rmsnorm(q, kv, q_weight, kv_weight, 1e-6)
+
+    q = torch.randn(4, 1024, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)
+    q_weight = torch.randn(1024, device="cuda", dtype=torch.bfloat16)
+    kv_weight = torch.randn(512, device="cuda", dtype=torch.bfloat16)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(norm, fullgraph=True)(q, kv, q_weight, kv_weight)
+    eager = norm(q, kv, q_weight, kv_weight)
+    torch.testing.assert_close(compiled, eager, rtol=0, atol=0)
