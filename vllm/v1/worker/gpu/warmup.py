@@ -465,8 +465,11 @@ def run_pure_prefill_warmup(
     prompt_token_ids = list(range(num_tokens + 1))
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
+    # Reserve what the scheduler would: a circular group holds its ring
+    # blocks, not one block per block_size tokens.
+    block_count = _warmup_block_counter(model_runner)
     block_counts = [
-        cdiv(num_tokens, group.kv_cache_spec.block_size) for group in kv_cache_groups
+        block_count(num_tokens, group.kv_cache_spec) for group in kv_cache_groups
     ]
     required_blocks = sum(block_counts)
     has_blocks = model_runner.kv_cache_config.num_blocks > required_blocks
@@ -565,11 +568,23 @@ def run_spec_verify_warmup(
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
-    group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
-    prefill_block_counts = [
-        cdiv(prompt_len, block_size) for block_size in group_block_sizes
+    # Circular groups claim their whole ring at the first allocation.
+    group_specs = [g.kv_cache_spec for g in kv_cache_groups]
+    ring_blocks = [
+        spec.num_ring_blocks if isinstance(spec, CircularBufferSpec) else None
+        for spec in (
+            s.first_spec if isinstance(s, UniformTypeKVCacheSpecs) else s
+            for s in group_specs
+        )
     ]
-    full_block_counts = [cdiv(max_len, block_size) for block_size in group_block_sizes]
+    prefill_block_counts = [
+        ring or cdiv(prompt_len, spec.block_size)
+        for ring, spec in zip(ring_blocks, group_specs)
+    ]
+    full_block_counts = [
+        ring or cdiv(max_len, spec.block_size)
+        for ring, spec in zip(ring_blocks, group_specs)
+    ]
     block_deltas = [
         full - prefill for full, prefill in zip(full_block_counts, prefill_block_counts)
     ]
