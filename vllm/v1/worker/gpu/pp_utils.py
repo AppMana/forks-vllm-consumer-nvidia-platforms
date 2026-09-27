@@ -165,7 +165,11 @@ class PPHandler:
                 return None
             keep_mask = ~exclude_mask
             idx_mapping_np = slot.idx_mapping_np[keep_mask]
-            idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
+            # int32 like the input batch's own idx_mapping, so post_update
+            # has one specialization whether or not rows were dropped.
+            idx_mapping = async_tensor_h2d(
+                idx_mapping_np, device=self.device, dtype=torch.int32
+            )
             row_indices_np = np.flatnonzero(keep_mask).astype(np.int64)
             row_indices = async_tensor_h2d(row_indices_np, device=self.device)
 
@@ -184,7 +188,7 @@ class PPHandler:
         payload = torch.zeros(
             1, self.payload_width, dtype=torch.int64, device=self.device
         )
-        idx_mapping = torch.full((1,), -1, dtype=torch.int64, device=self.device)
+        idx_mapping = torch.full((1,), -1, dtype=torch.int32, device=self.device)
         return self._unpack_payload(payload, idx_mapping)
 
     def _unpack_payload(

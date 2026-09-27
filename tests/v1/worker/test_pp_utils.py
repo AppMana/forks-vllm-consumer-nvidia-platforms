@@ -318,17 +318,21 @@ def _post_update_signature(args: tuple) -> list:
     return signature
 
 
+@pytest.mark.parametrize("need_sampled", [(True, True, True), (True, False, True)])
 @pytest.mark.parametrize("max_sample_len", [1, 8])
 def test_warmup_pp_decode_update_matches_serving_specialization(
-    monkeypatch, max_sample_len
+    monkeypatch, max_sample_len, need_sampled
 ):
     """The warmup launch must hit the same triton specialization as serving.
 
     A mismatch means the first real ``update_pp_decode_requests`` recompiles
     mid-serving, where the in-flight broadcast NCCL kernel blocks the CUDA
     module load and deadlocks the pipeline. Serving consumes a received
-    payload through ``get_prev_sampled_outputs``; the warmup must call
+    payload through ``get_prev_sampled_outputs``, either whole or compacted
+    when a row no longer needs its sample; the warmup must call
     ``post_update`` with identically shaped, strided and typed arguments.
+    The received idx_mapping is the input batch's, which the runner builds
+    as int32.
     """
     calls = []
     monkeypatch.setattr(model_runner, "post_update", lambda *args: calls.append(args))
@@ -345,9 +349,9 @@ def test_warmup_pp_decode_update_matches_serving_specialization(
         PendingRecv(
             event=object(),  # type: ignore[arg-type]
             payload=torch.zeros(num_reqs, handler.payload_width, dtype=torch.int64),
-            idx_mapping=torch.arange(num_reqs, dtype=torch.int64),
+            idx_mapping=torch.arange(num_reqs, dtype=torch.int32),
             idx_mapping_np=np.arange(num_reqs, dtype=np.intp),
-            need_sampled_mask=np.ones(num_reqs, dtype=bool),
+            need_sampled_mask=np.array(need_sampled),
             gen_at_receive_np=np.zeros(num_reqs, dtype=np.int32),
         )
     )
