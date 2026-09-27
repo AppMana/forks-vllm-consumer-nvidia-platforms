@@ -489,6 +489,8 @@ def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch)
     sampler_warmup = []
     runner = SimpleNamespace(
         is_pooling_model=False,
+        is_last_pp_rank=True,
+        pp_handler=None,
         parallel_config=SimpleNamespace(pipeline_parallel_size=5),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         model_config=SimpleNamespace(
@@ -532,6 +534,55 @@ def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch)
     assert mixed_sizes == [16]
     assert metadata_warmup == [(torch.device("cuda", 0), 4)]
     assert sampler_warmup == [True]
+
+
+@pytest.mark.parametrize("is_last_pp_rank", [False, True])
+def test_deepseek_v4_pp_warmup_warms_the_deferred_consume_path(
+    monkeypatch, is_last_pp_rank
+):
+    """Non-last PP ranks apply the last rank's broadcast pp_size steps later
+    through update_pp_decode_requests, which launches _post_update_kernel. The
+    broadcast is off during warmup, so only warmup_pp_decode_update compiles
+    it; without it the kernel compiled on the first live request on rank 0 of
+    a PP=2 text mini, while the in-flight broadcast can block the module load.
+    """
+    consume_warmups = []
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        is_last_pp_rank=is_last_pp_rank,
+        pp_handler=object(),
+        warmup_pp_decode_update=lambda: consume_warmups.append(True),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        ),
+        device=torch.device("cuda", 0),
+        num_speculative_steps=0,
+        adaptive_verification=None,
+        rejection_sampler=None,
+        vllm_config=SimpleNamespace(is_mm_encoder_only=False),
+    )
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_prefill_chunk_metadata_kernel",
+        lambda device, *, compress_ratio: None,
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_mixed_prefill_decode_warmup",
+        lambda _runner, _execute, _sample, num_tokens, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        gpu_warmup, "warmup_topk_topp_sampler", lambda _runner: True, raising=False
+    )
+
+    gpu_warmup.warmup_kernels(
+        runner, lambda _scheduler_output: None, lambda _grammar_output: None
+    )
+
+    assert consume_warmups == ([] if is_last_pp_rank else [True])
 
 
 def test_non_deepseek_v4_pp_warmup_kernels_keeps_generic_execute_model(monkeypatch):

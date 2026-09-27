@@ -1068,6 +1068,11 @@ def _warmup_kernels(
         # and the draft-propose stack otherwise JIT-compile on the first live
         # request (observed: 19 distinct kernels, ~20s of first-request TTFT).
         run_spec_verify_warmup(model_runner, worker_execute_model, worker_sample_tokens)
+        # The deferred PP post-update path only runs on real steps, and the
+        # broadcast is off during warmup, so nothing above compiles it on the
+        # non-last ranks.
+        if not model_runner.is_last_pp_rank and model_runner.pp_handler is not None:
+            model_runner.warmup_pp_decode_update()
         warmup_topk_topp_sampler(model_runner)
         torch.accelerator.synchronize()
         return
