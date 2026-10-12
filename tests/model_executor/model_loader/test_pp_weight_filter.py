@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for PP weight filtering during model loading."""
 
+import pytest
 import torch
 
 from vllm.model_executor.model_loader import weight_utils
@@ -83,6 +84,24 @@ class TestParseLayerId:
 
 
 class TestShouldSkipPpWeight:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "model.mtp.layers.0.mlp.gate_proj.weight_scale_inv",
+        ],
+    )
+    @pytest.mark.parametrize("is_last", [False, True])
+    def test_nested_mtp_layers_belong_to_last_stage(self, name, is_last):
+        """MTP layer zero is independent of target layer zero's PP owner."""
+        local_range = (32, 64) if is_last else (0, 32)
+        assert should_skip_pp_weight(
+            name,
+            local_range,
+            is_first_pipeline_rank=not is_last,
+            is_last_pipeline_rank=is_last,
+        ) is (not is_last)
+
     def test_no_filter(self):
         assert not should_skip_pp_weight("anything", None)
 

@@ -75,14 +75,15 @@ def should_skip_pp_weight(
         return False
     if weight_name.startswith(("vision.", "aligner.", "image_")):
         return not is_first_pipeline_rank
+    # MTP has its own layer numbering, independent of the target PP slice.
+    if weight_name.startswith(_LAST_STAGE_PREFIXES):
+        return not is_last_pipeline_rank
     lid = parse_layer_id(weight_name)
     if lid is not None:
         start, end = local_layer_range
         return not (start <= lid < end)
     if weight_name.startswith(_FIRST_STAGE_PREFIXES):
         return not is_first_pipeline_rank
-    if weight_name.startswith(_LAST_STAGE_PREFIXES):
-        return not is_last_pipeline_rank
     # Unknown shared/global tensors stay visible on every rank. This is the
     # conservative fallback for model-specific parameters whose ownership is
     # not encoded by the standard checkpoint names above.
