@@ -58,17 +58,16 @@ def _qwen_int8_prefill_linear(
             has_zp=False,
             n32k16_reorder=True,
         )
-    from consumer_int8.ops import cutlass_channel_mm, quantize_rows, unpack_allspark
+    from consumer_int8.ops import fused_channel_mm, quantize_rows, unpack_allspark
 
     weight = torch.empty((n, k), dtype=torch.int8, device=x.device)
     scales = torch.empty(n, dtype=torch.bfloat16, device=x.device)
     unpack_allspark(packed_weight, packed_scales.flatten(), weight, scales)
     codes = torch.empty_like(x, dtype=torch.int8)
     row_scales = torch.empty(m, dtype=torch.float32, device=x.device)
-    workspace = torch.empty((m, n), dtype=torch.int32, device=x.device)
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     quantize_rows(x, codes, row_scales)
-    cutlass_channel_mm(codes, weight, row_scales, scales, workspace, out)
+    fused_channel_mm(codes, weight, row_scales, scales, out)
     return out
 
 
