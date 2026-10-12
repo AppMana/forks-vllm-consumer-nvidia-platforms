@@ -98,6 +98,7 @@ class QwenInt8Config(QuantizationConfig):
         gdn_decode_backend: str = "triton",
         kv_cache_backend: str = "triton",
         linear_backend: str = "allspark",
+        attention_backend: str = "triton",
     ) -> None:
         super().__init__()
         if not quantized_modules or any(
@@ -108,11 +109,12 @@ class QwenInt8Config(QuantizationConfig):
         self.source_modules = dict(quantized_modules)
         self.quantized_modules = dict(quantized_modules)
         self.int8_weight_strategy = "channel"
-        for backend in (gdn_decode_backend, kv_cache_backend):
+        for backend in (gdn_decode_backend, kv_cache_backend, attention_backend):
             if backend not in ("triton", "consumer_int8"):
                 raise ValueError(f"Unsupported qwen_int8 backend: {backend}")
         self.gdn_decode_backend = gdn_decode_backend
         self.kv_cache_backend = kv_cache_backend
+        self.attention_backend = attention_backend
         if linear_backend not in (
             "allspark",
             "consumer_int8",
@@ -152,6 +154,7 @@ class QwenInt8Config(QuantizationConfig):
             config.get("gdn_decode_backend", "triton"),
             config.get("kv_cache_backend", "triton"),
             config.get("linear_backend", "allspark"),
+            config.get("attention_backend", "triton"),
         )
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
@@ -210,6 +213,23 @@ class QwenInt8KVCacheMethod(BaseKVCacheMethod):
     def create_weights(self, layer: torch.nn.Module) -> None:
         super().create_weights(layer)
         layer._consumer_int8_cache_write = None
+        layer._consumer_int8_attention = None
+        if self.quant_config.attention_backend == "consumer_int8":
+            if not (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability(86)
+                and layer.head_size == 256
+                and layer.kv_cache_dtype == "int8_per_token_head"
+                and layer.num_heads in (12, 24)
+                and layer.num_heads == 6 * layer.num_kv_heads
+            ):
+                raise ValueError(
+                    "consumer_int8 attention requires SM86, Qwen D256/GQA6 "
+                    "and INT8 per-head cache"
+                )
+            from consumer_int8.ops import paged_attention
+
+            layer._consumer_int8_attention = paged_attention
         if self.quant_config.kv_cache_backend == "consumer_int8":
             if not (
                 current_platform.is_cuda()

@@ -696,6 +696,34 @@ class TritonAttentionImpl(AttentionImpl):
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        native_attention = getattr(layer, "_consumer_int8_attention", None)
+        if (
+            native_attention is not None
+            and max_seqlen_q >= 64
+            and attn_metadata.causal is True
+            and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+            and query.dtype == torch.bfloat16
+            and self.sliding_window == (-1, -1)
+            and self.alibi_slopes is None
+            and self.sinks is None
+            and not self.logits_soft_cap
+            and mm_prefix_range_tensor is None
+            and attn_metadata.rswa_window is None
+            and self.chunk_lookback == -1
+            and output_scale is None
+        ):
+            native_attention(
+                query[:num_actual_tokens],
+                kv_cache,
+                block_table,
+                cu_seqlens_q,
+                seqused_k,
+                output[:num_actual_tokens],
+                max_seqlen_q,
+                self.scale,
+            )
+            return output
+
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
