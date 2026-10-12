@@ -109,9 +109,11 @@ class QwenInt8Config(QuantizationConfig):
         self.source_modules = dict(quantized_modules)
         self.quantized_modules = dict(quantized_modules)
         self.int8_weight_strategy = "channel"
-        for backend in (gdn_decode_backend, kv_cache_backend, attention_backend):
+        for backend in (gdn_decode_backend, kv_cache_backend):
             if backend not in ("triton", "consumer_int8"):
                 raise ValueError(f"Unsupported qwen_int8 backend: {backend}")
+        if attention_backend not in ("triton", "consumer_int8", "consumer_fa2"):
+            raise ValueError(f"Unsupported qwen_int8 attention: {attention_backend}")
         self.gdn_decode_backend = gdn_decode_backend
         self.kv_cache_backend = kv_cache_backend
         self.attention_backend = attention_backend
@@ -214,7 +216,8 @@ class QwenInt8KVCacheMethod(BaseKVCacheMethod):
         super().create_weights(layer)
         layer._consumer_int8_cache_write = None
         layer._consumer_int8_attention = None
-        if self.quant_config.attention_backend == "consumer_int8":
+        layer._consumer_int8_fa2 = None
+        if self.quant_config.attention_backend in ("consumer_int8", "consumer_fa2"):
             if not (
                 current_platform.is_cuda()
                 and current_platform.is_device_capability(86)
@@ -230,6 +233,12 @@ class QwenInt8KVCacheMethod(BaseKVCacheMethod):
             from consumer_int8.ops import paged_attention
 
             layer._consumer_int8_attention = paged_attention
+            if self.quant_config.attention_backend == "consumer_fa2":
+                from consumer_int8.ops import unpack_kv_cache
+
+                from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+                layer._consumer_int8_fa2 = (unpack_kv_cache, flash_attn_varlen_func)
         if self.quant_config.kv_cache_backend == "consumer_int8":
             if not (
                 current_platform.is_cuda()

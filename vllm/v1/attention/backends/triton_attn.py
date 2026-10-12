@@ -712,6 +712,39 @@ class TritonAttentionImpl(AttentionImpl):
             and self.chunk_lookback == -1
             and output_scale is None
         ):
+            converted_fa2 = getattr(layer, "_consumer_int8_fa2", None)
+            sequences = seqused_k.numel()
+            capacity = cdiv(max_seqlen_k, 16) * 16
+            scratch_bytes = sequences * capacity * self.num_kv_heads * 256 * 4
+            # One transient layer, bounded independently of the persistent cache.
+            # Larger batches retain the direct packed CUDA implementation.
+            if converted_fa2 is not None and scratch_bytes <= 512 * 1024**2:
+                unpack, flash_attention = converted_fa2
+                key_scratch = torch.empty(
+                    (sequences, capacity, self.num_kv_heads, 256),
+                    device=query.device,
+                    dtype=torch.bfloat16,
+                )
+                value_scratch = torch.empty_like(key_scratch)
+                scratch_table = torch.arange(
+                    sequences, device=query.device, dtype=torch.int32
+                ).view(-1, 1)
+                unpack(kv_cache, block_table, seqused_k, key_scratch, value_scratch)
+                flash_attention(
+                    q=query[:num_actual_tokens],
+                    k=key_scratch,
+                    v=value_scratch,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    block_table=scratch_table,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    fa_version=2,
+                )
+                return output
             native_attention(
                 query[:num_actual_tokens],
                 kv_cache,
