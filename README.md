@@ -19,6 +19,30 @@ naming the kernels they require; stock vLLM cannot load either. The
 separate `appmana/deepseek-v4-nvfp4-fp8` checkpoint uses a different
 quantization and kernel configuration.
 
+## Qwen3.8-27B INT8 validation
+
+The `qwen_int8` adapter loads a full text, vision and MTP checkpoint encoded
+from `Qwen/Qwen3.8-27B` revision
+`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. Encoding, AOT SM86 CUDA kernels
+and the two-GPU benchmark harness live in the separate
+[`consumer-int8-kernels`](https://github.com/AppMana/consumer-int8-kernels)
+package. The encoded checkpoint remains unreleased while long-context
+retrieval and serving benchmarks are being validated.
+
+Language/MTP linears use biased UINT8 weights with BF16 channel scales;
+vision linears use signed INT8 group-32 weights with FP32 scales. Recurrent
+state stays FP32. The current quality-qualified candidate uses AllSpark
+projections, native small-batch GDN decode, native INT8 cache insertion and
+the existing paged Triton full-attention backend. GDN arithmetic remains
+floating point, and Qwen's hybrid architecture has no sparse indexer.
+W8A8 prefill candidates are experimental: they pass the held-out text NLL
+limit but introduce an OCR regression at C=4.
+
+The package's `benchmarks/run_quality.py` validates TP2/PP2 and MTP against
+fixed text and vision fixtures. `benchmarks/run_matrix.py` records separate
+aggregate and per-stream prefill/decode rates using engine timestamps and
+actual token counts for the 8k/16k/32k, C=1/2/4 needle matrix.
+
 ## What this fork adds
 
 - `dsv4_int` loading and dispatch for INT4 routed experts and INT8 linears.

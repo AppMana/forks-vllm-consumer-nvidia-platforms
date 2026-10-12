@@ -60,6 +60,8 @@ ARG APPMANA_NCCL_GENCODE="-gencode=arch=compute_86,code=sm_86 -gencode=arch=comp
 ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 ARG APPMANA_NCCL_GIT_REF=22355b63ea9ffd869e208e4f6d381e6f31b471d9
 ARG BUILD_DEEPEP=1
+ARG CONSUMER_INT8_GIT_REPO=https://github.com/AppMana/consumer-int8-kernels.git
+ARG CONSUMER_INT8_GIT_REF=016ec328d7f07bf5363a94e1d04b7ff398b3610b
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
 # 0.2.70 is the first provider that serves BOTH host engines: libusb4_rdma for
@@ -618,6 +620,13 @@ ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
 ARG TRITON_INSTALL_FROM_SOURCE_REVISION
 ARG max_jobs
+ARG CONSUMER_INT8_GIT_REPO
+ARG CONSUMER_INT8_GIT_REF
+ARG USE_SCCACHE
+ARG SCCACHE_ENDPOINT
+ARG SCCACHE_BUCKET_NAME
+ARG SCCACHE_REGION_NAME
+ARG SCCACHE_S3_NO_CREDENTIALS=0
 
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 ENV UV_HTTP_TIMEOUT=500
@@ -725,6 +734,35 @@ RUN --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
         MAX_JOBS="${max_jobs:-}" \
             python3 /tmp/build_nixl_for_rubin.py --skip-system-deps --build-only; \
     fi
+# Build the independent SM86 kernels on each host architecture. No GPU or
+# inference-time compiler is needed. Submodule revisions come from the pin.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=cache,target=/workspace/tmp/sccache,sharing=shared \
+    --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
+    set -eu; \
+    git init /tmp/consumer-int8-src; \
+    git -C /tmp/consumer-int8-src remote add origin "${CONSUMER_INT8_GIT_REPO}"; \
+    git -C /tmp/consumer-int8-src fetch --depth=1 origin "${CONSUMER_INT8_GIT_REF}"; \
+    git -C /tmp/consumer-int8-src checkout --detach FETCH_HEAD; \
+    test "$(git -C /tmp/consumer-int8-src rev-parse HEAD)" = "${CONSUMER_INT8_GIT_REF}"; \
+    git -C /tmp/consumer-int8-src submodule update --init --recursive --depth=1; \
+    uv pip install --python /opt/venv/bin/python 'setuptools>=77' wheel ninja; \
+    export TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS="${max_jobs:-2}"; \
+    if [ "${USE_SCCACHE:-0}" = "1" ]; then \
+        mkdir -p /workspace/tmp/sccache; \
+        if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT; fi; \
+        export SCCACHE_BUCKET="${SCCACHE_BUCKET_NAME}" \
+            SCCACHE_REGION="${SCCACHE_REGION_NAME}" \
+            SCCACHE_S3_NO_CREDENTIALS="${SCCACHE_S3_NO_CREDENTIALS}" \
+            SCCACHE_DIR=/workspace/tmp/sccache \
+            SCCACHE_SERVER_UDS=/workspace/tmp/sccache-consumer-int8.sock \
+            SCCACHE_IDLE_TIMEOUT=0 \
+            PYTORCH_NVCC="sccache /usr/local/cuda/bin/nvcc"; \
+    fi; \
+    uv build --wheel --no-build-isolation --python /opt/venv/bin/python \
+        --out-dir /tmp/consumer-int8-dist /tmp/consumer-int8-src; \
+    cd /tmp/consumer-int8-dist; \
+    sha256sum *.whl > wheels.sha256
 #################### EXTENSIONS BUILD IMAGE ####################
 
 #################### WHEEL BUILD IMAGE ####################
@@ -1456,6 +1494,8 @@ ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
 ARG CUDA_VERSION
 ARG LMCACHE_GIT_REF=0982a7f901aa727b225513a8f526432887bfa4b2
+ARG CONSUMER_INT8_GIT_REPO
+ARG CONSUMER_INT8_GIT_REF
 # FlashMLA (int8 + sparse MLA) comes from the fork's PEP 503 simple index, not
 # a pinned wheel URL: the URL baked in an x86_64 filename, so an aarch64 build
 # could not install it at all. The index lets pip resolve per platform.
@@ -1726,6 +1766,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             print('NIXL EP extension:', ext[0])"; \
     fi
 
+COPY --from=extensions-build /tmp/consumer-int8-dist/wheels.sha256 /tmp/consumer-int8-wheels.sha256
+RUN --mount=type=bind,from=extensions-build,src=/tmp/consumer-int8-dist,target=/tmp/consumer-int8-dist,ro \
+    --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system --no-deps /tmp/consumer-int8-dist/*.whl
+RUN python3 -c "import consumer_int8.ops as ops; assert callable(ops.kv_cache_update); assert callable(ops.gdn_packed_decode); assert callable(ops.cutlass_channel_mm)"
+
 RUN INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS}" python3 - <<'PY'
 import ctypes
 import importlib
@@ -1836,6 +1882,8 @@ LABEL org.opencontainers.image.source="${VLLM_SOURCE_REPO}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
       ai.vllm.source.repo="${VLLM_SOURCE_REPO}" \
+      ai.appmana.consumer-int8.repo="${CONSUMER_INT8_GIT_REPO}" \
+      ai.appmana.consumer-int8.ref="${CONSUMER_INT8_GIT_REF}" \
       ai.appmana.lmcache.ref="${LMCACHE_GIT_REF}" \
       ai.appmana.flashmla.spec="${FLASHMLA_SPEC} from ${FLASHMLA_INDEX_URL}" \
       ai.appmana.sparkinfer.spec="${SPARKINFER_SPEC} from ${SPARKINFER_INDEX_URL}" \

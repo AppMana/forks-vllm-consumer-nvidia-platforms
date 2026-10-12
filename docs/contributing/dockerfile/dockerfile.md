@@ -20,6 +20,14 @@ The edges of the build graph represent:
 The `test-deps` stage branches from `vllm-runtime-base` so Git and the test
 requirements remain cached independently of per-commit vLLM wheels and source.
 
+The `extensions-build` stage builds the independent `consumer-int8-kernels`
+wheel from `CONSUMER_INT8_GIT_REF`, including pinned CUTLASS and NInfer
+submodules. It emits SM86 CUDA code for both amd64 and arm64 hosts.
+`vllm-openai-base` installs the wheel without dependency resolution and verifies
+its native operators import without a GPU. The image labels record its source
+repository and revision. These Qwen kernels are opt-in on SM86; the wheel's
+presence does not change SM121 backend selection.
+
 The `extensions-build` stage can also produce an optional source-built Triton
 wheel. `vllm-openai-base` installs that wheel after its other Python
 dependencies so dependency resolution cannot restore an older Triton version.
