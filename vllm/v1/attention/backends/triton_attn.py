@@ -814,6 +814,10 @@ class TritonAttentionImpl(AttentionImpl):
             key_cache, value_cache = self._pth_key_value_caches(kv_cache)
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
+            native_cache_write = getattr(layer, "_consumer_int8_cache_write", None)
+            if native_cache_write is not None:
+                native_cache_write(key, value, kv_cache, slot_mapping)
+                return
             triton_reshape_and_cache_flash_per_token_head_quant(
                 key,
                 value,

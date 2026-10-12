@@ -725,6 +725,12 @@ def test_build_per_request_timing_metrics_valid_timestamps():
     assert metrics.queue_time_ms == pytest.approx(500.0)
     assert metrics.mean_itl_ms == pytest.approx(1000.0 / 9, rel=1e-4)
     assert metrics.tokens_per_second == pytest.approx(10.0 / 1.5, rel=1e-4)
+    phase = metrics.engine_phase_timing
+    assert phase is not None
+    assert phase.scheduled_s == _PER_REQUEST_STATS.scheduled_ts
+    assert phase.first_token_s == _PER_REQUEST_STATS.first_token_ts
+    assert phase.last_token_s == _PER_REQUEST_STATS.last_token_ts
+    assert phase.num_preemptions == _PER_REQUEST_STATS.num_preemptions
 
 
 @pytest.mark.asyncio

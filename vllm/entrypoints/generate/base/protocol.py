@@ -106,7 +106,22 @@ class SpeculativeDecodingMetrics(OpenAIBaseModel):
     per_step_drafted: list[int] | None = None
 
 
+class EnginePhaseTiming(OpenAIBaseModel):
+    """Engine-core monotonic timestamps, comparable only on the same host.
+
+    Prefill includes scheduled execution through the first output token;
+    decode excludes that first token. These are request phase intervals,
+    not sums of isolated GPU kernel time.
+    """
+
+    scheduled_s: float
+    first_token_s: float
+    last_token_s: float
+    num_preemptions: int = 0
+
+
 class PerRequestMetrics(OpenAIBaseModel):
+    engine_phase_timing: EnginePhaseTiming | None = None
     time_to_first_token_ms: float | None = None
     generation_time_ms: float | None = None
     queue_time_ms: float | None = None

@@ -13,6 +13,7 @@ from pydantic import ConfigDict
 from vllm import RequestOutput
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.base.protocol import (
+    EnginePhaseTiming,
     PerRequestMetrics,
     SpeculativeDecodingMetrics,
 )
@@ -88,7 +89,17 @@ def build_per_request_timing_metrics(
         if inference_time_ms > 0:
             tokens_per_second = num_generation_tokens / inference_time_ms * 1000
 
+    phase_timing = None
+    if 0 < scheduled_ts < first_token_ts <= last_token_ts:
+        phase_timing = EnginePhaseTiming(
+            scheduled_s=scheduled_ts,
+            first_token_s=first_token_ts,
+            last_token_s=last_token_ts,
+            num_preemptions=metrics.num_preemptions,
+        )
+
     return PerRequestMetrics(
+        engine_phase_timing=phase_timing,
         time_to_first_token_ms=time_to_first_token_ms,
         generation_time_ms=generation_time_ms,
         queue_time_ms=queue_time_ms,

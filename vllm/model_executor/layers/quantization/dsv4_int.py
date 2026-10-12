@@ -15,7 +15,7 @@ linear math for the smaller INT8 blocks until a W8A16 linear kernel is wired in.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -864,13 +864,18 @@ class Dsv4Mxfp4Int8Config(Dsv4IntConfig):
         return None
 
 
+class Int8LinearConfig(Protocol):
+    @property
+    def int8_weight_strategy(self) -> str: ...
+
+
 @register_weight_loader_v2_supported_method
 class Dsv4Int8LinearMethod(LinearMethodBase):
     """INT8 W8A16 linear method for DeepSeek V4 dense FP8 replacements."""
 
     BLOCK_SIZE = (128, 128)
 
-    def __init__(self, quant_config: Dsv4IntConfig, prefix: str) -> None:
+    def __init__(self, quant_config: Int8LinearConfig, prefix: str) -> None:
         self.quant_config = quant_config
         self.strategy = quant_config.int8_weight_strategy
         # WO_A is consumed by a custom inverse-RoPE BF16 einsum (not a GEMM), so

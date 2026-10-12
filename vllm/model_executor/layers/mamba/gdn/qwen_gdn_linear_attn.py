@@ -484,6 +484,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
         self.qkvz_layout = "interleaved" if gqa_interleaved_layout else "flat"
+        self._consumer_gdn_decode = None
+        if (
+            getattr(self.quant_config, "gdn_decode_backend", "triton")
+            == "consumer_int8"
+        ):
+            if not (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability(86)
+                and self.head_k_dim == self.head_v_dim == 128
+                and not gqa_interleaved_layout
+            ):
+                raise ValueError("consumer_int8 GDN requires SM86, D128 and flat QKV")
+            # AOT module load belongs to construction, never the serving path.
+            from consumer_int8.ops import gdn_packed_decode
+
+            self._consumer_gdn_decode = gdn_packed_decode
+
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -1762,6 +1779,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             validate_data=False,
         )
+        # The initial A5000 measurements favor the native recurrence only
+        # while the active state fits the small-batch working set. Retain the
+        # existing kernel for larger batches and speculative verification.
+        local_heads = self.num_v_heads // self.tp_size
+        if self._consumer_gdn_decode is not None and (
+            (local_heads == 48 and num_actual_tokens == 1)
+            or (local_heads == 24 and 0 < num_actual_tokens <= 2)
+        ):
+            assert non_spec_state_indices_tensor is not None
+            self._consumer_gdn_decode(
+                mixed_qkv_non_spec,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                ssm_state,
+                non_spec_state_indices_tensor[:num_actual_tokens],
+                core_attn_out[:num_actual_tokens].view(-1, local_heads, 128),
+            )
+            return
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
