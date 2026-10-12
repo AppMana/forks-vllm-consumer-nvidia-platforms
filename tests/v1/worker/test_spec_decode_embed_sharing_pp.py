@@ -296,3 +296,58 @@ def test_m3_weight_transfer_updates_embedding_ownership(make_m3_draft, initial_e
     eagle_utils.maybe_share_target_embed(draft, draft.model, target)
     assert draft.model.embed_tokens is original
     torch.testing.assert_close(original.weight, torch.full((VOCAB, HIDDEN), 3.0))
+
+
+@pytest.mark.parametrize(
+    "rank,tied,method,expected",
+    [
+        (0, False, None, True),
+        (1, False, None, False),
+        (2, False, None, False),
+        (2, False, "mtp", False),
+        (2, True, None, True),
+        (1, True, None, False),
+        (2, False, "eagle3", True),
+        (2, False, "dspark", True),
+    ],
+)
+def test_qwen_hybrid_pp_only_allocates_required_target_embeddings(
+    monkeypatch, rank, tied, method, expected
+):
+    """Unused PP embeddings cost 2.37 GiB and prevent 27B MTP loading on A5000."""
+    from vllm.config import CompilationConfig, CompilationMode
+    from vllm.model_executor.models import qwen3_5 as qwen
+
+    pp = lambda: SimpleNamespace(
+        world_size=3, is_first_rank=rank == 0, is_last_rank=rank == 2
+    )
+    monkeypatch.setattr(qwen, "get_pp_group", pp)
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_pp_group", pp)
+    monkeypatch.setattr(qwen, "VocabParallelEmbedding", lambda *_, **kw: _embed())
+    monkeypatch.setattr(qwen, "make_layers", lambda *_, **kw: (0, 0, nn.ModuleList()))
+    monkeypatch.setattr(qwen, "Qwen3_5RMSNorm", lambda *_, **kw: nn.Identity())
+    monkeypatch.setattr(
+        qwen, "is_model_fused_shared_expert_compatible", lambda *_, **kw: False
+    )
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(mode=CompilationMode.NONE),
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0)
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                vocab_size=VOCAB,
+                hidden_size=HIDDEN,
+                num_hidden_layers=0,
+                rms_norm_eps=1e-6,
+                tie_word_embeddings=tied,
+                model_type="qwen3_5_text",
+            )
+        ),
+        speculative_config=None if method is None else SimpleNamespace(method=method),
+        quant_config=None,
+    )
+    model = qwen.Qwen3_5Model(vllm_config=config)
+    assert isinstance(model.embed_tokens, nn.Embedding) is expected
+    loaded = model.load_weights([("embed_tokens.weight", torch.ones(VOCAB, HIDDEN))])
+    assert ("embed_tokens.weight" in loaded) is expected
