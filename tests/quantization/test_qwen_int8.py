@@ -11,6 +11,8 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.quantization.qwen_int8 import (
     QwenInt8Config,
+    QwenInt8LinearMethod,
+    QwenInt8PrefillLinearMethod,
     QwenVisionInt8LinearMethod,
 )
 from vllm.model_executor.models.utils import WeightsMapper
@@ -88,3 +90,27 @@ def test_vision_groups_crossing_tp_boundary_are_rejected_before_allocation():
             1152,
             torch.bfloat16,
         )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "native_prefill"),
+    [
+        ("language_model.model.layers.0.mlp.gate_up_proj", True),
+        ("language_model.model.layers.0.mlp.down_proj", True),
+        ("language_model.model.layers.0.self_attn.qkv_proj", False),
+        ("language_model.model.layers.0.linear_attn.in_proj_qkvz", False),
+        ("language_model.model.layers.0.linear_attn.out_proj", False),
+        ("mtp.fc", False),
+        ("mtp.layers.0.mlp.gate_up_proj", True),
+    ],
+)
+def test_mlp_prefill_keeps_attention_and_mtp_fc_at_bf16_activation_precision(
+    prefix, native_prefill
+):
+    config = QwenInt8Config(
+        {prefix: "channel_uint8"}, linear_backend="consumer_int8_mlp_prefill"
+    )
+    layer = object.__new__(MergedColumnParallelLinear)
+    method = config.get_quant_method(layer, prefix)
+    expected = QwenInt8PrefillLinearMethod if native_prefill else QwenInt8LinearMethod
+    assert type(method) is expected

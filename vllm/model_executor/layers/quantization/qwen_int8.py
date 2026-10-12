@@ -56,6 +56,7 @@ class QwenInt8Config(QuantizationConfig):
             "consumer_int8",
             "consumer_int8_hybrid",
             "consumer_int8_prefill",
+            "consumer_int8_mlp_prefill",
         ):
             raise ValueError(f"Unsupported qwen_int8 linear backend: {linear_backend}")
         self.linear_backend = linear_backend
@@ -123,7 +124,10 @@ class QwenInt8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             encoding = self._encoding(prefix)
             if encoding == "channel_uint8":
-                if self.linear_backend == "consumer_int8_prefill":
+                if self.linear_backend == "consumer_int8_prefill" or (
+                    self.linear_backend == "consumer_int8_mlp_prefill"
+                    and ".mlp." in prefix
+                ):
                     return QwenInt8PrefillLinearMethod(self, prefix)
                 if self.linear_backend in ("consumer_int8", "consumer_int8_hybrid"):
                     return QwenInt8CUTLASSLinearMethod(self, prefix)
