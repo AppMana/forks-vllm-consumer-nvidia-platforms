@@ -96,7 +96,7 @@ def test_vision_groups_crossing_tp_boundary_are_rejected_before_allocation():
     ("prefix", "native_prefill"),
     [
         ("language_model.model.layers.0.mlp.gate_up_proj", True),
-        ("language_model.model.layers.0.mlp.down_proj", True),
+        ("language_model.model.layers.0.mlp.down_proj", False),
         ("language_model.model.layers.0.self_attn.qkv_proj", False),
         ("language_model.model.layers.0.linear_attn.in_proj_qkvz", False),
         ("language_model.model.layers.0.linear_attn.out_proj", False),

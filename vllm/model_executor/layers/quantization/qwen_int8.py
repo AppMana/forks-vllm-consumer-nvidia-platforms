@@ -127,6 +127,8 @@ class QwenInt8Config(QuantizationConfig):
                 if self.linear_backend == "consumer_int8_prefill" or (
                     self.linear_backend == "consumer_int8_mlp_prefill"
                     and ".mlp." in prefix
+                    and prefix.rsplit(".", 1)[-1]
+                    in ("gate_up_proj", "gate_proj", "up_proj")
                 ):
                     return QwenInt8PrefillLinearMethod(self, prefix)
                 if self.linear_backend in ("consumer_int8", "consumer_int8_hybrid"):
