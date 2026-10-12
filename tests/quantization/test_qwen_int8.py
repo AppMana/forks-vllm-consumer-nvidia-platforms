@@ -114,3 +114,47 @@ def test_mlp_prefill_keeps_attention_and_mtp_fc_at_bf16_activation_precision(
     method = config.get_quant_method(layer, prefix)
     expected = QwenInt8PrefillLinearMethod if native_prefill else QwenInt8LinearMethod
     assert type(method) is expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefill_dispatch_survives_guard_free_graph_reuse_for_decode():
+    """A graph traced at M=1024 must still use W8A16 for smaller runtime M."""
+    from vllm import _custom_ops as ops
+
+    if torch.cuda.get_device_capability() != (8, 6):
+        pytest.skip("consumer INT8 kernels require SM86")
+    torch.manual_seed(911)
+    n, k = 128, 256
+    codes = torch.randint(0, 256, (k, n), device="cuda", dtype=torch.uint8)
+    scales = torch.full((1, n), 0.01, device="cuda", dtype=torch.bfloat16)
+    weight, scale, _ = ops.allspark_repack_weight(codes, scales, None, False)
+    config = QwenInt8Config({"layer": "channel_uint8"})
+
+    class Program(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Module()
+            self.layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+            self.layer.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
+            self.layer.output_size_per_partition = n
+            self.layer._dsv4_int_allspark = True
+            self.layer._dsv4_int_allspark_args = {
+                "sm_count": torch.cuda.get_device_properties(0).multi_processor_count,
+                "sm_version": 86,
+                "cublas_m_threshold": 1024,
+            }
+            self.method = QwenInt8PrefillLinearMethod(config, "layer")
+            self.method.process_weights_after_loading(self.layer)
+
+        def forward(self, x):
+            return self.method.apply(self.layer, x)
+
+    program = Program()
+    sample = torch.randn(1024, k, device="cuda", dtype=torch.bfloat16)
+    # vLLM reuses an AOT graph over its compile range without Python guards.
+    graph = torch._dynamo.export(program)(sample).graph_module
+    reference = QwenInt8LinearMethod(config, "layer")
+    for rows in (1, 4, 229, 916):
+        x = sample[:rows]
+        expected = reference.apply(program.layer, x)
+        torch.testing.assert_close(graph(x), expected, atol=0, rtol=0)

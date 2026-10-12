@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -27,6 +28,67 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.models.deepseek_v4.common.vision_int8 import VisionInt8LinearMethod
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _qwen_int8_prefill_linear(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    packed_scales: torch.Tensor,
+    n: int,
+    sm_count: int,
+    sm_version: int,
+    cublas_m_threshold: int,
+) -> torch.Tensor:
+    # Keep the shape decision opaque to guard-free AOT graph reuse. A Python
+    # branch in LinearMethod.apply can be frozen from the 1024-row trace input
+    # and then quantize even single-token decode activations at runtime.
+    m, k = x.shape
+    if m < 1024:
+        return ops.allspark_w8a16_gemm(
+            a=x,
+            b_qweight=packed_weight,
+            b_scales=packed_scales,
+            b_qzeros=None,
+            n=n,
+            group_size=-1,
+            sm_count=sm_count,
+            sm_version=sm_version,
+            CUBLAS_M_THRESHOLD=cublas_m_threshold,
+            has_zp=False,
+            n32k16_reorder=True,
+        )
+    from consumer_int8.ops import cutlass_channel_mm, quantize_rows, unpack_allspark
+
+    weight = torch.empty((n, k), dtype=torch.int8, device=x.device)
+    scales = torch.empty(n, dtype=torch.bfloat16, device=x.device)
+    unpack_allspark(packed_weight, packed_scales.flatten(), weight, scales)
+    codes = torch.empty_like(x, dtype=torch.int8)
+    row_scales = torch.empty(m, dtype=torch.float32, device=x.device)
+    workspace = torch.empty((m, n), dtype=torch.int32, device=x.device)
+    out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    quantize_rows(x, codes, row_scales)
+    cutlass_channel_mm(codes, weight, row_scales, scales, workspace, out)
+    return out
+
+
+def _qwen_int8_prefill_linear_fake(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    packed_scales: torch.Tensor,
+    n: int,
+    sm_count: int,
+    sm_version: int,
+    cublas_m_threshold: int,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], n))
+
+
+direct_register_custom_op(
+    op_name="qwen_int8_prefill_linear",
+    op_func=_qwen_int8_prefill_linear,
+    fake_impl=_qwen_int8_prefill_linear_fake,
+)
 
 
 class QwenInt8Config(QuantizationConfig):
@@ -194,30 +256,25 @@ class QwenInt8PrefillLinearMethod(QwenInt8LinearMethod):
         if not current_platform.is_device_capability(86):
             raise ValueError("consumer_int8 prefill requires SM86")
         super().process_weights_after_loading(layer)
-        from consumer_int8.ops import cutlass_channel_mm, quantize_rows, unpack_allspark
-
-        self._unpack = unpack_allspark
-        self._quantize = quantize_rows
-        self._mm = cutlass_channel_mm
+        # Load the AOT extension during construction, before CUDA capture.
+        import consumer_int8.ops  # noqa: F401
 
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         shape = x.shape[:-1]
-        m = x.numel() // x.shape[-1]
-        if m < 1024:
-            return super().apply(layer, x, bias)
-        x = x.reshape(m, -1).contiguous()
-        k, n = x.shape[1], layer.output_size_per_partition
-        weight = torch.empty((n, k), dtype=torch.int8, device=x.device)
-        scales = torch.empty(n, dtype=torch.bfloat16, device=x.device)
-        self._unpack(layer.weight, layer.weight_scale_inv.flatten(), weight, scales)
-        codes = torch.empty_like(x, dtype=torch.int8)
-        row_scales = torch.empty(m, dtype=torch.float32, device=x.device)
-        workspace = torch.empty((m, n), dtype=torch.int32, device=x.device)
-        out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-        self._quantize(x, codes, row_scales)
-        self._mm(codes, weight, row_scales, scales, workspace, out)
+        x = x.reshape(-1, x.shape[-1]).contiguous()
+        n = layer.output_size_per_partition
+        args = layer._dsv4_int_allspark_args
+        out = torch.ops.vllm.qwen_int8_prefill_linear(
+            x,
+            layer.weight,
+            layer.weight_scale_inv,
+            n,
+            args["sm_count"],
+            args["sm_version"],
+            args["cublas_m_threshold"],
+        )
         if bias is not None:
             out.add_(bias)
         return out.reshape(*shape, n)
