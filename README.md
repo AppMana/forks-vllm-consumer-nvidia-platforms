@@ -26,8 +26,9 @@ from `Qwen/Qwen3.8-27B` revision
 `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. Encoding, AOT SM86 CUDA kernels
 and the two-GPU benchmark harness live in the separate
 [`consumer-int8-kernels`](https://github.com/AppMana/consumer-int8-kernels)
-package. The encoded checkpoint remains unreleased while long-context
-retrieval and serving benchmarks are being validated.
+package. The [two-A5000 evaluation](https://github.com/AppMana/consumer-int8-kernels/blob/main/docs/a5000-2026-10-12.md)
+has completed all 36 TP=2/PP=2, MTP off/on, C=1/2/4 × 8k/16k/32k cells.
+The encoded checkpoint remains unreleased pending hardware release gates.
 
 Language/MTP linears use biased UINT8 weights with BF16 channel scales;
 vision linears use signed INT8 group-32 weights with FP32 scales. Recurrent
@@ -42,6 +43,18 @@ The package's `benchmarks/run_quality.py` validates TP2/PP2 and MTP against
 fixed text and vision fixtures. `benchmarks/run_matrix.py` records separate
 aggregate and per-stream prefill/decode rates using engine timestamps and
 actual token counts for the 8k/16k/32k, C=1/2/4 needle matrix.
+
+All four configurations passed the held-out NLL limit (increases of
+0.004887–0.006327 nats/token over BF16) and scored 85/100 vision fixtures
+at both concurrencies with no new failures against BF16's 82/100. Raw
+needle recall was 244/252; all 252 answers matched after removing outer
+whitespace. BF16 replay reproduced both failing prompts, with zero new
+raw-recall regressions. The original absolute raw-recall gate remains false.
+The report preserves both checks, all timings and source pins. TP=2 decoded
+faster than PP=2 in every measured cell; MTP's effect depends on context.
+The tested PP=2/MTP-on profile had only about 138 MiB of estimated free
+memory at its tightest sampled point, so it is not a production memory
+qualification.
 
 ## What this fork adds
 
