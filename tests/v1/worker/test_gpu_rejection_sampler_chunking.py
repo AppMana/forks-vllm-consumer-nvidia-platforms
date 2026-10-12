@@ -44,6 +44,8 @@ def test_rejection_warmup_covers_absent_drafts_and_runtime_token_dtype(
             (kwargs["target_logits"].dtype, None if draft is None else draft.dtype)
         )
         assert kwargs["draft_sampled"].dtype == torch.int32
+        assert kwargs["idx_mapping"].dtype == torch.int64
+        assert kwargs["expanded_idx_mapping"].dtype == torch.int64
 
     monkeypatch.setattr(rejection_sampler_utils, "rejection_sample", record)
     ids = torch.empty(8, dtype=torch.int32)

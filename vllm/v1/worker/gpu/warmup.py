@@ -932,7 +932,7 @@ def warmup_post_update_num_computed_tokens_kernel(
     if num_computed_tokens_gpu is None:
         return False
 
-    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    idx_mapping = torch.zeros(1, dtype=torch.int64, device=device)
     query_start_loc = torch.tensor([0, 0], dtype=torch.int32, device=device)
 
     post_update_num_computed_tokens(
@@ -984,7 +984,7 @@ def warmup_post_update_kernel(
         return False
 
     num_speculative_steps = int(getattr(model_runner, "num_speculative_steps", 0) or 0)
-    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    idx_mapping = torch.zeros(1, dtype=torch.int64, device=device)
     num_sampled = torch.zeros(1, dtype=torch.int32, device=device)
     num_rejected = torch.zeros(1, dtype=torch.int32, device=device)
     query_start_loc = torch.tensor([0, 0], dtype=torch.int32, device=device)

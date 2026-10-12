@@ -34,6 +34,7 @@ def test_post_update_warmup_covers_prefill_decode_and_penalties(monkeypatch):
     signatures = set()
 
     def record(idx, computed, last, bins, sampled, num_sampled, rejected, query, *rest):
+        assert idx.dtype == torch.int64
         signatures.add((sampled.stride(0), bins is not None, query is not None))
         assert torch.count_nonzero(num_sampled) == 0
         assert torch.count_nonzero(rejected) == 0
