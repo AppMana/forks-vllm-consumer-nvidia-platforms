@@ -572,6 +572,26 @@ def test_deepseek_v4_pp_warmup_kernels_run_coupled_production_batch(monkeypatch)
     assert sampler_warmup == [True]
 
 
+@pytest.mark.parametrize("pp_size,num_spec", [(1, 0), (1, 1), (2, 0), (2, 1)])
+def test_generic_warmup_only_requests_supported_logprobs(
+    monkeypatch, pp_size, num_spec
+):
+    """PP-deferred verification rejects output logprobs even during warmup."""
+    executed: list[gpu_warmup.SchedulerOutput] = []
+    runner = _FakeModelRunner()
+    runner.parallel_config = SimpleNamespace(pipeline_parallel_size=pp_size)
+    runner.num_speculative_steps = num_spec
+    runner.decode_query_len = num_spec + 1
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(gpu_warmup, "warmup_long_prefill_kernels", lambda *args: None)
+    gpu_warmup.warmup_kernels(runner, executed.append, lambda _: None)
+    requests = executed[0].scheduled_new_reqs
+    assert requests
+    expected_logprobs = None if pp_size > 1 and num_spec > 0 else 5
+    assert all(r.sampling_params.logprobs == expected_logprobs for r in requests)
+    assert all(r.sampling_params.prompt_logprobs == 1 for r in requests)
+
+
 def test_non_deepseek_v4_pp_warmup_kernels_keeps_generic_execute_model(monkeypatch):
     executed = []
     sampled = []

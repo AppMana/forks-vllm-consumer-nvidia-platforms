@@ -1154,6 +1154,9 @@ def _warmup_kernels(
         pooling_params.verify(model_runner.model_config)
     else:
         sampling_params = SamplingParams.for_sampler_warmup()
+        if pp_size > 1 and num_spec_steps > 0:
+            # The PP-deferred verifier does not support output logprobs.
+            sampling_params.logprobs = None
         pooling_params = None
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.
