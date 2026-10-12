@@ -630,6 +630,7 @@ def test_apply_fails_closed_on_dense_symbol_with_vanilla_weights():
     hf_config = SimpleNamespace(
         vllm={"kernels": [DENSE_EXPERTS_INT8_ACTIVATION]},
         quantization_config=None,
+        architectures=["DeepseekV4ForCausalLM"],
     )
     model_config = SimpleNamespace(hf_config=hf_config, quantization=None)
     cache_config = SimpleNamespace(cache_dtype="auto")
@@ -961,13 +962,22 @@ def test_indexer_gate_refusal_is_never_silent(monkeypatch):
     assert any("decode context parallel" in m for m in records), records
 
 
-def test_indexer_forward_consumes_the_gate():
-    import inspect
-
+def test_indexer_forward_consumes_the_gate(monkeypatch):
     import vllm.model_executor.layers.sparse_attn_indexer as indexer
 
-    source = inspect.getsource(indexer.sparse_attn_indexer)
-    assert "should_use_prefill_streaming_topk(" in source
+    monkeypatch.setattr(indexer, "current_platform", _fake_platform())
+    activate_kernel_config(
+        resolve_kernel_config(
+            {
+                "kernels": [INDEXER_STREAMING_TOPK_PREFILL],
+                "indexer_prefill_topk_slab_rows": 4,
+            }
+        )
+    )
+    assert not indexer.should_stream_prefill_topk_for_context(1, False, 4)
+    assert indexer.should_stream_prefill_topk_for_context(1, False, 5)
+    activate_kernel_config(resolve_kernel_config({"kernels": []}))
+    assert not indexer.should_stream_prefill_topk_for_context(1, False, 5)
 
 
 def test_indexer_module_constant_retired():

@@ -179,12 +179,14 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         minimax_m3_msa_warmup,
     )
 
-    if not worker.use_v2_model_runner:
-        # The KV-block zeroing kernel is driven by the scheduler's
-        # `new_block_ids_to_zero`, so no dummy run ever reaches it.
-        zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
-        if zeroer is not None:
-            zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
+    # The scheduler drives KV zeroing; DSpark PP skips the V2 dummy requests
+    # that normally warm this kernel, so cover both runners here.
+    zeroer_name = (
+        "kv_block_zeroer" if worker.use_v2_model_runner else "_kv_block_zeroer"
+    )
+    zeroer = getattr(worker.model_runner, zeroer_name, None)
+    if zeroer is not None:
+        zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
 
     enable_jit_warmup = worker.vllm_config.kernel_config.enable_jit_warmup
     if enable_jit_warmup:
@@ -270,6 +272,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     _deepseek_v4_sparse_mla_prefill_warmup(worker)
     _deepseek_v4_block_table_slot_mapping_warmup(worker)
     _deepseek_v4_marlin_moe_warmup(worker)
+    _deepseek_v4_image_visibility_warmup(worker)
     _deepseek_v4_vision_warmup(worker)
 
     # Deep GEMM warmup
@@ -789,6 +792,33 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
     # the file). FlashInfer gates its own autotune(cache=...) save the same way.
     if tuner._dirty:
         tuner.save_configs(str(cache_path))
+
+
+def _deepseek_v4_image_visibility_warmup(worker: "Worker") -> None:
+    """Compile image-span metadata on every attention rank, without KV writes."""
+    if not _is_deepseek_v4_worker(worker) or worker.model_runner is None:
+        return
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        _compute_image_visibility_kernel,
+    )
+
+    widths = {
+        builder.max_image_tokens
+        for groups in getattr(worker.model_runner, "attn_groups", [])
+        for group in groups
+        for builder in group.metadata_builders
+        if getattr(builder, "max_image_tokens", 0) > 0
+    }
+    for width in sorted(widths):
+        # All eight metadata arrays are aligned int32 tensors. warmup compiles
+        # with dtype placeholders and never reads or mutates the live buffers.
+        _compute_image_visibility_kernel.warmup(
+            *([torch.int32] * 8), width, token_offset=0, grid=(1,)
+        )
+    if widths:
+        logger.info(
+            "DeepSeek V4 image visibility warmed for widths %s.", sorted(widths)
+        )
 
 
 def _deepseek_v4_vision_warmup(worker: "Worker") -> None:

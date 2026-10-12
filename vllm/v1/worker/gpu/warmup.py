@@ -985,39 +985,37 @@ def warmup_post_update_kernel(
 
     num_speculative_steps = int(getattr(model_runner, "num_speculative_steps", 0) or 0)
     idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
-    sampled_tokens = torch.zeros(
-        1, num_speculative_steps + 1, dtype=torch.int64, device=device
-    )
     num_sampled = torch.zeros(1, dtype=torch.int32, device=device)
     num_rejected = torch.zeros(1, dtype=torch.int32, device=device)
     query_start_loc = torch.tensor([0, 0], dtype=torch.int32, device=device)
 
-    # Two real call sites, two distinct Triton specializations: Triton treats
-    # a None-valued pointer argument as a different compiled kernel from a
-    # real-tensor argument of the same otherwise-matching shape/dtype (it
-    # changes the generated null-check/launcher code, not just a runtime
-    # branch inside the kernel body). model_runner.py's synchronous
-    # postprocess after this rank's own sampler always passes a real
-    # query_start_loc tensor; the ASYNC PP-deferred path (non-last ranks
-    # consuming a prior step's broadcast) always passes query_start_loc=None.
-    # Both must be warmed independently.
-    for warm_query_start_loc in (query_start_loc, None):
-        post_update(
-            idx_mapping,
-            num_computed_tokens_gpu,
-            last_sampled_tokens,
-            None,  # output_bin_counts: None on non-last-rank in the real call too
-            sampled_tokens,
-            num_sampled,
-            num_rejected,
-            warm_query_start_loc,
-            all_token_ids_gpu,
-            total_len_gpu,
-        )
+    sampler = getattr(model_runner, "sampler", None)
+    penalties = getattr(sampler, "penalties_state", None)
+    output_counts = getattr(penalties, "output_bin_counts", None)
+    count_buffers = [None] if output_counts is None else [None, output_counts]
+    # The initial prefill emits one token even when speculative decode emits
+    # multiple tokens. Stride 1 has a different Triton specialization. Cover
+    # the last rank's penalty buffer and absent query pointers as well.
+    for width in sorted({1, num_speculative_steps + 1}):
+        sampled_tokens = torch.zeros(1, width, dtype=torch.int64, device=device)
+        for warm_query_start_loc in (query_start_loc, None):
+            for counts in count_buffers:
+                post_update(
+                    idx_mapping,
+                    num_computed_tokens_gpu,
+                    last_sampled_tokens,
+                    counts,
+                    sampled_tokens,
+                    num_sampled,
+                    num_rejected,
+                    warm_query_start_loc,
+                    all_token_ids_gpu,
+                    total_len_gpu,
+                )
     torch.accelerator.synchronize()
 
     logger.info(
-        "post_update kernel warmup completed (both query_start_loc specializations)."
+        "post_update kernel warmup completed (prefill and decode specializations)."
     )
     return True
 

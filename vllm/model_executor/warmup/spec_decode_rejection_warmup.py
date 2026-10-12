@@ -11,13 +11,14 @@ server's vocab size and speculative config.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
     from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
@@ -59,7 +60,15 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
         (torch.float32, torch.float32),
         (torch.float32, model_dtype),
         (model_dtype, torch.float32),
+        # The initial prefill has no draft distribution, even for DSpark.
+        (model_dtype, None),
+        (torch.float32, None),
     }
+    if worker.use_v2_model_runner:
+        runner = cast("GPUModelRunner", worker.model_runner)
+        draft_token_dtype = runner.input_buffers.input_ids.dtype
+    else:
+        draft_token_dtype = worker.model_runner.input_ids.gpu.dtype
 
     logger.info(
         "Warming up spec-decode rejection sampler kernels "
@@ -73,8 +82,12 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
         target_logits = torch.zeros(
             (num_logits, vocab_size), dtype=tgt_dtype, device=device
         )
-        draft_logits = torch.zeros(
-            (num_reqs, num_spec, vocab_size), dtype=draft_dtype, device=device
+        draft_logits = (
+            None
+            if draft_dtype is None
+            else torch.zeros(
+                (num_reqs, num_spec, vocab_size), dtype=draft_dtype, device=device
+            )
         )
         synthetic_rates = (
             torch.full((num_spec,), 0.5, dtype=torch.float32, device=device)
@@ -85,7 +98,9 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
             rejection_sample(
                 target_logits=target_logits,
                 draft_logits=draft_logits,
-                draft_sampled=torch.zeros(num_logits, dtype=torch.int64, device=device),
+                draft_sampled=torch.zeros(
+                    num_logits, dtype=draft_token_dtype, device=device
+                ),
                 cu_num_logits=torch.tensor(
                     [0, num_logits], dtype=torch.int32, device=device
                 ),

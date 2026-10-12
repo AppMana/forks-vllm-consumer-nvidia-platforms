@@ -1657,6 +1657,75 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         fi; \
     fi
 
+# Mooncake registers GPU memory for RDMA via nvidia-peermem by default. Hosts
+# without that module loaded (e.g. GB200) must pass WITH_NVIDIA_PEERMEM=0 at run
+# time; see docs/features/mooncake_connector_usage.md. Deliberately not an ENV
+# here so the image does not override mooncake's own default.
+
+# Install Rubin prerelease dependencies when explicitly requested. Keep this
+# after the public vLLM and KV connector dependency pins installed above.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
+    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+        echo "Installing Rubin prerelease requirements..." \
+        && uv pip install --system \
+            --prerelease=allow --index-strategy unsafe-first-match \
+            -r /tmp/vllm-requirements/rubin-prerelease.txt; \
+    fi
+
+# Install source-built Triton last so dependency resolution cannot restore the
+# previously installed version.
+COPY --from=extensions-build \
+    /tmp/triton_from_source_workspace/dist/wheel.sha256 \
+    /tmp/triton-source-wheel.sha256
+COPY tools/install_triton_from_source.sh /tmp/install_triton_from_source.sh
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=bind,from=extensions-build,source=/tmp/triton_from_source_workspace/dist,target=/tmp/triton-source-dist,ro \
+    if [ -n "${TRITON_INSTALL_FROM_SOURCE_REPO}" ]; then \
+        CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1,2); \
+        if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+            case "${CUDA_MAJOR_MINOR}" in \
+                13.4|13.5) \
+                    TRITON_SYSTEM_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+                    TRITON_EXPECTED_PTXAS_VERSION="${CUDA_MAJOR_MINOR}" \
+                        bash /tmp/install_triton_from_source.sh \
+                            /tmp/triton-source-dist \
+                            /tmp/triton-source-wheel.sha256 \
+                    ;; \
+                *) \
+                    echo "Unsupported Rubin CUDA version: ${CUDA_MAJOR_MINOR}" >&2; \
+                    exit 1 \
+                    ;; \
+            esac; \
+        else \
+            bash /tmp/install_triton_from_source.sh \
+                /tmp/triton-source-dist \
+                /tmp/triton-source-wheel.sha256; \
+        fi; \
+    fi \
+    && rm -f \
+        /tmp/install_triton_from_source.sh \
+        /tmp/triton-source-wheel.sha256
+
+# Install source-built NIXL last, replacing the nixl packages installed above, so
+# the image has a NIXL EP build for its PyTorch version. There is no GPU driver
+# at build time, so check for the extension instead of importing it.
+ARG BUILD_NIXL
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=bind,from=extensions-build,source=/tmp/nixl_workspace/dist,target=/tmp/nixl-dist,ro \
+    set -eu; \
+    if [ "${BUILD_NIXL}" = "true" ]; then \
+        ls /tmp/nixl-dist/*.whl; \
+        uv pip uninstall --system nixl nixl-cu12 nixl-cu13; \
+        uv pip install --system --no-deps /tmp/nixl-dist/*.whl; \
+        python3 -c "import glob, importlib.util as u, os, torch; \
+            spec = u.find_spec('nixl_ep_cu' + os.environ['CUDA_VERSION'].split('.')[0]); \
+            mm = ''.join(torch.__version__.split('.')[:2]); \
+            ext = glob.glob(os.path.join(spec.submodule_search_locations[0], 'nixl_ep_cpp_torch' + mm + '.*')) if spec else []; \
+            assert ext, 'NIXL EP has no build for torch ' + torch.__version__; \
+            print('NIXL EP extension:', ext[0])"; \
+    fi
+
 RUN INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS}" python3 - <<'PY'
 import ctypes
 import importlib
@@ -1752,74 +1821,6 @@ op_name = b"deepseek_v4_fp8_ds_mla_dequantize_and_gather_k_cache"
 if not any(op_name in so.read_bytes() for so in stable_libtorch):
     raise AttributeError(op_name.decode())
 PY
-# Mooncake registers GPU memory for RDMA via nvidia-peermem by default. Hosts
-# without that module loaded (e.g. GB200) must pass WITH_NVIDIA_PEERMEM=0 at run
-# time; see docs/features/mooncake_connector_usage.md. Deliberately not an ENV
-# here so the image does not override mooncake's own default.
-
-# Install Rubin prerelease dependencies when explicitly requested. Keep this
-# after the public vLLM and KV connector dependency pins installed above.
-RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
-    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
-        echo "Installing Rubin prerelease requirements..." \
-        && uv pip install --system \
-            --prerelease=allow --index-strategy unsafe-first-match \
-            -r /tmp/vllm-requirements/rubin-prerelease.txt; \
-    fi
-
-# Install source-built Triton last so dependency resolution cannot restore the
-# previously installed version.
-COPY --from=extensions-build \
-    /tmp/triton_from_source_workspace/dist/wheel.sha256 \
-    /tmp/triton-source-wheel.sha256
-COPY tools/install_triton_from_source.sh /tmp/install_triton_from_source.sh
-RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=extensions-build,source=/tmp/triton_from_source_workspace/dist,target=/tmp/triton-source-dist,ro \
-    if [ -n "${TRITON_INSTALL_FROM_SOURCE_REPO}" ]; then \
-        CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1,2); \
-        if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
-            case "${CUDA_MAJOR_MINOR}" in \
-                13.4|13.5) \
-                    TRITON_SYSTEM_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
-                    TRITON_EXPECTED_PTXAS_VERSION="${CUDA_MAJOR_MINOR}" \
-                        bash /tmp/install_triton_from_source.sh \
-                            /tmp/triton-source-dist \
-                            /tmp/triton-source-wheel.sha256 \
-                    ;; \
-                *) \
-                    echo "Unsupported Rubin CUDA version: ${CUDA_MAJOR_MINOR}" >&2; \
-                    exit 1 \
-                    ;; \
-            esac; \
-        else \
-            bash /tmp/install_triton_from_source.sh \
-                /tmp/triton-source-dist \
-                /tmp/triton-source-wheel.sha256; \
-        fi; \
-    fi \
-    && rm -f \
-        /tmp/install_triton_from_source.sh \
-        /tmp/triton-source-wheel.sha256
-
-# Install source-built NIXL last, replacing the nixl packages installed above, so
-# the image has a NIXL EP build for its PyTorch version. There is no GPU driver
-# at build time, so check for the extension instead of importing it.
-ARG BUILD_NIXL
-RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=extensions-build,source=/tmp/nixl_workspace/dist,target=/tmp/nixl-dist,ro \
-    set -eu; \
-    if [ "${BUILD_NIXL}" = "true" ]; then \
-        ls /tmp/nixl-dist/*.whl; \
-        uv pip uninstall --system nixl nixl-cu12 nixl-cu13; \
-        uv pip install --system --no-deps /tmp/nixl-dist/*.whl; \
-        python3 -c "import glob, importlib.util as u, os, torch; \
-            spec = u.find_spec('nixl_ep_cu' + os.environ['CUDA_VERSION'].split('.')[0]); \
-            mm = ''.join(torch.__version__.split('.')[:2]); \
-            ext = glob.glob(os.path.join(spec.submodule_search_locations[0], 'nixl_ep_cpp_torch' + mm + '.*')) if spec else []; \
-            assert ext, 'NIXL EP has no build for torch ' + torch.__version__; \
-            print('NIXL EP extension:', ext[0])"; \
-    fi
 
 ENV VLLM_USAGE_SOURCE production-docker-image
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \

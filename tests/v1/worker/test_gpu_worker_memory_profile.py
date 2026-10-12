@@ -10,7 +10,7 @@ class _FakeModelRunner:
     def __init__(self) -> None:
         self.profile_runs = 0
 
-    def profile_run(self) -> None:
+    def profile_run(self, *, randomize_inputs: bool = False) -> None:
         self.profile_runs += 1
 
 
@@ -21,13 +21,18 @@ def _make_worker(*, model_type: str, pipeline_parallel_size: int) -> Worker:
     worker.model_runner = _FakeModelRunner()
     worker.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
+            multimodal_config=None,
             hf_config=SimpleNamespace(
                 model_type=model_type,
-                architectures=["DeepseekV4ForCausalLM"] if model_type == "deepseek_v4" else [],
+                architectures=["DeepseekV4ForCausalLM"]
+                if model_type == "deepseek_v4"
+                else [],
             ),
         ),
         parallel_config=SimpleNamespace(pipeline_parallel_size=pipeline_parallel_size),
     )
+    worker.model_config = worker.vllm_config.model_config
+    worker.parallel_config = worker.vllm_config.parallel_config
     return worker
 
 

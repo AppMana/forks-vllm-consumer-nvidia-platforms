@@ -12,7 +12,9 @@ from vllm.config.vllm import VllmConfig
 
 
 def _config(architecture: str):
-    return SimpleNamespace(model_config=SimpleNamespace(architectures=[architecture]))
+    config = VllmConfig.__new__(VllmConfig)
+    config.model_config = SimpleNamespace(architectures=[architecture])
+    return config
 
 
 @pytest.mark.parametrize(

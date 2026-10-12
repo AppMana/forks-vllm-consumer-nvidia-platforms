@@ -16,7 +16,6 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     _is_compatible,
-    get_uniform_token_count,
 )
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import (
@@ -25,6 +24,7 @@ from vllm.v1.worker.gpu.model_runner import (
     _copy_or_reuse_pp_intermediate_tensor,
 )
 from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 
 def test_pp_intermediate_copy_uses_received_length() -> None:
@@ -110,13 +110,19 @@ def test_pp_deferred_steady_verify_is_one_width_k_plus_one_forward() -> None:
     runner.req_states = req_states
     runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
     runner.pcp_manager = None
+    runner.adaptive_verification = None
+    runner.fast_prefill = None
+    runner.aux_output_connector = None
+    runner.check_ep_fault = False
+    runner._draft_workspace_lane = 0
     runner.block_tables = MagicMock()
     runner.update_requests(scheduler_output)
 
-    uniform_token_count = get_uniform_token_count(
+    uniform_token_count = get_uniform_decode_token_count(
         num_reqs=1,
         num_tokens=scheduler_output.total_num_scheduled_tokens,
         max_query_len=max(scheduler_output.num_scheduled_tokens.values()),
+        decode_graph_eligible=True,
     )
     batch_desc = BatchExecutionDescriptor(
         cg_mode=CUDAGraphMode.FULL,
@@ -124,8 +130,9 @@ def test_pp_deferred_steady_verify_is_one_width_k_plus_one_forward() -> None:
         num_reqs=1,
         uniform_token_count=uniform_token_count,
     )
-    input_batch = runner.prepare_inputs(scheduler_output, batch_desc)
-    torch.cuda.synchronize()
+    batch_state, _ = runner.gather_batch_req_state(scheduler_output, dummy_run=False)
+    input_batch = runner.prepare_inputs(scheduler_output, batch_state, batch_desc, 0)
+    torch.accelerator.synchronize()
 
     observed = (
         scheduler_output.num_scheduled_tokens[request.request_id],
@@ -150,6 +157,8 @@ def test_pp_deferred_steady_verify_is_one_width_k_plus_one_forward() -> None:
         num_tokens=num_draft_tokens + 1,
         uniform_token_count=num_draft_tokens + 1,
         num_active_loras=0,
+        max_query_len=num_draft_tokens + 1,
+        num_ubatches=1,
     )
 
 
@@ -180,11 +189,13 @@ def _make_sampling_runner(num_draft_tokens: int):
     runner.rejection_sampler = None
     runner.speculator = None
     runner.structured_outputs_worker = None
+    runner.batch_sharder = None
     runner.pp_handler = None
     runner.req_states = SimpleNamespace(last_sampled_tokens=torch.zeros(1))
     input_batch = SimpleNamespace(
         logits_indices=torch.tensor([0]),
         num_draft_tokens=num_draft_tokens,
+        num_reqs=1,
     )
     return runner, input_batch, sampler_output
 
@@ -287,9 +298,7 @@ def test_chunked_prefill_drafts_only_after_final_chunk(
         idx_mapping=torch.tensor([0]),
         query_start_loc=torch.tensor([0, num_scheduled_tokens]),
         num_scheduled_tokens=np.array([num_scheduled_tokens], dtype=np.int32),
-        num_computed_prefill_tokens_np=np.array(
-            [num_computed_tokens], dtype=np.int32
-        ),
+        num_computed_prefill_tokens_np=np.array([num_computed_tokens], dtype=np.int32),
         prefill_len_np=np.array([8000], dtype=np.int32),
     )
     runner.execute_model_state = ExecuteModelState(
@@ -299,17 +308,27 @@ def test_chunked_prefill_drafts_only_after_final_chunk(
         hidden_states=torch.zeros(num_scheduled_tokens, 4),
         aux_hidden_states=None,
         finished_req_ids=set(),
+        dp_sync_state=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        num_spec_tokens_to_schedule=5,
     )
     runner.is_last_pp_rank = True
     runner.pcp_manager = None
-    sampler_output = SimpleNamespace(sampled_token_ids=torch.zeros((1, 1)))
+    runner.adaptive_verification = None
+    runner.fast_prefill = None
+    runner.aux_output_connector = None
+    runner.check_ep_fault = False
+    runner._draft_workspace_lane = 0
+    sampler_output = SimpleNamespace(
+        sampled_token_ids=torch.zeros((1, 1)), logprobs_tensors=None
+    )
     num_sampled = torch.tensor([int(should_generate)], dtype=torch.int32)
     num_rejected = torch.zeros(1, dtype=torch.int32)
-    runner.sample = MagicMock(
-        return_value=(sampler_output, num_sampled, num_rejected)
-    )
+    runner.sample = MagicMock(return_value=(sampler_output, num_sampled, num_rejected))
     runner.prompt_logprobs_worker = SimpleNamespace(
-        compute_prompt_logprobs=MagicMock(return_value={})
+        compute_prompt_logprobs=MagicMock(return_value={}),
+        compute_prompt_token_id_logprobs=MagicMock(return_value={}),
     )
     runner.model = SimpleNamespace(compute_logits=MagicMock())
     runner.__dict__["main_stream"] = object()
@@ -346,8 +365,7 @@ def test_chunked_prefill_drafts_only_after_final_chunk(
 
     runner.speculator.propose.assert_called_once()
     assert (
-        runner.speculator.propose.call_args.kwargs["generate_draft"]
-        is should_generate
+        runner.speculator.propose.call_args.kwargs["generate_draft"] is should_generate
     )
     proposed_token_ids = runner.pp_handler.broadcast.call_args.kwargs[
         "proposed_token_ids"

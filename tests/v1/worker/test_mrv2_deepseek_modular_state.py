@@ -7,8 +7,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.model_states import default as default_state
+from vllm.v1.worker.gpu.model_states import init_model_state
 
 
 class FakeDefaultModelState:
@@ -38,7 +38,10 @@ def _vllm_config_for_arch(arch: str):
         model_config=SimpleNamespace(
             architectures=[arch],
             is_hybrid=False,
-        )
+            is_attention_free=False,
+            enable_prompt_embeds=False,
+        ),
+        compilation_config=SimpleNamespace(static_forward_context={}),
     )
 
 
@@ -49,9 +52,7 @@ def _vllm_config_for_arch(arch: str):
         "DeepseekV4ForCausalLM",
     ],
 )
-def test_mrv2_qwen3_and_deepseek_v4_use_default_model_state(
-    monkeypatch, arch: str
-):
+def test_mrv2_qwen3_and_deepseek_v4_use_default_model_state(monkeypatch, arch: str):
     monkeypatch.setattr(default_state, "DefaultModelState", FakeDefaultModelState)
 
     model_state = init_model_state(

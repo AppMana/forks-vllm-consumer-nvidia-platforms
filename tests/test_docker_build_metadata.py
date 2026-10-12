@@ -19,11 +19,11 @@ Both are text checks and cost nothing.
 """
 
 import json
-import re
 import subprocess
 from pathlib import Path
 
 import pytest
+import regex as re
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile"
@@ -36,7 +36,7 @@ FLASH_ATTN_ARCH_PATCH = (
     REPO_ROOT / "cmake" / "patches" / "vllm_flash_attn_arch_gating.patch"
 )
 PYTHON_OVERLAY_DOCKERFILE = REPO_ROOT / "docker" / "Dockerfile.python-overlay"
-AMPERE_BUILD_HELPER = REPO_ROOT / "tools" / "ampere" / "build_vllm_ampere_image.sh"
+CONSUMER_BUILD_HELPER = REPO_ROOT / "docker" / "build-consumer-platforms.sh"
 
 # The architectures this branch exists to serve: sm_86 (Ampere consumer) and
 # sm_121a (GB10 / DGX Spark).
@@ -163,9 +163,8 @@ def test_ampere_build_includes_flash_attention_for_model_inspection() -> None:
     assert assignment in csrc
     assert assignment in build
 
-    helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
-    assert 'skip_flash_attn_build="${VLLM_SKIP_FLASH_ATTN_BUILD:-0}"' in helper
-    assert '--build-arg "VLLM_SKIP_FLASH_ATTN_BUILD=${skip_flash_attn_build}"' in helper
+    helper = CONSUMER_BUILD_HELPER.read_text(encoding="utf-8")
+    assert "build-arg:VLLM_SKIP_FLASH_ATTN_BUILD" not in helper
 
     setup_source = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
     guard = 'os.environ.get("VLLM_SKIP_FLASH_ATTN_BUILD") != "1"'
@@ -232,17 +231,11 @@ def test_flash_attention_arch_patch_applies_to_pinned_source(tmp_path: Path) -> 
 
 def test_ampere_helper_uses_current_provider_release() -> None:
     """The build helper must not override the image's provider pins."""
-    helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
-    provider = dockerfile_arg_defaults("USB4_RDMA_PROVIDER_VERSION")[0]
-    release = dockerfile_arg_defaults("APPMANA_THUNDERBOLT_RELEASE_TAG")[0]
-    assert (
-        f'usb4_rdma_provider_version="${{USB4_RDMA_PROVIDER_VERSION:-{provider}}}"'
-        in helper
-    )
-    assert (
-        f'appmana_thunderbolt_release_tag="${{APPMANA_THUNDERBOLT_RELEASE_TAG:-{release}}}"'
-        in helper
-    )
+    helper = CONSUMER_BUILD_HELPER.read_text(encoding="utf-8")
+    assert dockerfile_arg_defaults("USB4_RDMA_PROVIDER_VERSION")[0]
+    assert dockerfile_arg_defaults("APPMANA_THUNDERBOLT_RELEASE_TAG")[0]
+    assert "build-arg:USB4_RDMA_PROVIDER_VERSION" not in helper
+    assert "build-arg:APPMANA_THUNDERBOLT_RELEASE_TAG" not in helper
 
 
 def test_sccache_has_a_persistent_buildkit_local_cache() -> None:
@@ -266,7 +259,7 @@ def test_rust_sccache_uses_a_prepared_persistent_temp_directory() -> None:
         and "mkdir -p /workspace/tmp /workspace/tmp/sccache" in block
         and "export TMPDIR=/workspace/tmp" in block
         and "export SCCACHE_DIR=/workspace/tmp/sccache" in block
-        and "export SCCACHE_SERVER_UDS=/workspace/tmp/sccache/sccache.sock" in block
+        and "export SCCACHE_SERVER_UDS=/workspace/tmp/sccache-rust.sock" in block
         for block in rust_builds
     )
 
@@ -317,10 +310,16 @@ def test_ampere_build_skips_unsupported_deepep_extensions() -> None:
     assert dockerfile_arg_defaults("BUILD_DEEPEP") == ["1"]
 
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    builds = [
+        block
+        for block in dockerfile_run_blocks()
+        if "/tmp/install_python_libraries.sh" in block
+    ]
+    assert len(builds) == 1
     assert re.search(
-        r'if \[ "\$\{BUILD_DEEPEP\}" = "1" \]; then.*?'
-        r"/tmp/install_python_libraries\.sh",
-        dockerfile,
+        r'if \[ "\$\{BUILD_DEEPEP\}" != "1" \]; then.*?'
+        r"deepep-disabled;.*?else.*?/tmp/install_python_libraries\.sh",
+        builds[0],
         re.DOTALL,
     )
     assert re.search(
@@ -330,9 +329,9 @@ def test_ampere_build_skips_unsupported_deepep_extensions() -> None:
         re.DOTALL,
     )
 
-    helper = AMPERE_BUILD_HELPER.read_text(encoding="utf-8")
-    assert 'build_deepep="${BUILD_DEEPEP:-0}"' in helper
-    assert '--build-arg "BUILD_DEEPEP=${build_deepep}"' in helper
+    helper = CONSUMER_BUILD_HELPER.read_text(encoding="utf-8")
+    assert 'BUILD_DEEPEP="${BUILD_DEEPEP:-0}"' in helper
+    assert '--opt "build-arg:BUILD_DEEPEP=$BUILD_DEEPEP"' in helper
 
 
 def test_deepep_disabled_marker_reaches_the_final_image() -> None:

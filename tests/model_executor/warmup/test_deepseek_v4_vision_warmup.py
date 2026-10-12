@@ -3,10 +3,14 @@
 """The vision warmup runs one synthetic image through the tower on its rank only."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
-from vllm.model_executor.warmup.kernel_warmup import _deepseek_v4_vision_warmup
+from vllm.model_executor.warmup.kernel_warmup import (
+    _deepseek_v4_image_visibility_warmup,
+    _deepseek_v4_vision_warmup,
+)
 
 
 class FakeTower(torch.nn.Module):
@@ -65,3 +69,28 @@ def test_vision_warmup_skips_ranks_without_the_tower_and_other_models(monkeypatc
         )
     )
     assert tower.calls == []
+
+
+def test_image_visibility_warms_attention_rank_without_vision_tower(monkeypatch):
+    from vllm.v1.attention.backends.mla import sparse_swa
+
+    warmup = Mock()
+    monkeypatch.setattr(sparse_swa._compute_image_visibility_kernel, "warmup", warmup)
+    worker = _worker(SimpleNamespace(vision=None, aligner=None))
+    worker.model_runner = SimpleNamespace(
+        attn_groups=[
+            [
+                SimpleNamespace(
+                    metadata_builders=[SimpleNamespace(max_image_tokens=256)]
+                ),
+                SimpleNamespace(
+                    metadata_builders=[SimpleNamespace(max_image_tokens=256)]
+                ),
+                SimpleNamespace(
+                    metadata_builders=[SimpleNamespace(max_image_tokens=0)]
+                ),
+            ]
+        ]
+    )
+    _deepseek_v4_image_visibility_warmup(worker)
+    warmup.assert_called_once_with(*([torch.int32] * 8), 256, token_offset=0, grid=(1,))

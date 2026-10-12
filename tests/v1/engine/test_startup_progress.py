@@ -20,6 +20,7 @@ from vllm.v1.engine.health import (
 )
 from vllm.v1.engine.utils import (
     CoreEngine,
+    CoreEngineLaunch,
     EngineZmqAddresses,
     wait_for_engine_startup,
 )
@@ -37,9 +38,14 @@ def test_wait_for_engine_startup_records_progress_messages():
         dealer = ctx.socket(zmq.DEALER)
         dealer.setsockopt(zmq.IDENTITY, (0).to_bytes(2, "little"))
         dealer.connect(addr)
+        dealer.setsockopt(zmq.RCVTIMEO, 5000)
         common = {"local": True, "headless": False}
         dealer.send(msgspec.msgpack.encode({"status": "HELLO", **common}))
-        dealer.recv()  # EngineHandshakeMetadata
+        try:
+            dealer.recv()  # EngineHandshakeMetadata
+        except zmq.Again:
+            dealer.close(linger=0)
+            return
         dealer.send(
             msgspec.msgpack.encode(
                 {
@@ -58,15 +64,18 @@ def test_wait_for_engine_startup_records_progress_messages():
     try:
         wait_for_engine_startup(
             handshake_socket=router,
-            addresses=EngineZmqAddresses(
-                inputs=["inproc://in"], outputs=["inproc://out"]
-            ),
             core_engines=[CoreEngine(index=0, local=True)],
             parallel_config=ParallelConfig(),
             coordinated_dp=False,
             cache_config=CacheConfig(),
-            proc_manager=None,
-            coord_process=None,
+            launch=CoreEngineLaunch(
+                engine_manager=None,
+                coordinator=None,
+                tensor_queue=None,
+                addresses=EngineZmqAddresses(
+                    inputs=["inproc://in"], outputs=["inproc://out"]
+                ),
+            ),
         )
     finally:
         thread.join(timeout=10)

@@ -19,6 +19,55 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
 )
 
 
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_rejection_warmup_covers_absent_drafts_and_runtime_token_dtype(
+    monkeypatch, use_v2
+):
+    import vllm.model_executor.warmup.spec_decode_rejection_warmup as warmup
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils
+
+    # CPU tensors suffice to inspect the JIT-relevant input contract.
+    def on_cpu(factory):
+        def allocate(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return factory(*args, **kwargs)
+
+        return allocate
+
+    for name in ("zeros", "full", "tensor", "arange"):
+        monkeypatch.setattr(torch, name, on_cpu(getattr(torch, name)))
+    signatures = set()
+
+    def record(**kwargs):
+        draft = kwargs["draft_logits"]
+        signatures.add(
+            (kwargs["target_logits"].dtype, None if draft is None else draft.dtype)
+        )
+        assert kwargs["draft_sampled"].dtype == torch.int32
+
+    monkeypatch.setattr(rejection_sampler_utils, "rejection_sample", record)
+    ids = torch.empty(8, dtype=torch.int32)
+    worker = SimpleNamespace(
+        use_v2_model_runner=use_v2,
+        model_runner=SimpleNamespace(
+            input_buffers=SimpleNamespace(input_ids=ids),
+            input_ids=SimpleNamespace(gpu=ids),
+        ),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                get_vocab_size=lambda: 32, dtype=torch.bfloat16
+            ),
+            speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        ),
+    )
+    warmup.spec_decode_rejection_warmup(worker)
+    assert signatures == {
+        (target, draft)
+        for target in (torch.bfloat16, torch.float32)
+        for draft in (None, torch.bfloat16, torch.float32)
+    }
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 def test_real_pp_anchor_is_verified_and_caps_emission_at_k() -> None:
     device = torch.device("cuda")

@@ -64,6 +64,8 @@ BUILDKIT_IN_CLUSTER="${BUILDKIT_IN_CLUSTER:-0}"
 # other. amd64 keeps the historical `buildcache` ref, which is the warm one.
 CACHE_REF="${CACHE_REF:-}"
 USE_SCCACHE="${USE_SCCACHE:-1}"
+# DeepEP currently targets SM90/SM100, outside the consumer architecture pair.
+BUILD_DEEPEP="${BUILD_DEEPEP:-0}"
 # LMCache, NIXL and Mooncake, as in the Harbor sm86 image; every one of them
 # ships aarch64 wheels, so both platforms carry the same connectors.
 INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS:-true}"
@@ -238,6 +240,7 @@ build_options=(
     --opt "build-arg:VLLM_VERSION_OVERRIDE=$wheel_version"
     --opt build-arg:RUN_WHEEL_CHECK=false
     --opt "build-arg:INSTALL_KV_CONNECTORS=$INSTALL_KV_CONNECTORS"
+    --opt "build-arg:BUILD_DEEPEP=$BUILD_DEEPEP"
 )
 if [ -n "$TARGET" ]; then
     build_options+=(--opt "target=$TARGET")

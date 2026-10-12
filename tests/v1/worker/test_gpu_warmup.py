@@ -15,6 +15,42 @@ import vllm.v1.worker.gpu.sample.states as sampling_states
 import vllm.v1.worker.gpu.warmup as gpu_warmup
 
 
+def test_post_update_warmup_covers_prefill_decode_and_penalties(monkeypatch):
+    from vllm.v1.worker.gpu import input_batch
+
+    counts = torch.zeros(2, 32, dtype=torch.int32)
+    model_runner = SimpleNamespace(
+        num_speculative_steps=7,
+        sampler=SimpleNamespace(
+            penalties_state=SimpleNamespace(output_bin_counts=counts)
+        ),
+        req_states=SimpleNamespace(
+            num_computed_tokens=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32)),
+            last_sampled_tokens=torch.zeros(2, dtype=torch.int64),
+            all_token_ids=SimpleNamespace(gpu=torch.zeros(2, 64, dtype=torch.int32)),
+            total_len=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32)),
+        ),
+    )
+    signatures = set()
+
+    def record(idx, computed, last, bins, sampled, num_sampled, rejected, query, *rest):
+        signatures.add((sampled.stride(0), bins is not None, query is not None))
+        assert torch.count_nonzero(num_sampled) == 0
+        assert torch.count_nonzero(rejected) == 0
+        if query is not None:
+            assert torch.count_nonzero(query) == 0
+
+    monkeypatch.setattr(input_batch, "post_update", record)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    assert gpu_warmup.warmup_post_update_kernel(model_runner, torch.device("cpu"))
+    assert signatures == {
+        (width, bins, query)
+        for width in (1, 8)
+        for bins in (False, True)
+        for query in (False, True)
+    }
+
+
 class _FakeKVConnector:
     def set_disabled(self, disabled: bool) -> None:
         self.disabled = disabled

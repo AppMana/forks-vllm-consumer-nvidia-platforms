@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Streaming indexer scoring must carry the weights of each TP-local row."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,10 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2])
-def test_streaming_scores_use_matching_query_and_weight_rows(monkeypatch, rank):
+@pytest.mark.parametrize("streaming", [False, True])
+def test_streaming_scores_use_matching_query_and_weight_rows(
+    monkeypatch, rank, streaming
+):
     sizes = [3, 2, 3]
     chunks = [
         SimpleNamespace(
@@ -51,7 +55,18 @@ def test_streaming_scores_use_matching_query_and_weight_rows(monkeypatch, rank):
     monkeypatch.setattr(indexer, "_reserve_prefill_gather_workspace", lambda **kw: None)
     monkeypatch.setattr(indexer, "_merge_dcp_topk_global", lambda *args, **kw: None)
     monkeypatch.setattr(
-        indexer, "should_stream_prefill_topk_for_context", lambda *a: True
+        indexer, "indexer_streaming_topk_prefill_enabled", lambda: streaming
+    )
+    monkeypatch.setattr(indexer, "_resolved_prefill_topk_slab_rows", lambda: 4)
+    monkeypatch.setattr(
+        indexer,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_xpu=lambda: False,
+            fp8_dtype=lambda: torch.float8_e4m3fn,
+            get_device_capability=lambda: SimpleNamespace(major=8, minor=6),
+        ),
     )
     monkeypatch.setattr(
         indexer,
@@ -75,29 +90,41 @@ def test_streaming_scores_use_matching_query_and_weight_rows(monkeypatch, rank):
         calls.extend(row_ids.tolist())
 
     monkeypatch.setattr(indexer, "streaming_prefill_topk", score)
+
+    class DensePathSelected(Exception):
+        pass
+
+    def dense_score(*args, **kwargs):
+        raise DensePathSelected
+
+    monkeypatch.setattr(indexer, "fp8_fp4_mqa_logits", dense_score)
     q = torch.arange(8, dtype=torch.float32).reshape(8, 1, 1)
     weights = torch.arange(100, 108, dtype=torch.float32).reshape(8, 1)
     out = torch.full((8, 2), -7, dtype=torch.int32)
-    indexer.sparse_attn_indexer(
-        hidden_states=torch.empty(8, 1),
-        k_cache_prefix="indexer",
-        kv_cache=torch.empty(0),
-        q_quant=q,
-        q_scale=None,
-        k=None,
-        weights=weights,
-        quant_block_size=128,
-        scale_fmt="ue8m0",
-        topk_tokens=2,
-        head_dim=128,
-        max_model_len=8,
-        total_seq_lens=8,
-        topk_indices_buffer=out,
-        skip_k_cache_insert=True,
-        use_pcp=False,
-        pcp_shard_decode_requests=False,
-        dense_mha_metadata_layer_name="",
-    )
+    with nullcontext() if streaming else pytest.raises(DensePathSelected):
+        indexer.sparse_attn_indexer(
+            hidden_states=torch.empty(8, 1),
+            k_cache_prefix="indexer",
+            kv_cache=torch.empty(0),
+            q_quant=q,
+            q_scale=None,
+            k=None,
+            weights=weights,
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=2,
+            head_dim=128,
+            max_model_len=8,
+            total_seq_lens=8,
+            topk_indices_buffer=out,
+            skip_k_cache_insert=True,
+            use_pcp=False,
+            pcp_shard_decode_requests=False,
+            dense_mha_metadata_layer_name="",
+        )
+    if not streaming:
+        assert calls == []
+        return
     start, end = sum(sizes[:rank]), sum(sizes[: rank + 1])
     assert calls == list(range(start, end))
     torch.testing.assert_close(

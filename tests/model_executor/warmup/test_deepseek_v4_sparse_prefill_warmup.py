@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 import vllm.model_executor.warmup.kernel_warmup as kernel_warmup
@@ -26,6 +27,11 @@ def _worker(architectures: list[str], max_tokens: int = 256, max_seqs: int = 6):
 
 def test_deepseek_v4_sparse_prefill_warmup_uses_direct_kernel_warmup(monkeypatch):
     worker = _worker(["DeepseekV4ForCausalLM"])
+    from vllm.transformers_utils.configs.dsv4.kernel_config import (
+        SPARSE_MLA_PREFILL_TRITON,
+    )
+
+    worker.model_config.hf_config.vllm = {"kernels": [SPARSE_MLA_PREFILL_TRITON]}
     direct_warmup = Mock()
     monkeypatch.setattr(
         kernel_warmup,
@@ -121,7 +127,7 @@ def test_deepseek_v4_marlin_moe_warmup_uses_direct_quant_method(monkeypatch):
         return torch.empty_like(x)
 
     monkeypatch.setattr(Dsv4Int4MoEMethod, "apply", fake_apply)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
 
     worker = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -172,7 +178,7 @@ def test_deepseek_v4_marlin_moe_warmup_uses_local_expert_map(monkeypatch):
         return torch.empty_like(x)
 
     monkeypatch.setattr(Dsv4Int4MoEMethod, "apply", fake_apply)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
 
     worker = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -198,9 +204,15 @@ def test_deepseek_v4_fp8_ds_mla_warmup_cache_stride_matches_native_layout():
     )
 
 
-def test_kernel_warmup_runs_model_agnostic_zero_kv_warmup(monkeypatch):
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_kernel_warmup_runs_model_agnostic_zero_kv_warmup(monkeypatch, use_v2):
     worker = _worker(["DeepseekV4ForCausalLM"])
-    worker.use_v2_model_runner = True
+    worker.use_v2_model_runner = use_v2
+    zeroer = Mock()
+    setattr(
+        worker.model_runner, "kv_block_zeroer" if use_v2 else "_kv_block_zeroer", zeroer
+    )
+    worker.model_runner.kv_cache_config = SimpleNamespace(num_blocks=123)
     worker.vllm_config = SimpleNamespace(
         model_config=worker.model_config,
         kernel_config=SimpleNamespace(
@@ -211,18 +223,17 @@ def test_kernel_warmup_runs_model_agnostic_zero_kv_warmup(monkeypatch):
         compilation_config=SimpleNamespace(cudagraph_capture_sizes=[]),
     )
     worker.get_model = lambda: torch.nn.Module()
+    worker.model_runner.get_model = worker.get_model
     worker.model_runner.is_pooling_model = False
     worker.model_runner.attn_groups = []
-    zero_warmup = Mock()
-    monkeypatch.setattr(kernel_warmup, "zero_kv_blocks_warmup", zero_warmup)
     monkeypatch.setattr(kernel_warmup, "qwen_triton_warmup", Mock())
+    monkeypatch.setattr(kernel_warmup, "qwen_vl_triton_warmup", Mock())
+    monkeypatch.setattr(kernel_warmup, "mamba_triton_warmup", Mock())
     monkeypatch.setattr(kernel_warmup, "deepseek_v4_mhc_warmup", Mock())
     monkeypatch.setattr(
         kernel_warmup, "flashinfer_sparse_mla_decode_autotune_warmup", Mock()
     )
-    monkeypatch.setattr(
-        kernel_warmup, "_deepseek_v4_sparse_mla_prefill_warmup", Mock()
-    )
+    monkeypatch.setattr(kernel_warmup, "_deepseek_v4_sparse_mla_prefill_warmup", Mock())
     monkeypatch.setattr(
         kernel_warmup, "_deepseek_v4_block_table_slot_mapping_warmup", Mock()
     )
@@ -234,4 +245,4 @@ def test_kernel_warmup_runs_model_agnostic_zero_kv_warmup(monkeypatch):
 
     kernel_warmup.kernel_warmup(worker)
 
-    zero_warmup.assert_called_once_with(worker.model_runner)
+    zeroer.warmup.assert_called_once_with(123)
