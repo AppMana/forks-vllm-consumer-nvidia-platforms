@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -38,14 +39,19 @@ class PendingRecv:
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
-    that produce a sampled token this step, and therefore must have that token
-    (and the draft block proposed from it) propagated to the earlier PP stages.
-    Returns None if no request in the batch produces a sample."""
+    with outputs that might be needed in a subsequent (decode) step.
+    Returns None if no sampled outputs are needed in the requests' next step."""
     old_computed = input_batch.num_computed_tokens_np
     prefill_len = input_batch.prefill_len_np
     # Exclude non-final prefill chunks (they don't produce a sample).
-    produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
-    return produces_sample if produces_sample.any() else None
+    need_sampled_mask = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+    if input_batch.max_seq_len_np is not None:
+        # Also exclude final prefill chunks whose single sampled token reaches
+        # the request's length cap.
+        finished_prefill = prefill_len + 1 >= input_batch.max_seq_len_np
+        finished_prefill &= input_batch.is_prefilling_np
+        need_sampled_mask &= ~finished_prefill
+    return need_sampled_mask if need_sampled_mask.any() else None
 
 
 class PPHandler:
@@ -89,8 +95,12 @@ class PPHandler:
         # pushed by step T's `receive` is consumed pp_size steps later. Pre-seeded
         # with pp_size None placeholders so the first pp_size consumes are no-ops.
         # None means no postprocess is pending for that step (broadcast skipped).
+        # Only XPU can disable microbatching via VLLM_XPU_PP_MICROBATCH.
+        ring_depth = get_pp_group().world_size
+        if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
+            ring_depth = 1
         self.queue: deque[PendingRecv | None] = (
-            deque() if self.is_last_rank else deque([None] * get_pp_group().world_size)
+            deque() if self.is_last_rank else deque([None] * ring_depth)
         )
 
         # Per req-index generation counter, incremented every time a request
@@ -103,10 +113,8 @@ class PPHandler:
             group_desc="pp_broadcast"
         )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
-
-        # Warmup steps run the pipeline with synthetic batches whose outputs are
-        # discarded; the sampled-token broadcast is disabled there so its
-        # side-stream NCCL ops cannot overlap the next step's activation p2p.
+        # Synthetic warmup batches discard outputs. Keep their side-stream
+        # sampled-token traffic from overlapping the next activation transfer.
         self.disabled = False
 
     def set_disabled(self, disabled: bool) -> None:
@@ -205,6 +213,23 @@ class PPHandler:
             proposed_tokens=proposed_tokens,
             idx_mapping=idx_mapping,
         )
+
+    def broadcast_drafts(
+        self, draft_tokens: torch.Tensor, input_batch: InputBatch
+    ) -> None:
+        """Broadcast draft proposals so non-last ranks can embed real token ids."""
+        assert self.is_last_rank
+        if compute_need_sampled_mask(input_batch) is None:
+            return
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            send = draft_tokens[input_batch.idx_mapping].contiguous()
+            # Must record the idx_mapping tensor since it was allocated
+            # on the main stream.
+            input_batch.idx_mapping.record_stream(self.broadcast_stream)
+            torch.distributed.broadcast(
+                send, src=self.last_rank, group=self.broadcast_group
+            )
 
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*

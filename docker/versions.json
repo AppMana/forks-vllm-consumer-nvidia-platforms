@@ -67,6 +67,9 @@
     "VLLM_SKIP_FLASH_ATTN_BUILD": {
       "default": "0"
     },
+    "BUILD_NIXL": {
+      "default": "false"
+    },
     "SCCACHE_BUCKET_NAME": {
       "default": "vllm-build-sccache"
     },
@@ -105,9 +108,6 @@
     },
     "RUN_WHEEL_CHECK": {
       "default": "true"
-    },
-    "FLASHINFER_VERSION": {
-      "default": "0.6.18.post1"
     },
     "GDRCOPY_CUDA_VERSION": {
       "default": "12.8"

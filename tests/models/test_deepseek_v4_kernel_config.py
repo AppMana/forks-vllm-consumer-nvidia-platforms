@@ -202,7 +202,7 @@ def test_sparkinfer_and_flash_decode_conflict_is_hard_error():
 
 
 def test_unknown_symbol_is_hard_error():
-    with pytest.raises(ValueError, match="[Uu]nknown"):
+    with pytest.raises(ValueError, match="(?i:unknown)"):
         resolve_kernel_config(
             {"kernels": ["flash_mla.no_such_kernel"], "cache_type": "fp8_ds_mla"}
         )
@@ -640,7 +640,7 @@ def test_apply_fails_closed_on_dense_symbol_with_vanilla_weights():
 def test_apply_fails_closed_on_bad_block_at_startup():
     model_config = _fake_model_config({"kernels": ["not.a.symbol"]})
     cache_config = SimpleNamespace(cache_dtype="auto")
-    with pytest.raises(ValueError, match="[Uu]nknown"):
+    with pytest.raises(ValueError, match="(?i:unknown)"):
         apply_checkpoint_config(model_config, cache_config)
 
 
@@ -987,3 +987,14 @@ def test_indexer_slab_rows_resolution():
         resolve_kernel_config({"kernels": [], "indexer_prefill_topk_slab_rows": 4096})
     )
     assert indexer._resolved_prefill_topk_slab_rows() == 4096
+
+
+def test_sparkinfer_backend_accepts_kv_spec_for_block_size_selection():
+    """The upstream cache planner passes a cache spec to every backend."""
+    from vllm.models.deepseek_v4.nvidia_sm12x.attention import (
+        DeepseekV4SparkInferMLABackend,
+    )
+
+    assert DeepseekV4SparkInferMLABackend.get_supported_kernel_block_sizes(None) == [
+        256
+    ]

@@ -147,7 +147,7 @@ def test_dflash_drafter_window_reserves_bonus_token():
     # window = 4, so 96 fits (96 + 4 == 100) but 97 does not (97 + 4 == 101)
     assert input_fits_in_drafter(dflash_runner, SimpleNamespace(max_seq_len=96))
     assert not input_fits_in_drafter(dflash_runner, SimpleNamespace(max_seq_len=97))
-    assert not input_fits_in_drafter(dflash_runner, None)  # no metadata
+    assert not input_fits_in_drafter(dflash_runner, None)
 
     # Other drafters don't reserve the bonus token, so 97 fits (97 + 3 == 100).
     plain_runner = SimpleNamespace(
@@ -184,14 +184,10 @@ def test_dflash_context_update_only_drafts_when_requested(
     )
     speculator.draft_kv_cache_group_id = 0
     speculator.draft_kv_cache_group_ids = [0]
-    speculator._context_slot_mappings = [
-        torch.zeros(1024, dtype=torch.int64)
-    ]
+    speculator._context_slot_mappings = [torch.zeros(1024, dtype=torch.int64)]
     speculator._layer_group_idx = None
     speculator._group_causal = True
-    speculator.model = SimpleNamespace(
-        precompute_and_store_context_kv=MagicMock()
-    )
+    speculator.model = SimpleNamespace(precompute_and_store_context_kv=MagicMock())
     speculator._copy_request_inputs = MagicMock()
     speculator._prepare_eplb_forward = MagicMock()
     speculator._build_draft_attn_metadata = MagicMock(return_value={})

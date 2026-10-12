@@ -8,7 +8,7 @@ import signal
 import socket
 import tempfile
 from argparse import Namespace
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, MutableSequence
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -16,7 +16,7 @@ import vllm.envs as envs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.instrumentator.startup import StartupProbeServer
-from vllm.logger import init_logger
+from vllm.logger import configure_logging_from_args, init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tool_parsers import ToolParserManager
 from vllm.usage.usage_lib import UsageContext
@@ -53,6 +53,9 @@ async def build_async_engine_client(
     # Context manager to handle engine_client lifecycle
     # Ensures everything is shutdown and cleaned up on error/exit
     engine_args = AsyncEngineArgs.from_cli_args(args)
+    from ..cli_args import propagate_flash_late_interaction
+
+    propagate_flash_late_interaction(args, engine_args)
     if client_config:
         engine_args._api_process_count = client_config.get("client_count", 1)
         engine_args._api_process_rank = client_config.get("client_index", 0)
@@ -120,6 +123,7 @@ async def build_and_serve(
     listen_address: str,
     sock: socket.socket,
     args: Namespace,
+    peer_loads: tuple[MutableSequence[int], int] | None = None,
     before_serve: Callable[[], None] | None = None,
     **uvicorn_kwargs,
 ) -> asyncio.Task:
@@ -154,6 +158,7 @@ async def build_and_serve(
         app,
         sock=sock,
         enable_ssl_refresh=args.enable_ssl_refresh,
+        peer_loads=peer_loads,
         host=args.host,
         port=args.port,
         log_level=args.uvicorn_log_level,
@@ -197,6 +202,11 @@ async def run_server_worker(
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
+    peer_loads = None
+    if client_config and "api_server_loads" in client_config:
+        loads = client_config.pop("api_server_loads")
+        peer_loads = (loads, client_config["client_index"])
+
     # Serve /health and /metrics from the already-bound socket during engine
     # initialization. Only when this worker owns the socket exclusively
     # (multi-API-server workers share a reuse-port socket).
@@ -216,6 +226,7 @@ async def run_server_worker(
                 listen_address,
                 sock,
                 args,
+                peer_loads=peer_loads,
                 before_serve=probe.stop if probe is not None else None,
                 **uvicorn_kwargs,
             )
@@ -251,6 +262,7 @@ def main():
     )
     parser = make_arg_parser(parser)
     args = parser.parse_args()
+    configure_logging_from_args(args)
     validate_parsed_serve_args(args)
 
     uvloop.run(run_server(args))

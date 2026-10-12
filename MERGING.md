@@ -149,6 +149,20 @@ Two consequences specific to this fork:
 
 ## Known traps
 
+- Upstream `09fe178dba` reverted DSpark pipeline parallel support. This fork
+  still uses the single PP payload and deferred verification. Preserve the
+  router padding mask, DFlash padding initialization, PPHandler disable/enable
+  around graph warmup, and the decode-update warmup. Removing any one can
+  strand pipeline ranks or route padded rows through the uint32 fast path.
+- The indexer now shards prefill query rows across TP ranks. Streaming top-k
+  must slice weights with the same `row_start:row_end` as the queries and
+  bounds; slicing the original chunk silently scores the wrong gate rows.
+  `test_indexer_streaming_row_shard.py` covers uneven chunks and rank offsets.
+- Attention backend `get_supported_kernel_block_sizes` accepts an optional
+  KV-cache spec. Fork backends must accept it even when their block size is
+  constant. DeepSeek V4's attention custom op also accepts optional quantized
+  output scales; preserve the mutation declaration and original QuantAct dtype.
+
 - `dnf: not found`: a new upstream package-install site without a
   `BUILD_OS` branch.
 - `ninja: error: unknown target '_<name>_C'`: a new

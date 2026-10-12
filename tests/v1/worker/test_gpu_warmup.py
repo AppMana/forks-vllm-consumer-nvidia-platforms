@@ -56,6 +56,7 @@ class _FakeModelRunner:
     is_last_pp_rank = False
     is_encoder_decoder = False
     decode_query_len = 1
+    num_speculative_steps = 0
     device = None
     max_num_reqs = 6
     model_state = SimpleNamespace(max_encoder_len=0)

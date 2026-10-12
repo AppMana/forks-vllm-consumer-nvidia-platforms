@@ -32,11 +32,11 @@ from vllm.logger import init_logger
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
 )
-from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLABackend
 from vllm.models.deepseek_v4.nvidia_sm12x.kernels import (
     sparkinfer_sparse_mla_decode,
     sparkinfer_sparse_mla_extend,
 )
+from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLABackend
 from vllm.platforms.interface import DeviceCapability
 from vllm.transformers_utils.configs.dsv4.kernel_config import (
     ROLE_SPARSE_MLA_DECODE_FP8,
@@ -49,6 +49,7 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     resolve_kernel_config_from_hf_config,
     resolved_proof_line,
 )
+from vllm.v1.attention.backend import MultipleOf
 
 logger = init_logger(__name__)
 
@@ -131,7 +132,7 @@ class DeepseekV4SparkInferMLABackend(DeepseekV4FlashMLABackend):
         return "SPARKINFER_MLA_SPARSE_DSV4"
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         # The standard DSV4 block size, shared with the other sparse-MLA
         # backends (kv manager groups require one common size). The AppMana
         # sparkinfer fork consumes vLLM's unpadded pages at any block size.

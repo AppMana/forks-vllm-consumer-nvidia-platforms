@@ -371,6 +371,7 @@ class FusedIndexerQRopeQuantTritonKernel(
             USE_EXPLICIT_FMA=current_platform.is_rocm(),
             QK_INT8=qk_int8,
             SOFTWARE_E4M3=software_e4m3,
+            enable_fp_fusion=True,
             num_warps=1,
         )
 
@@ -606,6 +607,7 @@ class FusedIndexerQRopeMxFp4TritonKernel(
             MXFP4_BLOCK=MXFP4_BLOCK_SIZE,
             index_weights_stride=index_weights.stride(0),
             index_weights_out_stride=index_weights_out.stride(0),
+            enable_fp_fusion=True,
             num_warps=1,
         )
 

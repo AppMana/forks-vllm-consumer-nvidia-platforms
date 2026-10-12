@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
 import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
-from typing import cast
+from collections.abc import Callable, Generator, Iterable
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -14,6 +16,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
@@ -25,6 +28,8 @@ from vllm.model_executor.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_mm_encoder_only_safetensors_files,
+    filter_safetensors_files_by_weight_name,
     get_quant_config,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
@@ -32,12 +37,19 @@ from vllm.model_executor.model_loader.weight_utils import (
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    resolve_mm_encoder_only_lm_prefixes,
     safetensors_weights_iterator,
 )
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
+
 logger = init_logger(__name__)
+
+# fbgemm_fp8 builds input_scale_ub from its config; checkpoints do not carry it.
+_CONFIG_BUILT_PARAMS = ("input_scale_ub",)
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -68,6 +80,10 @@ class DefaultModelLoader(BaseModelLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
+        is_unused_weight: Callable[[str], bool] | None = None
+        """If defined, safetensors shards holding only weights whose checkpoint
+        name (before *prefix*) it accepts are not read."""
+
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
@@ -77,6 +93,9 @@ class DefaultModelLoader(BaseModelLoader):
         self.local_layer_range: tuple[int, int] | None = None
         self.is_first_pipeline_rank = True
         self.is_last_pipeline_rank = True
+        # Set in load_weights when --mm-encoder-only; used to drop LM-only shards.
+        self._encoder_only_lm_prefixes: tuple[str, ...] | None = None
+        self._encoder_only_weights_mapper: WeightsMapper | None = None
 
         extra_config = load_config.model_loader_extra_config
         if not isinstance(extra_config, dict):
@@ -135,7 +154,7 @@ class DefaultModelLoader(BaseModelLoader):
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
-    ) -> tuple[str, list[str], bool]:
+    ) -> tuple[str, list[str], bool, str]:
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
@@ -252,20 +271,44 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
-        return hf_folder, hf_weights_files, use_safetensors
+        return hf_folder, hf_weights_files, use_safetensors, index_file
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self, source: Source
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
-        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path,
-            source.subfolder,
-            source.revision,
-            source.fall_back_to_pt,
-            source.allow_patterns_overrides,
+        hf_folder, hf_weights_files, use_safetensors, index_file = (
+            self._prepare_weights(
+                source.model_or_path,
+                source.subfolder,
+                source.revision,
+                source.fall_back_to_pt,
+                source.allow_patterns_overrides,
+            )
         )
+        if (
+            self._encoder_only_lm_prefixes is not None
+            and use_safetensors
+            and hf_weights_files
+        ):
+            hf_weights_files = filter_mm_encoder_only_safetensors_files(
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                self._encoder_only_lm_prefixes,
+                weights_mapper=self._encoder_only_weights_mapper,
+            )
+            if not hf_weights_files:
+                raise RuntimeError(
+                    "mm-encoder-only shard filter removed all weight files for "
+                    f"`{source.model_or_path}`; check language_model prefixes "
+                    f"{self._encoder_only_lm_prefixes}"
+                )
+        if source.is_unused_weight is not None and use_safetensors:
+            hf_weights_files = filter_safetensors_files_by_weight_name(
+                hf_weights_files, source.is_unused_weight
+            )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -345,6 +388,7 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            is_unused_weight=getattr(model, "is_unused_checkpoint_weight", None),
         )
         yield from self._get_weights_iterator(primary_weights)
 
@@ -362,6 +406,29 @@ class DefaultModelLoader(BaseModelLoader):
             revision=model_config.revision,
             fall_back_to_pt=True,
             allow_patterns_overrides=None,
+        )
+
+    def _init_mm_encoder_only_weight_filter(
+        self, model: nn.Module, model_config: ModelConfig
+    ) -> None:
+        """Skip pure language-model safetensors shards under --mm-encoder-only."""
+        mm_config = model_config.multimodal_config
+        if mm_config is None or not mm_config.mm_encoder_only:
+            self._encoder_only_lm_prefixes = None
+            self._encoder_only_weights_mapper = None
+            return
+
+        # Derive from _language_model_names; fail-closed on shared HF roots
+        # (Molmo/Phi-4-MM/Muse). Qwen nested/flat keys classified via mapper.
+        weights_mapper = cast(
+            "WeightsMapper | None", getattr(model, "hf_to_vllm_mapper", None)
+        )
+        self._encoder_only_lm_prefixes = resolve_mm_encoder_only_lm_prefixes(
+            getattr(model, "_language_model_names", None),
+            weights_mapper=weights_mapper,
+        )
+        self._encoder_only_weights_mapper = (
+            weights_mapper if self._encoder_only_lm_prefixes is not None else None
         )
 
     def _init_ep_weight_filter(self, model_config: ModelConfig) -> None:
@@ -477,6 +544,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
         self._init_pp_weight_filter(model_config)
+        self._init_mm_encoder_only_weight_filter(model, model_config)
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
@@ -498,13 +566,19 @@ class DefaultModelLoader(BaseModelLoader):
         # method has declared it cannot derive (see
         # QuantizeMethodBase.checkpoint_required_params).
         strict = bool(self.enable_weights_track) or model_config.quantization is None
-        self.track_weights_loading(model, loaded_weights, strict=strict)
+        self.track_weights_loading(
+            model,
+            loaded_weights,
+            strict=strict,
+            quantized=model_config.quantization is not None,
+        )
 
     def track_weights_loading(
         self,
         model: nn.Module,
         loaded_weights: set[str] | None,
         strict: bool = True,
+        quantized: bool = False,
     ) -> None:
         if loaded_weights is None:
             return
@@ -530,11 +604,18 @@ class DefaultModelLoader(BaseModelLoader):
                 continue
             get_required = getattr(quant_method, "checkpoint_required_params", None)
             required = get_required(module) if get_required is not None else frozenset()
-            for param_name, _ in module.named_parameters():
+            for param_name, param in module.named_parameters():
                 full_name = f"{name}.{param_name}" if name else param_name
                 if param_name in required and full_name not in loaded_weights:
                     required_not_loaded.add(full_name)
-                else:
+                elif (
+                    not quantized
+                    or has_online_quant
+                    or isinstance(quant_method, BaseKVCacheMethod)
+                    or param.numel() == 0
+                    or param_name.rsplit(".", 1)[-1] in _CONFIG_BUILT_PARAMS
+                    or getattr(param, "is_checkpoint_optional", False)
+                ):
                     derivable.add(full_name)
         derivable -= required_not_loaded
 

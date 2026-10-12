@@ -5,7 +5,7 @@ from typing import Any
 
 from transformers import TokenizersBackend
 
-from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
+from vllm.renderers.chat_utils import ChatCompletionMessageParam
 
 from .deepseek_v4_encoding import DEFAULT_REASONING_EFFORT, encode_messages
 from .hf import HfTokenizer, get_cached_tokenizer
