@@ -213,6 +213,7 @@ def test_custom_model_load_weights_receives_original_names_and_dtypes(
         model=str(tmp_path),
         revision=None,
         quantization=None,
+        multimodal_config=None,
     )
 
     loader.load_weights(model, model_config)

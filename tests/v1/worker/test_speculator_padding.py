@@ -32,6 +32,7 @@ class _Speculator(DraftModelSpeculator):
 def _speculator(max_num_reqs: int) -> DraftModelSpeculator:
     spec = object.__new__(_Speculator)
     spec.max_num_reqs = max_num_reqs
+    spec.dcp_size = 1
     spec.max_model_len = 8192
     spec.draft_max_seq_len = 8192
     spec.arange_np = np.arange(max_num_reqs + 1, dtype=np.int32)
@@ -42,6 +43,7 @@ def _speculator(max_num_reqs: int) -> DraftModelSpeculator:
         query_start_loc=torch.zeros(max_num_reqs + 1, dtype=torch.int32),
         seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32),
         dcp_local_seq_lens=None,
+        positions=torch.zeros(max_num_reqs * 8, dtype=torch.int64),
     )
     spec.block_tables = SimpleNamespace(
         input_block_tables=[torch.zeros(max_num_reqs, 4, dtype=torch.int32)],

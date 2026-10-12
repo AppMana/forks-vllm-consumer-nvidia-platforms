@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -211,7 +212,9 @@ def test_compressor_states_charge_a_fixed_ring_per_request(
     groups = get_kv_cache_groups(config, _mini_specs(monkeypatch, config))
 
     # The rings pack into the slot the attention groups already need.
-    assert _get_kv_cache_bytes_per_block(groups) == TRUNK_SLOT_BYTES
+    assert (
+        _get_kv_cache_bytes_per_block(groups, KVCacheLayout.BLHNC) == TRUNK_SLOT_BYTES
+    )
     kv_cache_config = get_kv_cache_config_from_groups(
         config, groups, available_memory=KV_CACHE_MEMORY
     )

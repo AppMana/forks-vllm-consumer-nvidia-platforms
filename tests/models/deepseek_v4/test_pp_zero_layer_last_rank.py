@@ -66,7 +66,7 @@ def _make_model(
     inst = m.DeepseekV4Model.__new__(m.DeepseekV4Model)
     nn.Module.__init__(inst)
     inst.config = SimpleNamespace(hidden_size=H)
-    inst.use_mega_moe = False
+    inst.use_native_mega_moe = False
     inst.hc_mult = HC
     inst.rms_norm_eps = 1e-6
     inst.hc_eps = 1e-6

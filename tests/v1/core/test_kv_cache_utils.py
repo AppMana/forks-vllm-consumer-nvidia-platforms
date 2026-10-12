@@ -1875,6 +1875,7 @@ def test_max_memory_usage_ignores_empty_projected_groups():
     sliding-window state caches)."""
     model_config = ModelConfig(max_model_len=1024)
     vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
 
     local_spec_a = new_kv_cache_spec(head_size=64)
     local_spec_b = new_kv_cache_spec(head_size=128)

@@ -46,6 +46,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
 
@@ -1371,7 +1372,9 @@ def test_packed_compressor_state_pages_do_not_overlap(monkeypatch):
     group_spec = UniformTypeKVCacheSpecs.from_specs(specs)
     assert group_spec is not None
 
-    stride = _get_kv_cache_bytes_per_block([KVCacheGroupSpec(list(specs), group_spec)])
+    stride = _get_kv_cache_bytes_per_block(
+        [KVCacheGroupSpec(list(specs), group_spec)], KVCacheLayout.BLHNC
+    )
 
     page = specs["compressor.0"].page_size_bytes
     assert page == specs["compressor.1"].page_size_bytes

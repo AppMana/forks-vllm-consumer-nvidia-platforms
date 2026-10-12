@@ -13,7 +13,7 @@ a non-16-byte-aligned view, which Triton silently recompiled as a distinct,
 effectively unwarmable kernel specialization -- see pp_utils.py's docstring
 and the "one tensor, one broadcast" rule it encodes. Nothing here should ever
 need a second `torch.distributed.broadcast` call; that's the regression this
-file guards against most directly (test_receive_and_broadcast_use_exactly_one_collective).
+file guards against most directly in the single-collective test.
 """
 
 from types import SimpleNamespace
@@ -23,7 +23,11 @@ import pytest
 import ray
 import torch
 
-from ..utils import init_test_distributed_environment, multi_gpu_test, multi_process_parallel
+from ..utils import (
+    init_test_distributed_environment,
+    multi_gpu_test,
+    multi_process_parallel,
+)
 
 
 def _fake_input_batch(
@@ -44,6 +48,7 @@ def _fake_input_batch(
         idx_mapping_np=idx_mapping_np,
         num_computed_tokens_np=np.full(num_reqs, old_computed, dtype=np.int32),
         prefill_len_np=np.full(num_reqs, prefill_len, dtype=np.int32),
+        is_prefilling_np=np.full(num_reqs, old_computed < prefill_len, dtype=bool),
         max_seq_len_np=np.full(num_reqs, max_seq_len, dtype=np.int32),
         num_scheduled_tokens=np.full(num_reqs, scheduled, dtype=np.int32),
     )
@@ -78,14 +83,20 @@ def pp_handler_broadcast_roundtrip_worker(
 
     def step_payload(step: int):
         sampled = torch.arange(
-            step * 100, step * 100 + num_reqs * (num_speculative_steps + 1),
-            dtype=torch.int64, device=device,
+            step * 100,
+            step * 100 + num_reqs * (num_speculative_steps + 1),
+            dtype=torch.int64,
+            device=device,
         ).reshape(num_reqs, num_speculative_steps + 1)
         proposed = torch.arange(
-            step * 1000, step * 1000 + num_reqs * num_speculative_steps,
-            dtype=torch.int64, device=device,
+            step * 1000,
+            step * 1000 + num_reqs * num_speculative_steps,
+            dtype=torch.int64,
+            device=device,
         ).reshape(num_reqs, num_speculative_steps)
-        num_sampled = torch.full((num_reqs,), step + 1, dtype=torch.int32, device=device)
+        num_sampled = torch.full(
+            (num_reqs,), step + 1, dtype=torch.int32, device=device
+        )
         num_rejected = torch.full((num_reqs,), step, dtype=torch.int32, device=device)
         return sampled, proposed, num_sampled, num_rejected
 
@@ -104,7 +115,7 @@ def pp_handler_broadcast_roundtrip_worker(
             sampled, proposed, num_sampled, num_rejected = step_payload(step)
             handler.broadcast(sampled, num_sampled, num_rejected, input_batch, proposed)
 
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
     if not handler.is_last_rank:
         # First pp_size (=2) consumes are no-ops (queue pre-seeded with None);
@@ -112,8 +123,8 @@ def pp_handler_broadcast_roundtrip_worker(
         assert set(consumed_at_step) == {2, 3}
         for step in (2, 3):
             source_step = step - pp_size
-            want_sampled, want_proposed, want_num_sampled, want_num_rejected = step_payload(
-                source_step
+            want_sampled, want_proposed, want_num_sampled, want_num_rejected = (
+                step_payload(source_step)
             )
             got = consumed_at_step[step]
             torch.testing.assert_close(got["sampled_tokens"], want_sampled)
@@ -169,7 +180,7 @@ def pp_handler_single_collective_worker(
         handler.broadcast(sampled, num_sampled, num_rejected, input_batch, proposed)
     else:
         handler.receive(input_batch)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     assert call_count["n"] == 1, (
         f"expected exactly one torch.distributed.broadcast call, got {call_count['n']}"
@@ -218,7 +229,7 @@ def pp_handler_payload_alignment_worker(
         handler.broadcast(sampled, num_sampled, num_rejected, input_batch, proposed)
     else:
         handler.receive(input_batch)
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         slot = handler.queue[-1]
         assert slot is not None
         assert slot.payload.data_ptr() % 16 == 0
@@ -271,7 +282,7 @@ def pp_handler_narrow_sampler_width_padding_worker(
         handler.broadcast(sampled, num_sampled, num_rejected, input_batch, proposed)
     else:
         handler.receive(input_batch)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     if not handler.is_last_rank:
         for _ in range(pp_size - 1):
@@ -294,7 +305,7 @@ def pp_handler_freed_request_excluded_worker(
     distributed_init_port: str,
 ):
     """A request index freed between receive() and its later consume must be
-    excluded (idx_mapping row set to -1) instead of silently postprocessed
+    excluded from the compacted output instead of silently postprocessed
     with stale/reused data."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     device = torch.device(f"cuda:{rank}")
@@ -321,7 +332,7 @@ def pp_handler_freed_request_excluded_worker(
         # Request index 1 gets freed (e.g. finished/aborted) before its
         # sampled output is ever consumed.
         handler.on_req_idx_freed(1)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     if not handler.is_last_rank:
         for _ in range(pp_size - 1):
@@ -329,8 +340,9 @@ def pp_handler_freed_request_excluded_worker(
         result = handler.get_prev_sampled_outputs()
         assert result is not None
         idx_mapping = result["idx_mapping"].cpu().numpy()
-        assert idx_mapping[0] == 0
-        assert idx_mapping[1] == -1
+        np.testing.assert_array_equal(idx_mapping, np.array([0], dtype=np.int32))
+        assert result["sampled_tokens"].shape == (1, 2)
+        assert result["proposed_tokens"].shape == (1, 1)
 
 
 @multi_gpu_test(num_gpus=2)
@@ -363,7 +375,9 @@ def test_pp_handler_excludes_freed_request_on_consume(monkeypatch: pytest.Monkey
 
 
 @multi_gpu_test(num_gpus=3)
-def test_pp_handler_speculative_broadcast_roundtrip_pp3(monkeypatch: pytest.MonkeyPatch):
+def test_pp_handler_speculative_broadcast_roundtrip_pp3(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Same roundtrip contract at pp_size=3, to catch bugs that only manifest
     with more than one non-last (interior) rank relaying the broadcast."""
     multi_process_parallel(monkeypatch, 1, 3, pp_handler_broadcast_roundtrip_worker)

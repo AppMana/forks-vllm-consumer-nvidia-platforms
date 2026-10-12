@@ -729,7 +729,7 @@ def test_fused_topk_softplus_sqrt_hash_bias_vl(
         [torch.randperm(num_experts)[:topk] for _ in range(vocab_size)]
     ).to(device="cuda", dtype=indices_dtype)
     bias_vl = torch.randn((num_experts,), dtype=torch.float32, device="cuda")
-    input_ids = _make_mixed_input_ids(num_tokens, image_sentinel_lo)
+    input_ids = _make_mixed_input_ids(num_tokens, image_sentinel_lo, indices_dtype)
     image_rows = (input_ids >= image_sentinel_lo) & (input_ids < image_sentinel_lo + 5)
     assert image_rows.any() and (~image_rows).any()
     assert (input_ids == image_sentinel_lo + 5).any()

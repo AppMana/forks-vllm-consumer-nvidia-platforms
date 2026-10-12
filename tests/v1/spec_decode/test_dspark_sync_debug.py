@@ -16,7 +16,7 @@ def test_sync_debug_does_not_synchronize_during_cuda_graph_capture(monkeypatch):
         "is_current_stream_capturing",
         lambda: True,
     )
-    monkeypatch.setattr(dflash_speculator.torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(dflash_speculator.torch.accelerator, "synchronize", synchronize)
 
     dflash_speculator.sync_debug("capture")
 
@@ -31,7 +31,7 @@ def test_sync_debug_synchronizes_outside_cuda_graph_capture(monkeypatch):
         "is_current_stream_capturing",
         lambda: False,
     )
-    monkeypatch.setattr(dflash_speculator.torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(dflash_speculator.torch.accelerator, "synchronize", synchronize)
 
     dflash_speculator.sync_debug("eager")
 
@@ -52,5 +52,5 @@ def test_sync_debug_is_safe_in_real_cuda_graph_capture(monkeypatch):
         value.add_(1)
 
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert value.item() == 1

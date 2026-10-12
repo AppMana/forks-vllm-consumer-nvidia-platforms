@@ -113,7 +113,7 @@ def test_default_loader_collects_every_explicit_override(tmp_path):
     )
 
     loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
-    _, files, use_safetensors = loader._prepare_weights(
+    _, files, use_safetensors, index_file = loader._prepare_weights(
         str(tmp_path),
         None,
         None,
@@ -122,6 +122,7 @@ def test_default_loader_collects_every_explicit_override(tmp_path):
     )
 
     assert use_safetensors is True
+    assert index_file == "model.safetensors.index.json"
     assert [path.rsplit("/", 1)[-1] for path in files] == shard_names
 
 

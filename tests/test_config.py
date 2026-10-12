@@ -822,11 +822,12 @@ def test_batch_invariant_breakable_cudagraph(
         get_num_kv_heads=lambda pc: heads[1],
     )
     config.parallel_config = SimpleNamespace(tensor_parallel_size=tp)
-    config.compilation_config = CompilationConfig()
+    config.compilation_config = CompilationConfig(mode=CompilationMode.VLLM_COMPILE)
     try:
         assert config._maybe_enable_breakable_cudagraph() is expected
-        if expected:
-            assert config.compilation_config.mode == CompilationMode.NONE
+        # The fork keeps the surrounding model body compiled when enabling
+        # breakable attention graphs. Preserve the caller's compilation mode.
+        assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
     finally:
         os.environ.pop("VLLM_USE_BREAKABLE_CUDAGRAPH", None)
         default_breakable_cudagraph_architectures.cache_clear()

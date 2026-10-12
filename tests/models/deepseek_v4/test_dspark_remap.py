@@ -196,7 +196,7 @@ def _make_weight_loading_model(
     model.model.layers = [
         SimpleNamespace(
             ffn=SimpleNamespace(
-                use_mega_moe=False,
+                use_native_mega_moe=False,
                 finalize_mega_moe_weights=lambda: None,
             )
         )

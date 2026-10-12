@@ -125,6 +125,7 @@ def test_indexer_draft_decode_metadata_update_is_capture_safe():
     ).clone()
 
     builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.indexer_uses_fp4 = False
     builder.dcp_world_size = 1
     builder.compress_ratio = 16
     builder.num_sms = num_sms
@@ -144,6 +145,7 @@ def test_indexer_draft_decode_metadata_update_is_capture_safe():
             decode_lens=torch.zeros(num_reqs, dtype=torch.int32, device=device),
             requires_padding=False,
             schedule_metadata=schedule_metadata,
+            max_context_len=128 // 16,
         ),
         block_table=block_table,
     )
@@ -196,6 +198,7 @@ def test_indexer_draft_decode_refresh_follows_new_batch(monkeypatch, compress_ra
         decode_lens=stale(num_reqs),
         requires_padding=False,
         schedule_metadata=stale(1),
+        max_context_len=128 // compress_ratio,
         indices=stale(num_reqs),
         per_req_decode_lens=stale(num_reqs),
     )
@@ -495,11 +498,18 @@ def test_indexer_phase_selects_runtime_path_and_capture_fallback(
     builder.dcp_world_size = 1
     builder.dcp_rank = 0
     builder.cp_kv_cache_interleave_size = 1
+    builder.compressed_cp_interleave_size = 1
     builder.max_prefill_buffer_size = seq_len
+    builder.supports_varlen = False
+    builder.tp_size = 1
+    builder.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=None)
+    )
     builder.indexer_uses_fp4 = False
     builder.num_speculative_tokens = 5
     builder.kv_cache_spec = SimpleNamespace(storage_block_size=256, block_size=256)
     builder.decode_lens_buffer = torch.zeros(1024, dtype=torch.int32)
+    builder.per_req_decode_lens_buffer = torch.zeros(1024, dtype=torch.int32)
     builder.decode_seq_lens_buffer = torch.zeros(1024, dtype=torch.int32)
     builder.global_decode_seq_lens_buffer = torch.zeros(1024, dtype=torch.int32)
     builder.expanded_block_table_buffer = torch.zeros((1024, 64), dtype=torch.int32)
@@ -954,3 +964,56 @@ def test_indexer_prefill_budget_matches_compressed_workspace(compress_ratio):
     assert len(chunks) > 1
     for req_slice, _ in chunks:
         assert int(compressed_seq_lens[req_slice].sum()) <= workspace_rows
+
+
+@pytest.mark.parametrize("capability_family", [80, 120])
+def test_indexer_draft_refresh_skips_unused_deep_gemm_metadata_on_consumer_cuda(
+    monkeypatch, capability_family
+):
+    """Portable indexer kernels do not consume DeepGEMM's GPU-specific schedule."""
+    monkeypatch.setattr(indexer_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        indexer_module.current_platform,
+        "is_device_capability_family",
+        lambda family: family == capability_family,
+    )
+    monkeypatch.setattr(indexer_module, "has_deep_gemm", lambda: True)
+
+    def unused_schedule(*args, **kwargs):
+        pytest.fail("Consumer indexer reached unused DeepGEMM metadata")
+
+    monkeypatch.setattr(
+        indexer_module, "get_paged_mqa_logits_metadata", unused_schedule
+    )
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.dcp_world_size = 1
+    builder.compress_ratio = 1
+    builder.indexer_uses_fp4 = False
+    builder.num_sms = 64
+    builder.kv_cache_spec = SimpleNamespace(num_states=64)
+    builder.arange_buffer = torch.arange(3, dtype=torch.int32)
+    decode = DeepSeekV32IndexerDecodeMetadata(
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        seq_lens=torch.zeros((2, 1), dtype=torch.int32),
+        decode_lens=torch.zeros(2, dtype=torch.int32),
+        requires_padding=False,
+        schedule_metadata=torch.empty((0, 2), dtype=torch.int32),
+        max_context_len=64,
+    )
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=torch.tensor([17, 33], dtype=torch.int32),
+        max_seq_len=64,
+        slot_mapping=torch.zeros(2, dtype=torch.int64),
+        num_decodes=2,
+        num_decode_tokens=2,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=decode,
+        block_table=torch.tensor([[1], [2]], dtype=torch.int32),
+    )
+
+    builder.update_draft_decode_metadata(metadata)
+
+    torch.testing.assert_close(decode.seq_lens.flatten(), metadata.seq_lens)
+    torch.testing.assert_close(decode.block_table, metadata.block_table)
+    assert torch.all(decode.decode_lens == 1)
