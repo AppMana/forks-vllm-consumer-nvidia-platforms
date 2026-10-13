@@ -305,8 +305,6 @@ table carries the rule.
 
 | Commit | Lesson |
 | --- | --- |
-| `c89fb48a97` | Real merge of upstream `bfa7e5b7af` (1,018 commits), from `pre-upstream-merge-2026-10-11`. The relative fork-test gate and local PP=1/PP=2 mini parity passed after follow-up fixes. Image and deployment gates are recorded separately; a local pass does not qualify the 3090 chain or GB10. |
-| `fe772c9ef6`, `1ec3fbc475`, `267ea06a03` | Qwen PP/MTP validation must construct the actual model: unused target embeddings consume 2.37 GiB on the last rank, MTP's `layers.0` uses independent numbering and must follow last-stage ownership before target-layer filtering, and PP speculative warmup cannot request unsupported generated-token logprobs. The 32k/C=4 preflight, quality fixtures and MTP matrix exercise these paths together. |
 | `9c9d5077ef` | Merge of upstream `f9ad9dd6b4` (218 commits), from `pre-upstream-merge-2026-09-23`. AllSpark reinstated after upstream deleted it; upstream's DSpark PP draft relay folded into the single payload. Gate D then needed `31d143c7c5` (PP=1 CUDA graphs had not started on the pre-merge tree either). |
 | `53873c6c4d` | Merge of upstream `729ebac498` (773 commits). The model for a merge body: the conflict count, then resolutions grouped by the policy areas, each naming what superseded any dropped fork code. Its first parent is `pre-upstream-merge-2026-09-18`. |
 | `334894183a` | Merge of upstream `e35298628f` (1798 commits). When upstream replaces a subsystem, re-express the fork's invariant in the new structure (the 528-byte `int8_ds_mla` page became spec `state_content_bytes`; 16-byte alignment moved into spec alignment) and say in the body which resolution still needs hardware validation. |
