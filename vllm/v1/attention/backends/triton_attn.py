@@ -726,23 +726,22 @@ class TritonAttentionImpl(AttentionImpl):
                     dtype=torch.bfloat16,
                 )
                 value_scratch = torch.empty_like(key_scratch)
-                scratch_table = torch.arange(
-                    sequences, device=query.device, dtype=torch.int32
-                ).view(-1, 1)
+                lse = torch.empty(
+                    (self.num_heads, num_actual_tokens),
+                    device=query.device,
+                    dtype=torch.float32,
+                )
                 unpack(kv_cache, block_table, seqused_k, key_scratch, value_scratch)
                 flash_attention(
-                    q=query[:num_actual_tokens],
-                    k=key_scratch,
-                    v=value_scratch,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    block_table=scratch_table,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    fa_version=2,
+                    query[:num_actual_tokens],
+                    key_scratch,
+                    value_scratch,
+                    cu_seqlens_q,
+                    seqused_k,
+                    output[:num_actual_tokens],
+                    lse,
+                    max_seqlen_q,
+                    self.scale,
                 )
                 return output
             native_attention(

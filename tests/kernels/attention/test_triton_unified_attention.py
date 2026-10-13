@@ -984,3 +984,54 @@ def test_softcap_does_not_overflow_on_large_scores() -> None:
     ref = soft_cap * torch.tanh(scores / soft_cap)
     assert torch.isfinite(out).all(), out
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("kv_heads", [2, 4])
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_sm86_int8_prefill_tiling_preserves_ragged_output(
+    monkeypatch, kv_heads, block_size
+):
+    """Larger query tiles must preserve INT8 scales and mixed decode/prefill rows."""
+    if not current_platform.is_device_capability(86):
+        pytest.skip("SM86 launch tuning")
+    set_random_seed(734)
+    tokens, sequences, capacity = 105, 4, 160
+    q = torch.randn(tokens, kv_heads * 12, 256, device="cuda", dtype=torch.bfloat16)[
+        :, : kv_heads * 6
+    ]
+    shape = (sequences * capacity // block_size, block_size, kv_heads, 256)
+    k = torch.randint(-127, 128, shape, device="cuda", dtype=torch.int8)
+    v = torch.randint(-127, 128, shape, device="cuda", dtype=torch.int8)
+    ks = torch.rand(shape[:-1], device="cuda") * 0.02 + 0.001
+    vs = torch.rand_like(ks) * 0.02 + 0.001
+    table = torch.randperm(shape[0], device="cuda", dtype=torch.int32).reshape(
+        sequences, -1
+    )
+    offsets = torch.tensor([0, 1, 34, 105, 105], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([39, 97, 131, 0], device="cuda", dtype=torch.int32)
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=offsets,
+        max_seqlen_q=71,
+        seqused_k=lengths,
+        max_seqlen_k=capacity,
+        softmax_scale=1 / 16,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+        k_scale_cache=ks,
+        v_scale_cache=vs,
+    )
+    out, expected = torch.empty_like(q), torch.empty_like(q)
+    unified_attention(out=out, **kwargs)
+    with monkeypatch.context() as context:
+        context.setattr(current_platform, "is_device_capability", lambda *_: False)
+        unified_attention(out=expected, **kwargs)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)

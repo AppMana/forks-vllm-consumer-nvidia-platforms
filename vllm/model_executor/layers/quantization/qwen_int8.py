@@ -233,11 +233,9 @@ class QwenInt8KVCacheMethod(BaseKVCacheMethod):
 
             layer._consumer_int8_attention = paged_attention
             if self.quant_config.attention_backend == "consumer_fa2":
-                from consumer_int8.ops import unpack_kv_cache
+                from consumer_int8.ops import fa2_prefill, unpack_kv_cache
 
-                from vllm.vllm_flash_attn import flash_attn_varlen_func
-
-                layer._consumer_int8_fa2 = (unpack_kv_cache, flash_attn_varlen_func)
+                layer._consumer_int8_fa2 = (unpack_kv_cache, fa2_prefill)
         if self.quant_config.kv_cache_backend == "consumer_int8":
             if not (
                 current_platform.is_cuda()

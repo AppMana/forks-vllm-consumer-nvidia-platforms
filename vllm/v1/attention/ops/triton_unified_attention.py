@@ -967,6 +967,21 @@ def unified_attention(
         launch_num_warps = 8
         launch_num_stages = 2
 
+    # GQA6 packs six query heads into M: 16 rows cover only two positions.
+    # Keep the KV reduction tile unchanged to preserve INT8 attention numerics.
+    if (
+        head_size == 256
+        and num_queries_per_kv == 6
+        and max_seqlen_q >= 32
+        and kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+        and current_platform.is_device_capability(86)
+        and not is_batch_invariant
+    ):
+        BLOCK_M = 64
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_warps = 4
+        launch_num_stages = 2
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
