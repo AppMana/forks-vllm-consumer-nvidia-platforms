@@ -371,3 +371,54 @@ def test_fusion_silu_and_mul_quant(
 
         # In post-nodes, fused kernels should be present and quant op should not
         backend.check_after_ops(model.ops_in_model_after())
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(86), reason="SM86 consumer INT8 only"
+)
+@pytest.mark.parametrize("width", [8704, 17408])
+def test_qwen_silu_projection_fuses_and_keeps_dynamic_decode(width):
+    import vllm.model_executor.layers.quantization.qwen_int8  # noqa: F401
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.dsv4_int import (
+        _dsv4_allspark_cublas_m_threshold,
+    )
+
+    torch.manual_seed(841)
+    n = 5120
+    raw = torch.randint(0, 256, (width, n), device="cuda", dtype=torch.uint8)
+    scales = torch.full((1, n), 0.01, device="cuda", dtype=torch.bfloat16)
+    weight, scales, _ = ops.allspark_repack_weight(raw, scales, None, False)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    threshold = _dsv4_allspark_cublas_m_threshold(86)
+
+    def program(x):
+        a = torch.nn.functional.silu(x[:, :width]) * x[:, width:]
+        return torch.ops.vllm.qwen_int8_prefill_linear(
+            a, weight, scales, n, sms, 86, threshold
+        )
+
+    config = VllmConfig(
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            custom_ops=["none"],
+            backend="eager",
+            pass_config=PassConfig(fuse_act_quant=True, eliminate_noops=True),
+        )
+    )
+    with set_current_vllm_config(config):
+        fusion = ActivationQuantFusionPass(config)
+        backend = TestBackend(
+            NoOpEliminationPass(config), fusion, PostCleanupPass(config)
+        )
+        compiled = torch.compile(program, backend=backend, fullgraph=True)
+        reference = torch.compile(program, fullgraph=True)
+        x = torch.randn(1024, 2 * width, device="cuda", dtype=torch.bfloat16)
+        torch._dynamo.mark_dynamic(x, 0)
+        torch.testing.assert_close(compiled(x), reference(x), atol=0, rtol=0)
+        assert fusion.matched_count == 1
+        backend.check_after_ops([torch.ops.vllm.qwen_int8_silu_prefill_linear.default])
+        for rows in (1, 4, 916):
+            torch.testing.assert_close(
+                compiled(x[:rows]), reference(x[:rows]), atol=0, rtol=0
+            )

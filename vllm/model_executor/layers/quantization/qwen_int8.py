@@ -31,6 +31,19 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+def _qwen_int8_prefill_schedule(m: int, n: int, k: int, sm_count: int) -> int:
+    if (
+        sm_count == 64
+        and 3328 <= m <= 4096
+        and (
+            (k == 5120 and n in (7168, 8192, 14336, 16384, 17408, 34816))
+            or (n == 5120 and k in (8704, 17408))
+        )
+    ):
+        return 6
+    return 0
+
+
 def _qwen_int8_prefill_linear(
     x: torch.Tensor,
     packed_weight: torch.Tensor,
@@ -67,7 +80,68 @@ def _qwen_int8_prefill_linear(
     row_scales = torch.empty(m, dtype=torch.float32, device=x.device)
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     quantize_rows(x, codes, row_scales)
-    fused_channel_mm(codes, weight, row_scales, scales, out)
+    fused_channel_mm(
+        codes,
+        weight,
+        row_scales,
+        scales,
+        out,
+        _qwen_int8_prefill_schedule(m, n, k, sm_count),
+    )
+    return out
+
+
+def _qwen_int8_silu_prefill_linear(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    packed_scales: torch.Tensor,
+    n: int,
+    sm_count: int,
+    sm_version: int,
+    cublas_m_threshold: int,
+) -> torch.Tensor:
+    from consumer_int8.ops import (
+        fused_channel_mm,
+        silu_mul,
+        silu_mul_quantize,
+        unpack_allspark,
+    )
+
+    m, width = x.shape
+    k = width // 2
+    # The runtime branch must stay inside the opaque custom op: an AOT graph
+    # traced at 1024 tokens is also reused for BF16-activation decode.
+    if m < 1024:
+        activation = x.new_empty((m, k))
+        silu_mul(x, activation)
+        return ops.allspark_w8a16_gemm(
+            a=activation,
+            b_qweight=packed_weight,
+            b_scales=packed_scales,
+            b_qzeros=None,
+            n=n,
+            group_size=-1,
+            sm_count=sm_count,
+            sm_version=sm_version,
+            CUBLAS_M_THRESHOLD=cublas_m_threshold,
+            has_zp=False,
+            n32k16_reorder=True,
+        )
+    weight = torch.empty((n, k), dtype=torch.int8, device=x.device)
+    scales = x.new_empty(n)
+    unpack_allspark(packed_weight, packed_scales.flatten(), weight, scales)
+    codes = torch.empty((m, k), dtype=torch.int8, device=x.device)
+    row_scales = torch.empty(m, dtype=torch.float32, device=x.device)
+    out = x.new_empty((m, n))
+    silu_mul_quantize(x, codes, row_scales)
+    fused_channel_mm(
+        codes,
+        weight,
+        row_scales,
+        scales,
+        out,
+        _qwen_int8_prefill_schedule(m, n, k, sm_count),
+    )
     return out
 
 
@@ -86,6 +160,13 @@ def _qwen_int8_prefill_linear_fake(
 direct_register_custom_op(
     op_name="qwen_int8_prefill_linear",
     op_func=_qwen_int8_prefill_linear,
+    fake_impl=_qwen_int8_prefill_linear_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen_int8_silu_prefill_linear",
+    op_func=_qwen_int8_silu_prefill_linear,
     fake_impl=_qwen_int8_prefill_linear_fake,
 )
 

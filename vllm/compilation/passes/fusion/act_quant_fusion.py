@@ -274,6 +274,50 @@ class SiluMulBlockQuantPattern(ActivationQuantPattern):
         return _replacement
 
 
+class QwenInt8SiluPattern(VllmPatternReplacement):
+    """Keep SwiGLU in registers until the SM86 row-wise INT8 quantization."""
+
+    def __init__(self, width: int) -> None:
+        from vllm.model_executor.layers.quantization.dsv4_int import (
+            _dsv4_allspark_cublas_m_threshold,
+        )
+
+        self.width = width
+        self.sm_count = current_platform.num_compute_units(
+            torch.accelerator.current_device_index()
+        )
+        self.threshold = _dsv4_allspark_cublas_m_threshold(86)
+        # Native compiled SwiGLU keeps the intermediate SiLU in FP32. Only
+        # match that arithmetic contract, not a separately rounded BF16 op.
+        self.activation = MatcherSiluAndMul(enabled=False)
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        return [
+            self.empty_bf16(5, 2 * self.width),
+            self.empty(5120, self.width, dtype=torch.uint8),
+            self.empty_bf16(1, 5120),
+        ]
+
+    @property
+    def pattern(self):
+        def pattern(x, weight, scales):
+            activation = self.activation(x)
+            return torch.ops.vllm.qwen_int8_prefill_linear(
+                activation, weight, scales, 5120, self.sm_count, 86, self.threshold
+            )
+
+        return pattern
+
+    @property
+    def replacement(self):
+        def replacement(x, weight, scales):
+            return torch.ops.vllm.qwen_int8_silu_prefill_linear(
+                x, weight, scales, 5120, self.sm_count, 86, self.threshold
+            )
+
+        return replacement
+
+
 class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
     """This pass fuses a pre-defined set of custom ops into fused ops.
     It uses the torch pattern matcher to find the patterns and replace them.
@@ -311,5 +355,11 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
                         is_tma_aligned=is_tma_aligned,
                     )
                 )
+
+        if current_platform.is_device_capability(86) and hasattr(
+            torch.ops.vllm, "qwen_int8_prefill_linear"
+        ):
+            for width in (8704, 17408):
+                self.register(QwenInt8SiluPattern(width))
 
         self.dump_patterns(config, self.pm_pass)

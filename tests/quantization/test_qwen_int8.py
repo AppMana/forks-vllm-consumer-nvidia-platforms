@@ -158,3 +158,44 @@ def test_prefill_dispatch_survives_guard_free_graph_reuse_for_decode():
         x = sample[:rows]
         expected = reference.apply(program.layer, x)
         torch.testing.assert_close(graph(x), expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("width", [8704, 17408])
+def test_silu_prefill_dispatch_preserves_decode_after_1024_row_trace(width):
+    from vllm import _custom_ops as ops
+
+    if torch.cuda.get_device_capability() != (8, 6):
+        pytest.skip("consumer INT8 kernels require SM86")
+    torch.manual_seed(113)
+    n = 128
+    raw = torch.randint(0, 256, (width, n), device="cuda", dtype=torch.uint8)
+    scales = torch.full((1, n), 0.01, device="cuda", dtype=torch.bfloat16)
+    weight, scales, _ = ops.allspark_repack_weight(raw, scales, None, False)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    class FusedProgram(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", weight)
+            self.register_buffer("scales", scales)
+
+        def forward(self, x):
+            return torch.ops.vllm.qwen_int8_silu_prefill_linear(
+                x, self.weight, self.scales, n, sms, 86, 1024
+            )
+
+    fused = FusedProgram()
+
+    @torch.compile(fullgraph=True, dynamic=True)
+    def activation(x):
+        return torch.nn.functional.silu(x[:, :width]) * x[:, width:]
+
+    sample = torch.randn(1024, 2 * width, device="cuda", dtype=torch.bfloat16)
+    graph = torch._dynamo.export(fused)(sample).graph_module
+    for rows in (1, 4, 229, 916, 1024):
+        x = sample[:rows]
+        reference = torch.ops.vllm.qwen_int8_prefill_linear(
+            activation(x), weight, scales, n, sms, 86, 1024
+        )
+        torch.testing.assert_close(graph(x), reference, atol=0, rtol=0)
