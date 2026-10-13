@@ -484,6 +484,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
         self.qkvz_layout = "interleaved" if gqa_interleaved_layout else "flat"
+        self._gdn_post_conv_prep = fused_post_conv_prep
+        self._consumer_gdn_conv = None
+        if (
+            getattr(self.quant_config, "gdn_preparation_backend", "triton")
+            == "consumer_int8"
+        ):
+            if not (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability(86)
+                and self.head_k_dim == self.head_v_dim == 128
+                and not gqa_interleaved_layout
+            ):
+                raise ValueError(
+                    "consumer_int8 preparation requires SM86, D128 and flat QKV"
+                )
+            from consumer_int8.ops import gdn_conv_prep, gdn_post_conv_prep
+
+            self._gdn_post_conv_prep = gdn_post_conv_prep
+            if (
+                self.conv_kernel_size == 4
+                and not vllm_config.cache_config.enable_prefix_caching
+            ):
+                self._consumer_gdn_conv = gdn_conv_prep
         self._consumer_gdn_decode = None
         if (
             getattr(self.quant_config, "gdn_decode_backend", "triton")
@@ -1460,7 +1483,35 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
 
         # 1.2: Process the remaining part
-        if attn_metadata.num_prefills > 0:
+        native_prepared = None
+        if (
+            self._consumer_gdn_conv is not None
+            and attn_metadata.num_prefills > 0
+            and num_actual_tokens >= max(256, 64 * attn_metadata.num_prefills)
+            and attn_metadata.num_decodes == 0
+            and spec_sequence_masks is None
+            and attn_metadata.checkpoint is None
+            and self.conv1d.bias is None
+            and self.activation in ("silu", "swish")
+        ):
+            max_query = min(
+                num_actual_tokens, attn_metadata.max_query_len or num_actual_tokens
+            )
+            native_prepared = self._consumer_gdn_conv(
+                mixed_qkv_non_spec,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                conv_weights,
+                conv_state,
+                non_spec_query_start_loc,
+                non_spec_state_indices_tensor,
+                has_initial_state,
+                self.num_k_heads // self.tp_size,
+                max_query,
+            )
+        elif attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
@@ -1522,23 +1573,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_prefill = a_non_spec
                 b_prefill = b_non_spec
 
+            prepare = (
+                self._gdn_post_conv_prep
+                if conv_output_prefill.shape[0] >= 1024
+                else fused_post_conv_prep
+            )
             (
                 query_non_spec,
                 key_non_spec,
                 value_non_spec,
                 g_non_spec,
                 beta_non_spec,
-            ) = fused_post_conv_prep(
-                conv_output=conv_output_prefill,
-                a=a_prefill,
-                b=b_prefill,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                num_k_heads=self.num_k_heads // self.tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                apply_l2norm=True,
-                output_g_exp=False,
+            ) = (
+                native_prepared
+                if native_prepared is not None
+                else prepare(
+                    conv_output=conv_output_prefill,
+                    a=a_prefill,
+                    b=b_prefill,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    num_k_heads=self.num_k_heads // self.tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                    apply_l2norm=True,
+                    output_g_exp=False,
+                )
             )
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)

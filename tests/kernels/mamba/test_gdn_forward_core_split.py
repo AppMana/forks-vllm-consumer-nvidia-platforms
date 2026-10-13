@@ -38,12 +38,9 @@ import torch
 
 from vllm.platforms import current_platform
 
-if not (
-    current_platform.is_cuda() and current_platform.is_device_capability_family(100)
-):
+if not (current_platform.is_cuda() and current_platform.has_device_capability(80)):
     pytest.skip(
-        reason="GDN _forward_core split test uses the CuteDSL prefill backend "
-        "(requires CUDA SM10x).",
+        reason="GDN _forward_core split test requires CUDA SM80+.",
         allow_module_level=True,
     )
 
@@ -87,18 +84,17 @@ PREFIX = "model.layers.0.linear_attn"
 
 
 def _make_vllm_config():
-    # A small, ungated GDN model whose config is cached locally; only the config
-    # (scheduler/cache/compilation/hf) is used here, never the weights. Inject
-    # linear_key_head_dim=128 and request the CuteDSL prefill backend -- the
-    # supported GDN chunk kernel on Blackwell (the Triton/FLA chunk kernel is
-    # unsupported on SM10x). CuteDSL consumes chunk_indices/chunk_offsets, so
-    # this also exercises the prefill-only chunk-metadata wiring.
+    # Use FLA on Ampere/Hopper and CuteDSL on Blackwell. Both consume the
+    # prefill-only chunk metadata; no model weights are needed.
     cfg = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
         block_size=BLOCK_SIZE,
         hf_config_override={"linear_key_head_dim": K},
     )
-    cfg.additional_config = {"gdn_prefill_backend": "cutedsl"}
+    backend = (
+        "cutedsl" if current_platform.is_device_capability_family(100) else "triton"
+    )
+    cfg.additional_config = {"gdn_prefill_backend": backend}
     return cfg
 
 
@@ -109,6 +105,8 @@ def _build_layer(
     layer = types.SimpleNamespace()
     layer.prefix = PREFIX
     layer.enable_packed_recurrent_decode = False
+    layer._consumer_gdn_conv = None
+    layer._gdn_post_conv_prep = qwen_gdn_linear_attn.fused_post_conv_prep
     layer.tp_size = 1
     layer.num_k_heads = H
     layer.num_v_heads = HV
@@ -151,14 +149,20 @@ def _run_forward_core(layer, meta, mixed_qkv, b, a, num_tokens):
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("num_decodes,prefill_lens", [(3, [512, 300]), (4, [64, 5])])
+@pytest.mark.parametrize(
+    "num_decodes,prefill_lens", [(0, [512, 300]), (3, [1024, 300]), (4, [64, 5])]
+)
+@pytest.mark.parametrize("native_preparation", [False, True])
 @pytest.mark.parametrize("fresh_prefill", [False, True])
 def test_forward_core_split_matches_unified(
     state_dtype: torch.dtype,
     num_decodes: int,
     prefill_lens: list[int],
     fresh_prefill: bool,
+    native_preparation: bool,
 ) -> None:
+    if native_preparation and not current_platform.is_device_capability(86):
+        pytest.skip("consumer_int8 preparation requires SM86")
     torch.manual_seed(0)
     device = torch.device("cuda")
     vllm_config = _make_vllm_config()
@@ -193,7 +197,10 @@ def test_forward_core_split_matches_unified(
     assert meta_split.num_decodes == num_decodes
     assert meta_split.num_prefills == len(prefill_lens)
     assert meta_split.num_decode_tokens == num_decodes
-    assert builder.gdn_prefill_backend == "cutedsl"
+    assert (
+        builder.gdn_prefill_backend
+        == vllm_config.additional_config["gdn_prefill_backend"]
+    )
 
     num_tokens = sum(query_lens)
 
@@ -253,6 +260,9 @@ def test_forward_core_split_matches_unified(
     )
     conv_bias = torch.randn(CONV_DIM, dtype=torch.bfloat16, device=device) * 0.1
 
+    if native_preparation:
+        conv_bias = None
+
     mixed_qkv = (
         torch.randn(num_tokens, CONV_DIM, dtype=torch.bfloat16, device=device) * 0.1
     )
@@ -271,6 +281,11 @@ def test_forward_core_split_matches_unified(
         conv_weight,
         conv_bias,
     )
+    if native_preparation:
+        from consumer_int8.ops import gdn_conv_prep, gdn_post_conv_prep
+
+        layer_split._consumer_gdn_conv = gdn_conv_prep
+        layer_split._gdn_post_conv_prep = gdn_post_conv_prep
     out_split = _run_forward_core(layer_split, meta_split, mixed_qkv, b, a, num_tokens)
 
     # ---- Unified path (real _forward_core, meta_unified) ----

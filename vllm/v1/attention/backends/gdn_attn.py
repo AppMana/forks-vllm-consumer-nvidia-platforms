@@ -82,6 +82,8 @@ class GDNAttentionMetadata:
     prefill_has_initial_state: torch.Tensor | None = None
     aiter_prefill_metadata: object | None = None
 
+    max_query_len: int | None = None
+
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
@@ -605,6 +607,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decodes=num_spec_decodes,
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
+            max_query_len=m.max_query_len,
             checkpoint=checkpoint,
             has_initial_state=has_initial_state,
             chunk_indices=chunk_indices,

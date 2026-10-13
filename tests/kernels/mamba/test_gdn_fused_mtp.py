@@ -104,6 +104,8 @@ def _build_layer(
     layer = types.SimpleNamespace(
         prefix=PREFIX,
         enable_packed_recurrent_decode=False,
+        _consumer_gdn_conv=None,
+        _gdn_post_conv_prep=qwen_gdn_linear_attn.fused_post_conv_prep,
         disable_tp_for_ba_proj=False,
         tp_size=1,
         num_k_heads=H,

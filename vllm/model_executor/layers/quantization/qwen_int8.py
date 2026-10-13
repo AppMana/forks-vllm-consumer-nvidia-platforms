@@ -98,6 +98,7 @@ class QwenInt8Config(QuantizationConfig):
         kv_cache_backend: str = "triton",
         linear_backend: str = "allspark",
         attention_backend: str = "triton",
+        gdn_preparation_backend: str = "triton",
     ) -> None:
         super().__init__()
         if not quantized_modules or any(
@@ -108,7 +109,7 @@ class QwenInt8Config(QuantizationConfig):
         self.source_modules = dict(quantized_modules)
         self.quantized_modules = dict(quantized_modules)
         self.int8_weight_strategy = "channel"
-        for backend in (gdn_decode_backend, kv_cache_backend):
+        for backend in (gdn_decode_backend, kv_cache_backend, gdn_preparation_backend):
             if backend not in ("triton", "consumer_int8"):
                 raise ValueError(f"Unsupported qwen_int8 backend: {backend}")
         if attention_backend not in ("triton", "consumer_int8", "consumer_fa2"):
@@ -116,6 +117,7 @@ class QwenInt8Config(QuantizationConfig):
         self.gdn_decode_backend = gdn_decode_backend
         self.kv_cache_backend = kv_cache_backend
         self.attention_backend = attention_backend
+        self.gdn_preparation_backend = gdn_preparation_backend
         if linear_backend not in (
             "allspark",
             "consumer_int8",
@@ -156,6 +158,7 @@ class QwenInt8Config(QuantizationConfig):
             config.get("kv_cache_backend", "triton"),
             config.get("linear_backend", "allspark"),
             config.get("attention_backend", "triton"),
+            config.get("gdn_preparation_backend", "triton"),
         )
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
