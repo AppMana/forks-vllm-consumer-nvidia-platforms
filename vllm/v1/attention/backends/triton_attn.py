@@ -505,6 +505,9 @@ class TritonAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
+        self.consumer_int8_sms = (
+            current_platform.num_compute_units() if current_platform.is_cuda() else 0
+        )
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -699,7 +702,13 @@ class TritonAttentionImpl(AttentionImpl):
         native_attention = getattr(layer, "_consumer_int8_attention", None)
         if (
             native_attention is not None
-            and max_seqlen_q >= 64
+            and (
+                max_seqlen_q >= 64
+                or (
+                    max_seqlen_q <= 8
+                    and getattr(layer, "_consumer_int8_decode", None) is not None
+                )
+            )
             and attn_metadata.causal is True
             and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
             and query.dtype == torch.bfloat16
@@ -712,6 +721,34 @@ class TritonAttentionImpl(AttentionImpl):
             and self.chunk_lookback == -1
             and output_scale is None
         ):
+            native_decode = getattr(layer, "_consumer_int8_decode", None)
+            if max_seqlen_q <= 8 and native_decode is not None:
+                # The 16-row tile fits two CTAs per SM; the 32-row
+                # verification tile uses eight warps and fits one.
+                rows = 16 if max_seqlen_q <= 2 else 32
+                query_tiles = cdiv(max_seqlen_q * 6, rows)
+                jobs = seqused_k.numel() * self.num_kv_heads * query_tiles
+                target = self.consumer_int8_sms * (2 if rows == 16 else 1)
+                parts = max(
+                    4, min(128, 1 << max(0, (target // max(jobs, 1)).bit_length() - 1))
+                )
+                scratch = torch.empty(
+                    (num_actual_tokens, self.num_heads, parts, 258),
+                    device=query.device,
+                    dtype=torch.float32,
+                )
+                native_decode(
+                    query[:num_actual_tokens],
+                    kv_cache,
+                    block_table,
+                    cu_seqlens_q,
+                    seqused_k,
+                    output[:num_actual_tokens],
+                    max_seqlen_q,
+                    self.scale,
+                    scratch,
+                )
+                return output
             converted_fa2 = getattr(layer, "_consumer_int8_fa2", None)
             sequences = seqused_k.numel()
             capacity = cdiv(max_seqlen_k, 16) * 16

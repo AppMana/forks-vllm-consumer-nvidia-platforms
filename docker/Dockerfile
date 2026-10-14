@@ -61,7 +61,7 @@ ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 ARG APPMANA_NCCL_GIT_REF=22355b63ea9ffd869e208e4f6d381e6f31b471d9
 ARG BUILD_DEEPEP=1
 ARG CONSUMER_INT8_GIT_REPO=https://github.com/AppMana/consumer-int8-kernels.git
-ARG CONSUMER_INT8_GIT_REF=cbb32ee63e6b333d6d125ec01ea72c4079bee61b
+ARG CONSUMER_INT8_GIT_REF=4419606516741d91b9f1575899ded132d525b452
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
 # 0.2.70 is the first provider that serves BOTH host engines: libusb4_rdma for

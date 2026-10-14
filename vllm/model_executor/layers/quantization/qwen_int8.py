@@ -180,6 +180,7 @@ class QwenInt8Config(QuantizationConfig):
         linear_backend: str = "allspark",
         attention_backend: str = "triton",
         gdn_preparation_backend: str = "triton",
+        attention_decode_backend: str = "consumer_int8",
     ) -> None:
         super().__init__()
         if not quantized_modules or any(
@@ -190,7 +191,12 @@ class QwenInt8Config(QuantizationConfig):
         self.source_modules = dict(quantized_modules)
         self.quantized_modules = dict(quantized_modules)
         self.int8_weight_strategy = "channel"
-        for backend in (gdn_decode_backend, kv_cache_backend, gdn_preparation_backend):
+        for backend in (
+            gdn_decode_backend,
+            kv_cache_backend,
+            gdn_preparation_backend,
+            attention_decode_backend,
+        ):
             if backend not in ("triton", "consumer_int8"):
                 raise ValueError(f"Unsupported qwen_int8 backend: {backend}")
         if attention_backend not in ("triton", "consumer_int8", "consumer_fa2"):
@@ -198,6 +204,7 @@ class QwenInt8Config(QuantizationConfig):
         self.gdn_decode_backend = gdn_decode_backend
         self.kv_cache_backend = kv_cache_backend
         self.attention_backend = attention_backend
+        self.attention_decode_backend = attention_decode_backend
         self.gdn_preparation_backend = gdn_preparation_backend
         if linear_backend not in (
             "allspark",
@@ -240,6 +247,7 @@ class QwenInt8Config(QuantizationConfig):
             config.get("linear_backend", "allspark"),
             config.get("attention_backend", "triton"),
             config.get("gdn_preparation_backend", "triton"),
+            config.get("attention_decode_backend", "consumer_int8"),
         )
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
@@ -299,6 +307,7 @@ class QwenInt8KVCacheMethod(BaseKVCacheMethod):
         super().create_weights(layer)
         layer._consumer_int8_cache_write = None
         layer._consumer_int8_attention = None
+        layer._consumer_int8_decode = None
         layer._consumer_int8_fa2 = None
         if self.quant_config.attention_backend in ("consumer_int8", "consumer_fa2"):
             if not (
@@ -313,9 +322,11 @@ class QwenInt8KVCacheMethod(BaseKVCacheMethod):
                     "consumer_int8 attention requires SM86, Qwen D256/GQA6 "
                     "and INT8 per-head cache"
                 )
-            from consumer_int8.ops import paged_attention
+            from consumer_int8.ops import paged_attention, paged_decode
 
             layer._consumer_int8_attention = paged_attention
+            if self.quant_config.attention_decode_backend == "consumer_int8":
+                layer._consumer_int8_decode = paged_decode
             if self.quant_config.attention_backend == "consumer_fa2":
                 from consumer_int8.ops import fa2_prefill, unpack_kv_cache
 
