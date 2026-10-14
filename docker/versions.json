@@ -38,7 +38,7 @@
       "default": "https://github.com/AppMana/consumer-int8-kernels.git"
     },
     "CONSUMER_INT8_GIT_REF": {
-      "default": "568337a43cc7cdbb3d503761bcf28ac1a823310a"
+      "default": "cbb32ee63e6b333d6d125ec01ea72c4079bee61b"
     },
     "APPMANA_THUNDERBOLT_RELEASE_REPO": {
       "default": "https://github.com/AppMana/forks-thunderbolt"
