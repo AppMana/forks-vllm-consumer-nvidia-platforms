@@ -351,3 +351,103 @@ def test_qwen_hybrid_pp_only_allocates_required_target_embeddings(
     assert isinstance(model.embed_tokens, nn.Embedding) is expected
     loaded = model.load_weights([("embed_tokens.weight", torch.ones(VOCAB, HIDDEN))])
     assert ("embed_tokens.weight" in loaded) is expected
+
+
+@pytest.mark.parametrize(
+    "use_v2,pp_size,method,load_format,tied,share",
+    [
+        (True, 1, "mtp", "auto", False, True),
+        (True, 1, "mtp", "safetensors", True, True),
+        (True, 1, "mtp", "pt", False, True),
+        (False, 1, "mtp", "auto", False, False),
+        (True, 2, "mtp", "auto", False, False),
+        (True, 1, None, "auto", False, False),
+        (True, 1, "mtp", "sharded_state", False, False),
+        (True, 1, "mtp", "tensorizer", False, False),
+        (True, 1, "mtp", "dummy", False, False),
+    ],
+)
+def test_qwen_mtp_avoids_temporary_vocab_copies(
+    monkeypatch, use_v2, pp_size, method, load_format, tied, share
+):
+    """Skip 2.37 GiB of TP2 temporary weights, then bind the loaded target."""
+    from vllm.config import CompilationConfig, CompilationMode
+    from vllm.model_executor.models import qwen3_5_mtp as mtp
+
+    allocations = []
+
+    class Vocab(nn.Embedding):
+        def __init__(self, vocab, hidden, **kwargs):
+            super().__init__(vocab, hidden)
+            allocations.append(self)
+
+        def tie_weights(self, embedding):
+            self.weight = embedding.weight
+            return self
+
+    monkeypatch.setattr(mtp, "get_pp_group", _fake_pp(pp_size))
+    monkeypatch.setattr(eagle_utils, "get_pp_group", _fake_pp(pp_size))
+    monkeypatch.setattr(mtp, "VocabParallelEmbedding", Vocab)
+    monkeypatch.setattr(mtp, "ParallelLMHead", Vocab)
+    monkeypatch.setattr(
+        mtp, "ColumnParallelLinear", lambda i, o, **kw: nn.Linear(i, o, bias=False)
+    )
+    monkeypatch.setattr(mtp, "Qwen3_5RMSNorm", lambda *a, **kw: nn.Identity())
+    monkeypatch.setattr(
+        mtp,
+        "LogitsProcessor",
+        lambda *_: lambda head, hidden: torch.nn.functional.linear(hidden, head.weight),
+    )
+    monkeypatch.setattr(
+        mtp, "is_model_fused_shared_expert_compatible", lambda *a, **kw: False
+    )
+    config = SimpleNamespace(
+        use_v2_model_runner=use_v2,
+        compilation_config=CompilationConfig(mode=CompilationMode.NONE),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                vocab_size=VOCAB,
+                hidden_size=HIDDEN,
+                num_hidden_layers=0,
+                mtp_num_hidden_layers=0,
+                rms_norm_eps=1e-6,
+                tie_word_embeddings=tied,
+            )
+        ),
+        speculative_config=None if method is None else SimpleNamespace(method=method),
+        load_config=SimpleNamespace(load_format=load_format),
+        quant_config=None,
+    )
+    draft = mtp.Qwen3_5MTP(vllm_config=config)
+    assert len(allocations) == (0 if share else 2)
+    loaded = draft.load_weights(
+        [
+            ("model.language_model.embed_tokens.weight", torch.ones(VOCAB, HIDDEN)),
+            ("lm_head.weight", torch.ones(VOCAB, HIDDEN)),
+        ]
+    )
+    assert ("model.embed_tokens.weight" in loaded) is not share
+    assert ("lm_head.weight" in loaded) is not share
+    if not share:
+        torch.testing.assert_close(
+            draft.model.embed_tokens.weight, torch.ones(VOCAB, HIDDEN)
+        )
+        return
+
+    target = nn.Module()
+    target.model = _inner(_embed(fill=2.0))
+    target.lm_head = target.model.embed_tokens if tied else _embed(fill=3.0)
+    config.speculative_config.draft_model_config = config.model_config
+    config.speculative_config.apply_draft_overrides = lambda c: c
+    monkeypatch.setattr(eagle_utils, "get_draft_load_config", lambda c: c.load_config)
+    monkeypatch.setattr(eagle_utils, "get_pp_safe_draft_load_config", lambda c: c)
+    monkeypatch.setattr(eagle_utils, "get_model", lambda **kw: draft)
+    result = eagle_utils.load_eagle_model(target, config)
+    assert result.model.embed_tokens is target.model.embed_tokens
+    assert result.lm_head is target.lm_head
+    torch.testing.assert_close(
+        result.embed_input_ids(torch.tensor([0, 1])), torch.full((2, HIDDEN), 2.0)
+    )
+    torch.testing.assert_close(
+        target.lm_head.weight, torch.full((VOCAB, HIDDEN), 2.0 if tied else 3.0)
+    )

@@ -52,6 +52,19 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _shares_target_vocab(vllm_config: VllmConfig) -> bool:
+    # The V2 MTP loader replaces both layers with the target's after loading.
+    # Keep standalone, PP and direct-state loaders' allocation behavior.
+    spec = vllm_config.speculative_config
+    return (
+        vllm_config.use_v2_model_runner
+        and spec is not None
+        and spec.method == "mtp"
+        and get_pp_group().world_size == 1
+        and vllm_config.load_config.load_format in ("auto", "safetensors", "pt")
+    )
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -81,10 +94,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
+        if _shares_target_vocab(vllm_config):
+            self.embed_tokens = PPMissingLayer()
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
@@ -234,7 +250,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and not _shares_target_vocab(vllm_config):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
