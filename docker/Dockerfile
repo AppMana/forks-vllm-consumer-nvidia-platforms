@@ -59,7 +59,7 @@ ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 # 2.29.7 -- two minor versions behind what Ampere was running.
 ARG APPMANA_NCCL_GENCODE="-gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_121,code=compute_121"
 ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
-ARG APPMANA_NCCL_GIT_REF=a7a2dd07bfd82889257dedc94de105075bc1a33b
+ARG APPMANA_NCCL_GIT_REF=0dd53af6f900ff0d3b7b27a8d8baab8e71e8333f
 ARG BUILD_DEEPEP=1
 ARG CONSUMER_INT8_GIT_REPO=https://github.com/AppMana/consumer-int8-kernels.git
 ARG CONSUMER_INT8_GIT_REF=0d3b296acf4eb7b91fcec6302536e88d578f488d
@@ -1059,12 +1059,11 @@ RUN set -eux; \
     test "$(readlink -f libnccl.so.2)" = "/usr/lib/${TRIPLET}/libnccl.so.2.32.3"; \
     grep -q "^#define NCCL_VERSION_CODE 23203$" /usr/include/nccl.h
 
-# The provider deb only exists for amd64 Thunderbolt hosts.
+# Install nccl-usb4 (bundles routed NCCL 2.32.3 + tbrxe rdmav59/rdmav34 providers) on amd64 Thunderbolt hosts.
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt \
     if [ "${INSTALL_USB4_RDMA_PROVIDER}" = "true" ] && [ "${TARGETARCH}" = "amd64" ]; then \
         set -eux; \
-        . /etc/os-release; \
         rm -f /etc/apt/apt.conf.d/docker-clean; \
         apt-get update -y; \
         apt-get install -y --no-install-recommends --allow-change-held-packages \
@@ -1073,20 +1072,11 @@ RUN --mount=type=cache,target=/var/cache/apt \
             ibverbs-utils \
             libibverbs1 \
             rdma-core; \
-        # The tbrxe provider is built against the distro rdma-core PABI (rdmav34).
-        # Hold libibverbs1/ibverbs-providers/ibverbs-utils to the distro rdma-core
-        # version so a newer libibverbs PABI cannot silently skip loading libtbrxe.
-        RDMA_CORE_VERSION="$(dpkg-query -W -f='${Version}' rdma-core)"; \
-        apt-get install -y --no-install-recommends --allow-change-held-packages --allow-downgrades \
-            "libibverbs1=${RDMA_CORE_VERSION}" \
-            "ibverbs-providers=${RDMA_CORE_VERSION}" \
-            "ibverbs-utils=${RDMA_CORE_VERSION}"; \
-        test "$(dpkg-query -W -f='${Version}' libibverbs1)" = "${RDMA_CORE_VERSION}"; \
         python3 -m pip install --no-deps --extra-index-url https://nodes.appmana.com/simple \
             "nccl-usb4 @ https://github.com/AppMana/forks-nccl-rdma-routing/releases/download/v2.32.3/nccl_usb4-2.32.3-py3-none-manylinux_2_28_x86_64.whl"; \
         python3 -c "import nccl_usb4; info = nccl_usb4.activate(); assert info['tbrxe_loaded'] and info['provider_version'] == '${USB4_RDMA_PROVIDER_VERSION}', info"; \
-        ln -sf "$(python3 -c 'import nccl_usb4; print(nccl_usb4.get_nccl_lib_path())')" "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libnccl.so.2.32.3"; \
         ldconfig; \
+        test -e "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libibverbs/libtbrxe-rdmav59.so"; \
         test -e "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libibverbs/libtbrxe-rdmav34.so"; \
         test -e /etc/libibverbs.d/tbrxe.driver; \
         if ibv_devices 2>&1 | grep -q "couldn't load driver"; then ibv_devices; exit 1; fi; \

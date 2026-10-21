@@ -29,7 +29,7 @@
       "default": "https://github.com/AppMana/forks-nccl-rdma-routing.git"
     },
     "APPMANA_NCCL_GIT_REF": {
-      "default": "a7a2dd07bfd82889257dedc94de105075bc1a33b"
+      "default": "0dd53af6f900ff0d3b7b27a8d8baab8e71e8333f"
     },
     "BUILD_DEEPEP": {
       "default": "1"

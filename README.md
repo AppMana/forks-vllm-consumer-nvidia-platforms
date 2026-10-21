@@ -242,9 +242,6 @@ four C=8 repeats):
 | 8,000 | 8 | 0.5 | 15,178 | 99,286 | 40.6 | 312.1 | 8/8 |
 | 8,000 | 8 | 0.4 | 20,200 | 114,611 | 40.8 | 315.5 | 8/8 |
 
-The `appmana/deepseek-v4-int4-int8` tables above predate the 2026-09-18
-merge and are re-measured when that checkpoint next serves the chain.
-
 ## Build
 
 ```bash
@@ -266,7 +263,7 @@ release gate in `MERGING.md` gives the steps.
 `docker/Dockerfile` builds one image with:
 
 - native vLLM extensions for RTX 30xx and GB10;
-- `nccl-usb4==2.32.3` (`AppMana/forks-nccl-rdma-routing`, bundling rail-routed `libnccl.so.2` 2.32.3 and `libtbrxe-rdmav34.so` 0.2.73 for USB4/Thunderbolt RDMA on `amd64`);
+- the AppMana NCCL fork (`nccl-usb4`);
 - the external FlashMLA wheel;
 - SparkInfer, for the FP8/NVFP4 checkpoint's GB10 attention and MoE kernels
   and the selectable SparkInfer mHC;
@@ -314,7 +311,7 @@ partition above and `--limit-mm-per-prompt '{"image":8}'`.
 - [`AppMana/forks-sparkinfer`](https://github.com/AppMana/forks-sparkinfer):
   GB10 FP8/NVFP4 attention and MoE kernels and mHC.
 - [`AppMana/forks-nccl-rdma-routing`](https://github.com/AppMana/forks-nccl-rdma-routing):
-  `nccl-usb4` Python package bundling rail-routed `libnccl.so.2` (`2.32.3`) and the `libtbrxe-rdmav34.so` userspace `libibverbs` provider (`0.2.73`).
+  NCCL rail and fallback routing.
 - [`AppMana/forks-lmcache`](https://github.com/AppMana/forks-lmcache):
   the KV connector with pipeline-local layouts and image-aware cache keys.
 

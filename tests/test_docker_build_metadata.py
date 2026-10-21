@@ -235,13 +235,14 @@ def test_ampere_helper_uses_current_provider_release() -> None:
     assert dockerfile_arg_defaults("USB4_RDMA_PROVIDER_VERSION") == ["0.2.73"]
     assert dockerfile_arg_defaults("APPMANA_THUNDERBOLT_RELEASE_TAG") == ["v3.32"]
     assert dockerfile_arg_defaults("APPMANA_NCCL_GIT_REF") == [
-        "a7a2dd07bfd82889257dedc94de105075bc1a33b"
+        "0dd53af6f900ff0d3b7b27a8d8baab8e71e8333f"
     ]
     assert "build-arg:USB4_RDMA_PROVIDER_VERSION" not in helper
     assert "build-arg:APPMANA_THUNDERBOLT_RELEASE_TAG" not in helper
 
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    assert '"libibverbs1=${RDMA_CORE_VERSION}"' in dockerfile
+    assert '"libibverbs1=${RDMA_CORE_VERSION}"' not in dockerfile
+    assert "nccl_usb4.activate()" in dockerfile
     assert "libtbrxe-rdmav34.so" in dockerfile
     assert "libusb4_rdma-rdmav34.so" not in dockerfile
     assert 'grep -q "couldn\'t load driver"' in dockerfile
