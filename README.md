@@ -266,7 +266,7 @@ release gate in `MERGING.md` gives the steps.
 `docker/Dockerfile` builds one image with:
 
 - native vLLM extensions for RTX 30xx and GB10;
-- the AppMana NCCL fork;
+- `nccl-usb4==2.32.3` (`AppMana/forks-nccl-rdma-routing`, bundling rail-routed `libnccl.so.2` 2.32.3 and `libtbrxe-rdmav34.so` 0.2.73 for USB4/Thunderbolt RDMA on `amd64`);
 - the external FlashMLA wheel;
 - SparkInfer, for the FP8/NVFP4 checkpoint's GB10 attention and MoE kernels
   and the selectable SparkInfer mHC;
@@ -314,7 +314,7 @@ partition above and `--limit-mm-per-prompt '{"image":8}'`.
 - [`AppMana/forks-sparkinfer`](https://github.com/AppMana/forks-sparkinfer):
   GB10 FP8/NVFP4 attention and MoE kernels and mHC.
 - [`AppMana/forks-nccl-rdma-routing`](https://github.com/AppMana/forks-nccl-rdma-routing):
-  NCCL rail and fallback routing.
+  `nccl-usb4` Python package bundling rail-routed `libnccl.so.2` (`2.32.3`) and the `libtbrxe-rdmav34.so` userspace `libibverbs` provider (`0.2.73`).
 - [`AppMana/forks-lmcache`](https://github.com/AppMana/forks-lmcache):
   the KV connector with pipeline-local layouts and image-aware cache keys.
 

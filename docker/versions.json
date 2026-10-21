@@ -29,7 +29,7 @@
       "default": "https://github.com/AppMana/forks-nccl-rdma-routing.git"
     },
     "APPMANA_NCCL_GIT_REF": {
-      "default": "22355b63ea9ffd869e208e4f6d381e6f31b471d9"
+      "default": "a7a2dd07bfd82889257dedc94de105075bc1a33b"
     },
     "BUILD_DEEPEP": {
       "default": "1"
@@ -47,10 +47,10 @@
       "default": "true"
     },
     "USB4_RDMA_PROVIDER_VERSION": {
-      "default": "0.2.72"
+      "default": "0.2.73"
     },
     "APPMANA_THUNDERBOLT_RELEASE_TAG": {
-      "default": "v2.43"
+      "default": "v3.32"
     },
     "BUILD_OS": {
       "default": "ubuntu"

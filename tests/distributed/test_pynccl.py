@@ -511,3 +511,55 @@ def test_pynccl_suspend_noop_without_symbol():
     comm.nccl.ncclCommSuspend.assert_not_called()
     comm.nccl.ncclCommResume.assert_not_called()
     assert comm._suspended is False
+
+
+def test_find_nccl_library_prefers_nvidia_nccl_package(monkeypatch, tmp_path):
+    """When VLLM_NCCL_SO_PATH is unset, find_nccl_library() prefers libnccl.so.2
+    inside find_nccl_library_paths() (nvidia.nccl) so PyNcclCommunicator and
+    torch.distributed load the exact same library."""
+    from vllm.utils import nccl as nccl_utils
+
+    monkeypatch.setattr(envs, "VLLM_NCCL_SO_PATH", None)
+    monkeypatch.setattr(torch.version, "cuda", "13.0")
+    pkg_lib = tmp_path / "nvidia" / "nccl" / "lib"
+    pkg_lib.mkdir(parents=True)
+    so_path = pkg_lib / "libnccl.so.2"
+    so_path.write_bytes(b"")
+
+    monkeypatch.setattr(nccl_utils, "find_nccl_library_paths", lambda: [str(pkg_lib)])
+    assert nccl_utils.find_nccl_library() == str(so_path)
+
+    # Falls back to bare libnccl.so.2 when no package path has libnccl.so.2
+    monkeypatch.setattr(nccl_utils, "find_nccl_library_paths", lambda: None)
+    assert nccl_utils.find_nccl_library() == "libnccl.so.2"
+
+
+@pytest.mark.parametrize("disabled", ["", "1", "true", "TRUE", "yes"])
+def test_find_nccl_library_paths_respects_usb4_disable(monkeypatch, tmp_path, disabled):
+    from types import SimpleNamespace
+
+    from vllm.utils import nccl as nccl_utils
+
+    usb4 = tmp_path / "nccl_usb4"
+    stock = tmp_path / "nvidia" / "nccl"
+    (usb4 / "nccl" / "lib").mkdir(parents=True)
+    (stock / "lib").mkdir(parents=True)
+    packages = {"nccl_usb4": usb4, "nvidia.nccl": stock}
+    monkeypatch.setenv("NCCL_USB4_DISABLE", disabled)
+    monkeypatch.setattr(
+        nccl_utils.importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(submodule_search_locations=[str(packages[name])]),
+    )
+    expected = [str(stock / "lib")]
+    if not disabled:
+        expected.insert(0, str(usb4 / "nccl" / "lib"))
+    assert nccl_utils.find_nccl_library_paths() == expected
+
+
+def test_find_nccl_library_preserves_explicit_override(monkeypatch):
+    from vllm.utils import nccl as nccl_utils
+
+    monkeypatch.setattr(envs, "VLLM_NCCL_SO_PATH", "/explicit/libnccl.so.2")
+    monkeypatch.setattr(nccl_utils, "find_nccl_library_paths", lambda: ["/package/lib"])
+    assert nccl_utils.find_nccl_library() == "/explicit/libnccl.so.2"

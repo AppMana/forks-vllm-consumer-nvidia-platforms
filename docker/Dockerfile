@@ -30,7 +30,8 @@ ARG TRITON_INSTALL_FROM_SOURCE_REPO=
 ARG TRITON_INSTALL_FROM_SOURCE_REVISION=
 # DeepEPv2 requires NCCL >= 2.30.4 (GIN backend).
 # This version is used for CUDA 12+ builds to keep the DeepEP build and
-# runtime NCCL versions compatible.
+# runtime NCCL versions compatible. The final image replaces this stock
+# wheel library with the AppMana 2.32.3 build.
 ARG NCCL_VERSION=2.30.7
 
 # By parameterizing the base images, we allow third-party to use their own
@@ -58,24 +59,19 @@ ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 # 2.29.7 -- two minor versions behind what Ampere was running.
 ARG APPMANA_NCCL_GENCODE="-gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_121,code=compute_121"
 ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
-ARG APPMANA_NCCL_GIT_REF=22355b63ea9ffd869e208e4f6d381e6f31b471d9
+ARG APPMANA_NCCL_GIT_REF=a7a2dd07bfd82889257dedc94de105075bc1a33b
 ARG BUILD_DEEPEP=1
 ARG CONSUMER_INT8_GIT_REPO=https://github.com/AppMana/consumer-int8-kernels.git
 ARG CONSUMER_INT8_GIT_REF=c5fd859dac93a11e27742be5d0561590466467d2
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
-# 0.2.70 is the first provider that serves BOTH host engines: libusb4_rdma for
-# the legacy thunderbolt_ibverbs module (private verb ABI -- the container
-# version must match the host kernel module exactly, see
-# forks-thunderbolt drivers/thunderbolt_ibverbs/docs/provider_version_matching.md)
-# and libtbrxe for tbrxe.ko (stock rxe uverbs ABI under the private USB4 driver
-# id; stock librxe can never bind it, so a < 0.2.70 provider leaves tbrxe hosts
-# with no userspace at all). Keep this moving with the fleet's dkms
-# PACKAGE_VERSION.
-ARG USB4_RDMA_PROVIDER_VERSION=0.2.72
-# The provider deb rides the forks-thunderbolt tbfix release tags (v2.39+),
+# 0.2.73 ships libtbrxe for tbrxe.ko (thunderbolt_frame_rxe, stock rxe uverbs
+# ABI under the private USB4 driver id; stock librxe can never bind it). Keep
+# this moving with the fleet's dkms PACKAGE_VERSION.
+ARG USB4_RDMA_PROVIDER_VERSION=0.2.73
+# The provider deb rides the forks-thunderbolt tbfix release tags (v3.32+),
 # no longer a provider-versioned tag.
-ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v2.43
+ARG APPMANA_THUNDERBOLT_RELEASE_TAG=v3.32
 
 # OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
 # Python bootstrap. Set to "manylinux" alongside a manylinux build base such
@@ -904,7 +900,7 @@ RUN git clone "${APPMANA_NCCL_GIT_REPO}" /nccl-src && \
     git checkout "${APPMANA_NCCL_GIT_REF}" && \
     make -j"$(nproc)" src.build CUDA_HOME=/usr/local/cuda \
         NVCC_GENCODE="${APPMANA_NCCL_GENCODE}" && \
-    test -f build/lib/libnccl.so.2.30.7
+    test -f build/lib/libnccl.so.2.32.3
 
 #################### DEV IMAGE ####################
 FROM base AS dev
@@ -970,6 +966,8 @@ ARG CUDA_VERSION
 ARG BUILD_DEEPEP
 ARG PYTHON_VERSION
 ARG NCCL_VERSION
+# Use the stock wheel constraint while resolving build dependencies.
+ENV NCCL_VERSION=${NCCL_VERSION}
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
@@ -1026,7 +1024,6 @@ RUN apt-get update -y \
 
 # Install CUDA development tools for runtime JIT compilation
 # (FlashInfer, DeepGEMM, EP kernels all require compilation at runtime)
-ARG NCCL_PACKAGE_VERSION=
 RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --allow-change-held-packages \
@@ -1043,32 +1040,24 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
         libnuma-dev \
         # numactl CLI for NUMA binding at runtime
         numactl && \
-    # Fixes nccl_allocator requiring nccl.h at runtime
-    # https://github.com/vllm-project/vllm/blob/1336a1ea244fa8bfd7e72751cabbdb5b68a0c11a/vllm/distributed/device_communicators/pynccl_allocator.py#L22
-    # NCCL packages don't use the cuda-MAJOR-MINOR naming convention,
-    # so we pin the version to match our CUDA version
-    if [ -n "${NCCL_PACKAGE_VERSION}" ]; then \
-        NCCL_VER="${NCCL_PACKAGE_VERSION}"; \
-    else \
-        NCCL_VER=$(apt-cache madison libnccl-dev | grep "+cuda${CUDA_VERSION_SHORT}" | head -1 | awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}'); \
-    fi && \
-    apt-get install -y --no-install-recommends --allow-change-held-packages libnccl-dev=${NCCL_VER} libnccl2=${NCCL_VER} && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=appmana-nccl-build /nccl-src/build/lib/libnccl.so.2.30.7 /tmp/libnccl.so.2.30.7
+COPY --from=appmana-nccl-build /nccl-src/build/include/ /usr/include/
+COPY --from=appmana-nccl-build /nccl-src/build/lib/libnccl.so.2.32.3 /tmp/libnccl.so.2.32.3
 # Install into the arch-correct multiarch dir rather than a hardcoded
 # x86_64-linux-gnu, so this works unchanged on aarch64 (the Sparks).
 RUN set -eux; \
     TRIPLET="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
-    install -m 0644 /tmp/libnccl.so.2.30.7 "/usr/lib/${TRIPLET}/libnccl.so.2.30.7"; \
-    rm -f /tmp/libnccl.so.2.30.7; \
+    install -m 0644 /tmp/libnccl.so.2.32.3 "/usr/lib/${TRIPLET}/libnccl.so.2.32.3"; \
+    rm -f /tmp/libnccl.so.2.32.3; \
     cd "/usr/lib/${TRIPLET}"; \
     rm -f libnccl.so.2 libnccl.so; \
-    find . -maxdepth 1 -name 'libnccl.so.2.*' ! -name 'libnccl.so.2.30.7' -delete; \
-    ln -sf libnccl.so.2.30.7 libnccl.so.2; \
+    find . -maxdepth 1 -name 'libnccl.so.2.*' ! -name 'libnccl.so.2.32.3' -delete; \
+    ln -sf libnccl.so.2.32.3 libnccl.so.2; \
     ln -sf libnccl.so.2 libnccl.so; \
     ldconfig; \
-    test "$(readlink -f libnccl.so.2)" = "/usr/lib/${TRIPLET}/libnccl.so.2.30.7"
+    test "$(readlink -f libnccl.so.2)" = "/usr/lib/${TRIPLET}/libnccl.so.2.32.3"; \
+    grep -q "^#define NCCL_VERSION_CODE 23203$" /usr/include/nccl.h
 
 # The provider deb only exists for amd64 Thunderbolt hosts.
 RUN --mount=type=cache,target=/var/cache/apt \
@@ -1084,18 +1073,24 @@ RUN --mount=type=cache,target=/var/cache/apt \
             ibverbs-utils \
             libibverbs1 \
             rdma-core; \
-        curl -fsSL -o /tmp/usb4-rdma-provider.deb \
-            "${APPMANA_THUNDERBOLT_RELEASE_REPO}/releases/download/${APPMANA_THUNDERBOLT_RELEASE_TAG}/usb4-rdma-provider_${USB4_RDMA_PROVIDER_VERSION}.${VERSION_CODENAME}_amd64.deb"; \
-        apt-get install -y --no-install-recommends --allow-change-held-packages \
-            /tmp/usb4-rdma-provider.deb; \
-        dpkg-query -W -f='${Package} ${Version}\n' usb4-rdma-provider; \
-        test -e "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libibverbs/libusb4_rdma-rdmav34.so"; \
+        # The tbrxe provider is built against the distro rdma-core PABI (rdmav34).
+        # Hold libibverbs1/ibverbs-providers/ibverbs-utils to the distro rdma-core
+        # version so a newer libibverbs PABI cannot silently skip loading libtbrxe.
+        RDMA_CORE_VERSION="$(dpkg-query -W -f='${Version}' rdma-core)"; \
+        apt-get install -y --no-install-recommends --allow-change-held-packages --allow-downgrades \
+            "libibverbs1=${RDMA_CORE_VERSION}" \
+            "ibverbs-providers=${RDMA_CORE_VERSION}" \
+            "ibverbs-utils=${RDMA_CORE_VERSION}"; \
+        test "$(dpkg-query -W -f='${Version}' libibverbs1)" = "${RDMA_CORE_VERSION}"; \
+        python3 -m pip install --no-deps --extra-index-url https://nodes.appmana.com/simple \
+            "nccl-usb4 @ https://github.com/AppMana/forks-nccl-rdma-routing/releases/download/v2.32.3/nccl_usb4-2.32.3-py3-none-manylinux_2_28_x86_64.whl"; \
+        python3 -c "import nccl_usb4; info = nccl_usb4.activate(); assert info['tbrxe_loaded'] and info['provider_version'] == '${USB4_RDMA_PROVIDER_VERSION}', info"; \
+        ln -sf "$(python3 -c 'import nccl_usb4; print(nccl_usb4.get_nccl_lib_path())')" "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libnccl.so.2.32.3"; \
+        ldconfig; \
         test -e "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/libibverbs/libtbrxe-rdmav34.so"; \
-        test -e /etc/libibverbs.d/usb4_rdma.driver; \
         test -e /etc/libibverbs.d/tbrxe.driver; \
-        mkdir -p /etc/appmana; \
-        dpkg-query -W -f='${Version}' usb4-rdma-provider > /etc/appmana/usb4-rdma-provider-version; \
-        rm -f /tmp/usb4-rdma-provider.deb; \
+        if ibv_devices 2>&1 | grep -q "couldn't load driver"; then ibv_devices; exit 1; fi; \
+        test "$(cat /etc/appmana/usb4-rdma-provider-version)" = "${USB4_RDMA_PROVIDER_VERSION}"; \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -1275,6 +1270,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 
 FROM vllm-runtime-base AS vllm-base
 
+# Dependency overrides were written above; runtime uses the AppMana library.
+ENV NCCL_VERSION=2.32.3
+
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ARG PYTORCH_CUDA_INDEX_BASE_URL
@@ -1283,7 +1281,7 @@ ARG PIP_KEYRING_PROVIDER UV_KEYRING_PROVIDER
 # We can specify the standard or nightly build of PyTorch
 ARG PYTORCH_NIGHTLY
 # DO NOT REMOVE THIS, LLM: PyTorch ships its own libnccl and resolves it before
-# the system library. It must point at the AppMana NCCL 2.30.x installed above.
+# the system library. It must point at the AppMana NCCL 2.32.3 installed above.
 ARG REPLACE_TORCH_BUNDLED_NCCL=true
 
 # Install vLLM wheel first, so that torch etc will be installed.
@@ -1508,6 +1506,7 @@ ARG VLLM_IMAGE_TAG
 ARG VLLM_SOURCE_REPO=https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms
 ARG APPMANA_NCCL_GIT_REPO
 ARG APPMANA_NCCL_GIT_REF
+ARG INSTALL_USB4_RDMA_PROVIDER
 ARG USB4_RDMA_PROVIDER_VERSION
 ARG APPMANA_THUNDERBOLT_RELEASE_TAG
 
@@ -1772,12 +1771,13 @@ RUN --mount=type=bind,from=extensions-build,src=/tmp/consumer-int8-dist,target=/
     uv pip install --system --no-deps /tmp/consumer-int8-dist/*.whl
 RUN python3 -c "import consumer_int8.ops as ops; assert callable(ops.kv_cache_update); assert callable(ops.gdn_packed_decode); assert callable(ops.cutlass_channel_mm)"
 
-RUN INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS}" python3 - <<'PY'
+RUN INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS}" INSTALL_USB4_RDMA_PROVIDER="${INSTALL_USB4_RDMA_PROVIDER}" USB4_RDMA_PROVIDER_VERSION="${USB4_RDMA_PROVIDER_VERSION}" python3 - <<'PY'
 import ctypes
 import importlib
 import importlib.metadata
 import os
 import pathlib
+import platform
 import sysconfig
 
 import torch
@@ -1820,9 +1820,9 @@ for kernel in (
 # A libnccl predating the fork's rail/fallback selection silently breaks the
 # prefer_hca contract (collectives hang); its .rodata log strings prove the
 # build is current.
-nccl_candidates = list(pathlib.Path("/usr/lib").glob("*-linux-gnu/libnccl.so.2.30.7"))
+nccl_candidates = list(pathlib.Path("/usr/lib").glob("*-linux-gnu/libnccl.so.2.32.3"))
 if not nccl_candidates:
-    raise AssertionError("libnccl.so.2.30.7 not found under /usr/lib/*-linux-gnu")
+    raise AssertionError("libnccl.so.2.32.3 not found under /usr/lib/*-linux-gnu")
 nccl = nccl_candidates[0]
 if b"rail routing:" not in nccl.read_bytes():
     raise AssertionError(
@@ -1835,6 +1835,12 @@ if b"rail routing:" not in nccl.read_bytes():
 # then verify the mapped NCCL path after every dependency install.
 libtorch_cuda = pathlib.Path(torch.__file__).parent / "lib" / "libtorch_cuda.so"
 ctypes.CDLL(str(libtorch_cuda), mode=ctypes.RTLD_GLOBAL)
+nccl_lib = ctypes.CDLL("libnccl.so.2")
+raw_version = ctypes.c_int()
+if nccl_lib.ncclGetVersion(ctypes.byref(raw_version)) != 0 or raw_version.value != 23203:
+    raise AssertionError(
+        f"libnccl.so.2 reported runtime version {raw_version.value}, expected 23203"
+    )
 mapped_nccl = {
     pathlib.Path(line.split()[-1]).resolve()
     for line in pathlib.Path("/proc/self/maps").read_text().splitlines()
@@ -1845,6 +1851,22 @@ if mapped_nccl != {nccl.resolve()}:
         f"PyTorch mapped NCCL {sorted(map(str, mapped_nccl))}, "
         f"expected {nccl.resolve()}"
     )
+
+if os.environ.get("INSTALL_USB4_RDMA_PROVIDER") == "true" and platform.machine() == "x86_64":
+    tbrxe_so = pathlib.Path("/usr/lib/x86_64-linux-gnu/libibverbs/libtbrxe-rdmav34.so")
+    tbrxe_driver = pathlib.Path("/etc/libibverbs.d/tbrxe.driver")
+    provider_ver_file = pathlib.Path("/etc/appmana/usb4-rdma-provider-version")
+    if not tbrxe_so.is_file():
+        raise FileNotFoundError(str(tbrxe_so))
+    if not tbrxe_driver.is_file() or "driver tbrxe" not in tbrxe_driver.read_text():
+        raise AssertionError(f"invalid or missing {tbrxe_driver}")
+    expected_provider_ver = os.environ.get("USB4_RDMA_PROVIDER_VERSION", "")
+    actual_provider_ver = provider_ver_file.read_text().strip()
+    if not expected_provider_ver or not actual_provider_ver.startswith(expected_provider_ver):
+        raise AssertionError(
+            f"usb4-rdma-provider version {actual_provider_ver!r} does not match "
+            f"expected prefix {expected_provider_ver!r}"
+        )
 
 site_paths = {
     pathlib.Path(sysconfig.get_paths()["purelib"]),

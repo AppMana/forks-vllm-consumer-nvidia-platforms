@@ -232,10 +232,19 @@ def test_flash_attention_arch_patch_applies_to_pinned_source(tmp_path: Path) -> 
 def test_ampere_helper_uses_current_provider_release() -> None:
     """The build helper must not override the image's provider pins."""
     helper = CONSUMER_BUILD_HELPER.read_text(encoding="utf-8")
-    assert dockerfile_arg_defaults("USB4_RDMA_PROVIDER_VERSION")[0]
-    assert dockerfile_arg_defaults("APPMANA_THUNDERBOLT_RELEASE_TAG")[0]
+    assert dockerfile_arg_defaults("USB4_RDMA_PROVIDER_VERSION") == ["0.2.73"]
+    assert dockerfile_arg_defaults("APPMANA_THUNDERBOLT_RELEASE_TAG") == ["v3.32"]
+    assert dockerfile_arg_defaults("APPMANA_NCCL_GIT_REF") == [
+        "a7a2dd07bfd82889257dedc94de105075bc1a33b"
+    ]
     assert "build-arg:USB4_RDMA_PROVIDER_VERSION" not in helper
     assert "build-arg:APPMANA_THUNDERBOLT_RELEASE_TAG" not in helper
+
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert '"libibverbs1=${RDMA_CORE_VERSION}"' in dockerfile
+    assert "libtbrxe-rdmav34.so" in dockerfile
+    assert "libusb4_rdma-rdmav34.so" not in dockerfile
+    assert 'grep -q "couldn\'t load driver"' in dockerfile
 
 
 def test_sccache_has_a_persistent_buildkit_local_cache() -> None:
@@ -541,3 +550,16 @@ def test_final_image_validates_the_nccl_elf_mapped_by_pytorch() -> None:
     assert "torch.cuda.nccl.version" not in validation, (
         "the compiled NCCL version does not identify the ELF mapped at runtime"
     )
+    assert "ncclGetVersion" in validation and "23203" in validation, (
+        "NCCL validation must verify the runtime libnccl.so.2 version code (23203)"
+    )
+    assert "libtbrxe-rdmav34.so" in validation, (
+        "final image validation must verify the installed tbrxe verbs provider"
+    )
+    assert "ENV NCCL_VERSION=2.32.3" in dockerfile, (
+        "vllm-base must report the routed library version in NCCL_VERSION"
+    )
+    assert (
+        "COPY --from=appmana-nccl-build /nccl-src/build/include/ /usr/include/"
+        in dockerfile
+    ), "vllm-runtime-base must install headers matching the built NCCL 2.32.3 library"

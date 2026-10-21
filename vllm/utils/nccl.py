@@ -18,9 +18,12 @@ logger = init_logger(__name__)
 
 
 def find_nccl_library() -> str:
-    """Return NCCL/RCCL shared library name to load.
+    """Return NCCL/RCCL shared library name or path to load.
 
-    Uses `VLLM_NCCL_SO_PATH` if set; otherwise chooses by torch backend.
+    Uses `VLLM_NCCL_SO_PATH` if set; otherwise prefers `libnccl.so.2` inside
+    the enabled `nccl_usb4` or `nvidia.nccl` package, falling back to bare
+    `libnccl.so.2` / `librccl.so.1`. Package discovery alone cannot guarantee
+    which library PyTorch has already loaded.
     """
     so_file = envs.VLLM_NCCL_SO_PATH
     if so_file:
@@ -30,6 +33,11 @@ def find_nccl_library() -> str:
     else:
         if torch.version.cuda is not None:
             so_file = "libnccl.so.2"
+            for lib_dir in find_nccl_library_paths() or ():
+                candidate = os.path.join(lib_dir, "libnccl.so.2")
+                if os.path.exists(candidate):
+                    so_file = candidate
+                    break
         elif torch.version.hip is not None:
             so_file = "librccl.so.1"
         else:
@@ -70,9 +78,25 @@ def find_nccl_include_paths() -> list[str] | None:
 def find_nccl_library_paths() -> list[str] | None:
     """Return possible library paths containing `libnccl.so`.
 
-    Looks inside the `nvidia-nccl-cuXX` pip package.
+    Prefers `nccl_usb4` (`nccl-usb4` package) when installed, then falls back
+    to the `nvidia-nccl-cuXX` pip package.
     """
     paths: list[str] = []
+    try:
+        spec = (
+            None
+            if os.environ.get("NCCL_USB4_DISABLE", "").strip()
+            in ("1", "true", "TRUE", "yes")
+            else importlib.util.find_spec("nccl_usb4")
+        )
+        if spec and (locs := getattr(spec, "submodule_search_locations", None)):
+            for loc in locs:
+                lib_dir = os.path.join(loc, "nccl", "lib")
+                if os.path.isdir(lib_dir):
+                    paths.append(lib_dir)
+    except Exception as e:
+        logger.debug("Failed to find nccl library path from nccl_usb4 package: %s", e)
+
     try:
         spec = importlib.util.find_spec("nvidia.nccl")
         if spec and (locs := getattr(spec, "submodule_search_locations", None)):
