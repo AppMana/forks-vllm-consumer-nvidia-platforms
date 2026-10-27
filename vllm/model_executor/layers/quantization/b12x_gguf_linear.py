@@ -22,12 +22,20 @@ class GGUFLinearSlice:
 
 class B12xGGUFLinearMethod(LinearMethodBase):
     def __init__(
-        self, slices=(), *, max_tokens, sources=(), partition=None, pad_to_block=False
+        self,
+        slices=(),
+        *,
+        max_tokens,
+        sources=(),
+        partition=None,
+        pad_to_block=False,
+        retain_output_buffers=True,
     ):
         self.slices = tuple(slices)
         self.sources = tuple(sources)
         self.partition = partition
         self.pad_to_block = pad_to_block
+        self.retain_output_buffers = retain_output_buffers
         if bool(self.slices) == bool(self.sources):
             raise ValueError("Supply either explicit GGUF slices or source matrices")
         if self.sources and partition not in ("column", "row", "replicated"):
@@ -212,11 +220,34 @@ class B12xGGUFLinearMethod(LinearMethodBase):
                 device=device,
             )
         )
+        if not self.retain_output_buffers:
+            # Prepared kernels own packed weights and launch metadata, not the
+            # output addresses. Let eager tensors follow their consumers' lifetimes;
+            # CUDA capture retains its own static allocations in the graph pool.
+            self._outputs.clear()
+            self._output = None
+
+    def _execution_outputs(self, m, device):
+        if self.retain_output_buffers:
+            assert self._output is not None
+            return [out[:m] for out in self._outputs], self._output[:m]
+        outputs = [
+            torch.empty(m, s.rows, dtype=torch.bfloat16, device=device)
+            for s in self.slices
+        ]
+        result = (
+            outputs[0]
+            if len(outputs) == 1
+            else torch.empty(
+                m, sum(s.rows for s in self.slices), dtype=torch.bfloat16, device=device
+            )
+        )
+        return outputs, result
 
     def apply(self, layer, x, bias=None):
-        if not self._states or self._output is None:
+        if not self._states:
             raise RuntimeError("Native GGUF linear must be prepared before execution")
-        if x.dtype != torch.bfloat16 or x.device != self._output.device:
+        if x.dtype != torch.bfloat16 or x.device != layer._b12x_gguf_device.device:
             raise ValueError("Native GGUF linear activation dtype/device mismatch")
         if x.ndim < 2 or x.shape[-1] != self.slices[0].columns or not x.is_contiguous():
             raise ValueError(
@@ -226,12 +257,9 @@ class B12xGGUFLinearMethod(LinearMethodBase):
         m = flat.shape[0]
         if m > self.max_tokens:
             raise ValueError("Native GGUF linear exceeds prepared capacity")
-        outputs = []
-        for state, weight, output in zip(self._states, self.weights, self._outputs):
-            target = output[:m]
+        outputs, result = self._execution_outputs(m, x.device)
+        for state, weight, target in zip(self._states, self.weights, outputs):
             state.run(flat, weight.values, weight.metadata, None, out=target)
-            outputs.append(target)
-        result = self._output[:m]
         if len(outputs) > 1:
             torch.cat(outputs, dim=-1, out=result)
         if bias is not None:
@@ -242,9 +270,8 @@ class B12xGGUFLinearMethod(LinearMethodBase):
 class B12xGGUFGroupedLinearMethod(B12xGGUFLinearMethod):
     """Compact WO-A baseline using one prepared tensor-core GEMM per group.
 
-    Group gathers and output concatenation use fixed buffers. This candidate
-    preserves exact checkpoint numerics; a fused grouped kernel must be raced
-    against it before selecting a serving performance policy.
+    Group gathers and concatenation can retain capacity buffers or allocate
+    live-row tensors. Both modes preserve the same prepared kernels and math.
     """
 
     def process_weights_after_loading(self, layer):
@@ -268,43 +295,56 @@ class B12xGGUFGroupedLinearMethod(B12xGGUFLinearMethod):
             for group in range(groups)
         )
         self._prepare_slices(layer)
-        self._group_inputs = torch.empty(
-            groups,
-            self.max_tokens,
-            source.columns,
-            dtype=torch.bfloat16,
-            device=layer._b12x_gguf_device.device,
+        self._group_inputs = (
+            torch.empty(
+                groups,
+                self.max_tokens,
+                source.columns,
+                dtype=torch.bfloat16,
+                device=layer._b12x_gguf_device.device,
+            )
+            if self.retain_output_buffers
+            else None
         )
 
     def apply(self, layer, x, bias=None):
         raise RuntimeError("Grouped GGUF WO-A must use apply_grouped")
 
     def apply_grouped(self, layer, x):
-        if not self._states or self._output is None or x.ndim != 3:
+        if not self._states or x.ndim != 3:
             raise ValueError("Native grouped GGUF input requires prepared [M,G,K]")
         if (
             x.dtype != torch.bfloat16
-            or x.device != self._output.device
+            or x.device != layer._b12x_gguf_device.device
             or x.shape[1:] != (len(self.slices), self.slices[0].columns)
         ):
             raise ValueError("Native grouped GGUF activation geometry/dtype mismatch")
         m = x.shape[0]
         if m > self.max_tokens:
             raise ValueError("Native grouped GGUF exceeds prepared capacity")
-        outputs = []
-        for group, (state, weight, output) in enumerate(
+        outputs, result = self._execution_outputs(m, x.device)
+        group_inputs = (
+            self._group_inputs
+            if self.retain_output_buffers
+            else torch.empty(
+                len(self.slices),
+                m,
+                self.slices[0].columns,
+                dtype=torch.bfloat16,
+                device=x.device,
+            )
+        )
+        assert group_inputs is not None
+        for group, (state, weight, target) in enumerate(
             zip(
                 self._states,
                 self.weights,
-                self._outputs,
+                outputs,
             )
         ):
-            source = self._group_inputs[group, :m]
+            source = group_inputs[group, :m]
             source.copy_(x[:, group])
-            target = output[:m]
             state.run(source, weight.values, weight.metadata, None, out=target)
-            outputs.append(target)
-        result = self._output[:m]
         if len(outputs) > 1:
             torch.cat(outputs, dim=-1, out=result)
         return result

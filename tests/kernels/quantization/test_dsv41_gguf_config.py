@@ -42,6 +42,14 @@ def test_real_header_selects_mixed_iq_pair(tmp_path):
     assert config.expert_backend == "b12x"
     assert config.q8_backend == "b12x"
     assert config.q6_backend == "b12x"
+    assert not config.b12x_ephemeral_outputs
+    assert Dsv41GGUFConfig.from_config(
+        {"gguf_files": [str(path)], "b12x_ephemeral_outputs": True}
+    ).b12x_ephemeral_outputs
+    with pytest.raises(ValueError, match="boolean"):
+        Dsv41GGUFConfig.from_config(
+            {"gguf_files": [str(path)], "b12x_ephemeral_outputs": "true"}
+        )
     native = Dsv41GGUFConfig.from_config(
         {
             "gguf_files": [str(path)],
@@ -188,7 +196,9 @@ def test_real_shared_mlp_native_tp_padding(tmp_path, monkeypatch, default_vllm_c
 @pytest.mark.parametrize(
     "groups,heads,head_dim,rank", [(2, 2, 128, 128), (4, 8, 512, 1024)]
 )
-@pytest.mark.parametrize("backend", ["b12x", "consumer_cuda", "consumer_q6"])
+@pytest.mark.parametrize(
+    "backend", ["b12x", "b12x_ephemeral", "consumer_cuda", "consumer_q6"]
+)
 def test_native_grouped_wo_a_dispatch(
     tmp_path, default_vllm_config, groups, heads, head_dim, rank, backend
 ):
@@ -229,7 +239,8 @@ def test_native_grouped_wo_a_dispatch(
     config = Dsv41GGUFConfig(
         [expert_path, attention_path],
         max_tokens=128,
-        q8_backend="b12x" if q6 else backend,
+        q8_backend="b12x" if q6 or backend == "b12x_ephemeral" else backend,
+        b12x_ephemeral_outputs=backend == "b12x_ephemeral",
         q6_backend="consumer_cuda" if q6 else "b12x",
         q6_expand_min_tokens=128,
         q6_projections=["attn.wo_a"],
@@ -278,6 +289,15 @@ def test_native_grouped_wo_a_dispatch(
         )
     layer.is_bmm, layer.bmm_batch_size = True, groups
     layer.quant_method.process_weights_after_loading(layer)
+    if backend == "b12x_ephemeral":
+        from vllm.model_executor.layers.quantization.b12x_gguf_linear import (
+            B12xGGUFGroupedLinearMethod,
+        )
+
+        assert isinstance(layer.quant_method, B12xGGUFGroupedLinearMethod)
+        assert layer.quant_method._outputs == []
+        assert layer.quant_method._output is None
+        assert layer.quant_method._group_inputs is None
     weight = (
         torch.from_numpy(gguf.dequantize(raw.reshape(n, -1), kind)[n // 2 :])
         .bfloat16()
@@ -339,7 +359,10 @@ def test_native_grouped_wo_a_dispatch(
             graph.reset()
 
 
-def test_native_vocab_and_lm_head_tp(tmp_path, monkeypatch, default_vllm_config):
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_native_vocab_and_lm_head_tp(
+    tmp_path, monkeypatch, default_vllm_config, ephemeral
+):
     import gguf
     import torch
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -380,7 +403,9 @@ def test_native_vocab_and_lm_head_tp(tmp_path, monkeypatch, default_vllm_config)
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-    config = Dsv41GGUFConfig([expert_path, vocab_path], max_tokens=17)
+    config = Dsv41GGUFConfig(
+        [expert_path, vocab_path], max_tokens=17, b12x_ephemeral_outputs=ephemeral
+    )
     monkeypatch.setattr(vocab, "get_tensor_model_parallel_world_size", lambda: 2)
     # Exercise actual vocabulary masking, but inspect the local contributions
     # before their collective; the test sums both owners on this physical GPU.

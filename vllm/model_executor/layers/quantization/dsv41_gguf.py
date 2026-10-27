@@ -44,7 +44,11 @@ class Dsv41GGUFConfig(QuantizationConfig):
         q6_backend="b12x",
         q6_expand_min_tokens=512,
         q6_projections=None,
+        b12x_ephemeral_outputs=False,
     ):
+        if type(b12x_ephemeral_outputs) is not bool:
+            raise ValueError("b12x_ephemeral_outputs must be boolean")
+        self.b12x_ephemeral_outputs = b12x_ephemeral_outputs
         if expert_backend not in {"b12x", "consumer_cuda"}:
             raise ValueError("Unknown DSV4.1 expert backend")
         self.expert_backend = expert_backend
@@ -229,6 +233,7 @@ class Dsv41GGUFConfig(QuantizationConfig):
             q6_backend=config.get("q6_backend", "b12x"),
             q6_expand_min_tokens=config.get("q6_expand_min_tokens", 512),
             q6_projections=config.get("q6_projections"),
+            b12x_ephemeral_outputs=config.get("b12x_ephemeral_outputs", False),
         )
 
     def get_quant_method(self, layer, prefix):
@@ -282,6 +287,7 @@ class Dsv41GGUFConfig(QuantizationConfig):
                         ),
                     ),
                     max_tokens=capacity,
+                    retain_output_buffers=not self.b12x_ephemeral_outputs,
                 )
             return B12xGGUFEmbeddingMethod(source, max_tokens=capacity)
 
@@ -389,6 +395,8 @@ class Dsv41GGUFConfig(QuantizationConfig):
                 else ConsumerQ6LinearMethod
             )
             extra["expand_min_tokens"] = self.q6_expand_min_tokens
+        if method in (B12xGGUFLinearMethod, B12xGGUFGroupedLinearMethod):
+            extra["retain_output_buffers"] = not self.b12x_ephemeral_outputs
         return method(
             **extra,
             sources=tuple(self.dense_sources[name] for name in names),

@@ -16,6 +16,59 @@ from vllm.model_executor.layers.quantization.b12x_iq import (
 )
 
 
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@torch.inference_mode()
+def test_ephemeral_dense_outputs_survive_later_calls(grouped, device):
+    """Returned outputs own their lifetime; graph replays allocate nothing."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.model_executor.layers.quantization.b12x_gguf_linear import (
+        B12xGGUFGroupedLinearMethod,
+        B12xGGUFLinearMethod,
+        GGUFLinearSlice,
+    )
+
+    cls = B12xGGUFGroupedLinearMethod if grouped else B12xGGUFLinearMethod
+    method = cls(
+        [GGUFLinearSlice(None, 16, 32)] * 2,
+        max_tokens=128,
+        retain_output_buffers=False,
+    )
+    layer = SimpleNamespace(_b12x_gguf_device=torch.empty(0, device=device))
+    values = [torch.randn(16, 32, device=device).bfloat16() for _ in range(2)]
+    method.weights = tuple(SimpleNamespace(values=w, metadata=None) for w in values)
+
+    def run(x, weight, metadata, scales, *, out):
+        torch.mm(x, weight.T, out=out)
+
+    method._states = [SimpleNamespace(run=run)] * 2
+    apply = (
+        method.apply_grouped
+        if isinstance(method, B12xGGUFGroupedLinearMethod)
+        else method.apply
+    )
+    x = torch.randn((7, 2, 32) if grouped else (7, 32), device=device).bfloat16()
+    result = apply(layer, x)
+    expected = result.clone()
+    other = apply(layer, x.neg())
+    assert torch.equal(result, expected)
+    assert torch.equal(other, -expected)
+    assert result.data_ptr() != other.data_ptr()
+    assert method._outputs == [] and method._output is None
+    if device == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = apply(layer, x)
+        x.neg_()
+        captured.fill_(float("nan"))
+        allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.accelerator.memory_stats()["allocation.all.allocated"] == allocated
+        assert torch.equal(captured, -expected)
+
+
 @pytest.mark.parametrize("backend", ["b12x", "consumer_cuda"])
 def test_iq_scratch_reuses_current_arena_and_isolates_lanes(monkeypatch, backend):
     from vllm.v1.worker import workspace
@@ -211,7 +264,9 @@ def test_stream_load_warmup_and_frozen_method_replay(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("backend", ["b12x", "consumer_cuda", "consumer_q6"])
+@pytest.mark.parametrize(
+    "backend", ["b12x", "b12x_ephemeral", "consumer_cuda", "consumer_q6"]
+)
 @pytest.mark.parametrize("shared_scratch", [False, True])
 @torch.inference_mode()
 def test_native_dense_streamed_merged_lifecycle(
@@ -274,7 +329,9 @@ def test_native_dense_streamed_merged_lifecycle(
 
         method = ConsumerQ6LinearMethod(slices, max_tokens=32, expand_min_tokens=8)
     else:
-        method = B12xGGUFLinearMethod(slices, max_tokens=32)
+        method = B12xGGUFLinearMethod(
+            slices, max_tokens=32, retain_output_buffers=backend != "b12x_ephemeral"
+        )
     layer = torch.nn.Module()
     with torch.device(device):
         method.create_weights(layer, 256, [136, 128], 256, 264, torch.bfloat16)
@@ -285,6 +342,8 @@ def test_native_dense_streamed_merged_lifecycle(
     layer.is_bmm = False
     method.process_weights_after_loading(layer)
     method.get_b12x_warmup_unit(layer, (1, 8, 32), torch.bfloat16).compile()
+    if backend == "b12x_ephemeral":
+        assert method._outputs == [] and method._output is None
     if manager is not None:
         # A later layer grows the arena before captures are installed.
         manager.get_simultaneous(((264 * 256 * 4,), torch.bfloat16))
