@@ -1663,11 +1663,11 @@ ARG B12X_GIT_REF=d2cfa37f449a894c42604c5ba7629be0af56b71a
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ -n "${B12X_GIT_REF}" ]; then \
         echo "${B12X_GIT_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
-        apt-get update && apt-get install -y --no-install-recommends liburing-dev pkg-config && \
+        apt-get update && apt-get install -y --no-install-recommends git liburing-dev pkg-config && \
         rm -rf /var/lib/apt/lists/* && \
         uv venv --python /usr/bin/python3 --system-site-packages /opt/b12x && \
         uv pip install --python /opt/b12x/bin/python \
-            'nvidia-cutlass-dsl[cu12,cu13]==4.6.2' 'gguf==0.18.0' && \
+            'nvidia-cutlass-dsl[cu13]==4.6.2' 'gguf==0.18.0' && \
         uv pip install --python /opt/b12x/bin/python --no-deps \
             "b12x @ git+https://github.com/AppMana/forks-sparkinfer.git@${B12X_GIT_REF}" && \
         /opt/b12x/bin/python -c "import importlib.metadata as m; from b12x.loader.gguf_experts import ExpertTensor; from b12x.loader.gguf_dense import DenseTensor; assert m.version('nvidia-cutlass-dsl') == '4.6.2'; assert m.version('gguf') == '0.18.0'"; \
