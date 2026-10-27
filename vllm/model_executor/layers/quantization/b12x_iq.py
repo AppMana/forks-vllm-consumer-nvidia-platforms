@@ -17,6 +17,24 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
 from vllm.utils.b12x import B12xWarmupUnit, b12x_warmup_token_counts
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
+
+
+def _iq_scratch(state, device):
+    specs = tuple(state.scratch.scratch_specs())
+    if is_workspace_manager_initialized():
+        # Sequential expert calls can reuse the worker's scratch arena. Fetch
+        # views again at execution: another warmup may grow the backing store.
+        # The manager isolates ubatches/lanes and locks storage before capture.
+        return tuple(
+            current_workspace_manager().get_simultaneous(
+                *((tuple(s.shape), s.dtype) for s in specs)
+            )
+        )
+    return tuple(torch.empty(s.shape, dtype=s.dtype, device=device) for s in specs)
 
 
 class B12xIQMoEMethod(FusedMoEMethodBase):
@@ -39,7 +57,7 @@ class B12xIQMoEMethod(FusedMoEMethodBase):
             raise ValueError("Native IQ does not support expert bias or LoRA")
         self.sources = (gate, up, down)
         self.experts: Any = None
-        self._plans: dict[int, tuple[Any, tuple[torch.Tensor, ...]]] = {}
+        self._plans: dict[int, tuple[Any, tuple[torch.Tensor, ...] | None]] = {}
         self._capacities: tuple[int, ...] = ()
         self._output: torch.Tensor | None = None
 
@@ -209,10 +227,7 @@ class B12xIQMoEMethod(FusedMoEMethodBase):
                 )
 
                 def factory(state, capacity=capacity):
-                    scratch = tuple(
-                        torch.empty(s.shape, dtype=s.dtype, device=device)
-                        for s in state.scratch.scratch_specs()
-                    )
+                    scratch = _iq_scratch(state, device)
                     binding = state.bind(
                         scratch=scratch,
                         a=x[:capacity],
@@ -238,9 +253,12 @@ class B12xIQMoEMethod(FusedMoEMethodBase):
                     )
                 )
                 state = require_prepared(declaration, "moe.decode")
-                scratch = tuple(
-                    torch.empty(s.shape, dtype=s.dtype, device=device)
-                    for s in state.scratch.scratch_specs()
+                # Do not retain shared views: they would keep obsolete arenas
+                # alive after growth and bypass the current ubatch/lane owner.
+                scratch = (
+                    None
+                    if is_workspace_manager_initialized()
+                    else _iq_scratch(state, device)
                 )
                 self._plans[capacity] = (state, scratch)
         self._capacities = tuple(sorted(self._plans))
@@ -257,6 +275,8 @@ class B12xIQMoEMethod(FusedMoEMethodBase):
         if topk_ids.dtype != torch.int32 or topk_weights.dtype != torch.float32:
             raise ValueError("Native IQ requires int32 IDs and float32 router weights")
         state, scratch = self._plans[self._capacities[index]]
+        if scratch is None:
+            scratch = _iq_scratch(state, x.device)
         output = self._output[:m]
         binding = state.bind(
             scratch=scratch,

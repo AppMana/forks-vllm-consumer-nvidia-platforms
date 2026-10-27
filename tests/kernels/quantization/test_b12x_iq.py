@@ -10,12 +10,41 @@ import torch
 import torch.nn.functional as F
 
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.quantization.b12x_iq import B12xIQMoEMethod
+from vllm.model_executor.layers.quantization.b12x_iq import (
+    B12xIQMoEMethod,
+    _iq_scratch,
+)
+
+
+def test_iq_scratch_reuses_current_arena_and_isolates_lanes(monkeypatch):
+    from vllm.v1.worker import workspace
+
+    device = torch.device("cpu")
+    manager = workspace.WorkspaceManager(device, num_lanes=2)
+    monkeypatch.setattr(workspace, "_manager", manager)
+    specs = (SimpleNamespace(shape=(32,), dtype=torch.float32),)
+    state = SimpleNamespace(scratch=SimpleNamespace(scratch_specs=lambda: specs))
+    first = _iq_scratch(state, device)[0]
+    assert _iq_scratch(state, device)[0].data_ptr() == first.data_ptr()
+    # Later layers can grow the arena; execution must fetch the new backing.
+    manager.get_simultaneous(((1024,), torch.float32))
+    grown = _iq_scratch(state, device)[0]
+    assert grown.data_ptr() != first.data_ptr()
+    with workspace.use_workspace_lane(1):
+        other = _iq_scratch(state, device)[0]
+        assert other.data_ptr() != grown.data_ptr()
+    manager.lock()
+    assert _iq_scratch(state, device)[0].data_ptr() == grown.data_ptr()
+    with workspace.use_workspace_lane(1):
+        assert _iq_scratch(state, device)[0].data_ptr() == other.data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("shared_scratch", [False, True])
 @torch.inference_mode()
-def test_stream_load_warmup_and_frozen_method_replay(tmp_path, monkeypatch):
+def test_stream_load_warmup_and_frozen_method_replay(
+    tmp_path, monkeypatch, shared_scratch
+):
     import gguf
     from b12x._lib import compiler
     from b12x._lib.runtime_control import kernel_resolution_guard
@@ -23,6 +52,10 @@ def test_stream_load_warmup_and_frozen_method_replay(tmp_path, monkeypatch):
 
     device = torch.device("cuda:0")
     torch.accelerator.set_device_index(device)
+    from vllm.v1.worker import workspace
+
+    manager = workspace.WorkspaceManager(device) if shared_scratch else None
+    monkeypatch.setattr(workspace, "_manager", manager)
     sources, refs = [], []
     rng = np.random.default_rng(51)
     for name, kind, size in (
@@ -79,6 +112,9 @@ def test_stream_load_warmup_and_frozen_method_replay(tmp_path, monkeypatch):
     method.get_b12x_warmup_unit(layer, (8, 32), torch.bfloat16).compile()
     assert method._output.data_ptr() == output_pointer
     assert set(method._plans) == {1, 8, 32}
+    if manager is not None:
+        assert all(scratch is None for _, scratch in method._plans.values())
+        manager.lock()
 
     def forbidden(*args, **kwargs):
         raise AssertionError("runtime compilation")
@@ -125,6 +161,10 @@ def test_stream_load_warmup_and_frozen_method_replay(tmp_path, monkeypatch):
             x.mul_(0.5)
             expected = oracle()
             captured.fill_(float("nan"))
+            if manager is not None:
+                # Another layer may overwrite every byte between launches.
+                for scratch in _iq_scratch(method._plans[32][0], device):
+                    scratch.view(torch.uint8).fill_(0xA5)
             allocations = torch.accelerator.memory_stats(device)[
                 "allocation.all.allocated"
             ]
