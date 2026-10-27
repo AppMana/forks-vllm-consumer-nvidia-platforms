@@ -1655,6 +1655,8 @@ print(f'sparkinfer AOT extensions: {len(found)}')"; \
     fi
 
 # Native GGUF IQ uses the separately qualified CUTLASS 4.6.2 toolchain.
+# QuACK 0.6.1 supplies router GEMM helpers compatible with this toolchain.
+# Its metadata pins CUTLASS 4.6.0; retain the GPU-qualified 4.6.2 pair below.
 # Keep FA4/MSA's global toolchain intact. Serve this variant with
 # VLLM_PLUGINS='' /opt/b12x/bin/python -m vllm.entrypoints.cli.main serve ...
 # GGUF is registered in vLLM itself; b12x's optional FP6/safetensors plugins
@@ -1669,8 +1671,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         uv pip install --python /opt/b12x/bin/python \
             'nvidia-cutlass-dsl[cu13]==4.6.2' 'gguf==0.18.0' && \
         uv pip install --python /opt/b12x/bin/python --no-deps \
+            'quack-kernels==0.6.1' \
             "b12x @ git+https://github.com/AppMana/forks-sparkinfer.git@${B12X_GIT_REF}" && \
-        /opt/b12x/bin/python -c "import importlib.metadata as m; from b12x.loader.gguf_experts import ExpertTensor; from b12x.loader.gguf_dense import DenseTensor; assert m.version('nvidia-cutlass-dsl') == '4.6.2'; assert m.version('gguf') == '0.18.0'"; \
+        /opt/b12x/bin/python -c "import importlib.metadata as m; from b12x.loader.gguf_experts import ExpertTensor; from b12x.loader.gguf_dense import DenseTensor; from quack.compile_utils import make_fake_tensor; assert m.version('nvidia-cutlass-dsl') == '4.6.2'; assert m.version('gguf') == '0.18.0'; assert m.version('quack-kernels') == '0.6.1'"; \
     fi
 
 # Fail the build, not the first request, if the sm12x kernel FQNs stop
