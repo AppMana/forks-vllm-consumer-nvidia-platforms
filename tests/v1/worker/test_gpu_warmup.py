@@ -351,11 +351,13 @@ def test_dspark_prepare_input_warmup_covers_every_reachable_block_size(monkeypat
 
 def test_topk_topp_warmup_covers_each_triton_specialization(monkeypatch):
     calls = []
+    gumbel_calls = []
     runner = SimpleNamespace(
         is_last_pp_rank=True,
         device=torch.device("cpu"),
         decode_query_len=8,
-        model_config=SimpleNamespace(get_vocab_size=lambda: 128),
+        model_config=SimpleNamespace(get_vocab_size=lambda: 128, dtype=torch.bfloat16),
+        sampler=SimpleNamespace(use_fp64_gumbel=True),
     )
 
     def apply(logits, top_k, top_p):
@@ -369,6 +371,12 @@ def test_topk_topp_warmup_covers_each_triton_specialization(monkeypatch):
         return logits
 
     monkeypatch.setattr(gpu_warmup, "apply_top_k_top_p_triton", apply, raising=False)
+    monkeypatch.setattr(
+        gpu_warmup,
+        "gumbel_sample",
+        lambda logits, *args, **kwargs: gumbel_calls.append((logits.dtype, kwargs)),
+        raising=False,
+    )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     assert gpu_warmup.warmup_topk_topp_sampler(runner)
@@ -376,6 +384,10 @@ def test_topk_topp_warmup_covers_each_triton_specialization(monkeypatch):
         ((8, 128), None, torch.float32),
         ((8, 128), torch.int32, None),
         ((8, 128), torch.int32, torch.float32),
+    ]
+    assert gumbel_calls == [
+        (dtype, {"apply_temperature": False, "is_drafting": False, "use_fp64": True})
+        for dtype in (torch.float32, torch.bfloat16)
     ]
 
 

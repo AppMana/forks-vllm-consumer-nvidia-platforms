@@ -45,6 +45,7 @@ logger = init_logger(__name__)
 
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+    from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
 
 def _pp_size(model_runner: GPUModelRunner) -> int:
@@ -209,7 +210,7 @@ def _missing_dflash_prepare_warmup_sizes(
 
 
 def warmup_topk_topp_sampler(model_runner: GPUModelRunner) -> bool:
-    """Warm the three Triton top-k/top-p constexpr combinations."""
+    """Warm top-k/top-p and raw/processed-logit Gumbel sampling."""
     if not HAS_TRITON or not getattr(model_runner, "is_last_pp_rank", False):
         return False
 
@@ -232,6 +233,27 @@ def warmup_topk_topp_sampler(model_runner: GPUModelRunner) -> bool:
     apply_top_k_top_p_triton(logits, None, top_p)
     apply_top_k_top_p_triton(logits, top_k, None)
     apply_top_k_top_p_triton(logits, top_k, top_p)
+    # FlashInfer can handle every synthetic random-sampling request while
+    # greedy requests later reach Gumbel with raw BF16 or processed FP32
+    # logits. Neither dtype may depend on the first live request to compile.
+    mapping = torch.arange(batch_size, dtype=torch.int64, device=device)
+    temperature = torch.zeros(batch_size, dtype=torch.float32, device=device)
+    seeds = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    positions = torch.zeros_like(seeds)
+    sampler = getattr(model_runner, "sampler", None)
+    for dtype in dict.fromkeys(
+        (torch.float32, getattr(model_config, "dtype", torch.float32))
+    ):
+        gumbel_sample(
+            logits.to(dtype),
+            mapping,
+            temperature,
+            seeds,
+            positions,
+            apply_temperature=False,
+            is_drafting=False,
+            use_fp64=getattr(sampler, "use_fp64_gumbel", False),
+        )
     torch.accelerator.synchronize()
     logger.info("Triton top-k/top-p sampler warmup completed.")
     return True
