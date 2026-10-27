@@ -52,7 +52,7 @@ class Dsv41GGUFConfig(QuantizationConfig):
         if expert_backend not in {"b12x", "consumer_cuda"}:
             raise ValueError("Unknown DSV4.1 expert backend")
         self.expert_backend = expert_backend
-        if q8_backend not in {"b12x", "consumer_cuda"}:
+        if q8_backend not in {"b12x", "consumer_cuda", "consumer_w8a8"}:
             raise ValueError("Unknown DSV4.1 Q8 backend")
         if not isinstance(q8_expand_min_tokens, int) or q8_expand_min_tokens <= 0:
             raise ValueError("Q8 expansion threshold must be a positive integer")
@@ -364,13 +364,15 @@ class Dsv41GGUFConfig(QuantizationConfig):
         )
         extra = {}
         if (
-            self.q8_backend == "consumer_cuda"
+            self.q8_backend in {"consumer_cuda", "consumer_w8a8"}
             and (self.q8_projections is None or suffix in self.q8_projections)
             and all(self.tensor_types[name] == "Q8_0" for name in names)
         ):
             from .consumer_q8 import (
                 ConsumerQ8GroupedLinearMethod,
                 ConsumerQ8LinearMethod,
+                ConsumerQ8W8A8GroupedLinearMethod,
+                ConsumerQ8W8A8LinearMethod,
             )
 
             method = (
@@ -379,6 +381,12 @@ class Dsv41GGUFConfig(QuantizationConfig):
                 else ConsumerQ8LinearMethod
             )
             extra["expand_min_tokens"] = self.q8_expand_min_tokens
+            if self.q8_backend == "consumer_w8a8":
+                method = (
+                    ConsumerQ8W8A8GroupedLinearMethod
+                    if suffix == "attn.wo_a"
+                    else ConsumerQ8W8A8LinearMethod
+                )
         if (
             self.q6_backend == "consumer_cuda"
             and (self.q6_projections is None or suffix in self.q6_projections)

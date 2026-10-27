@@ -197,7 +197,8 @@ def test_real_shared_mlp_native_tp_padding(tmp_path, monkeypatch, default_vllm_c
     "groups,heads,head_dim,rank", [(2, 2, 128, 128), (4, 8, 512, 1024)]
 )
 @pytest.mark.parametrize(
-    "backend", ["b12x", "b12x_ephemeral", "consumer_cuda", "consumer_q6"]
+    "backend",
+    ["b12x", "b12x_ephemeral", "consumer_cuda", "consumer_q6", "consumer_w8a8"],
 )
 def test_native_grouped_wo_a_dispatch(
     tmp_path, default_vllm_config, groups, heads, head_dim, rank, backend
@@ -259,7 +260,7 @@ def test_native_grouped_wo_a_dispatch(
             tp_size=2,
             prefix="model.layers.0.attn.wo_a",
         )
-    if backend == "consumer_cuda":
+    if backend in ("consumer_cuda", "consumer_w8a8"):
         from vllm.model_executor.layers.quantization.b12x_gguf_linear import (
             B12xGGUFGroupedLinearMethod,
         )
@@ -342,7 +343,8 @@ def test_native_grouped_wo_a_dispatch(
                 )
 
             output = run()
-            assert (output.float() - expected).norm() / expected.norm() < 0.005
+            tolerance = 0.03 if backend == "consumer_w8a8" else 0.005
+            assert (output.float() - expected).norm() / expected.norm() < tolerance
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 output = run()
@@ -355,7 +357,7 @@ def test_native_grouped_wo_a_dispatch(
                 allocated
                 == torch.accelerator.memory_stats()["allocation.all.allocated"]
             )
-            assert (output.float() + expected).norm() / expected.norm() < 0.005
+            assert (output.float() + expected).norm() / expected.norm() < tolerance
             graph.reset()
 
 

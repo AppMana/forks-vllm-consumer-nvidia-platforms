@@ -265,7 +265,8 @@ def test_stream_load_warmup_and_frozen_method_replay(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "backend", ["b12x", "b12x_ephemeral", "consumer_cuda", "consumer_q6"]
+    "backend",
+    ["b12x", "b12x_ephemeral", "consumer_cuda", "consumer_q6", "consumer_w8a8"],
 )
 @pytest.mark.parametrize("shared_scratch", [False, True])
 @torch.inference_mode()
@@ -293,7 +294,7 @@ def test_native_dense_streamed_merged_lifecycle(
     slices, refs = [], []
     rng = np.random.default_rng(73)
     for kind, n, block, size in (("Q6_K", 136, 256, 210), ("Q8_0", 128, 32, 34)):
-        if backend == "consumer_cuda":
+        if backend in ("consumer_cuda", "consumer_w8a8"):
             kind, block, size = "Q8_0", 32, 34
         elif backend == "consumer_q6":
             kind, block, size = "Q6_K", 256, 210
@@ -316,12 +317,18 @@ def test_native_dense_streamed_merged_lifecycle(
             .bfloat16()
             .to(device)
         )
-    if backend == "consumer_cuda":
+    if backend in ("consumer_cuda", "consumer_w8a8"):
         from vllm.model_executor.layers.quantization.consumer_q8 import (
             ConsumerQ8LinearMethod,
+            ConsumerQ8W8A8LinearMethod,
         )
 
-        method = ConsumerQ8LinearMethod(slices, max_tokens=32, expand_min_tokens=8)
+        cls = (
+            ConsumerQ8W8A8LinearMethod
+            if backend == "consumer_w8a8"
+            else ConsumerQ8LinearMethod
+        )
+        method = cls(slices, max_tokens=32, expand_min_tokens=8)
     elif backend == "consumer_q6":
         from vllm.model_executor.layers.quantization.consumer_q6 import (
             ConsumerQ6LinearMethod,
@@ -354,12 +361,20 @@ def test_native_dense_streamed_merged_lifecycle(
 
     monkeypatch.setattr(compiler, "compile", forbidden)
     ref = torch.cat(refs).float()
+    tolerance = 0.03 if backend == "consumer_w8a8" else 0.004
+    if backend == "consumer_w8a8":
+        assert method._scales is None and method._output is None
+        assert method._weight_workspace is None
     with kernel_resolution_guard("vLLM native dense method"):
         for m in (1, 3, 7, 8, 17, 32):
             x = torch.randn(m, 256, device=device, dtype=torch.bfloat16)
             expected = x.float() @ ref.T
             result = method.apply(layer, x)
-            assert (result.float() - expected).norm() / expected.norm() < 0.004
+            assert (result.float() - expected).norm() / expected.norm() < tolerance
+            if backend == "consumer_w8a8":
+                saved = result.clone()
+                method.apply(layer, x.neg())
+                assert torch.equal(result, saved)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 captured = method.apply(layer, x)
@@ -374,7 +389,7 @@ def test_native_dense_streamed_merged_lifecycle(
                 torch.accelerator.memory_stats()["allocation.all.allocated"]
                 == allocated
             )
-            assert (captured.float() + expected).norm() / expected.norm() < 0.004
+            assert (captured.float() + expected).norm() / expected.norm() < tolerance
             graph.reset()
         with pytest.raises(ValueError, match="capacity"):
             method.apply(

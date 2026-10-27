@@ -76,15 +76,18 @@ class ConsumerQ8LinearMethod(B12xGGUFLinearMethod):
                     self._scales[group, target : target + count].copy_(scales[0])
                     del raw, codes, scales
                 offset += source.rows
-            self._output = torch.empty(
-                self.max_tokens, groups, n, dtype=torch.bfloat16, device=device
-            )
-            if not is_workspace_manager_initialized():
-                self._weight_workspace = torch.empty_like(
-                    self._codes, dtype=torch.bfloat16
-                )
+            self._finish_preparation()
             layer.b12x_warmup_provider = self
             self.warmup_launches(layer, token_counts=(self.max_tokens,))
+
+    def _finish_preparation(self):
+        assert self._codes is not None
+        groups, n, _ = self._codes.shape
+        self._output = torch.empty(
+            self.max_tokens, groups, n, dtype=torch.bfloat16, device=self._codes.device
+        )
+        if not is_workspace_manager_initialized():
+            self._weight_workspace = torch.empty_like(self._codes, dtype=torch.bfloat16)
 
     @torch.inference_mode()
     def warmup_launches(self, layer, *, token_counts):
@@ -164,3 +167,103 @@ class ConsumerQ8GroupedLinearMethod(ConsumerQ8LinearMethod):
 
     def apply_grouped(self, layer, x):
         return self._run(x).flatten(1)
+
+
+class ConsumerQ8W8A8LinearMethod(ConsumerQ8LinearMethod):
+    """Experimental channel requantization into native INT8 tensor MMA.
+
+    This explicitly changes GGUF weight values and quantizes activations,
+    including decode. It requires model quality and latency qualification.
+    Only one INT8 weight copy survives loading; eager outputs own their
+    lifetime and CUDA graph captures retain their own activation scratch.
+    """
+
+    def _finish_preparation(self):
+        from consumer_int8.ops import fused_channel_mm, quantize_rows
+
+        assert self._codes is not None and self._scales is not None
+        self._quantize_rows = quantize_rows
+        self._fused_channel_mm = fused_channel_mm
+        groups, n, k = self._codes.shape
+        if n % 8 or k % 64:
+            raise ValueError("Native W8A8 requires N8/K64 aligned weights")
+        self._channel_scales = torch.empty(
+            groups, n, dtype=torch.bfloat16, device=self._codes.device
+        )
+        # Bound conversion memory independently of the layer's full shape.
+        for group in range(groups):
+            for start in range(0, n, 128):
+                codes = self._codes[group, start : start + 128]
+                scales = self._scales[group, start : start + 128]
+                dense = (
+                    (codes.float().reshape(-1, k // 32, 32) * scales.float()[..., None])
+                    .reshape(-1, k)
+                    .bfloat16()
+                )
+                channel = (
+                    (dense.float().abs().amax(1) / 127).clamp_min(1e-20).bfloat16()
+                )
+                converted = (
+                    (dense.float() / channel.float()[:, None])
+                    .round()
+                    .clamp(-127, 127)
+                    .to(torch.int8)
+                )
+                codes.copy_(converted)
+                self._channel_scales[group, start : start + 128].copy_(channel)
+        self._scales = None
+
+    @torch.inference_mode()
+    def warmup_launches(self, layer, *, token_counts):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("W8A8 warmup must precede capture")
+        counts = tuple(token_counts)
+        if not counts or min(counts) <= 0 or max(counts) > self.max_tokens:
+            raise ValueError("W8A8 warmup exceeds capacity")
+        if self._codes is None:
+            raise RuntimeError("Load W8A8 weights before warmup")
+        for m in counts:
+            x = torch.zeros(
+                m,
+                self._codes.shape[0],
+                self._codes.shape[2],
+                device=self._codes.device,
+                dtype=torch.bfloat16,
+            )
+            self._run(x)
+
+    def _run(self, x):
+        if self._codes is None:
+            raise RuntimeError("W8A8 execution requires prepared weights")
+        groups, n, k = self._codes.shape
+        if (
+            x.ndim != 3
+            or x.shape[1:] != (groups, k)
+            or x.dtype != torch.bfloat16
+            or x.device != self._codes.device
+            or x.shape[0] > self.max_tokens
+        ):
+            raise ValueError("W8A8 activation geometry/dtype/device/capacity mismatch")
+        m = x.shape[0]
+        output = torch.empty(groups, m, n, dtype=x.dtype, device=x.device)
+        if m:
+            qa = torch.empty(m, k, dtype=torch.int8, device=x.device)
+            sa = torch.empty(m, dtype=torch.float32, device=x.device)
+            for group in range(groups):
+                values = x[:, group].contiguous()
+                self._quantize_rows(values, qa, sa)
+                self._fused_channel_mm(
+                    qa,
+                    self._codes[group],
+                    sa,
+                    self._channel_scales[group],
+                    output[group],
+                    0,
+                )
+        return output.transpose(0, 1).contiguous()
+
+
+class ConsumerQ8W8A8GroupedLinearMethod(
+    ConsumerQ8W8A8LinearMethod, ConsumerQ8GroupedLinearMethod
+):
+    pass
