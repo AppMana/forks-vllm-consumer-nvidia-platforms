@@ -215,6 +215,7 @@ def test_native_grouped_wo_a_dispatch(
         max_tokens=128,
         q8_backend=backend,
         q8_expand_min_tokens=128,
+        q8_projections=["attn.wo_a"],
     )
     device = torch.device("cuda:0")
     with torch.device(device):
@@ -227,6 +228,20 @@ def test_native_grouped_wo_a_dispatch(
             tp_rank=1,
             tp_size=2,
             prefix="model.layers.0.attn.wo_a",
+        )
+    if backend == "consumer_cuda":
+        from vllm.model_executor.layers.quantization.b12x_gguf_linear import (
+            B12xGGUFGroupedLinearMethod,
+        )
+        from vllm.model_executor.layers.quantization.consumer_q8 import (
+            ConsumerQ8GroupedLinearMethod,
+        )
+
+        assert isinstance(layer.quant_method, ConsumerQ8GroupedLinearMethod)
+        config.q8_projections = frozenset()
+        assert isinstance(
+            config.get_quant_method(layer, "model.layers.0.attn.wo_a"),
+            B12xGGUFGroupedLinearMethod,
         )
     layer.is_bmm, layer.bmm_batch_size = True, groups
     layer.quant_method.process_weights_after_loading(layer)

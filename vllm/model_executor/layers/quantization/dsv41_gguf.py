@@ -40,6 +40,7 @@ class Dsv41GGUFConfig(QuantizationConfig):
         expert_backend="b12x",
         q8_backend="b12x",
         q8_expand_min_tokens=512,
+        q8_projections=None,
     ):
         if expert_backend not in {"b12x", "consumer_cuda"}:
             raise ValueError("Unknown DSV4.1 expert backend")
@@ -50,6 +51,14 @@ class Dsv41GGUFConfig(QuantizationConfig):
             raise ValueError("Q8 expansion threshold must be a positive integer")
         self.q8_backend = q8_backend
         self.q8_expand_min_tokens = q8_expand_min_tokens
+        if q8_projections is not None and (
+            not isinstance(q8_projections, (list, tuple))
+            or not all(isinstance(name, str) for name in q8_projections)
+        ):
+            raise ValueError("Q8 projections must be a list of layer suffixes")
+        self.q8_projections = (
+            None if q8_projections is None else frozenset(q8_projections)
+        )
         super().__init__()
         from b12x.loader.gguf_experts import index_experts
         from gguf import GGUFReader
@@ -199,6 +208,7 @@ class Dsv41GGUFConfig(QuantizationConfig):
             expert_backend=config.get("expert_backend", "b12x"),
             q8_backend=config.get("q8_backend", "b12x"),
             q8_expand_min_tokens=config.get("q8_expand_min_tokens", 512),
+            q8_projections=config.get("q8_projections"),
         )
 
     def get_quant_method(self, layer, prefix):
@@ -327,8 +337,10 @@ class Dsv41GGUFConfig(QuantizationConfig):
             else B12xGGUFLinearMethod
         )
         extra = {}
-        if self.q8_backend == "consumer_cuda" and all(
-            self.tensor_types[name] == "Q8_0" for name in names
+        if (
+            self.q8_backend == "consumer_cuda"
+            and (self.q8_projections is None or suffix in self.q8_projections)
+            and all(self.tensor_types[name] == "Q8_0" for name in names)
         ):
             from .consumer_q8 import (
                 ConsumerQ8GroupedLinearMethod,
