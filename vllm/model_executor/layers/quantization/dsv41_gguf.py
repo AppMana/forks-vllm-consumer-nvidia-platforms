@@ -33,10 +33,23 @@ class Dsv41GGUFConfig(QuantizationConfig):
     # Shared-expert intermediate padding preserves Q6_K blocks under TP.
     weight_block_size = [256, 256]
 
-    def __init__(self, files, max_tokens=None, expert_backend="b12x"):
+    def __init__(
+        self,
+        files,
+        max_tokens=None,
+        expert_backend="b12x",
+        q8_backend="b12x",
+        q8_expand_min_tokens=512,
+    ):
         if expert_backend not in {"b12x", "consumer_cuda"}:
             raise ValueError("Unknown DSV4.1 expert backend")
         self.expert_backend = expert_backend
+        if q8_backend not in {"b12x", "consumer_cuda"}:
+            raise ValueError("Unknown DSV4.1 Q8 backend")
+        if not isinstance(q8_expand_min_tokens, int) or q8_expand_min_tokens <= 0:
+            raise ValueError("Q8 expansion threshold must be a positive integer")
+        self.q8_backend = q8_backend
+        self.q8_expand_min_tokens = q8_expand_min_tokens
         super().__init__()
         from b12x.loader.gguf_experts import index_experts
         from gguf import GGUFReader
@@ -184,6 +197,8 @@ class Dsv41GGUFConfig(QuantizationConfig):
             config["gguf_files"],
             max_tokens=config.get("max_tokens"),
             expert_backend=config.get("expert_backend", "b12x"),
+            q8_backend=config.get("q8_backend", "b12x"),
+            q8_expand_min_tokens=config.get("q8_expand_min_tokens", 512),
         )
 
     def get_quant_method(self, layer, prefix):
@@ -311,7 +326,23 @@ class Dsv41GGUFConfig(QuantizationConfig):
             if suffix == "attn.wo_a"
             else B12xGGUFLinearMethod
         )
+        extra = {}
+        if self.q8_backend == "consumer_cuda" and all(
+            self.tensor_types[name] == "Q8_0" for name in names
+        ):
+            from .consumer_q8 import (
+                ConsumerQ8GroupedLinearMethod,
+                ConsumerQ8LinearMethod,
+            )
+
+            method = (
+                ConsumerQ8GroupedLinearMethod
+                if suffix == "attn.wo_a"
+                else ConsumerQ8LinearMethod
+            )
+            extra["expand_min_tokens"] = self.q8_expand_min_tokens
         return method(
+            **extra,
             sources=tuple(self.dense_sources[name] for name in names),
             partition=partition,
             max_tokens=capacity,

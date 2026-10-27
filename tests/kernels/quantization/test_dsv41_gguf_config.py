@@ -40,10 +40,18 @@ def test_real_header_selects_mixed_iq_pair(tmp_path):
     write_shard(path)
     config = Dsv41GGUFConfig.from_config({"gguf_files": [str(path)]})
     assert config.expert_backend == "b12x"
+    assert config.q8_backend == "b12x"
     native = Dsv41GGUFConfig.from_config(
-        {"gguf_files": [str(path)], "expert_backend": "consumer_cuda"}
+        {
+            "gguf_files": [str(path)],
+            "expert_backend": "consumer_cuda",
+            "q8_backend": "consumer_cuda",
+            "q8_expand_min_tokens": 128,
+        }
     )
     assert native.expert_backend == "consumer_cuda"
+    assert native.q8_backend == "consumer_cuda"
+    assert native.q8_expand_min_tokens == 128
     with pytest.raises(ValueError, match="backend"):
         Dsv41GGUFConfig.from_config(
             {"gguf_files": [str(path)], "expert_backend": "invalid"}
@@ -173,8 +181,9 @@ def test_real_shared_mlp_native_tp_padding(tmp_path, monkeypatch, default_vllm_c
 @pytest.mark.parametrize(
     "groups,heads,head_dim,rank", [(2, 2, 128, 128), (4, 8, 512, 1024)]
 )
+@pytest.mark.parametrize("backend", ["b12x", "consumer_cuda"])
 def test_native_grouped_wo_a_dispatch(
-    tmp_path, default_vllm_config, groups, heads, head_dim, rank
+    tmp_path, default_vllm_config, groups, heads, head_dim, rank, backend
 ):
     import gguf
     import torch
@@ -201,7 +210,12 @@ def test_native_grouped_wo_a_dispatch(
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-    config = Dsv41GGUFConfig([expert_path, attention_path], max_tokens=128)
+    config = Dsv41GGUFConfig(
+        [expert_path, attention_path],
+        max_tokens=128,
+        q8_backend=backend,
+        q8_expand_min_tokens=128,
+    )
     device = torch.device("cuda:0")
     with torch.device(device):
         layer = ColumnParallelLinear(
