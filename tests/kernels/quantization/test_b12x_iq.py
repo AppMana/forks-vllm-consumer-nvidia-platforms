@@ -211,13 +211,16 @@ def test_stream_load_warmup_and_frozen_method_replay(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("backend", ["b12x", "consumer_cuda"])
+@pytest.mark.parametrize("backend", ["b12x", "consumer_cuda", "consumer_q6"])
 @pytest.mark.parametrize("shared_scratch", [False, True])
 @torch.inference_mode()
 def test_native_dense_streamed_merged_lifecycle(
     tmp_path, monkeypatch, backend, shared_scratch
 ):
     import gguf
+
+    if backend == "consumer_q6" and torch.cuda.get_device_capability()[0] < 12:
+        pytest.skip("Q6 small-row b12x arm requires SM120/121")
     from b12x._lib import compiler
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.loader.gguf_dense import DenseTensor
@@ -237,6 +240,8 @@ def test_native_dense_streamed_merged_lifecycle(
     for kind, n, block, size in (("Q6_K", 136, 256, 210), ("Q8_0", 128, 32, 34)):
         if backend == "consumer_cuda":
             kind, block, size = "Q8_0", 32, 34
+        elif backend == "consumer_q6":
+            kind, block, size = "Q6_K", 256, 210
         raw = rng.integers(0, 256, (n, 256 // block, size), dtype=np.uint8)
         base = rng.normal(0, 0.001, (n, 256 // block, 1)).astype(np.float16)
         if kind == "Q6_K":
@@ -262,6 +267,12 @@ def test_native_dense_streamed_merged_lifecycle(
         )
 
         method = ConsumerQ8LinearMethod(slices, max_tokens=32, expand_min_tokens=8)
+    elif backend == "consumer_q6":
+        from vllm.model_executor.layers.quantization.consumer_q6 import (
+            ConsumerQ6LinearMethod,
+        )
+
+        method = ConsumerQ6LinearMethod(slices, max_tokens=32, expand_min_tokens=8)
     else:
         method = B12xGGUFLinearMethod(slices, max_tokens=32)
     layer = torch.nn.Module()
@@ -285,7 +296,7 @@ def test_native_dense_streamed_merged_lifecycle(
     monkeypatch.setattr(compiler, "compile", forbidden)
     ref = torch.cat(refs).float()
     with kernel_resolution_guard("vLLM native dense method"):
-        for m in (1, 3, 8, 17, 32):
+        for m in (1, 3, 7, 8, 17, 32):
             x = torch.randn(m, 256, device=device, dtype=torch.bfloat16)
             expected = x.float() @ ref.T
             result = method.apply(layer, x)
@@ -294,7 +305,7 @@ def test_native_dense_streamed_merged_lifecycle(
             with torch.cuda.graph(graph):
                 captured = method.apply(layer, x)
             x.neg_()
-            if backend == "consumer_cuda":
+            if backend in ("consumer_cuda", "consumer_q6"):
                 method._scratch().fill_(float("nan"))
             captured.fill_(float("nan"))
             allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]

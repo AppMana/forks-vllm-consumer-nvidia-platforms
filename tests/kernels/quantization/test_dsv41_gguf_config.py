@@ -41,17 +41,24 @@ def test_real_header_selects_mixed_iq_pair(tmp_path):
     config = Dsv41GGUFConfig.from_config({"gguf_files": [str(path)]})
     assert config.expert_backend == "b12x"
     assert config.q8_backend == "b12x"
+    assert config.q6_backend == "b12x"
     native = Dsv41GGUFConfig.from_config(
         {
             "gguf_files": [str(path)],
             "expert_backend": "consumer_cuda",
             "q8_backend": "consumer_cuda",
             "q8_expand_min_tokens": 128,
+            "q6_backend": "consumer_cuda",
+            "q6_expand_min_tokens": 512,
+            "q6_projections": ["attn.wo_a"],
         }
     )
     assert native.expert_backend == "consumer_cuda"
     assert native.q8_backend == "consumer_cuda"
     assert native.q8_expand_min_tokens == 128
+    assert native.q6_backend == "consumer_cuda"
+    assert native.q6_expand_min_tokens == 512
+    assert native.q6_projections == {"attn.wo_a"}
     with pytest.raises(ValueError, match="backend"):
         Dsv41GGUFConfig.from_config(
             {"gguf_files": [str(path)], "expert_backend": "invalid"}
@@ -181,7 +188,7 @@ def test_real_shared_mlp_native_tp_padding(tmp_path, monkeypatch, default_vllm_c
 @pytest.mark.parametrize(
     "groups,heads,head_dim,rank", [(2, 2, 128, 128), (4, 8, 512, 1024)]
 )
-@pytest.mark.parametrize("backend", ["b12x", "consumer_cuda"])
+@pytest.mark.parametrize("backend", ["b12x", "consumer_cuda", "consumer_q6"])
 def test_native_grouped_wo_a_dispatch(
     tmp_path, default_vllm_config, groups, heads, head_dim, rank, backend
 ):
@@ -194,17 +201,26 @@ def test_native_grouped_wo_a_dispatch(
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    if backend == "consumer_q6" and torch.cuda.get_device_capability()[0] < 12:
+        pytest.skip("Q6 small-row b12x arm requires SM120/121")
     expert_path, attention_path = tmp_path / "expert.gguf", tmp_path / "attn.gguf"
     write_shard(expert_path)
     rng = np.random.default_rng(778)
     n, k = 2 * groups * rank, heads * head_dim
-    raw = rng.integers(0, 256, (n, k // 32, 34), dtype=np.uint8)
-    raw[..., :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    q6 = backend == "consumer_q6"
+    kind = gguf.GGMLQuantizationType.Q6_K if q6 else gguf.GGMLQuantizationType.Q8_0
+    raw = rng.integers(
+        0, 256, (n, k // (256 if q6 else 32), 210 if q6 else 34), dtype=np.uint8
+    )
+    if q6:
+        raw[..., 208:] = np.array([0.001], dtype=np.float16).view(np.uint8)
+    else:
+        raw[..., :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
     writer = gguf.GGUFWriter(attention_path, "deepseek41")
     writer.add_tensor(
         "blk.0.attn_output_a.weight",
         raw.reshape(n, -1),
-        raw_dtype=gguf.GGMLQuantizationType.Q8_0,
+        raw_dtype=kind,
     )
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -213,7 +229,10 @@ def test_native_grouped_wo_a_dispatch(
     config = Dsv41GGUFConfig(
         [expert_path, attention_path],
         max_tokens=128,
-        q8_backend=backend,
+        q8_backend="b12x" if q6 else backend,
+        q6_backend="consumer_cuda" if q6 else "b12x",
+        q6_expand_min_tokens=128,
+        q6_projections=["attn.wo_a"],
         q8_expand_min_tokens=128,
         q8_projections=["attn.wo_a"],
     )
@@ -243,14 +262,24 @@ def test_native_grouped_wo_a_dispatch(
             config.get_quant_method(layer, "model.layers.0.attn.wo_a"),
             B12xGGUFGroupedLinearMethod,
         )
+    if q6:
+        from vllm.model_executor.layers.quantization.b12x_gguf_linear import (
+            B12xGGUFGroupedLinearMethod,
+        )
+        from vllm.model_executor.layers.quantization.consumer_q6 import (
+            ConsumerQ6GroupedLinearMethod,
+        )
+
+        assert isinstance(layer.quant_method, ConsumerQ6GroupedLinearMethod)
+        config.q6_projections = frozenset()
+        assert (
+            type(config.get_quant_method(layer, "model.layers.0.attn.wo_a"))
+            is B12xGGUFGroupedLinearMethod
+        )
     layer.is_bmm, layer.bmm_batch_size = True, groups
     layer.quant_method.process_weights_after_loading(layer)
     weight = (
-        torch.from_numpy(
-            gguf.dequantize(raw.reshape(n, -1), gguf.GGMLQuantizationType.Q8_0)[
-                n // 2 :
-            ]
-        )
+        torch.from_numpy(gguf.dequantize(raw.reshape(n, -1), kind)[n // 2 :])
         .bfloat16()
         .to(device)
         .reshape(groups, rank, k)

@@ -41,6 +41,9 @@ class Dsv41GGUFConfig(QuantizationConfig):
         q8_backend="b12x",
         q8_expand_min_tokens=512,
         q8_projections=None,
+        q6_backend="b12x",
+        q6_expand_min_tokens=512,
+        q6_projections=None,
     ):
         if expert_backend not in {"b12x", "consumer_cuda"}:
             raise ValueError("Unknown DSV4.1 expert backend")
@@ -58,6 +61,20 @@ class Dsv41GGUFConfig(QuantizationConfig):
             raise ValueError("Q8 projections must be a list of layer suffixes")
         self.q8_projections = (
             None if q8_projections is None else frozenset(q8_projections)
+        )
+        if q6_backend not in {"b12x", "consumer_cuda"}:
+            raise ValueError("Unknown DSV4.1 Q6 backend")
+        if type(q6_expand_min_tokens) is not int or q6_expand_min_tokens <= 0:
+            raise ValueError("Q6 expansion threshold must be a positive integer")
+        if q6_projections is not None and (
+            not isinstance(q6_projections, (list, tuple))
+            or not all(isinstance(name, str) for name in q6_projections)
+        ):
+            raise ValueError("Q6 projections must be a list of layer suffixes")
+        self.q6_backend = q6_backend
+        self.q6_expand_min_tokens = q6_expand_min_tokens
+        self.q6_projections = (
+            None if q6_projections is None else frozenset(q6_projections)
         )
         super().__init__()
         from b12x.loader.gguf_experts import index_experts
@@ -209,6 +226,9 @@ class Dsv41GGUFConfig(QuantizationConfig):
             q8_backend=config.get("q8_backend", "b12x"),
             q8_expand_min_tokens=config.get("q8_expand_min_tokens", 512),
             q8_projections=config.get("q8_projections"),
+            q6_backend=config.get("q6_backend", "b12x"),
+            q6_expand_min_tokens=config.get("q6_expand_min_tokens", 512),
+            q6_projections=config.get("q6_projections"),
         )
 
     def get_quant_method(self, layer, prefix):
@@ -353,6 +373,22 @@ class Dsv41GGUFConfig(QuantizationConfig):
                 else ConsumerQ8LinearMethod
             )
             extra["expand_min_tokens"] = self.q8_expand_min_tokens
+        if (
+            self.q6_backend == "consumer_cuda"
+            and (self.q6_projections is None or suffix in self.q6_projections)
+            and all(self.tensor_types[name] == "Q6_K" for name in names)
+        ):
+            from .consumer_q6 import (
+                ConsumerQ6GroupedLinearMethod,
+                ConsumerQ6LinearMethod,
+            )
+
+            method = (
+                ConsumerQ6GroupedLinearMethod
+                if suffix == "attn.wo_a"
+                else ConsumerQ6LinearMethod
+            )
+            extra["expand_min_tokens"] = self.q6_expand_min_tokens
         return method(
             **extra,
             sources=tuple(self.dense_sources[name] for name in names),

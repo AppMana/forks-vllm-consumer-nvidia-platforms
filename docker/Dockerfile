@@ -62,7 +62,7 @@ ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 ARG APPMANA_NCCL_GIT_REF=0dd53af6f900ff0d3b7b27a8d8baab8e71e8333f
 ARG BUILD_DEEPEP=1
 ARG CONSUMER_INT8_GIT_REPO=https://github.com/AppMana/consumer-int8-kernels.git
-ARG CONSUMER_INT8_GIT_REF=1e01f68e942764ccc4e4ea217c0c29008ee2139b
+ARG CONSUMER_INT8_GIT_REF=eb202d9e2610de67c9a342161201975b4018db85
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
 # 0.2.73 ships libtbrxe for tbrxe.ko (thunderbolt_frame_rxe, stock rxe uverbs
@@ -1782,7 +1782,7 @@ COPY --from=extensions-build /tmp/consumer-int8-dist/wheels.sha256 /tmp/consumer
 RUN --mount=type=bind,from=extensions-build,src=/tmp/consumer-int8-dist,target=/tmp/consumer-int8-dist,ro \
     --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system --no-deps /tmp/consumer-int8-dist/*.whl
-RUN python3 -c "import consumer_int8.ops as ops; assert callable(ops.kv_cache_update); assert callable(ops.gdn_packed_decode); assert callable(ops.cutlass_channel_mm); import consumer_int8.gguf as gguf; from consumer_int8.gguf_moe import ExecutionPlan, prepare_experts; assert all(callable(op) for op in (gguf.q8_packed_mm, gguf.q8_expand_mm, gguf.mixed_iq_moe, gguf.plan_routes, ExecutionPlan, prepare_experts))"
+RUN python3 -c "import consumer_int8.ops as ops; assert callable(ops.kv_cache_update); assert callable(ops.gdn_packed_decode); assert callable(ops.cutlass_channel_mm); import consumer_int8.gguf as gguf; from consumer_int8.gguf_moe import ExecutionPlan, prepare_experts; assert all(callable(op) for op in (gguf.q8_packed_mm, gguf.q8_expand_mm, gguf.q6_packed_expand, gguf.mixed_iq_moe, gguf.plan_routes, ExecutionPlan, prepare_experts))"
 
 RUN INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS}" INSTALL_USB4_RDMA_PROVIDER="${INSTALL_USB4_RDMA_PROVIDER}" USB4_RDMA_PROVIDER_VERSION="${USB4_RDMA_PROVIDER_VERSION}" python3 - <<'PY'
 import ctypes
