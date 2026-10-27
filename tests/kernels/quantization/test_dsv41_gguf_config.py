@@ -39,6 +39,15 @@ def test_real_header_selects_mixed_iq_pair(tmp_path):
     path = tmp_path / "experts.gguf"
     write_shard(path)
     config = Dsv41GGUFConfig.from_config({"gguf_files": [str(path)]})
+    assert config.expert_backend == "b12x"
+    native = Dsv41GGUFConfig.from_config(
+        {"gguf_files": [str(path)], "expert_backend": "consumer_cuda"}
+    )
+    assert native.expert_backend == "consumer_cuda"
+    with pytest.raises(ValueError, match="backend"):
+        Dsv41GGUFConfig.from_config(
+            {"gguf_files": [str(path)], "expert_backend": "invalid"}
+        )
     gate, up, down = config.expert_sources[0]
     assert (gate.quant_type, up.quant_type, down.quant_type) == (
         "IQ2_S",

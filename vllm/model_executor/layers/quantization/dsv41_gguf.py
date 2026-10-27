@@ -33,7 +33,10 @@ class Dsv41GGUFConfig(QuantizationConfig):
     # Shared-expert intermediate padding preserves Q6_K blocks under TP.
     weight_block_size = [256, 256]
 
-    def __init__(self, files, max_tokens=None):
+    def __init__(self, files, max_tokens=None, expert_backend="b12x"):
+        if expert_backend not in {"b12x", "consumer_cuda"}:
+            raise ValueError("Unknown DSV4.1 expert backend")
+        self.expert_backend = expert_backend
         super().__init__()
         from b12x.loader.gguf_experts import index_experts
         from gguf import GGUFReader
@@ -177,7 +180,11 @@ class Dsv41GGUFConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config):
-        return cls(config["gguf_files"], max_tokens=config.get("max_tokens"))
+        return cls(
+            config["gguf_files"],
+            max_tokens=config.get("max_tokens"),
+            expert_backend=config.get("expert_backend", "b12x"),
+        )
 
     def get_quant_method(self, layer, prefix):
         from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -245,6 +252,12 @@ class Dsv41GGUFConfig(QuantizationConfig):
             if layer.moe_config.swiglu_limit != self.routed_clamps[number]:
                 raise ValueError("Model routed clamp disagrees with GGUF metadata")
             gate, up, down = self.expert_sources[number]
+            if self.expert_backend == "consumer_cuda":
+                from .consumer_iq import ConsumerIQMoEMethod
+
+                return ConsumerIQMoEMethod(
+                    layer.moe_config, gate=gate, up=up, down=down
+                )
             return B12xIQMoEMethod(layer.moe_config, gate=gate, up=up, down=down)
         if isinstance(layer, LinearBase):
             return self._linear_method(layer, prefix)

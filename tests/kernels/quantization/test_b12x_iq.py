@@ -16,7 +16,8 @@ from vllm.model_executor.layers.quantization.b12x_iq import (
 )
 
 
-def test_iq_scratch_reuses_current_arena_and_isolates_lanes(monkeypatch):
+@pytest.mark.parametrize("backend", ["b12x", "consumer_cuda"])
+def test_iq_scratch_reuses_current_arena_and_isolates_lanes(monkeypatch, backend):
     from vllm.v1.worker import workspace
 
     device = torch.device("cpu")
@@ -24,26 +25,36 @@ def test_iq_scratch_reuses_current_arena_and_isolates_lanes(monkeypatch):
     monkeypatch.setattr(workspace, "_manager", manager)
     specs = (SimpleNamespace(shape=(32,), dtype=torch.float32),)
     state = SimpleNamespace(scratch=SimpleNamespace(scratch_specs=lambda: specs))
-    first = _iq_scratch(state, device)[0]
-    assert _iq_scratch(state, device)[0].data_ptr() == first.data_ptr()
+    if backend == "consumer_cuda":
+        from vllm.model_executor.layers.quantization.consumer_iq import (
+            _consumer_scratch,
+        )
+
+        plan = SimpleNamespace(scratch_specs=lambda: (((32,), torch.float32),))
+        get_scratch = lambda: _consumer_scratch(plan)
+    else:
+        get_scratch = lambda: _iq_scratch(state, device)
+    first = get_scratch()[0]
+    assert get_scratch()[0].data_ptr() == first.data_ptr()
     # Later layers can grow the arena; execution must fetch the new backing.
     manager.get_simultaneous(((1024,), torch.float32))
-    grown = _iq_scratch(state, device)[0]
+    grown = get_scratch()[0]
     assert grown.data_ptr() != first.data_ptr()
     with workspace.use_workspace_lane(1):
-        other = _iq_scratch(state, device)[0]
+        other = get_scratch()[0]
         assert other.data_ptr() != grown.data_ptr()
     manager.lock()
-    assert _iq_scratch(state, device)[0].data_ptr() == grown.data_ptr()
+    assert get_scratch()[0].data_ptr() == grown.data_ptr()
     with workspace.use_workspace_lane(1):
-        assert _iq_scratch(state, device)[0].data_ptr() == other.data_ptr()
+        assert get_scratch()[0].data_ptr() == other.data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("shared_scratch", [False, True])
+@pytest.mark.parametrize("backend", ["b12x", "consumer_cuda"])
 @torch.inference_mode()
 def test_stream_load_warmup_and_frozen_method_replay(
-    tmp_path, monkeypatch, shared_scratch
+    tmp_path, monkeypatch, shared_scratch, backend
 ):
     import gguf
     from b12x._lib import compiler
@@ -96,7 +107,14 @@ def test_stream_load_warmup_and_frozen_method_replay(
         swiglu_alpha=None,
         swiglu_beta=None,
     )
-    method = B12xIQMoEMethod(config, gate=sources[0], up=sources[1], down=sources[2])
+    method_type = B12xIQMoEMethod
+    if backend == "consumer_cuda":
+        from vllm.model_executor.layers.quantization.consumer_iq import (
+            ConsumerIQMoEMethod,
+        )
+
+        method_type = ConsumerIQMoEMethod
+    method = method_type(config, gate=sources[0], up=sources[1], down=sources[2])
     layer = torch.nn.Module()
     layer.register_buffer(
         "expert_map", torch.tensor([0, -1, 1, -1], dtype=torch.int32, device=device)
@@ -163,7 +181,15 @@ def test_stream_load_warmup_and_frozen_method_replay(
             captured.fill_(float("nan"))
             if manager is not None:
                 # Another layer may overwrite every byte between launches.
-                for scratch in _iq_scratch(method._plans[32][0], device):
+                if backend == "consumer_cuda":
+                    from vllm.model_executor.layers.quantization.consumer_iq import (
+                        _consumer_scratch,
+                    )
+
+                    buffers = _consumer_scratch(method._plans[32][0])
+                else:
+                    buffers = _iq_scratch(method._plans[32][0], device)
+                for scratch in buffers:
                     scratch.view(torch.uint8).fill_(0xA5)
             allocations = torch.accelerator.memory_stats(device)[
                 "allocation.all.allocated"
