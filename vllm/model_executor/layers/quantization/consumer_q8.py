@@ -194,10 +194,15 @@ class ConsumerQ8W8A8LinearMethod(ConsumerQ8LinearMethod):
         return codes.reshape(*raw.shape[:2], -1), scales
 
     def _finish_preparation(self):
-        from consumer_int8.ops import fused_channel_mm, quantize_rows
+        from consumer_int8.ops import (
+            fused_channel_mm,
+            quantize_grouped4096,
+            quantize_rows,
+        )
 
         assert self._codes is not None and self._scales is not None
         self._quantize_rows = quantize_rows
+        self._quantize_grouped4096 = quantize_grouped4096
         self._fused_channel_mm = fused_channel_mm
         groups, n, k = self._codes.shape
         if n % 8 or k % 64:
@@ -262,15 +267,21 @@ class ConsumerQ8W8A8LinearMethod(ConsumerQ8LinearMethod):
         m = x.shape[0]
         output = torch.empty(groups, m, n, dtype=x.dtype, device=x.device)
         if m:
-            qa = torch.empty(m, k, dtype=torch.int8, device=x.device)
-            sa = torch.empty(m, dtype=torch.float32, device=x.device)
+            grouped = groups > 1 and k == 4096 and x.is_contiguous()
+            scratch_groups = groups if grouped else 1
+            qa = torch.empty(scratch_groups, m, k, dtype=torch.int8, device=x.device)
+            sa = torch.empty(scratch_groups, m, dtype=torch.float32, device=x.device)
+            if grouped:
+                self._quantize_grouped4096(x, qa, sa)
             for group in range(groups):
-                values = x[:, group].contiguous()
-                self._quantize_rows(values, qa, sa)
+                slot = group if grouped else 0
+                if not grouped:
+                    values = x[:, group].contiguous()
+                    self._quantize_rows(values, qa[slot], sa[slot])
                 self._fused_channel_mm(
-                    qa,
+                    qa[slot],
                     self._codes[group],
-                    sa,
+                    sa[slot],
                     self._channel_scales[group],
                     output[group],
                     0,
