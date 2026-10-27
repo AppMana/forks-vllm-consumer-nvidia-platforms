@@ -66,6 +66,7 @@ CACHE_REF="${CACHE_REF:-}"
 USE_SCCACHE="${USE_SCCACHE:-1}"
 # DeepEP currently targets SM90/SM100, outside the consumer architecture pair.
 BUILD_DEEPEP="${BUILD_DEEPEP:-0}"
+B12X_GIT_REF="${B12X_GIT_REF:-}"
 # LMCache, NIXL and Mooncake, as in the Harbor sm86 image; every one of them
 # ships aarch64 wheels, so both platforms carry the same connectors.
 INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS:-true}"
@@ -242,6 +243,9 @@ build_options=(
     --opt "build-arg:INSTALL_KV_CONNECTORS=$INSTALL_KV_CONNECTORS"
     --opt "build-arg:BUILD_DEEPEP=$BUILD_DEEPEP"
 )
+if [ -n "$B12X_GIT_REF" ]; then
+    build_options+=(--opt "build-arg:B12X_GIT_REF=$B12X_GIT_REF")
+fi
 if [ -n "$TARGET" ]; then
     build_options+=(--opt "target=$TARGET")
 fi

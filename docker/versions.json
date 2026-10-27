@@ -150,6 +150,9 @@
     },
     "SPARKINFER_REF": {
       "default": "d91c0a600c0a18d008c649d2aa30e89514ffba16"
+    },
+    "B12X_GIT_REF": {
+      "default": "d2cfa37f449a894c42604c5ba7629be0af56b71a"
     }
   }
 }

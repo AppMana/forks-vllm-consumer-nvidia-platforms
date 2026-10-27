@@ -48,6 +48,7 @@ class LoadConfig:
       loading behavior.
     - "npcache" will load the weights in pytorch format and store a numpy cache
       to speed up the loading.
+    - "dsv41_gguf": load local DeepSeek V4.1 GGUF shards with native compact weights.
     - "dummy" will initialize the weights with random values, which is mainly
       for profiling.
     - "tensorizer" will use CoreWeave's tensorizer library for fast weight

@@ -5,8 +5,10 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
+from vllm.model_executor.models.utils import StageMissingLayer
 from vllm.model_executor.warmup.kernel_warmup import (
     _deepseek_v4_image_visibility_warmup,
     _deepseek_v4_vision_warmup,
@@ -69,6 +71,27 @@ def test_vision_warmup_skips_ranks_without_the_tower_and_other_models(monkeypatc
         )
     )
     assert tower.calls == []
+
+
+@pytest.mark.parametrize("missing", ["vision", "aligner", "both"])
+def test_vision_warmup_skips_disabled_v41_meta_tower(missing):
+    with torch.device("meta"):
+        tower = FakeTower()
+        aligner = FakeAligner()
+    model = SimpleNamespace(
+        vision=(
+            StageMissingLayer("vision", tower)
+            if missing in ("vision", "both")
+            else tower
+        ),
+        aligner=(
+            StageMissingLayer("vision", aligner)
+            if missing in ("aligner", "both")
+            else aligner
+        ),
+    )
+    _deepseek_v4_vision_warmup(_worker(model, ("DeepseekV41ForCausalLM",)))
+    assert tower.calls == aligner.calls == []
 
 
 def test_image_visibility_warms_attention_rank_without_vision_tower(monkeypatch):

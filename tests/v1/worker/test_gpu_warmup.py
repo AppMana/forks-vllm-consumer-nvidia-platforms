@@ -157,6 +157,49 @@ def test_mixed_prefill_decode_warmup_drains_async_pp_slots():
     }
 
 
+def test_v41_long_prefill_warmup_uses_model_indexer_geometry(monkeypatch):
+    from vllm.model_executor.kernels.attention.dsa import candidate_blocks
+
+    calls = []
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        device=torch.device("cpu"),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                index_n_heads=32,
+                index_head_dim=128,
+                candidate_topk_blocks=2048,
+                candidate_block_size=8,
+            )
+        ),
+    )
+    for name in (
+        "warmup_prefill_chunk_metadata_kernel",
+        "warmup_indexer_prefill_gather_kernel",
+        "warmup_indexer_prefill_topk_kernel",
+        "warmup_indexer_streaming_topk_kernels",
+        "warmup_block_table_slot_mapping_kernel",
+        "run_mixed_prefill_decode_warmup",
+    ):
+        monkeypatch.setattr(gpu_warmup, name, lambda *a, **kw: False)
+    monkeypatch.setattr(
+        gpu_warmup,
+        "warmup_indexer_prefill_logits_kernel",
+        lambda device, **kw: calls.append(("logits", kw)),
+    )
+    monkeypatch.setattr(
+        candidate_blocks,
+        "warmup_candidate_block_kernels",
+        lambda device, **kw: calls.append(("candidates", kw)),
+    )
+    gpu_warmup.warmup_long_prefill_kernels(runner, lambda _: None, lambda _: None)
+    assert calls == [
+        ("logits", {"num_heads": 32, "head_dim": 128}),
+        ("candidates", {"topk_blocks": 2048, "block_size": 8}),
+    ]
+
+
 def test_deepseek_v4_long_prefill_warmup_runs_production_shapes(monkeypatch):
     mixed_sizes = []
     metadata_warmup = []

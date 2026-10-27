@@ -55,6 +55,10 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    fused_qnorm_rope_kv_int8_ds_mla_insert,
+    rope_kv_int8_ds_mla_insert,
+)
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v41.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
@@ -510,7 +514,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.packed_kv_cache_dtype,
         )
         self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
-        self.swa_bytes_per_token = 528 if self.kv_mxfp8 else 584
+        self.swa_bytes_per_token = (
+            528 if self.kv_cache_dtype == "int8_ds_mla" or self.kv_mxfp8 else 584
+        )
         # nvfp4_ds_mla keeps the MXFP8 sliding-window record and stores the
         # compressed cache as NVFP4 (256 B of e2m1 pairs + 32 e4m3 scales).
         self.compressed_bytes_per_token = (
@@ -519,7 +525,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # One alignment for every page in the block: the block stride is their
         # sum, and 512 satisfies both TMA strides in play (512 for the V4.1
         # fp8 record, 256 for NVFP4).
-        self.kv_page_alignment = 512 if self.kv_mxfp8 else 576
+        self.kv_page_alignment = (
+            528
+            if self.kv_cache_dtype == "int8_ds_mla"
+            else (512 if self.kv_mxfp8 else 576)
+        )
         if self.kv_cache_dtype == "nvfp4_ds_mla" and not self.kv_mxfp8:
             raise ValueError(
                 "nvfp4_ds_mla needs the V4.1 KV records, which FlashMLA "
@@ -696,18 +706,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # The KV half of _fused_qnorm_rope_kv_insert, bit for bit, without
             # the unused query; same as dspark's _insert_context_kv.
             cache = self.swa_cache_layer.kv_cache
-            torch.ops._C.fused_deepseek_v4_kv_rope_insert(
-                kv,
-                cache,
-                cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                self.swa_cache_layer.block_size,
-                self._flashinfer_fp8_kv_scale
-                if cache.dtype == torch.float8_e4m3fn
-                else None,
-                self.kv_mxfp8,
-            )
+            if self.kv_cache_dtype == "int8_ds_mla":
+                rope_kv_int8_ds_mla_insert(
+                    kv,
+                    cache,
+                    cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.swa_cache_layer.block_size,
+                )
+            else:
+                torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+                    kv,
+                    cache,
+                    cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.swa_cache_layer.block_size,
+                    self._flashinfer_fp8_kv_scale
+                    if cache.dtype == torch.float8_e4m3fn
+                    else None,
+                    self.kv_mxfp8,
+                )
         if self.compressor is not None:
             latent = self.compressor(kv_score, positions)
             self.compressor.insert_cache(latent, positions, self.rotary_emb)
@@ -1054,6 +1074,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_dtype = swa_kv_cache.dtype
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
+        if self.kv_cache_dtype == "int8_ds_mla":
+            assert not self.accepts_unnormed_unroped_query
+            return fused_qnorm_rope_kv_int8_ds_mla_insert(
+                q,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                positions,
+                cos_sin_cache,
+                self.padded_heads,
+                self.eps,
+                swa_metadata.block_size,
+                apply_q_norm=False,
+            )
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side: GPT-J RoPE, zero-filling the padding head slots; the
@@ -1145,7 +1179,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # fp8_ds_mla is a UE8M0 block-scaled uint8 layout whose page rounds up
         # to the decode kernel's TMA stride; plain bf16 / per-tensor fp8 rows
         # use natural element-size pages.
-        uses_fp8_ds_mla_layout = self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
+        uses_fp8_ds_mla_layout = self.kv_cache_dtype in (
+            "fp8_ds_mla",
+            "nvfp4_ds_mla",
+            "int8_ds_mla",
+        )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,

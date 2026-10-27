@@ -922,6 +922,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
   # subtract out the archs that are already built for 3x
   list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
+  # SM12x uses c3x for FP8 but still needs the Sm80 INT8 MMA kernels.
+  cuda_archs_loose_intersection(SCALED_MM_2X_INT8_ARCHS
+    "12.0;12.0a;12.0f;12.1;12.1a" "${CUDA_ARCHS}")
+  list(APPEND SCALED_MM_2X_ARCHS ${SCALED_MM_2X_INT8_ARCHS})
+  list(REMOVE_DUPLICATES SCALED_MM_2X_ARCHS)
   if (SCALED_MM_2X_ARCHS)
     set(SCALED_MM_C2X_SRCS "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c2x.cu")
     set_gencode_flags_for_srcs(

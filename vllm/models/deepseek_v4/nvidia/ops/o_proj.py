@@ -133,6 +133,25 @@ def deep_gemm_fp8_o_proj(
     kernel, one ``wo_a`` group per slot with the live groups first, so only
     the padding groups are sliced off.
     """
+    grouped_native = getattr(getattr(wo_a, "quant_method", None), "apply_grouped", None)
+    if grouped_native is not None:
+        if not isinstance(o, torch.Tensor):
+            raise ValueError("Native GGUF WO-A requires BF16 attention output")
+        if is_neox_style:
+            raise ValueError("Native GGUF WO-A currently requires interleaved RoPE")
+        rotated, _ = fused_inv_rope_fp8_quant(
+            o,
+            positions,
+            cos_sin_cache,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            quant_group_size=einsum_recipe[2],
+            tma_aligned_scales=False,
+            quantize=False,
+        )
+        return wo_b(grouped_native(wo_a, rotated))
     # dsv4_int stores wo_a as INT8 and dequantizes it to BF16 once at load
     # (`_dsv4_int_dequanted`); that path uses inverse-RoPE + a BF16 einsum, not
     # the FP8 einsum (which asserts fp8 weights).

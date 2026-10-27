@@ -70,7 +70,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
-_INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS: set[tuple[int, bool]] = set()
+_INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS: set[tuple[int, bool, int, int]] = set()
 _INDEXER_PREFILL_GATHER_KERNEL_WARMUPS: set[tuple[int, bool]] = set()
 _INDEXER_PREFILL_TOPK_KERNEL_WARMUPS: set[int] = set()
 _INDEXER_STREAMING_TOPK_KERNEL_WARMUPS: set[int] = set()
@@ -612,6 +612,8 @@ def warmup_indexer_prefill_logits_kernel(
     device: torch.device,
     *,
     qk_int8: bool | None = None,
+    num_heads: int = 64,
+    head_dim: int = 128,
 ) -> None:
     """Compile the contiguous prefill-logits kernel used by the indexer."""
     if device.type != "cuda":
@@ -626,13 +628,11 @@ def warmup_indexer_prefill_logits_kernel(
     device_index = device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    key = (device_index, qk_int8)
+    key = (device_index, qk_int8, num_heads, head_dim)
     if key in _INDEXER_PREFILL_LOGITS_KERNEL_WARMUPS:
         return
 
     num_rows = 1
-    num_heads = 64
-    head_dim = 128
     context_rows = 513
     qk_dtype = torch.int8 if qk_int8 else current_platform.fp8_dtype()
     q = torch.zeros((num_rows, num_heads, head_dim), dtype=qk_dtype, device=device)

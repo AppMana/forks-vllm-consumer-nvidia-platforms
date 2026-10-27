@@ -205,6 +205,8 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
     head_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     token_stride: tl.constexpr,
+    apply_q_norm: tl.constexpr,
+    compress_ratio: tl.constexpr,
 ):
     """Fused per-(token, slot) Q RMSNorm+RoPE / KV RoPE+int8 cache insert.
 
@@ -248,12 +250,16 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
             # one stale cache row is recoverable, a dead engine is not.
             tl.atomic_add(guard_counter_ptr, 1)
             return
+        position = tl.load(positions_ptr + token)
+        if (position + 1) % compress_ratio != 0:
+            return
         x = tl.load(kv_ptr + token * head_dim + offs).to(tl.float32)
     else:
         x = tl.load(q_ptr + (token * num_heads + slot) * head_dim + offs).to(tl.float32)
         # Per-head RMSNorm (no weight), fp32 math.
-        rms_rcp = tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + eps)
-        x = x * rms_rcp
+        if apply_q_norm:
+            rms_rcp = tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + eps)
+            x = x * rms_rcp
 
     # ── GPT-J RoPE on interleaved (even, odd) pairs of dims [448, 512) ──
     NUM_PAIRS: tl.constexpr = head_dim // 2
@@ -268,6 +274,8 @@ def _fused_qnorm_rope_kv_int8_ds_mla_insert_kernel(
     cs_idx = tl.maximum(rope_pair_local, 0)
 
     pos = tl.load(positions_ptr + token)
+    if is_kv:
+        pos = pos // compress_ratio * compress_ratio
     # Reading the cos/sin table at a corrupt position faults just like a
     # corrupt slot. Clamp to a valid row (the RoPE values are wrong for this
     # token, the addresses are not) and count it. Mask-style rather than a
@@ -349,6 +357,9 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
     num_heads_padded: int,
     eps: float,
     block_size: int,
+    *,
+    apply_q_norm: bool = True,
+    compress_ratio: int = 1,
 ) -> torch.Tensor:
     """int8_ds_mla SWA-cache twin of the csrc fp8 writer.
 
@@ -359,6 +370,8 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
     With DP padding ``slot_mapping`` can be shorter than ``q``: Q norm/rope
     runs on every row; KV insert only on the first ``slot_mapping.shape[0]``.
     """
+    if compress_ratio not in (1, 2) or (compress_ratio != 1 and q.shape[1] != 0):
+        raise ValueError("Compressed INT8 insertion requires a KV-only ratio1/2 launch")
     assert q.dim() == 3 and q.shape[-1] == _INT8_DS_MLA_DIM, (
         f"q must be [N, H, 512], got {q.shape}"
     )
@@ -410,6 +423,8 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
         head_dim=_INT8_DS_MLA_DIM,
         rope_dim=64,
         token_stride=_INT8_DS_MLA_TOKEN_BYTES,
+        apply_q_norm=apply_q_norm,
+        compress_ratio=compress_ratio,
     )
     if _INSERT_GUARD_REPORT and not torch.cuda.is_current_stream_capturing():
         host = guard_counter.cpu()
@@ -424,6 +439,25 @@ def fused_qnorm_rope_kv_int8_ds_mla_insert(
                 num_tokens_insert,
             )
     return q_out
+
+
+def rope_kv_int8_ds_mla_insert(
+    kv, k_cache, slot_mapping, positions, cos_sin_cache, block_size, *, compress_ratio=1
+):
+    """KV-only reuse of the fused writer; ratio2 rotates at the group's start."""
+    fused_qnorm_rope_kv_int8_ds_mla_insert(
+        kv[:, None, :][:, :0],
+        kv,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        0,
+        0.0,
+        block_size,
+        apply_q_norm=False,
+        compress_ratio=compress_ratio,
+    )
 
 
 def get_int8_ds_mla_cache_views(

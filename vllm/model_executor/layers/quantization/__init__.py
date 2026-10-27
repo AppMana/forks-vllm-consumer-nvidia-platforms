@@ -37,6 +37,7 @@ QuantizationMethods = Literal[
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
     "dsv4_int",
+    "dsv41_gguf",
     "qwen_int8",
     "dsv4_mxfp4_int8",
     "online",
@@ -140,6 +141,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         CompressedTensorsConfig,
     )
     from .dsv4_int import Dsv4IntConfig, Dsv4Mxfp4Int8Config
+    from .dsv41_gguf import Dsv41GGUFConfig
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
@@ -182,6 +184,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "deepseek_v4_fp8": deepseek_config,
         "dsv4_int": Dsv4IntConfig,
+        "dsv41_gguf": Dsv41GGUFConfig,
         "qwen_int8": QwenInt8Config,
         "dsv4_mxfp4_int8": Dsv4Mxfp4Int8Config,
         "humming": HummingConfig,

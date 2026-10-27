@@ -168,7 +168,7 @@ def test_int8_ds_mla_gather_dequant_prefill_shape() -> None:
         block_size=block_size,
         offset=128,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     expected = _expected_int8_dequant(k)
     torch.testing.assert_close(
@@ -203,9 +203,7 @@ def test_generic_gather_dispatches_int8_ds_mla() -> None:
     )
 
     expected = _expected_int8_dequant(k)
-    torch.testing.assert_close(
-        out[0], expected[5:8], rtol=0, atol=_INT8_DS_MLA_ATOL
-    )
+    torch.testing.assert_close(out[0], expected[5:8], rtol=0, atol=_INT8_DS_MLA_ATOL)
 
 
 def test_int8_ds_mla_token_stride_is_16_byte_multiple() -> None:
@@ -290,17 +288,13 @@ def _run_fused_insert_case(k_cache: torch.Tensor, block_size: int) -> None:
         eps,
         block_size,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     # ----- Q side: RMSNorm + RoPE + zero padding -----
     assert q_out.shape == (num_tokens, padded_heads, 512)
     q_ref = _reference_qnorm_rope(q, positions, cos_sin, eps).to(torch.bfloat16)
-    torch.testing.assert_close(
-        q_out[:, :num_heads], q_ref, rtol=1.6e-2, atol=1.6e-2
-    )
-    assert torch.equal(
-        q_out[:, num_heads:], torch.zeros_like(q_out[:, num_heads:])
-    )
+    torch.testing.assert_close(q_out[:, :num_heads], q_ref, rtol=1.6e-2, atol=1.6e-2)
+    assert torch.equal(q_out[:, num_heads:], torch.zeros_like(q_out[:, num_heads:]))
 
     # ----- KV side: RoPE (no norm) + int8 row + fp32 scale -----
     kv_ref = _reference_qnorm_rope(kv.unsqueeze(1), positions, cos_sin, None)[:, 0]
@@ -444,9 +438,7 @@ def test_generic_gather_rejects_fp8_layout_for_explicit_int8_dtype(flat) -> None
 
 def test_generic_gather_rejects_wrong_block_count_for_int8_layout() -> None:
     block_size = 64
-    wrong_block_count = torch.zeros(
-        2, block_size - 1, 528, dtype=torch.uint8
-    )
+    wrong_block_count = torch.zeros(2, block_size - 1, 528, dtype=torch.uint8)
     with pytest.raises(ValueError, match="528-byte INT8 cache layout"):
         dequantize_and_gather_k_cache(
             torch.empty(1, 1, 512, dtype=torch.bfloat16),
@@ -494,7 +486,7 @@ def test_fused_qnorm_rope_kv_int8_insert_guards_oob_slot_and_position() -> None:
     q_out = fused_qnorm_rope_kv_int8_ds_mla_insert(
         q, kv, k_cache, slot_mapping, positions, cos_sin, 2, 1e-6, block_size
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     delta = counter.cpu() - before
     assert int(delta[0]) == 1, f"expected 1 oob-slot trip, got {int(delta[0])}"
@@ -512,3 +504,92 @@ def test_fused_qnorm_rope_kv_int8_insert_guards_oob_slot_and_position() -> None:
         b, p = divmod(slot, block_size)
         row_used = bool(rows_i8[b, p].any() or scales[b, p] != 0)
         assert row_used == (slot in written), f"slot {slot}: used={row_used}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_v41_int8_cache_keeps_unnormalized_q_and_group_rope(ratio):
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        fused_qnorm_rope_kv_int8_ds_mla_insert,
+        rope_kv_int8_ds_mla_insert,
+    )
+
+    torch.manual_seed(109)
+    device = torch.device("cuda")
+    q = torch.randn(7, 3, 512, dtype=torch.bfloat16, device=device) * 3
+    kv = torch.randn(7, 512, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(7, dtype=torch.int64, device=device) + 3
+    angles = torch.randn(32, 32, device=device)
+    rope = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    slots = torch.tensor([0, 5, -1, 3, 2, 7, 4], device=device)
+    cache = torch.full((2, 4, 528), 0x55, dtype=torch.uint8, device=device)
+    if ratio == 1:
+        out = fused_qnorm_rope_kv_int8_ds_mla_insert(
+            q, kv, cache, slots, positions, rope, 4, 1e-20, 4, apply_q_norm=False
+        )
+        expected_q = _reference_qnorm_rope(q, positions, rope, None).bfloat16()
+        torch.testing.assert_close(out[:, :3], expected_q, atol=0.03125, rtol=0.008)
+        assert torch.count_nonzero(out[:, 3]) == 0
+    graph = torch.cuda.CUDAGraph()
+    rope_kv_int8_ds_mla_insert(
+        kv, cache, slots, positions, rope, 4, compress_ratio=ratio
+    )
+    with torch.cuda.graph(graph):
+        rope_kv_int8_ds_mla_insert(
+            kv, cache, slots, positions, rope, 4, compress_ratio=ratio
+        )
+    for repeat in range(2):
+        if repeat:
+            kv.neg_()
+            positions.add_(1)
+        cache.fill_(0x55)
+        graph.replay()
+        torch.accelerator.synchronize()
+        rotated = _reference_qnorm_rope(kv, positions // ratio * ratio, rope, None)
+        expected, scales = _reference_int8_quant_row(rotated)
+        rows, row_scales = get_int8_ds_mla_cache_views(cache, 4)
+        written = set()
+        for i, slot in enumerate(slots.tolist()):
+            if slot < 0 or (int(positions[i]) + 1) % ratio:
+                continue
+            written.add(slot)
+            # Fused RoPE can differ at BF16 ties; compare the dequantized row.
+            torch.testing.assert_close(
+                rows[slot // 4, slot % 4].float() * row_scales[slot // 4, slot % 4],
+                expected[i].float() * scales[i],
+                atol=0.04,
+                rtol=0.02,
+            )
+        for slot in set(range(8)) - written:
+            assert torch.all(cache[slot // 4, slot % 4] == 0x55)
+    graph.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_v41_int8_group_insert_above_2gib():
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        rope_kv_int8_ds_mla_insert,
+    )
+
+    block = 32
+    first_block = (2**31 + block * 528 - 1) // (block * 528)
+    cache = torch.empty(first_block + 1, block, 528, dtype=torch.uint8, device="cuda")
+    assert cache.stride(0) * first_block >= 2**31
+    cache[-1].fill_(0x55)
+    kv = torch.ones(2, 512, dtype=torch.bfloat16, device="cuda")
+    kv[1].fill_(-2)
+    positions = torch.tensor([3, 4], dtype=torch.int64, device="cuda")
+    slots = torch.tensor(
+        [first_block * block + 7, first_block * block + 8], device="cuda"
+    )
+    rope = torch.cat(
+        (torch.ones(8, 32, device="cuda"), torch.zeros(8, 32, device="cuda")), dim=1
+    )
+    rope_kv_int8_ds_mla_insert(
+        kv, cache, slots, positions, rope, block, compress_ratio=2
+    )
+    torch.accelerator.synchronize()
+    rows, scales = get_int8_ds_mla_cache_views(cache, block)
+    assert torch.all(rows[-1, 7] == 127)
+    torch.testing.assert_close(scales[-1, 7], torch.tensor(1 / 127, device="cuda"))
+    assert torch.all(cache[-1, 8] == 0x55)

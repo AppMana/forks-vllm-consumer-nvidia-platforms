@@ -730,7 +730,7 @@ RUN --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
         MAX_JOBS="${max_jobs:-}" \
             python3 /tmp/build_nixl_for_rubin.py --skip-system-deps --build-only; \
     fi
-# Build the independent SM86 kernels on each host architecture. No GPU or
+# Build the independent consumer kernels for the selected GPU architectures. No GPU or
 # inference-time compiler is needed. Submodule revisions come from the pin.
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=cache,target=/workspace/tmp/sccache,sharing=shared \
@@ -743,7 +743,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     test "$(git -C /tmp/consumer-int8-src rev-parse HEAD)" = "${CONSUMER_INT8_GIT_REF}"; \
     git -C /tmp/consumer-int8-src submodule update --init --recursive --depth=1; \
     uv pip install --python /opt/venv/bin/python 'setuptools>=77' wheel ninja; \
-    export TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS="${max_jobs:-2}"; \
+    export TORCH_CUDA_ARCH_LIST="${torch_cuda_arch_list}" MAX_JOBS="${max_jobs:-2}"; \
     if [ "${USE_SCCACHE:-0}" = "1" ]; then \
         mkdir -p /workspace/tmp/sccache; \
         if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT; fi; \
@@ -1653,6 +1653,25 @@ assert found, 'sparkinfer PCIe extensions are absent from the published wheel'; 
 print(f'sparkinfer AOT extensions: {len(found)}')"; \
     fi
 
+# Native GGUF IQ uses the separately qualified CUTLASS 4.6.2 toolchain.
+# Keep FA4/MSA's global toolchain intact. Serve this variant with
+# VLLM_PLUGINS='' /opt/b12x/bin/python -m vllm.entrypoints.cli.main serve ...
+# GGUF is registered in vLLM itself; b12x's optional FP6/safetensors plugins
+# target a different vLLM integration API.
+ARG B12X_GIT_REF=d2cfa37f449a894c42604c5ba7629be0af56b71a
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ -n "${B12X_GIT_REF}" ]; then \
+        echo "${B12X_GIT_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
+        apt-get update && apt-get install -y --no-install-recommends liburing-dev pkg-config && \
+        rm -rf /var/lib/apt/lists/* && \
+        uv venv --python /usr/bin/python3 --system-site-packages /opt/b12x && \
+        uv pip install --python /opt/b12x/bin/python \
+            'nvidia-cutlass-dsl[cu12,cu13]==4.6.2' 'gguf==0.18.0' && \
+        uv pip install --python /opt/b12x/bin/python --no-deps \
+            "b12x @ git+https://github.com/AppMana/forks-sparkinfer.git@${B12X_GIT_REF}" && \
+        /opt/b12x/bin/python -c "import importlib.metadata as m; from b12x.loader.gguf_experts import ExpertTensor; from b12x.loader.gguf_dense import DenseTensor; assert m.version('nvidia-cutlass-dsl') == '4.6.2'; assert m.version('gguf') == '0.18.0'"; \
+    fi
+
 # Fail the build, not the first request, if the sm12x kernel FQNs stop
 # resolving -- the registry is the only thing making one image serve both
 # architectures, so a silent break there is a deploy-time surprise.
@@ -1900,6 +1919,7 @@ LABEL org.opencontainers.image.source="${VLLM_SOURCE_REPO}" \
       ai.appmana.flashmla.spec="${FLASHMLA_SPEC} from ${FLASHMLA_INDEX_URL}" \
       ai.appmana.sparkinfer.spec="${SPARKINFER_SPEC} from ${SPARKINFER_INDEX_URL}" \
       ai.appmana.sparkinfer.ref="${SPARKINFER_REF}" \
+      ai.appmana.b12x.ref="${B12X_GIT_REF}" \
       ai.appmana.nccl.repo="${APPMANA_NCCL_GIT_REPO}" \
       ai.appmana.nccl.ref="${APPMANA_NCCL_GIT_REF}" \
       ai.appmana.usb4_rdma.provider="${USB4_RDMA_PROVIDER_VERSION}" \

@@ -316,6 +316,22 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
+        if k_cache_layer.kv_cache_dtype == "int8_ds_mla":
+            from vllm.models.deepseek_v4.common.ops.cache_utils import (
+                rope_kv_int8_ds_mla_insert,
+            )
+
+            rope_kv_int8_ds_mla_insert(
+                latent,
+                kv_cache,
+                k_cache_metadata.slot_mapping,
+                positions,
+                rotary_emb.cos_sin_cache,
+                k_cache_metadata.block_size // self.compress_ratio,
+                compress_ratio=self.compress_ratio,
+            )
+            return
+
         rope_quant_insert(
             latent,
             positions,

@@ -219,6 +219,15 @@ void cutlass_scaled_mm(torch::stable::Tensor& c, torch::stable::Tensor const& a,
       a.get_device_index());
   int32_t version_num = get_sm_version_num();
 
+#if defined ENABLE_SCALED_MM_C2X && ENABLE_SCALED_MM_C2X
+  // SM12x c3x supports FP8 only; INT8 uses the Sm80 mma.sync path.
+  if (version_num >= 120 && version_num < 130 &&
+      a.scalar_type() == torch::headeronly::ScalarType::Char) {
+    cutlass_scaled_mm_sm80(c, a, b, a_scales, b_scales, bias);
+    return;
+  }
+#endif
+
 #if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
   if (version_num >= 120) {
     cutlass_scaled_mm_sm120(c, a, b, a_scales, b_scales, bias);

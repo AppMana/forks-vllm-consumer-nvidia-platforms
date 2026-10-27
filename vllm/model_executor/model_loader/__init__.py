@@ -10,6 +10,7 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.dsv41_gguf_loader import Dsv41GGUFModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.flashpack_loader import FlashPackModelLoader
 from vllm.model_executor.model_loader.modelexpress_loader import (
@@ -35,6 +36,7 @@ LoadFormats = Literal[
     "auto",
     "hf",
     "dummy",
+    "dsv41_gguf",
     "fastsafetensors",
     "flashpack",
     "instanttensor",
@@ -53,6 +55,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "auto": DefaultModelLoader,
     "hf": DefaultModelLoader,
     "dummy": DummyModelLoader,
+    "dsv41_gguf": Dsv41GGUFModelLoader,
     "fastsafetensors": DefaultModelLoader,
     "flashpack": FlashPackModelLoader,
     "instanttensor": DefaultModelLoader,

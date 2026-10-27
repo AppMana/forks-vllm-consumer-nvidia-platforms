@@ -834,7 +834,16 @@ def _deepseek_v4_vision_warmup(worker: "Worker") -> None:
     model = worker.get_model()
     vision = getattr(model, "vision", None)
     aligner = getattr(model, "aligner", None)
-    if vision is None or aligner is None:
+    from vllm.model_executor.models.utils import StageMissingLayer
+
+    # Disabled modalities retain meta-device stubs for attribute inspection.
+    # Those stubs are not executable towers, including in text-only V4.1.
+    if (
+        vision is None
+        or aligner is None
+        or isinstance(vision, StageMissingLayer)
+        or isinstance(aligner, StageMissingLayer)
+    ):
         return
     projection = vision.patch_embed.proj
     grid = 2 * int(aligner.downsample_ratio)

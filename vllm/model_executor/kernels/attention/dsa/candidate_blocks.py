@@ -6,6 +6,25 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def warmup_candidate_block_kernels(
+    device: torch.device, *, topk_blocks: int, block_size: int
+) -> None:
+    """Prepare prefill/decode bounds and aligned/unaligned logits strides."""
+    if device.type != "cuda":
+        return
+    candidates = torch.empty((2, topk_blocks), dtype=torch.int32, device=device)
+    starts = torch.zeros(2, dtype=torch.int32, device=device)
+    for width in (512, 513):
+        ends = torch.full((2,), width, dtype=torch.int32, device=device)
+        for bounds in (None, starts):
+            logits = torch.zeros((2, width), dtype=torch.float32, device=device)
+            select_candidate_blocks(
+                logits, bounds, ends, topk_blocks, block_size, candidates
+            )
+            apply_candidate_mask(logits, bounds, ends, candidates, block_size)
+    torch.accelerator.synchronize()
+
+
 @triton.jit
 def _max_with_nan(a, b):
     return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)

@@ -53,14 +53,16 @@ def _reference_engram_post_wkv(
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "num_tokens,num_kv_tokens,hc_mult,dim,tp_size,tp_rank,use_mask",
+    "num_tokens,num_kv_tokens,hc_mult,dim,tp_size,tp_rank,use_mask,fold_gate",
     [
-        (1, 1, 4, 5120, 1, 0, False),
-        (3, 5, 4, 96, 2, 0, True),
-        (3, 5, 2, 257, 2, 1, False),
-        (3, 5, 4, 96, 2, 1, True),
-        (1, 1, 4, 96, 4, 3, True),
-        (0, 0, 4, 96, 4, 0, False),
+        (1, 1, 4, 5120, 1, 0, False, False),
+        (3, 5, 4, 96, 2, 0, True, False),
+        (3, 5, 2, 257, 2, 1, False, False),
+        (3, 5, 4, 96, 2, 1, True, False),
+        (1, 1, 4, 96, 4, 3, True, False),
+        (0, 0, 4, 96, 4, 0, False, False),
+        (1, 1, 4, 5120, 1, 0, False, True),
+        (7, 7, 4, 5120, 1, 0, True, True),
     ],
 )
 def test_fused_engram_post_wkv_matches_reference(
@@ -71,6 +73,7 @@ def test_fused_engram_post_wkv_matches_reference(
     tp_size,
     tp_rank,
     use_mask,
+    fold_gate,
     monkeypatch,
 ):
     """Preserve gate math, WKV layout, masking, and SP padding semantics."""
@@ -134,6 +137,11 @@ def test_fused_engram_post_wkv_matches_reference(
         assert args[0].shape[0] == num_tokens
 
     module.wkv.register_forward_pre_hook(check_local_projection)
+    if fold_gate:
+        # Unsloth stores the FP32 product. Compare with the reference using
+        # the original two BF16 factors, including real width and masking.
+        q_weight = q_weight.float() * k_weight.float()
+        k_weight = torch.ones_like(k_weight)
     module.q_weight = torch.nn.Parameter(q_weight, requires_grad=False)
     module.k_weight = torch.nn.Parameter(k_weight, requires_grad=False)
 

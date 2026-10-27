@@ -449,7 +449,7 @@ class NgramHashState(nn.Module):
         tokenizer = AutoTokenizer.from_pretrained(
             model_config.tokenizer,
             trust_remote_code=model_config.trust_remote_code,
-            revision=model_config.revision,
+            revision=model_config.tokenizer_revision,
         )
         token_map, vocab_size = build_compressed_token_map(tokenizer)
         if vocab_size != layout.compressed_vocab_size:
@@ -1548,7 +1548,12 @@ class Engram(nn.Module):
         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
         # suffix rule.
-        self.embed_tokens = self._create_embedding(layout, layer_hash_index)
+        create_embedding = getattr(quant_config, "create_engram_embedding", None)
+        self.embed_tokens = (
+            create_embedding(layout, layer_hash_index)
+            if create_embedding is not None
+            else self._create_embedding(layout, layer_hash_index)
+        )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         # Without sequence parallelism every TP rank holds every token, so
         # shard the output columns instead of replicating the projection.

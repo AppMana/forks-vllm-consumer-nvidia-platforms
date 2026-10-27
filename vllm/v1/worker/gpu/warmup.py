@@ -748,7 +748,28 @@ def warmup_long_prefill_kernels(
         # avoids first-request JIT even when a PP rank has no long prefill work.
         warmup_prefill_chunk_metadata_kernel(device, compress_ratio=4)
         warmup_indexer_prefill_gather_kernel(device)
-        warmup_indexer_prefill_logits_kernel(device)
+        text_config = getattr(
+            getattr(model_runner, "model_config", None), "hf_text_config", None
+        )
+        if text_config is not None and hasattr(text_config, "index_n_heads"):
+            warmup_indexer_prefill_logits_kernel(
+                device,
+                num_heads=text_config.index_n_heads,
+                head_dim=text_config.index_head_dim,
+            )
+        else:
+            warmup_indexer_prefill_logits_kernel(device)
+        candidate_topk = getattr(text_config, "candidate_topk_blocks", 0)
+        if candidate_topk and text_config is not None:
+            from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+                warmup_candidate_block_kernels,
+            )
+
+            warmup_candidate_block_kernels(
+                device,
+                topk_blocks=candidate_topk,
+                block_size=text_config.candidate_block_size,
+            )
         warmup_indexer_prefill_topk_kernel(device)
         warmup_indexer_streaming_topk_kernels(device)
         warmup_block_table_slot_mapping_kernel(model_runner, device)

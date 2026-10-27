@@ -11,6 +11,23 @@
 
 namespace vllm {
 
+// Ampere INT8 MMA is also supported by consumer Blackwell.
+template <typename Kernel>
+struct enable_sm80_int8 : Kernel {
+  template <typename... Args>
+  CUTLASS_DEVICE static void invoke(Args&&... args) {
+#if defined __CUDA_ARCH__
+  #if (__CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 890) || \
+      (__CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300)
+    Kernel::invoke(std::forward<Args>(args)...);
+  #else
+    printf("This INT8 kernel only supports sm[80, 89) and sm[120, 130).\n");
+    asm("trap;");
+  #endif
+#endif
+  }
+};
+
 template <typename InType, typename OutType,
           template <typename, typename> typename Epilogue>
 struct sm80_config_default {
@@ -23,7 +40,7 @@ struct sm80_config_default {
   using WarpShape = typename cutlass::gemm::GemmShape<64, 64, 64>;
   using InstructionShape = typename cutlass::gemm::GemmShape<16, 8, 32>;
   using Cutlass2xGemm =
-      cutlass_2x_gemm<cutlass::arch::Sm80, enable_sm80_to_sm89, InType, OutType,
+      cutlass_2x_gemm<cutlass::arch::Sm80, enable_sm80_int8, InType, OutType,
                       Epilogue, TileShape, WarpShape, InstructionShape, 5>;
 };
 
@@ -39,7 +56,7 @@ struct sm80_config_M64 {
   using WarpShape = typename cutlass::gemm::GemmShape<64, 64, 64>;
   using InstructionShape = typename cutlass::gemm::GemmShape<16, 8, 32>;
   using Cutlass2xGemm =
-      cutlass_2x_gemm<cutlass::arch::Sm80, enable_sm80_to_sm89, InType, OutType,
+      cutlass_2x_gemm<cutlass::arch::Sm80, enable_sm80_int8, InType, OutType,
                       Epilogue, TileShape, WarpShape, InstructionShape, 5>;
 };
 
@@ -53,7 +70,7 @@ struct sm80_config_M32 {
   using WarpShape = typename cutlass::gemm::GemmShape<32, 64, 64>;
   using InstructionShape = typename cutlass::gemm::GemmShape<16, 8, 32>;
   using Cutlass2xGemm =
-      cutlass_2x_gemm<cutlass::arch::Sm80, enable_sm80_to_sm89, InType, OutType,
+      cutlass_2x_gemm<cutlass::arch::Sm80, enable_sm80_int8, InType, OutType,
                       Epilogue, TileShape, WarpShape, InstructionShape, 5>;
 };
 
@@ -67,7 +84,7 @@ struct sm80_config_M16 {
   using WarpShape = typename cutlass::gemm::GemmShape<16, 64, 64>;
   using InstructionShape = typename cutlass::gemm::GemmShape<16, 8, 32>;
   using Cutlass2xGemm =
-      cutlass_2x_gemm<cutlass::arch::Sm80, enable_sm80_to_sm89, InType, OutType,
+      cutlass_2x_gemm<cutlass::arch::Sm80, enable_sm80_int8, InType, OutType,
                       Epilogue, TileShape, WarpShape, InstructionShape, 5>;
 };
 

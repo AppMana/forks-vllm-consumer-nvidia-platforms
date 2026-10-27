@@ -204,6 +204,16 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     FlashMLA path.
     """
     backend = vllm_config.attention_config.backend
+    if vllm_config.cache_config.cache_dtype == "int8_ds_mla":
+        if backend not in (None, AttentionBackendEnum.NATIVE_INT8_MLA_SPARSE_DSV41):
+            raise ValueError("V4.1 INT8 KV cache requires NATIVE_INT8_MLA_SPARSE_DSV41")
+        from .int8_attention import DeepseekV41Int8Attention
+
+        return DeepseekV41Int8Attention
+    if backend is AttentionBackendEnum.NATIVE_INT8_MLA_SPARSE_DSV41:
+        raise ValueError(
+            "Native V4.1 INT8 attention requires --kv-cache-dtype int8_ds_mla"
+        )
     device_capability = current_platform.get_device_capability()
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
@@ -1573,6 +1583,7 @@ class DeepseekV41LLMForCausalLM(
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=vllm_config.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:

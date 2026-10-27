@@ -66,6 +66,30 @@ capability = current_platform.get_device_capability()
 capability_int = (capability[0] * 10 + capability[1]) if capability is not None else 0
 
 
+@pytest.mark.parametrize("m", [1, 32, 64, 128, 512])
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_cutlass_int8_graph_replay_overwrites_output(m, out_dtype, with_bias):
+    """Exercise small-SMEM fallback tiles and reject empty architecture guards."""
+    a = torch.randint(-16, 16, (m, 256), device="cuda", dtype=torch.int8)
+    b = torch.randint(-16, 16, (512, 256), device="cuda", dtype=torch.int8).T
+    sa = torch.full((m, 1), 0.125, device="cuda")
+    sb = torch.full((1, 512), 0.0625, device="cuda")
+    bias = torch.ones(512, device="cuda", dtype=out_dtype) if with_bias else None
+    ops.cutlass_scaled_mm(a, b, sa, sb, out_dtype, bias)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = ops.cutlass_scaled_mm(a, b, sa, sb, out_dtype, bias)
+    a.zero_()
+    a[:, 0] = 8
+    out.fill_(float("nan"))
+    graph.replay()
+    expected = (a.float() @ b.float()) * sb * sa
+    if bias is not None:
+        expected += bias
+    torch.testing.assert_close(out, expected.to(out_dtype), rtol=0, atol=0)
+
+
 def rand_int8(shape: tuple, device: str = "cuda"):
     return to_int8(torch.rand(shape, device=device) * 255 - 128)
 

@@ -113,6 +113,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     # DeepSeek V4.1 sparse MLA backends (model-driven; selected via the V4.1
     # layer). Separate names from DSV4 so a V4.1 model never resolves the
     # V4.0 backend classes through this enum.
+    NATIVE_INT8_MLA_SPARSE_DSV41 = (
+        "vllm.models.deepseek_v41.nvidia.int8_attention.DeepseekV41Int8Backend"
+    )
     FLASHMLA_SPARSE_DSV41 = (
         "vllm.models.deepseek_v41.sparse_mla.DeepseekV4FlashMLABackend"
     )
