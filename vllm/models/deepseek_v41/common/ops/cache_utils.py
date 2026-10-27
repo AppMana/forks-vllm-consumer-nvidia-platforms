@@ -863,7 +863,12 @@ def compute_global_topk_indices_and_lens(
     return global_topk_indices, topk_lens
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "token_to_req_indices_ptr",
+        "is_valid_token_ptr",
+    ],
+)
 def _compute_global_topk_indices_and_lens_kernel(
     global_topk_indices_ptr,
     global_topk_indices_stride: tl.constexpr,
@@ -878,6 +883,7 @@ def _compute_global_topk_indices_and_lens_kernel(
     is_valid_token_ptr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
+    # Mixed decode/prefill slices change alignment of these scalar loads.
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)

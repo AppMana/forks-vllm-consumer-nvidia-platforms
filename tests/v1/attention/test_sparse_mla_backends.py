@@ -2505,6 +2505,60 @@ def test_sparse_indexer_max_logits_bytes_honors_env_override(monkeypatch):
     assert sparse_indexer_max_logits_bytes(is_sm12x=False) == 384 * 1024 * 1024
 
 
+@pytest.mark.parametrize("block_size", [4, 8])
+def test_v41_global_topk_slices_reuse_warmed_kernel(monkeypatch, block_size):
+    """Mixed prefill offsets must preserve slots without compiling new variants."""
+    from vllm.models.deepseek_v41.common.ops.cache_utils import (
+        compute_global_topk_indices_and_lens as map_indices,
+    )
+    from vllm.triton_utils import triton
+
+    device = torch.device(DEVICE_TYPE)
+    rows, topk = 23, 512
+    local = torch.arange(rows * topk, dtype=torch.int32).reshape(rows, topk)
+    local = local.remainder(8 * block_size)
+    local[:, ::11] = -1
+    requests = torch.arange(rows, dtype=torch.int32).remainder(3)
+    valid = torch.arange(rows).remainder(3) != 1
+    table = torch.arange(24, dtype=torch.int32).reshape(3, 8).flip(1) + 17
+    local_gpu, requests_gpu, valid_gpu, table_gpu = (
+        tensor.to(device) for tensor in (local, requests, valid, table)
+    )
+    map_indices(local_gpu[:7], requests_gpu[:7], table_gpu, block_size, valid_gpu[:7])
+    map_indices(
+        local_gpu[1:8], requests_gpu[1:8], table_gpu, block_size, valid_gpu[1:8]
+    )
+    torch.accelerator.synchronize()
+
+    def reject_compile(**kwargs):
+        pytest.fail("Sliced metadata triggered compilation after aligned warmup")
+
+    monkeypatch.setattr(triton.knobs.runtime, "jit_post_compile_hook", reject_compile)
+    for offset in range(17):
+        count = 3 if offset % 2 else 7
+        selection = slice(offset, offset + count)
+        for changed in (False, True):
+            req = (requests[selection] + int(changed)).remainder(3)
+            requests_gpu[selection].copy_(req)
+            out, lens = map_indices(
+                local_gpu[selection],
+                requests_gpu[selection],
+                table_gpu,
+                block_size,
+                valid_gpu[selection],
+            )
+            indices = local[selection]
+            nonnegative = indices >= 0
+            expected = table[
+                req.long()[:, None], indices.clamp_min(0).long() // block_size
+            ]
+            expected = expected * block_size + indices.remainder(block_size)
+            expected[~nonnegative] = -1
+            expected_lens = nonnegative.sum(1).to(torch.int32) * valid[selection]
+            torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+            torch.testing.assert_close(lens.cpu(), expected_lens, rtol=0, atol=0)
+
+
 def test_compute_global_topk_indices_supports_in_place_output():
     device = torch.device(DEVICE_TYPE)
     block_size = 4
