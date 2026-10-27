@@ -347,6 +347,11 @@ def test_native_dense_streamed_merged_lifecycle(
     with pytest.raises(NotImplementedError, match="Grouped WO-A"):
         method.process_weights_after_loading(layer)
     layer.is_bmm = False
+    if backend == "consumer_w8a8":
+        import sys
+
+        # Channel W8A8 must load without the separate GGUF/BF16 kernel module.
+        monkeypatch.setitem(sys.modules, "consumer_int8.gguf", None)
     method.process_weights_after_loading(layer)
     method.get_b12x_warmup_unit(layer, (1, 8, 32), torch.bfloat16).compile()
     if backend == "b12x_ephemeral":

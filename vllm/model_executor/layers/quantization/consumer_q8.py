@@ -36,8 +36,6 @@ class ConsumerQ8LinearMethod(B12xGGUFLinearMethod):
         return self._weight_workspace
 
     def _prepare_slices(self, layer):
-        from consumer_int8.gguf import pack_q8
-
         if self._codes is not None:
             raise RuntimeError("Reload requires rebuilding Q8 captures")
         device = layer._b12x_gguf_device.device
@@ -70,7 +68,7 @@ class ConsumerQ8LinearMethod(B12xGGUFLinearMethod):
                         column_start=source.column_start,
                         columns=k,
                     )
-                    codes, scales = pack_q8(raw.to(device).unsqueeze(0))
+                    codes, scales = self._pack_q8(raw.to(device).unsqueeze(0))
                     target = start if grouped else offset + start
                     self._codes[group, target : target + count].copy_(codes[0])
                     self._scales[group, target : target + count].copy_(scales[0])
@@ -79,6 +77,12 @@ class ConsumerQ8LinearMethod(B12xGGUFLinearMethod):
             self._finish_preparation()
             layer.b12x_warmup_provider = self
             self.warmup_launches(layer, token_counts=(self.max_tokens,))
+
+    @staticmethod
+    def _pack_q8(raw):
+        from consumer_int8.gguf import pack_q8
+
+        return pack_q8(raw)
 
     def _finish_preparation(self):
         assert self._codes is not None
@@ -177,6 +181,17 @@ class ConsumerQ8W8A8LinearMethod(ConsumerQ8LinearMethod):
     Only one INT8 weight copy survives loading; eager outputs own their
     lifetime and CUDA graph captures retain their own activation scratch.
     """
+
+    @staticmethod
+    def _pack_q8(raw):
+        # W8A8 needs only the channel INT8 AOT library, not GGUF/BF16 kernels.
+        if raw.dtype != torch.uint8 or raw.ndim != 4 or raw.shape[-1] != 34:
+            raise ValueError("Expected Q8 uint8 [G,N,K/32,34] blocks")
+        scales = raw[..., :2].contiguous().view(torch.float16).squeeze(-1)
+        if not torch.isfinite(scales).all().item():
+            raise ValueError("Q8 scales must be finite")
+        codes = raw[..., 2:].contiguous().view(torch.int8)
+        return codes.reshape(*raw.shape[:2], -1), scales
 
     def _finish_preparation(self):
         from consumer_int8.ops import fused_channel_mm, quantize_rows
