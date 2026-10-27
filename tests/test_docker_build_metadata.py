@@ -117,6 +117,19 @@ def test_torch_cuda_arch_list_arg_is_consistent() -> None:
     )
 
 
+def test_non_sccache_build_disables_setup_auto_detection() -> None:
+    """The Spark build must not contact S3 just because sccache is installed."""
+    blocks = re.findall(
+        r'if \[ "\$USE_SCCACHE" != "1" \]; then .*?fi',
+        DOCKERFILE.read_text(),
+        re.DOTALL,
+    )
+    assert len(blocks) == 1
+    assert blocks[0].index("export VLLM_DISABLE_SCCACHE=1") < blocks[0].index(
+        "setup.py bdist_wheel"
+    )
+
+
 @pytest.mark.parametrize("arch", REQUIRED_ARCHES)
 def test_torch_cuda_arch_list_covers_both_platforms(arch: str) -> None:
     """One image serves sm_86 and sm_121; a missing arch means no SASS."""

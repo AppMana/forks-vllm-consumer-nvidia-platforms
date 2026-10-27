@@ -573,6 +573,7 @@ ENV CCACHE_DIR=/root/.cache/ccache
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "$USE_SCCACHE" != "1" ]; then \
+        export VLLM_DISABLE_SCCACHE=1 && \
         # Clean any existing CMake artifacts
         rm -rf .deps && \
         mkdir -p .deps && \
