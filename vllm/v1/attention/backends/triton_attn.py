@@ -723,12 +723,12 @@ class TritonAttentionImpl(AttentionImpl):
         ):
             native_decode = getattr(layer, "_consumer_int8_decode", None)
             if max_seqlen_q <= 8 and native_decode is not None:
-                # The 16-row tile fits two CTAs per SM; the 32-row
-                # verification tile uses eight warps and fits one.
+                # Both native tile variants target two resident CTAs per SM.
+                # The precision kernel bounds the 32-row tile to 128 registers.
                 rows = 16 if max_seqlen_q <= 2 else 32
                 query_tiles = cdiv(max_seqlen_q * 6, rows)
                 jobs = seqused_k.numel() * self.num_kv_heads * query_tiles
-                target = self.consumer_int8_sms * (2 if rows == 16 else 1)
+                target = self.consumer_int8_sms * 2
                 parts = max(
                     4, min(128, 1 << max(0, (target // max(jobs, 1)).bit_length() - 1))
                 )

@@ -11,12 +11,13 @@ records the procedure and the invariants each merge has to preserve.
 
 | Checkpoint | Revision | Source | Quantization | Serving |
 | --- | --- | --- | --- | --- |
+| [`unsloth/DeepSeek-V4.1-Flash-1017-GGUF`](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`UD-Q2_K_XL`) | `60ad3651641b5c97679c807e064ab1d7a3ca1455` | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | `quant_method = dsv41_gguf`: mixed `IQ2_XXS` / `IQ3_XXS` / `MXFP4` (`Q4_0`) routed experts (`b12x` W4A16 decode + optional borrowed-weight native `dp4a` INT8 prefill), `Q8_0` / `Q6_K` dense, shared-expert and attention linears with live-row transient BF16 expansion and grouped `wo_a` W8A8 (`consumer_int8.gguf`), disk-backed Engram embeddings, packed `int8_ds_mla` cache, INT8 sparse indexer | TP=2/EP=2 across two DGX Spark GB10s (`max_num_batched_tokens=2048`, `max_num_seqs=8`, PIECEWISE CUDA graphs `[1,2,4,8]`) |
 | [`appmana/deepseek-v4-int4-int8`](https://huggingface.co/appmana/deepseek-v4-int4-int8) | `3b25318eca9ccebc48130251d2c8b825341ad0ea` | `deepseek-ai/DeepSeek-V4-Flash-0731` at `9e165c30e2704aec5d9d593cce3eebd58bbef1cb` | INT4 group-32 routed experts (MSE scales), channel-INT8 dense, shared-expert and attention linears, packed `int8_ds_mla` cache, INT8 sparse indexer, three native DSpark draft stages | PP=11 or PP=12 across RTX 3090s; TP=2 across two GB10s |
 | [`appmana/deepseek-v4-flash-vision-exp-int4-int8`](https://huggingface.co/appmana/deepseek-v4-flash-vision-exp-int4-int8) | `65df4c51a2e724340c7963ccddd1f5199a2575e4` (BF16 vision tower on branch `bf16-vision-reference`, `bee7f4e9f445e49067b35d88e4ef3ef3ca9f1a56`) | `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` at `6821d6ad3681a4b137b066b76094fa82ebd0a380` | The same language quantization plus a group-32 W8A8 INT8 vision tower and aligner run on integer tensor cores | PP=11 across RTX 3090s with layer partition `4,4,4,4,4,4,4,4,5,5,1`, eight images per request, eight sequences, DSpark with seven probabilistic draft tokens |
 
-Both carry `quantization_config.quant_method = dsv4_int` and a `vllm` block
-naming the kernels they require; stock vLLM cannot load either. The
-separate `appmana/deepseek-v4-nvfp4-fp8` checkpoint uses a different
+The `dsv4_int` and `dsv41_gguf` configurations declare a `vllm` block naming
+the kernels and `int8_ds_mla` cache they require; stock vLLM cannot load them.
+The separate `appmana/deepseek-v4-nvfp4-fp8` checkpoint uses a different
 quantization and kernel configuration.
 
 ## Qwen3.8-27B INT8
@@ -34,7 +35,11 @@ inside a custom operator preserves this policy during AOT graph reuse.
 Native CUDA implementations handle small-batch GDN decode and INT8 cache
 insertion. The `consumer_fa2` attention backend converts active INT8 cache
 rows to temporary BF16 pages for FlashAttention 2, with direct packed CUDA
-attention above its 512-MiB scratch cap. Decode retains Triton, and GDN
+attention above its 512-MiB scratch cap. Short-query decode and MTP
+verification (`max_seqlen_q <= 8`) use `consumer_int8.ops.paged_decode` over
+the packed INT8 cache with high-plus-residual BF16 PV accumulation and
+two-CTA-per-SM occupancy (`target = 2 * SMs`, `2.58x–36.35x` faster than
+Triton `unified_attention` across `q=1..8` and `Hkv=2,4` on RTX A5000). GDN
 prefill retains FLA. INT8 storage does not imply integer attention arithmetic.
 
 The package's `benchmarks/run_quality.py` checks fixed text and vision
@@ -241,6 +246,42 @@ four C=8 repeats):
 | 8,000 | 8 | 0.5 | 17,410 | 112,354 | 41.1 | 316.9 | 8/8 |
 | 8,000 | 8 | 0.5 | 15,178 | 99,286 | 40.6 | 312.1 | 8/8 |
 | 8,000 | 8 | 0.4 | 20,200 | 114,611 | 40.8 | 315.5 | 8/8 |
+
+### `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` (`UD-Q2_K_XL`), 2 DGX Spark GB10s
+
+Two DGX Spark GB10 nodes (`spark-2ab3` and `spark-5867`) linked by dual-rail
+200 Gb/s RoCE; `TP=2, EP=2, PP=1`, `quant_method=dsv41_gguf` (`UD-Q2_K_XL` at
+revision `60ad3651641b5c97679c807e064ab1d7a3ca1455`), `int8_ds_mla` cache,
+disk-backed Engram embeddings (`io_uring`), `max_num_batched_tokens=2048`,
+`max_num_seqs=8`, PIECEWISE CUDA graphs at `[1,2,4,8]`, grouped W8A8 `attn.wo_a`
+and live-row transient BF16 expansion (`ghcr.io/appmana/vllm-consumer:sm86-sm121-efd38faff6`,
+`sha256:40caacbff9d940dc920cdc78dab516e7e1b5df87f440e31ca5cf59e974b8e3a9`).
+Measured 2026-10-27 to 2026-10-28.
+
+Cold single-request prefill throughput (`max_tokens=1`, 3 trials per length,
+zero prefix-cache hits):
+
+| Input tokens | Median prefill tok/s |
+| ---: | ---: |
+| 4,096 | 1,900.1 |
+| 8,192 | 1,866.1 |
+| 20,000 | 1,837.4 |
+
+GSM8K 128-question diagnostic subset (5-shot, `C=8`, `max_tokens=512`,
+`temperature=0`, `thinking=false`): **126/128 (98.44%)**, `0` invalid,
+**67.91 tok/s** aggregate output (`19,138` output tokens in `281.81 s`).
+
+Cold 8,192-input / 1,024-output needle-in-haystack (`B=1` and `B=7`, unique
+salted prefix per request, `benchmarks/benchmark_dsv41_needle.py`):
+
+| Variant | Cohort | Verbatim | Median / Last TTFT s | Prefill tok/s | Post-prefill decode s | Decode tok/s | Total wall s | Aggregate output tok/s | Total tok/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048 Control (`b12x` W4A16) | `B=1` (3 trials) | 3/3 | 4.519 | 1,812.6 | 53.271 | 19.20 | 57.791 | 17.72 | 159.5 |
+| 2048 Borrowed Old (uniform `M=16` `dp4a`) | `B=1` (3 trials) | 3/3 | 4.989 | 1,642.1 | 53.288 | 19.20 | 58.277 | 17.57 | 158.1 |
+| 2048 Hybrid Fused (`M=16/M=32` + fused FC1 `dp4a`) | `B=1` (3 trials) | 3/3 | 4.710 | 1,739.1 | 53.589 | 19.09 | 58.299 | 17.56 | 158.1 |
+| 2048 Control (`b12x` W4A16) | `B=7` (`7x 8k/1k`) | 7/7 | 5.303 / 30.515 | 1,879.2 | 99.969 | 71.63 | 130.483 | 54.93 | 494.4 |
+| 2048 Borrowed Old (uniform `M=16` `dp4a`) | `B=7` (`7x 8k/1k`) | 7/7 | 5.640 / 32.405 | 1,769.6 | 93.045 | 76.96 | 125.450 | 57.14 | 514.2 |
+| 2048 Hybrid Fused (`M=16/M=32` + fused FC1 `dp4a`) | `B=7` (`7x 8k/1k`) | 7/7 | 5.384 / 30.692 | 1,868.3 | 96.311 | 74.35 | 127.004 | 56.44 | 508.0 |
 
 ## Build
 
