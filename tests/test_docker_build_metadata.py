@@ -151,6 +151,8 @@ def test_versions_json_matches_the_dockerfile() -> None:
         ("nvcc_threads", "NVCC_THREADS"),
         ("BUILD_DEEPEP", "BUILD_DEEPEP"),
         ("APPMANA_NCCL_GIT_REF", "APPMANA_NCCL_GIT_REF"),
+        ("CONSUMER_INT8_GIT_REF", "CONSUMER_INT8_GIT_REF"),
+        ("B12X_GIT_REF", "B12X_GIT_REF"),
         ("USB4_RDMA_PROVIDER_VERSION", "USB4_RDMA_PROVIDER_VERSION"),
         ("APPMANA_THUNDERBOLT_RELEASE_TAG", "APPMANA_THUNDERBOLT_RELEASE_TAG"),
     ):

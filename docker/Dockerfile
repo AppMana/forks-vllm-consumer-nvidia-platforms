@@ -59,10 +59,12 @@ ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 # 2.29.7 -- two minor versions behind what Ampere was running.
 ARG APPMANA_NCCL_GENCODE="-gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_121,code=compute_121"
 ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
+# Release tag v2.32.3 on AppMana/forks-nccl-rdma-routing
 ARG APPMANA_NCCL_GIT_REF=0dd53af6f900ff0d3b7b27a8d8baab8e71e8333f
 ARG BUILD_DEEPEP=1
 ARG CONSUMER_INT8_GIT_REPO=https://github.com/AppMana/consumer-int8-kernels.git
-ARG CONSUMER_INT8_GIT_REF=db3cec4417a0ef6903221f4401a03fdb80e63ae8
+# Release tag v0.1.0 on AppMana/consumer-int8-kernels
+ARG CONSUMER_INT8_GIT_REF=ade8c34ef81a3b9b9dadc04700e9c7f1f169fd03
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
 # 0.2.73 ships libtbrxe for tbrxe.ko (thunderbolt_frame_rxe, stock rxe uverbs
@@ -1482,6 +1484,7 @@ ARG INSTALL_KV_CONNECTORS=false
 ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
 ARG CUDA_VERSION
+# Tag appmana-v0.5.6.dev1 on AppMana/forks-lmcache
 ARG LMCACHE_GIT_REF=0982a7f901aa727b225513a8f526432887bfa4b2
 ARG CONSUMER_INT8_GIT_REPO
 ARG CONSUMER_INT8_GIT_REF
@@ -1661,6 +1664,7 @@ print(f'sparkinfer AOT extensions: {len(found)}')"; \
 # VLLM_PLUGINS='' /opt/b12x/bin/python -m vllm.entrypoints.cli.main serve ...
 # GGUF is registered in vLLM itself; b12x's optional FP6/safetensors plugins
 # target a different vLLM integration API.
+# Release tag v1.3.0 (b12x-v1.3.0) on AppMana/forks-sparkinfer (branch appmana/b12x)
 ARG B12X_GIT_REF=f2afc780a091e1484d11550845ae548fffdc7878
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ -n "${B12X_GIT_REF}" ]; then \
@@ -1673,7 +1677,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         uv pip install --python /opt/b12x/bin/python --no-deps \
             'quack-kernels==0.6.1' \
             "b12x @ git+https://github.com/AppMana/forks-sparkinfer.git@${B12X_GIT_REF}" && \
-        /opt/b12x/bin/python -c "import importlib.metadata as m; from b12x.loader.gguf_experts import ExpertTensor; from b12x.loader.gguf_dense import DenseTensor; from quack.compile_utils import make_fake_tensor; assert m.version('nvidia-cutlass-dsl') == '4.6.2'; assert m.version('gguf') == '0.18.0'; assert m.version('quack-kernels') == '0.6.1'"; \
+        /opt/b12x/bin/python -c "import importlib.metadata as m; from b12x.loader.gguf_experts import ExpertTensor; from b12x.loader.gguf_dense import DenseTensor; from quack.compile_utils import make_fake_tensor; assert m.version('b12x') == '1.3.0'; assert m.version('nvidia-cutlass-dsl') == '4.6.2'; assert m.version('gguf') == '0.18.0'; assert m.version('quack-kernels') == '0.6.1'"; \
     fi
 
 # Fail the build, not the first request, if the sm12x kernel FQNs stop
@@ -1782,7 +1786,7 @@ COPY --from=extensions-build /tmp/consumer-int8-dist/wheels.sha256 /tmp/consumer
 RUN --mount=type=bind,from=extensions-build,src=/tmp/consumer-int8-dist,target=/tmp/consumer-int8-dist,ro \
     --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system --no-deps /tmp/consumer-int8-dist/*.whl
-RUN python3 -c "import consumer_int8.ops as ops; assert callable(ops.kv_cache_update); assert callable(ops.gdn_packed_decode); assert callable(ops.cutlass_channel_mm); import consumer_int8.gguf as gguf; from consumer_int8.gguf_moe import ExecutionPlan, prepare_experts; assert all(callable(op) for op in (gguf.q8_packed_mm, gguf.q8_expand_mm, gguf.q6_packed_expand, gguf.mixed_iq_moe, gguf.plan_routes, ExecutionPlan, prepare_experts))"
+RUN python3 -c "import importlib.metadata as m, consumer_int8, consumer_int8.ops as ops; assert m.version('consumer-int8-kernels') == '0.1.0'; assert consumer_int8.__version__ == '0.1.0'; assert callable(ops.kv_cache_update); assert callable(ops.gdn_packed_decode); assert callable(ops.cutlass_channel_mm); import consumer_int8.gguf as gguf; from consumer_int8.gguf_moe import ExecutionPlan, prepare_experts; assert all(callable(op) for op in (gguf.q8_packed_mm, gguf.q8_expand_mm, gguf.q6_packed_expand, gguf.mixed_iq_moe, gguf.plan_routes, ExecutionPlan, prepare_experts))"
 
 RUN INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS}" INSTALL_USB4_RDMA_PROVIDER="${INSTALL_USB4_RDMA_PROVIDER}" USB4_RDMA_PROVIDER_VERSION="${USB4_RDMA_PROVIDER_VERSION}" python3 - <<'PY'
 import ctypes
