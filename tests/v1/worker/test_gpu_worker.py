@@ -658,20 +658,19 @@ class _OrderedHandle:
 def test_execute_model_waits_previous_pp_send_before_forward(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Previous device handles are waited before the forward pass; the
-    metadata handle is left to the GroupCoordinator's reaper."""
+    """Previous device handles are waited before the forward pass;
+    isend_tensor_dict sends metadata synchronously and returns tensor handles only."""
     import torch
 
     from vllm.sequence import IntermediateTensors
 
     log: list[str] = []
     previous_tensor_send = _OrderedHandle(log, "prev-tensor")
-    metadata_handle = _OrderedHandle(log, "meta")
     tensor_handle = _OrderedHandle(log, "tensor")
 
     def isend_tensor_dict(tensors, all_gather_group=None, all_gather_tensors=None):
         log.append("isend")
-        return [metadata_handle, tensor_handle]
+        return [tensor_handle]
 
     pp_group = SimpleNamespace(
         is_first_rank=True,

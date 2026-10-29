@@ -303,6 +303,17 @@ def test_deepseek_v4_long_prefill_warmup_includes_scheduler_cap(monkeypatch):
 
     assert scheduler_config.max_num_scheduled_tokens == 1024
     assert mixed_sizes == [16, 1024]
+    assert pure_prefill_sizes == [1, 28, 60]
+
+    # When an explicit scheduler cap < max_num_batched_tokens is configured,
+    # pure-prefill warmup also covers that exact boundary.
+    scheduler_config.max_num_scheduled_tokens = 1020
+    pure_prefill_sizes.clear()
+    gpu_warmup.warmup_long_prefill_kernels(
+        runner,
+        lambda _scheduler_output: None,
+        lambda _grammar_output: None,
+    )
     assert pure_prefill_sizes == [1, 28, 60, 1020]
 
 

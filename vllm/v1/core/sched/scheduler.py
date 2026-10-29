@@ -3373,6 +3373,10 @@ class Scheduler(SchedulerInterface):
                 request = self.running.pop()
                 self._preempt_request(request, timestamp, drop_stale_output=True)
 
+            while self.deferred_frees:
+                _, blocks = self.deferred_frees.popleft()
+                self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+
             # Clear scheduled request ids cache. Since we are forcing preemption
             # + resumption in the same step, we must act as if these requests were
             # not scheduled in the prior step. They will be flushed from the

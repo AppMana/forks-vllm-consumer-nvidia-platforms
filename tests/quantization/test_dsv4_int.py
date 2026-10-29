@@ -535,9 +535,9 @@ def test_dsv4_channel_int8_linear_method_prefers_allspark_on_supported_device(
     layer = FakeLayer()
     layer.input_size_per_partition = k
     layer.output_size_per_partition = n
-    layer.weight = torch.nn.Parameter(q_biased.contiguous(), requires_grad=False)
+    layer.weight = torch.nn.Parameter(q_biased.clone(), requires_grad=False)
     layer.weight_scale_inv = torch.nn.Parameter(
-        scale.to(dtype).contiguous(), requires_grad=False
+        scale.to(dtype).clone(), requires_grad=False
     )
 
     cfg = Dsv4IntConfig.from_config(
@@ -606,8 +606,10 @@ def test_allspark_channel_int8_linear_method_matches_dequant_reference(monkeypat
     layer = FakeLayer()
     layer.input_size_per_partition = k
     layer.output_size_per_partition = n
-    layer.weight = torch.nn.Parameter(q_biased, requires_grad=False)
-    layer.weight_scale_inv = torch.nn.Parameter(scale.to(dtype), requires_grad=False)
+    layer.weight = torch.nn.Parameter(q_biased.clone(), requires_grad=False)
+    layer.weight_scale_inv = torch.nn.Parameter(
+        scale.to(dtype).clone(), requires_grad=False
+    )
 
     cfg = Dsv4IntConfig.from_config(
         {

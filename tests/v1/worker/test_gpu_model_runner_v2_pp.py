@@ -356,7 +356,10 @@ def test_chunked_prefill_drafts_only_after_final_chunk(
     runner.pp_handler = MagicMock()
     runner.num_speculative_steps = 5
     runner.draft_tokens_handler = MagicMock()
-    runner.kv_connector = SimpleNamespace(post_forward=MagicMock(return_value=None))
+    runner.kv_connector = SimpleNamespace(
+        post_forward=MagicMock(return_value=None),
+        finalize_step=MagicMock(),
+    )
     runner.eplb = SimpleNamespace(step=MagicMock())
 
     monkeypatch.setattr(model_runner_module, "AsyncOutput", MagicMock())

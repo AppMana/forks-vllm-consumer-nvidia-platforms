@@ -305,6 +305,7 @@ table carries the rule.
 
 | Commit | Lesson |
 | --- | --- |
+| `6565b522f0` | Merge of upstream `0c81a0371f` (1218 commits), from `pre-upstream-merge-2026-10-28`. Upstream removed `EagleProposer` (`dspark.py` now subclasses `SpecDecodeBaseProposer`), dropped DFlash/DSpark draft slots from the scheduler token budget (`#59468`) while capping `max_num_active_seqs`, made DeepSeek V4 thinking mode and `high` reasoning effort the default (`0731`), and added `finalize_step()` to `KVConnector`. Fork `defer_block_free=True` under `max_concurrent_batches > 1` must drain `deferred_frees` in `reset_prefix_cache(reset_running_requests=True)`. |
 | `9c9d5077ef` | Merge of upstream `f9ad9dd6b4` (218 commits), from `pre-upstream-merge-2026-09-23`. AllSpark reinstated after upstream deleted it; upstream's DSpark PP draft relay folded into the single payload. Gate D then needed `31d143c7c5` (PP=1 CUDA graphs had not started on the pre-merge tree either). |
 | `53873c6c4d` | Merge of upstream `729ebac498` (773 commits). The model for a merge body: the conflict count, then resolutions grouped by the policy areas, each naming what superseded any dropped fork code. Its first parent is `pre-upstream-merge-2026-09-18`. |
 | `334894183a` | Merge of upstream `e35298628f` (1798 commits). When upstream replaces a subsystem, re-express the fork's invariant in the new structure (the 528-byte `int8_ds_mla` page became spec `state_content_bytes`; 16-byte alignment moved into spec alignment) and say in the body which resolution still needs hardware validation. |

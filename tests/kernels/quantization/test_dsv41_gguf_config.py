@@ -123,7 +123,9 @@ def add_shared_shard(path):
 
 
 @pytest.mark.skipif(
-    __import__("torch").cuda.is_available() is False, reason="CUDA required"
+    __import__("torch").cuda.is_available() is False
+    or __import__("torch").cuda.get_device_capability()[0] < 12,
+    reason="SM120/SM121 CUDA required",
 )
 def test_real_shared_mlp_native_tp_padding(tmp_path, monkeypatch, default_vllm_config):
     import torch
@@ -212,8 +214,11 @@ def test_native_grouped_wo_a_dispatch(
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if backend == "consumer_q6" and torch.cuda.get_device_capability()[0] < 12:
-        pytest.skip("Q6 small-row b12x arm requires SM120/121")
+    if (
+        backend in ("b12x", "b12x_ephemeral", "consumer_q6")
+        and torch.cuda.get_device_capability()[0] < 12
+    ):
+        pytest.skip("b12x A16 arm requires SM120/121")
     expert_path, attention_path = tmp_path / "expert.gguf", tmp_path / "attn.gguf"
     write_shard(expert_path)
     rng = np.random.default_rng(778)
@@ -373,6 +378,8 @@ def test_native_vocab_and_lm_head_tp(
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability()[0] < 12:
+        pytest.skip("b12x A16 arm requires SM120/121")
     expert_path, vocab_path = tmp_path / "expert.gguf", tmp_path / "vocab.gguf"
     write_shard(expert_path)
     writer = gguf.GGUFWriter(vocab_path, "deepseek41")

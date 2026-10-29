@@ -874,6 +874,7 @@ def warmup_block_table_slot_mapping_kernel(
     if max_tokens <= 0:
         return False
 
+    assert input_batch is not None
     multi_group_block_table = input_batch.block_table
 
     # max_num_batched_tokens is a whole-BATCH token budget (possibly summed
@@ -1085,7 +1086,7 @@ def warmup_kernels(
     try:
         _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
         # All PP ranks must run the same forwards to match sends and receives.
-        if model_runner.speculative_config is not None:
+        if getattr(model_runner, "speculative_config", None) is not None:
             # Greedy batches skip logits processing, so rejection kernels
             # also see model-dtype logits instead of FP32.
             _warmup_kernels(
@@ -1099,7 +1100,7 @@ def warmup_kernels(
     if adaptive_verification is not None:
         adaptive_verification.warmup_budget_kernel()
     acceptance_estimator = getattr(
-        model_runner.speculator, "acceptance_estimator", None
+        getattr(model_runner, "speculator", None), "acceptance_estimator", None
     )
     if acceptance_estimator is not None:
         acceptance_estimator.warmup()

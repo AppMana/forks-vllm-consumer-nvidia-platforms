@@ -215,6 +215,9 @@ def create_scheduler(
         parallel_config=ParallelConfig(
             pipeline_parallel_size=pipeline_parallel_size,
             data_parallel_size=data_parallel_size,
+            distributed_executor_backend=(
+                "ray" if pipeline_parallel_size * data_parallel_size > 1 else None
+            ),
         ),
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,

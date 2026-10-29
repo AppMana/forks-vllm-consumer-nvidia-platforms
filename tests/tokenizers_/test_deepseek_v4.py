@@ -251,6 +251,7 @@ def test_deepseek_v4_attaches_tools_to_existing_system_message():
         messages,
         tools=tools,
         tokenize=False,
+        reasoning_effort="low",
     )
 
     assert prompt.startswith(
@@ -423,8 +424,11 @@ def test_deepseek_v4_renders_0731_max_reasoning_effort(reasoning_effort):
 @pytest.mark.parametrize(
     ("effort_map", "expected_prefix"),
     [
-        (None, "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"),
-        ({"xhigh": "max"}, "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"),
+        (None, "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum"),
+        (
+            {"xhigh": "high"},
+            "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum",
+        ),
         ({"xhigh": "low"}, "<｜begin▁of▁sentence｜><｜User｜>Hello"),
     ],
 )

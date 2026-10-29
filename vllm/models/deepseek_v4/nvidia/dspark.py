@@ -605,6 +605,8 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         self.set_moe_parameters()
 
     def set_moe_parameters(self) -> None:
+        if not hasattr(self.model, "layers"):
+            return
         collect_moe_layers(
             self,
             self.model.layers,
@@ -730,7 +732,9 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 ckpt_down_proj_name="w2",
                 ckpt_up_proj_name="w3",
                 num_experts=self.config.n_routed_experts,
-                num_redundant_experts=first_layer.ffn.n_redundant_experts,
+                num_redundant_experts=getattr(
+                    first_layer.ffn, "n_redundant_experts", 0
+                ),
             )
         # Mirror the target model's weights mapper (model.py
         # _make_deepseek_v4_weights_mapper): fp4 AND int4 experts register

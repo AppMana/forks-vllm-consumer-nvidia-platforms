@@ -2431,9 +2431,11 @@ class VllmConfig:
                     f" num_lookahead_tokens={self.num_lookahead_tokens}."
                 )
             spec = self.speculative_config
-            if spec.use_dflash() or spec.use_dspark():
+            if (
+                spec.use_dflash() or spec.use_dspark()
+            ) and self.num_lookahead_tokens > 0:
                 max_num_active_seqs = (
-                    self.scheduler_config.max_num_active_seqs
+                    getattr(self.scheduler_config, "max_num_active_seqs", None)
                     or self.scheduler_config.max_num_seqs
                 )
                 max_draft_seqs = max_num_batched_tokens // self.num_lookahead_tokens

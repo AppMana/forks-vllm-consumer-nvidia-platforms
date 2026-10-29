@@ -62,9 +62,7 @@ class _FakeHfTokenizer:
 
 
 def _chat_template_kwargs(**request_fields: Any) -> dict[str, Any]:
-    request = ChatCompletionRequest(
-        model="m", messages=MESSAGES, **request_fields
-    )
+    request = ChatCompletionRequest(model="m", messages=MESSAGES, **request_fields)
     return request.build_chat_params(None, "auto").chat_template_kwargs
 
 
@@ -99,11 +97,12 @@ def _parser_initial_state(chat_template_kwargs: dict[str, Any]) -> ParserState:
         ({"reasoning_effort": "xhigh"}, True),
         # "none" is the explicit opt-out.
         ({"reasoning_effort": "none"}, False),
-        # No signal at all defaults to chat mode.
-        ({}, False),
+        # No signal at all defaults to thinking mode in 0731+.
+        ({}, True),
         # The template-level flags still work on their own.
         ({"chat_template_kwargs": {"thinking": True}}, True),
         ({"chat_template_kwargs": {"enable_thinking": True}}, True),
+        ({"chat_template_kwargs": {"enable_thinking": False}}, False),
         # "none" wins over a template-level thinking flag.
         (
             {
@@ -145,7 +144,9 @@ def test_thinking_mode_consistent_across_layers(
 def test_none_effort_matches_default_chat_prompt():
     assert _rendered_prompt(
         _chat_template_kwargs(reasoning_effort="none")
-    ) == _rendered_prompt(_chat_template_kwargs())
+    ) == _rendered_prompt(
+        _chat_template_kwargs(chat_template_kwargs={"enable_thinking": False})
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +177,8 @@ def _prefix_of(prompt: str, baseline: str) -> str:
     """
     assert baseline.startswith(bos_token)
     assert prompt.startswith(bos_token)
-    body = baseline[len(bos_token):]
-    prompt = prompt[len(bos_token):]
+    body = baseline[len(bos_token) :]
+    prompt = prompt[len(bos_token) :]
     assert prompt.endswith(body), (
         "a reasoning-effort prompt must be the baseline thinking prompt with a "
         "preamble inserted after BOS; anything else means the level leaked "
@@ -188,7 +189,11 @@ def _prefix_of(prompt: str, baseline: str) -> str:
 
 def _thinking_baseline() -> str:
     """The thinking-mode prompt with no effort preamble at all."""
-    return _rendered_prompt(_chat_template_kwargs(chat_template_kwargs={"thinking": True}))
+    return _rendered_prompt(
+        _chat_template_kwargs(
+            chat_template_kwargs={"thinking": True}, reasoning_effort="low"
+        )
+    )
 
 
 def test_reasoning_effort_prompts_match_the_released_encoding():
@@ -249,7 +254,7 @@ def test_openai_effort_maps_to_the_right_dsv4_preamble(
 
 
 def test_effort_levels_are_ordered_and_distinct():
-    """low < high < max must stay three observably different prompts.
+    """Low < high < max must stay three observably different prompts.
 
     Before 0731 "high" emitted nothing, so low and high were identical and a
     mapping bug between them was undetectable. Guard the separation itself.
@@ -275,7 +280,9 @@ def test_effort_has_no_effect_in_chat_mode():
     A leak here would inject "Reasoning Effort: ..." into a non-thinking
     request, which the model has no reasoning block to satisfy.
     """
-    chat_baseline = _rendered_prompt(_chat_template_kwargs())
+    chat_baseline = _rendered_prompt(
+        _chat_template_kwargs(chat_template_kwargs={"enable_thinking": False})
+    )
 
     for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
         prompt = _rendered_prompt(
@@ -320,9 +327,7 @@ def test_unknown_effort_falls_back_to_the_default_level():
     unknown levels, so the mapping layer has to absorb them.
     """
     baseline = _thinking_baseline()
-    prompt = _rendered_prompt(
-        {"thinking": True, "reasoning_effort": "ludicrous"}
-    )
+    prompt = _rendered_prompt({"thinking": True, "reasoning_effort": "ludicrous"})
 
     assert prompt == baseline
     assert DEFAULT_REASONING_EFFORT == "low"

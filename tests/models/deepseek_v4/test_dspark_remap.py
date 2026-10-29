@@ -186,8 +186,6 @@ def _make_weight_loading_model(
         "fused_moe_make_expert_params_mapping",
         lambda *_args, **_kwargs: [],
     )
-    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(dspark, "get_tensor_model_parallel_rank", lambda: 0)
 
     model = DSparkDeepseekV4ForCausalLM.__new__(DSparkDeepseekV4ForCausalLM)
     nn.Module.__init__(model)

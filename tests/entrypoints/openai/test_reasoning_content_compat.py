@@ -14,8 +14,8 @@ mismatch is on the wire.
 
 import json
 
+from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.entrypoints.openai.chat_completion.protocol import ChatMessage
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 
 REASONING = "17*20 = 340, 17*3 = 51, sum = 391."
 CONTENT = "The product of 17 and 23 is 391."
