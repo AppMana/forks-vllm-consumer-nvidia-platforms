@@ -1439,11 +1439,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         workspace_size: int,
         max_logits_bytes: int,
         request_offset: int = 0,
+        slab_rows: int = 0,
     ) -> list[tuple[slice, slice]]:
         """Split this step's prefill requests into chunks, respecting:
         - N constraint: total_seq_lens <= workspace_size (existing O(N)
           workspace)
-        - Logits constraint: M * N * 4 <= max_logits_bytes
+        - Logits constraint: M * logits_n * 4 <= max_logits_bytes, where
+          ``logits_n = min(N, slab_rows)`` when streaming prefill top-k is
+          enabled (``slab_rows > 0``) and ``N > slab_rows``, else ``N``.
 
         When a single request-level chunk still exceeds the logits budget,
         sub-chunks on the query dimension (M) to bound peak memory.
@@ -1464,7 +1467,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     compressed_seq_lens_cpu[end].item(),
                 )
                 new_m, new_n = chunk_m + q, chunk_n + s
-                if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
+                logits_n = min(new_n, slab_rows) if slab_rows > 0 else new_n
+                if new_n <= workspace_size and new_m * logits_n <= max_logits_elems:
                     chunk_m, chunk_n = new_m, new_n
                     end += 1
                 else:
@@ -1480,8 +1484,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 end += 1
 
             req_slice = slice(start + request_offset, end + request_offset)
+            logits_chunk_n = min(chunk_n, slab_rows) if slab_rows > 0 else chunk_n
             max_q = (
-                max(1, max_logits_elems // chunk_n) if chunk_n > 0 else max(1, chunk_m)
+                max(1, max_logits_elems // logits_chunk_n)
+                if logits_chunk_n > 0
+                else max(1, chunk_m)
             )
             for q_off in range(0, chunk_m, max_q):
                 sub_m = min(max_q, chunk_m - q_off)
@@ -1614,12 +1621,25 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     request_offset=num_decodes,
                 )
             else:
+                from vllm.model_executor.layers.sparse_attn_indexer import (
+                    _resolved_prefill_topk_slab_rows,
+                    should_use_prefill_streaming_topk,
+                )
+
+                slab_rows = (
+                    _resolved_prefill_topk_slab_rows()
+                    if should_use_prefill_streaming_topk(
+                        self.dcp_world_size, self.indexer_uses_fp4
+                    )
+                    else 0
+                )
                 chunk_specs = self._split_indexer_prefill_chunks(
                     self._prefill_split_seq_lens(compressed_seq_lens_cpu[num_decodes:]),
                     prefill_query_lens_cpu,
                     self.max_prefill_buffer_size,
                     max_logits_bytes,
                     request_offset=num_decodes,
+                    slab_rows=slab_rows,
                 )
 
             chunks = []

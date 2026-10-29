@@ -15,6 +15,11 @@ group-boundary tokens ``(position + 1) % compress_ratio == 0`` produce a key.
 
 import torch
 
+from vllm.models.deepseek_v4.common.ops.fp8e4m3_arith import (
+    cuda_supports_fp8e4nv_in_triton,
+    fp8e4m3_encode_from_fp32,
+)
+from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _round_clamp_int8
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
@@ -38,6 +43,8 @@ def indexer_k_norm_rope_store(
     kv_slot_mapping: torch.Tensor,
     compress_ratio: int,
     use_fp4_cache: bool,
+    *,
+    use_int8_cache: bool = False,
 ) -> None:
     """k_norm → RoPE → quant → paged store for indexer keys.
 
@@ -53,8 +60,9 @@ def indexer_k_norm_rope_store(
         kv_slot_mapping: [num_tokens] slots in the indexer cache (-1 = skip).
         compress_ratio: group size; keys are emitted at group boundaries.
         use_fp4_cache: MXFP4 (2 nibbles/byte + ue8m0 per 32) when True, else
-            per-token FP8 with a single fp32 scale (four packed ue8m0 bytes
-            under `mqa_logits_use_mx_scales`).
+            per-token FP8 or symmetric INT8 with a single fp32 scale.
+        use_int8_cache: Symmetric INT8 [-127, 127] with plain fp32 absmax/127.0
+            scale when True (mutually exclusive with ``use_fp4_cache``).
 
     """
     num_tokens = kv_slot_mapping.numel()
@@ -62,6 +70,7 @@ def indexer_k_norm_rope_store(
     assert k_pre.dtype == torch.bfloat16 and k_pre.stride(1) == 1
     assert num_tokens <= k_pre.shape[0] and num_tokens <= positions.numel()
     assert compress_ratio in (1, 2)
+    assert not (use_fp4_cache and use_int8_cache)
     if num_tokens == 0:
         return
 
@@ -82,9 +91,9 @@ def indexer_k_norm_rope_store(
     block_size = k_cache.shape[1]
     shuffle = current_platform.is_rocm() and block_size > 1
     if shuffle:
-        if use_fp4_cache:
+        if use_fp4_cache or use_int8_cache:
             raise NotImplementedError(
-                "MXFP4 indexer K cache has no tiled ROCm layout; "
+                "MXFP4/INT8 indexer K cache has no tiled ROCm layout; "
                 "the ROCm readers only implement the FP8 one."
             )
         if block_size % _BLOCK_TILE_SIZE != 0 or head_dim % _HEAD_TILE_SIZE != 0:
@@ -94,6 +103,12 @@ def indexer_k_norm_rope_store(
                 f"({head_dim}) % {_HEAD_TILE_SIZE} == 0."
             )
 
+    software_e4m3 = (
+        not use_fp4_cache
+        and not use_int8_cache
+        and current_platform.is_cuda()
+        and not cuda_supports_fp8e4nv_in_triton(unknown=False)
+    )
     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
     _indexer_k_norm_rope_quant_store_kernel[(num_tokens,)](
         k_pre,
@@ -114,7 +129,11 @@ def indexer_k_norm_rope_store(
         KV_BLOCK_STRIDE=k_cache.stride(0),
         FP8_MAX=448.0,
         USE_FP4=use_fp4_cache,
-        MX_SCALE=not use_fp4_cache and mqa_logits_use_mx_scales(),
+        INT8_K=use_int8_cache,
+        SOFTWARE_E4M3=software_e4m3,
+        MX_SCALE=(
+            not use_fp4_cache and not use_int8_cache and mqa_logits_use_mx_scales()
+        ),
         SHUFFLE=shuffle,
         BLOCK_TILE_SIZE=_BLOCK_TILE_SIZE,
         HEAD_TILE_SIZE=_HEAD_TILE_SIZE,
@@ -143,6 +162,8 @@ def _indexer_k_norm_rope_quant_store_kernel(
     KV_BLOCK_STRIDE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     USE_FP4: tl.constexpr,
+    INT8_K: tl.constexpr,
+    SOFTWARE_E4M3: tl.constexpr,
     MX_SCALE: tl.constexpr,
     SHUFFLE: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
@@ -239,6 +260,15 @@ def _indexer_k_norm_rope_quant_store_kernel(
 
         tl.store(val_ptr + tl.arange(0, TOKEN_STRIDE), packed_flat)
         tl.store(scale_ptr + tl.arange(0, SCALE_DIM), ue8m0)
+    elif INT8_K:
+        # Per-token symmetric INT8 [-127, 127] with one plain float32 scale.
+        result = tl.interleave(new_even, new_odd)  # [HEAD_SIZE] fp32
+        result_bf16 = result.to(tl.bfloat16).to(tl.float32)
+        absmax = tl.maximum(tl.max(tl.abs(result_bf16), axis=0), 1e-4)
+        scale = absmax * (1.0 / 127.0)
+        q_uint8 = _round_clamp_int8(result_bf16 / scale).to(tl.uint8, bitcast=True)
+        tl.store(val_ptr + block, q_uint8)
+        tl.store(scale_ptr.to(tl.pointer_type(tl.float32)), scale)
     else:
         # Per-token FP8 (single 128-wide block) with one float32 scale.
         result = tl.interleave(new_even, new_odd)  # [HEAD_SIZE] fp32
@@ -248,7 +278,10 @@ def _indexer_k_norm_rope_quant_store_kernel(
         exponent = tl.ceil(tl.log2(absmax * INV_FP8_MAX))
         inv_scale = tl.exp2(-exponent)
         x_clamped = tl.clamp(result_bf16 * inv_scale, -FP8_MAX, FP8_MAX)
-        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        if SOFTWARE_E4M3:
+            x_uint8 = fp8e4m3_encode_from_fp32(x_clamped)
+        else:
+            x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
         if SHUFFLE:
             tiled = (
                 block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE

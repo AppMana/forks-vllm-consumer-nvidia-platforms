@@ -1008,3 +1008,61 @@ def test_sparkinfer_backend_accepts_kv_spec_for_block_size_selection():
     assert DeepseekV4SparkInferMLABackend.get_supported_kernel_block_sizes(None) == [
         256
     ]
+
+
+def test_blockless_dsv41_gguf_resolves_int8_cache_and_streaming_topk(monkeypatch):
+    import vllm.platforms
+
+    monkeypatch.setattr(
+        vllm.platforms,
+        "current_platform",
+        _fake_platform(capability=(12, 1)),
+    )
+    monkeypatch.setattr(kernel_config, "_flash_mla_has", lambda *names: True)
+    hf_config = SimpleNamespace(
+        architectures=["DeepseekV4ForCausalLM"],
+        quantization_config={"quant_method": "dsv41_gguf"},
+    )
+    resolved = resolve_kernel_config_from_hf_config(hf_config)
+    assert resolved.cache_type == "int8_ds_mla"
+    assert resolved.roles[ROLE_SPARSE_MLA_DECODE_INT8] == SPARSE_MLA_DECODE_INT8_FLASH
+    assert resolved.roles[ROLE_SPARSE_MLA_PREFILL] == SPARSE_MLA_PREFILL_INT8_FLASH
+    assert resolved.roles[ROLE_INDEXER_CACHE_INT8] == INDEXER_CACHE_INT8_WRITER
+    assert resolved.roles[ROLE_INDEXER_QUERY_INT8] == INDEXER_QUERY_INT8_QUANT
+    assert (
+        resolved.roles[ROLE_INDEXER_STREAMING_TOPK_PREFILL]
+        == INDEXER_STREAMING_TOPK_PREFILL
+    )
+    assert not resolved.has_role(ROLE_DENSE_EXPERTS_INT8_ACTIVATION)
+
+
+def test_split_indexer_prefill_chunks_respects_slab_rows():
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV32IndexerMetadataBuilder,
+    )
+
+    # 950k context, M=2048 queries, 256 MiB logits budget:
+    # Without slab_rows, 2048 * 950000 * 4 = 7.78 GiB -> 30 sub-chunks of M=70.
+    # With slab_rows=16384, 2048 * 16384 * 4 = 128 MiB -> 1 chunk of M=2048.
+    seq_lens = torch.tensor([950000], dtype=torch.int32)
+    query_lens = torch.tensor([2048], dtype=torch.int32)
+    max_logits_bytes = 256 * 1024 * 1024
+    workspace_size = 1000000
+
+    unsplit = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
+        seq_lens,
+        query_lens,
+        workspace_size,
+        max_logits_bytes,
+        slab_rows=16384,
+    )
+    assert unsplit == [(slice(0, 1), slice(0, 2048))]
+
+    split = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
+        seq_lens,
+        query_lens,
+        workspace_size,
+        max_logits_bytes,
+        slab_rows=0,
+    )
+    assert len(split) == 30

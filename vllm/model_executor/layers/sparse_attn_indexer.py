@@ -7,7 +7,6 @@ import math
 import torch
 import torch.distributed as dist
 
-import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -25,6 +24,9 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    _max_with_nan,
+)
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask as _apply_candidate_mask,
 )
@@ -68,6 +70,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
+    sparse_indexer_max_logits_bytes,
     tp_prefill_row_sharding_supported,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
@@ -833,6 +836,169 @@ def _decode_topk_keys(
     return torch.where(value_part > _NEG_INF_CENTERED_KEY, local, local.new_tensor(-1))
 
 
+def _decode_block_topk_keys(top_keys: torch.Tensor) -> torch.Tensor:
+    """Unpack selected block keys into request-local int32 block IDs; -1 where
+    the key's value part is -inf / sentinel."""
+    value_part = top_keys >> 32
+    blocks = ((1 << 32) - 1 - (top_keys & 0xFFFFFFFF)).to(torch.int32)
+    return torch.where(
+        value_part > _NEG_INF_CENTERED_KEY, blocks, blocks.new_tensor(-1)
+    )
+
+
+@triton.jit(do_not_specialize=["col_offset", "slab_nblocks", "stride_cand_row"])
+def _slab_candidate_flags_kernel(
+    candidates_ptr,
+    ks_ptr,
+    slab_flags_ptr,
+    stride_cand_row: tl.int64,
+    stride_cand_col: tl.int64,
+    col_offset,
+    slab_nblocks,
+    BLOCK_SIZE: tl.constexpr,
+    K_CAND: tl.constexpr,
+    PADDED_K: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, 1024)
+    for tile in range(tl.cdiv(slab_nblocks, 1024)):
+        slots = tile * 1024 + offs
+        tl.store(
+            slab_flags_ptr + row * slab_nblocks + slots,
+            0,
+            mask=slots < slab_nblocks,
+        )
+    start = tl.load(ks_ptr + row)
+    b0 = tl.maximum((col_offset - start) // BLOCK_SIZE, 0)
+    k_offs = tl.arange(0, PADDED_K)
+    cand_b = tl.load(
+        candidates_ptr + row * stride_cand_row + k_offs * stride_cand_col,
+        mask=k_offs < K_CAND,
+        other=-1,
+    )
+    rel_b = cand_b - b0
+    in_slab = (k_offs < K_CAND) & (cand_b >= 0) & (rel_b >= 0) & (rel_b < slab_nblocks)
+    tl.debug_barrier()
+    tl.store(slab_flags_ptr + row * slab_nblocks + rel_b, 1, mask=in_slab)
+
+
+@triton.jit(do_not_specialize=["col_offset", "slab_width", "slab_nblocks", "stride_lm"])
+def _slab_apply_candidate_mask_kernel(
+    slab_logits_ptr,
+    ks_ptr,
+    ke_ptr,
+    slab_flags_ptr,
+    stride_lm: tl.int64,
+    col_offset,
+    slab_width,
+    slab_nblocks,
+    BLOCK_SIZE: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    start = tl.load(ks_ptr + row)
+    end = tl.load(ke_ptr + row)
+    gcol = col_offset + cols
+    valid = (cols < slab_width) & (gcol >= start) & (gcol < end)
+    b0 = tl.maximum((col_offset - start) // BLOCK_SIZE, 0)
+    rel_b = (gcol - start) // BLOCK_SIZE - b0
+    in_flags = valid & (rel_b >= 0) & (rel_b < slab_nblocks)
+    keep = tl.load(slab_flags_ptr + row * slab_nblocks + rel_b, mask=in_flags, other=0)
+    tl.store(
+        slab_logits_ptr + row * stride_lm + cols,
+        float("-inf"),
+        mask=(cols < slab_width) & ~(valid & (keep != 0)),
+    )
+
+
+@triton.jit(do_not_specialize=["col_offset", "slab_width", "slab_nblocks", "stride_lm"])
+def _slab_candidate_block_keys_kernel(
+    slab_logits_ptr,
+    ks_ptr,
+    ke_ptr,
+    carry_block_ptr,
+    carry_score_ptr,
+    slab_keys_ptr,
+    stride_lm: tl.int64,
+    stride_km: tl.int64,
+    col_offset,
+    slab_width,
+    slab_nblocks,
+    BLOCK_SIZE: tl.constexpr,
+    PADDED_BLOCK_SIZE: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    start = tl.load(ks_ptr + row)
+    end = tl.load(ke_ptr + row)
+    prev_carry_b = tl.load(carry_block_ptr + row)
+    prev_carry_s = tl.load(carry_score_ptr + row)
+
+    c_start = tl.maximum(col_offset, start)
+    c_end = tl.minimum(col_offset + slab_width, end)
+    has_cols = c_end > c_start
+    b_first = tl.where(has_cols, (c_start - start) // BLOCK_SIZE, 0)
+    b_last = tl.where(has_cols, (c_end - 1 - start) // BLOCK_SIZE, -1)
+    last_continues = (
+        has_cols
+        & (end > col_offset + slab_width)
+        & (start + (b_last + 1) * BLOCK_SIZE > col_offset + slab_width)
+    )
+    b_emit_end = tl.where(last_continues, b_last, b_last + 1)
+    newest_b = (end - start - 1) // BLOCK_SIZE
+    offs = tl.arange(0, PADDED_BLOCK_SIZE)
+
+    for rel_start in range(0, slab_nblocks, TILE):
+        rel = rel_start + tl.arange(0, TILE)
+        in_out = rel < slab_nblocks
+        b = b_first + rel
+        active = has_cols & in_out & (b <= b_last)
+        gcol = start + b[:, None] * BLOCK_SIZE + offs[None, :]
+        scol = gcol - col_offset
+        in_slab = (
+            active[:, None]
+            & (offs[None, :] < BLOCK_SIZE)
+            & (gcol >= c_start)
+            & (gcol < c_end)
+        )
+        vals = tl.load(
+            slab_logits_ptr + row * stride_lm + scol,
+            mask=in_slab,
+            other=float("-inf"),
+        ).to(tl.float32)
+        reduced = tl.reduce(vals, 1, _max_with_nan)
+        reduced = tl.where(
+            active & (b == prev_carry_b),
+            _max_with_nan(reduced, prev_carry_s),
+            reduced,
+        )
+        carry_mask = active & last_continues & (b == b_last)
+        tl.store(
+            carry_block_ptr + row + tl.zeros((TILE,), dtype=tl.int32),
+            b,
+            mask=carry_mask,
+        )
+        tl.store(
+            carry_score_ptr + row + tl.zeros((TILE,), dtype=tl.int32),
+            reduced,
+            mask=carry_mask,
+        )
+
+        emit = active & (b < b_emit_end)
+        pinned = (end > start) & ((b == newest_b) | (reduced != reduced))
+        score = tl.where(pinned, float("inf"), reduced)
+        bits = score.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+        centered = tl.where(bits < (1 << 31), bits, (1 << 31) - 1 - bits)
+        key = (centered << 32) + ((1 << 32) - 1 - b.to(tl.int64))
+        key = tl.where(emit & (score != float("-inf")), key, _INT64_MIN)
+        tl.store(slab_keys_ptr + row * stride_km + rel, key, mask=in_out)
+
+    if not last_continues:
+        tl.store(carry_block_ptr + row, -1)
+        tl.store(carry_score_ptr + row, float("-inf"))
+
+
 def streaming_prefill_topk(
     q_cast: torch.Tensor,  # [M, H, D] fp8-bytes or int8
     kv: tuple[torch.Tensor, torch.Tensor],  # ([N, D], [N] fp32 scale)
@@ -843,6 +1009,10 @@ def streaming_prefill_topk(
     topk_tokens: int,
     slab_rows: int | None = None,
     qk_int8: bool | None = None,
+    *,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> None:
     """Exact slab-tiled replacement for full-logits + prefill top-k.
 
@@ -851,6 +1021,15 @@ def streaming_prefill_topk(
     merge only ever ranks 2k unique int64 keys instead of the whole slab.
     Boundary ties are deterministic and the selected rows and their order are
     invariant across launches and slab sizes.
+
+    When ``candidate_blocks`` is provided (DeepSeek-V4.1 two-level candidate
+    filtering):
+    - ``candidate_write=True`` selects the top ``candidate_blocks.shape[1]``
+      request-local blocks of ``candidate_block_size`` compressed positions
+      (pinning each row's newest block) in the same streaming pass and writes
+      them into ``candidate_blocks``.
+    - ``candidate_write=False`` masks each slab's logits to the blocks listed
+      in ``candidate_blocks`` before selecting the slab's top-k tokens.
     """
     from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
         indexer_imma_enabled,
@@ -860,6 +1039,13 @@ def streaming_prefill_topk(
     m = q_cast.shape[0]
     n = k_values.shape[0]
     k_top = topk_tokens
+    if m == 0:
+        return
+    if n == 0:
+        topk_indices_out.fill_(-1)
+        if candidate_blocks is not None and candidate_write:
+            candidate_blocks.fill_(-1)
+        return
     if qk_int8 is None:
         qk_int8 = (
             q_cast.dtype == torch.int8
@@ -871,6 +1057,31 @@ def streaming_prefill_topk(
     device = q_cast.device
     ks32 = cu_seqlen_ks.to(torch.int32)
     ke32 = cu_seqlen_ke.to(torch.int32)
+
+    has_cand_mask = candidate_blocks is not None and not candidate_write
+    has_cand_write = candidate_blocks is not None and candidate_write
+    if candidate_blocks is not None:
+        assert candidate_block_size > 0
+        k_cand = candidate_blocks.shape[1]
+        max_slab_nblocks = triton.cdiv(min(slab_rows, n), candidate_block_size) + 1
+        if has_cand_mask:
+            slab_flags = torch.empty(
+                (m, max_slab_nblocks), dtype=torch.uint8, device=device
+            )
+            padded_k_cand = max(1, triton.next_power_of_2(k_cand))
+        else:
+            slab_nblocks_alloc = max(k_cand, max_slab_nblocks)
+            slab_block_keys = torch.empty(
+                (m, slab_nblocks_alloc), dtype=torch.int64, device=device
+            )
+            block_candidates = torch.full(
+                (m, 2 * k_cand), -(1 << 63), dtype=torch.int64, device=device
+            )
+            carry_block = torch.full((m,), -1, dtype=torch.int32, device=device)
+            carry_score = torch.full(
+                (m,), float("-inf"), dtype=torch.float32, device=device
+            )
+            padded_block_size = max(1, triton.next_power_of_2(candidate_block_size))
 
     # [:, :k] holds the running selection, [:, k:] the current slab's exact
     # selection; the first slab is written straight into the running half.
@@ -890,6 +1101,74 @@ def streaming_prefill_topk(
             ke_local,
             qk_int8=qk_int8,
         )
+        if has_cand_mask:
+            assert candidate_blocks is not None
+            cur_nblocks = triton.cdiv(s, candidate_block_size) + 1
+            _slab_candidate_flags_kernel[(m,)](
+                candidate_blocks,
+                ks32,
+                slab_flags,
+                candidate_blocks.stride(0),
+                candidate_blocks.stride(1),
+                n0,
+                cur_nblocks,
+                BLOCK_SIZE=candidate_block_size,
+                K_CAND=k_cand,
+                PADDED_K=padded_k_cand,
+            )
+            _slab_apply_candidate_mask_kernel[(m, triton.cdiv(s, 1024))](
+                slab_logits,
+                ks32,
+                ke32,
+                slab_flags,
+                slab_logits.stride(0),
+                n0,
+                s,
+                cur_nblocks,
+                BLOCK_SIZE=candidate_block_size,
+                TILE=1024,
+            )
+        elif has_cand_write:
+            cur_nblocks = max(k_cand, triton.cdiv(s, candidate_block_size) + 1)
+            _slab_candidate_block_keys_kernel[(m,)](
+                slab_logits,
+                ks32,
+                ke32,
+                carry_block,
+                carry_score,
+                slab_block_keys,
+                slab_logits.stride(0),
+                slab_block_keys.stride(0),
+                n0,
+                s,
+                cur_nblocks,
+                BLOCK_SIZE=candidate_block_size,
+                PADDED_BLOCK_SIZE=padded_block_size,
+                TILE=64,
+                num_warps=4,
+            )
+            slab_top_blocks = torch.topk(
+                slab_block_keys[:, :cur_nblocks],
+                k_cand,
+                dim=1,
+                largest=True,
+                sorted=False,
+            ).values
+            if first:
+                block_candidates[:, :k_cand].copy_(slab_top_blocks)
+            else:
+                block_candidates[:, k_cand:].copy_(slab_top_blocks)
+                if k_cand & (k_cand - 1) == 0:
+                    merge_topk_keys_(block_candidates, k_cand)
+                else:
+                    block_candidates[:, :k_cand] = torch.topk(
+                        block_candidates,
+                        k_cand,
+                        dim=1,
+                        largest=True,
+                        sorted=False,
+                    ).values
+
         target = candidates[:, :k_top] if first else candidates[:, k_top:]
         exact_slab_topk_keys(
             slab_logits,
@@ -904,6 +1183,17 @@ def streaming_prefill_topk(
             first = False
             continue
         merge_topk_keys_(candidates, k_top)
+
+    if has_cand_write:
+        assert candidate_blocks is not None
+        final_blocks = torch.topk(
+            block_candidates[:, :k_cand],
+            k_cand,
+            dim=1,
+            largest=True,
+            sorted=True,
+        ).values
+        candidate_blocks.copy_(_decode_block_topk_keys(final_blocks))
 
     final = torch.topk(
         candidates[:, :k_top],
@@ -1385,7 +1675,7 @@ def sparse_attn_indexer(
         if logits_dtype != torch.float32 and fp32_decode_logits:
             elem_bytes += torch.float32.itemsize
         max_logits_bytes = max(
-            envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024,
+            sparse_indexer_max_logits_bytes(),
             max_decode_tokens * round_up(max_model_len, row_align) * elem_bytes,
         )
         _ = torch.empty(
@@ -1641,6 +1931,13 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                         topk_indices,
                         topk_tokens,
+                        candidate_blocks=(
+                            candidate_blocks[row_start:row_end]
+                            if candidate_blocks is not None
+                            else None
+                        ),
+                        candidate_block_size=candidate_block_size,
+                        candidate_write=candidate_write,
                     )
                     # DCP merge below is a no-op at dcp_world_size <= 1; give
                     # it an empty logits tensor.

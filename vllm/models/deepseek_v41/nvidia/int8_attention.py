@@ -42,6 +42,10 @@ class DeepseekV41Int8Attention(DeepseekV4FlashMLAAttention):
         self._decode = sparse_mla_decode_int8
         self._prefill = sparse_mla_prefill_int8
 
+    @property
+    def packed_kv_cache_dtype(self) -> CacheDType:
+        return "int8_ds_mla"
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
         return num_heads

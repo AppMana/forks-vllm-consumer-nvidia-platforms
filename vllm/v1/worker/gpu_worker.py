@@ -1141,6 +1141,15 @@ class Worker(WorkerBase):
 
             trigger_inductor_lazy_init(self.device)
 
+        if current_platform.is_cuda() and current_platform.is_device_capability_family(
+            120
+        ):
+            # On unified-memory SM12x (DGX Spark GB10), unreferenced caching-
+            # allocator segments from the max_num_batched_tokens warmup stay
+            # carved out of host MemAvailable (~6+ GiB). Return them to the OS
+            # while keeping all live buffers, workspaces, and CUDA graph pools.
+            torch.accelerator.empty_cache()
+
         # All warmup is done, start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         self._maybe_activate_jit_monitor()

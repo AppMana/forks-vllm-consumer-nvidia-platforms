@@ -361,7 +361,11 @@ def _checkpoint_kernel_family(hf_config: Any) -> str:
     else:
         method = str(getattr(quant, "quant_method", "") or "").lower()
     expert_dtype = str(getattr(hf_config, "expert_dtype", "") or "").lower()
-    if method.startswith("dsv4_int") or expert_dtype.startswith("int"):
+    if (
+        method.startswith("dsv4_int")
+        or method == "dsv41_gguf"
+        or expert_dtype.startswith("int")
+    ):
         return "int"
     return "fp"
 
@@ -409,6 +413,11 @@ def blockless_role_defaults(hf_config: Any) -> tuple[dict[str, str], str]:
     major = capability.major if capability is not None else 0
 
     if _checkpoint_kernel_family(hf_config) == "int":
+        quant = getattr(hf_config, "quantization_config", None) or {}
+        if isinstance(quant, Mapping):
+            method = str(quant.get("quant_method", "") or "").lower()
+        else:
+            method = str(getattr(quant, "quant_method", "") or "").lower()
         native = major >= 8 and _flash_mla_has(
             "sparse_mla_decode_int8", "sparse_mla_prefill_int8"
         )
@@ -426,8 +435,11 @@ def blockless_role_defaults(hf_config: Any) -> tuple[dict[str, str], str]:
             ROLE_SPARSE_MLA_DECODE_FP8: SPARSE_MLA_DECODE_FP8_TRITON,
             ROLE_INDEXER_CACHE_INT8: INDEXER_CACHE_INT8_WRITER,
             ROLE_INDEXER_QUERY_INT8: INDEXER_QUERY_INT8_QUANT,
-            ROLE_DENSE_EXPERTS_INT8_ACTIVATION: DENSE_EXPERTS_INT8_ACTIVATION,
         }
+        if method == "dsv41_gguf":
+            roles[ROLE_INDEXER_STREAMING_TOPK_PREFILL] = INDEXER_STREAMING_TOPK_PREFILL
+        else:
+            roles[ROLE_DENSE_EXPERTS_INT8_ACTIVATION] = DENSE_EXPERTS_INT8_ACTIVATION
         return roles, "int8_ds_mla"
 
     if major >= 12:
@@ -615,6 +627,7 @@ def apply_checkpoint_config(model_config: Any, cache_config: Any) -> None:
     is_deepseek_v4 = getattr(model_config, "quantization", None) in (
         "dsv4_int",
         "dsv4_mxfp4_int8",
+        "dsv41_gguf",
     ) or any("DeepseekV4" in architecture for architecture in architectures)
     if not is_deepseek_v4:
         return

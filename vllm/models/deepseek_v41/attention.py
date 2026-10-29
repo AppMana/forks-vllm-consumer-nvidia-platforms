@@ -67,6 +67,10 @@ from vllm.models.deepseek_v4.common.ops.cache_utils import (
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v41.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
+from vllm.transformers_utils.configs.dsv4.kernel_config import (
+    activate_kernel_config,
+    resolve_kernel_config_from_hf_config,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -299,6 +303,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
         self.layer_id = layer_id
+        activate_kernel_config(resolve_kernel_config_from_hf_config(config))
 
         self.prefix = prefix  # Alias for compatibility with compressor
         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
@@ -1297,9 +1302,15 @@ class DeepseekV4PPProxyIndexer(nn.Module):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         assert cache_config is not None
+        activate_kernel_config(resolve_kernel_config_from_hf_config(config))
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
+            indexer_cache_is_int8,
+        )
+
         self.head_dim = config.index_head_dim
         self.compress_ratio = compress_ratio
         self.use_fp4_kv = dsa_indexer_uses_fp4(vllm_config)
+        self._indexer_cache_is_int8 = indexer_cache_is_int8() and not self.use_fp4_kv
         self.wk = ReplicatedLinear(
             main_head_dim,
             self.head_dim,
@@ -1337,6 +1348,7 @@ class DeepseekV4PPProxyIndexer(nn.Module):
             indexer_metadata.slot_mapping,
             self.compress_ratio,
             self.use_fp4_kv,
+            use_int8_cache=self._indexer_cache_is_int8,
         )
 
 
@@ -1356,6 +1368,7 @@ class DeepseekV4PPProxyKVSource(nn.Module, AttentionLayerBase):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         assert cache_config is not None
+        activate_kernel_config(resolve_kernel_config_from_hf_config(config))
         self.layer_id = extract_layer_index(prefix)
         self.prefix = prefix
         self.backend_cls = backend_cls
@@ -1527,8 +1540,11 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             "fp8_ds_mla",
             "nvfp4_ds_mla",
         )
+        uses_int8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "int8_ds_mla"
         page_alignment = (
-            576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
+            576
+            if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record()
+            else (528 if uses_int8_ds_mla_layout else 512)
         )
         return MLAAttentionSpec(
             block_size=self.cache_config.block_size,
@@ -1622,9 +1638,21 @@ class DeepseekV4Indexer(nn.Module):
         self.compress_ratio = compress_ratio
         self.owns_k = owns_k
         self.use_fp4_kv = dsa_indexer_uses_fp4(vllm_config)
+        from vllm.models.deepseek_v4.nvidia_imma.triton_kernels import (
+            indexer_cache_is_int8,
+            indexer_imma_enabled,
+        )
+
+        self._indexer_cache_is_int8 = indexer_cache_is_int8() and not self.use_fp4_kv
+        self._indexer_query_is_int8 = indexer_imma_enabled() and not self.use_fp4_kv
         logger.info_once(
-            "Using %s indexer cache for Lightning Indexer.",
-            "MXFP4" if self.use_fp4_kv else "FP8",
+            "Lightning Indexer: cache_payload=%s query=%s",
+            "mxfp4"
+            if self.use_fp4_kv
+            else ("int8" if self._indexer_cache_is_int8 else "fp8"),
+            "mxfp4"
+            if self.use_fp4_kv
+            else ("int8-imma" if self._indexer_query_is_int8 else "fp8"),
         )
 
         # no tensor parallel, just replicated
@@ -1757,6 +1785,7 @@ class DeepseekV4Indexer(nn.Module):
             indexer_metadata.slot_mapping,
             self.compress_ratio,
             self.use_fp4_kv,
+            use_int8_cache=self._indexer_cache_is_int8,
         )
 
     def forward_q(
@@ -1783,6 +1812,7 @@ class DeepseekV4Indexer(nn.Module):
             self.n_head**-0.5,
             use_fp4=self.use_fp4_kv,
             weights_out_dtype=self.indexer_weights_dtype,
+            q_is_int8=self._indexer_query_is_int8,
         )
         if isinstance(q_quant, tuple):
             q, q_scale = q_quant
