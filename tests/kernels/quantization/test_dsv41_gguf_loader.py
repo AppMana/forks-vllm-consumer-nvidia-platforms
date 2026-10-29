@@ -158,3 +158,93 @@ def test_preflight_rejects_before_writing(tmp_path, default_vllm_config, kwargs,
         load_plain_parameters(model, [path], tp_rank=0, tp_size=2)
     for name, p in model.named_parameters():
         assert torch.equal(p, before[name])
+
+
+def test_pp_missing_and_proxy_layer_loading(tmp_path, default_vllm_config):
+    import gguf
+
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    root = torch.nn.Module()
+    root.model = torch.nn.Module()
+    root.model.start_layer = 1
+    root.model.end_layer = 2
+    root.model.embed_tokens = PPMissingLayer()
+    root.model.norm = PPMissingLayer()
+    root.lm_head = PPMissingLayer()
+
+    proxy = torch.nn.Module()
+    proxy.attn = torch.nn.Module()
+    proxy.attn.indexer = torch.nn.Module()
+    proxy.attn.indexer.wk = torch.nn.Module()
+    parameter(proxy.attn.indexer.wk, "weight", (4, 4), torch.bfloat16)
+    proxy.attn.indexer.k_norm = torch.nn.Module()
+    parameter(proxy.attn.indexer.k_norm, "weight", (4,), torch.bfloat16)
+
+    layer1 = torch.nn.Module()
+    parameter(layer1, "hc_attn_base", (3,))
+
+    root.model.layers = torch.nn.ModuleList([proxy, layer1])
+
+    path = tmp_path / "pp.gguf"
+    writer = gguf.GGUFWriter(path, "deepseek41")
+    writer.add_tensor(
+        "token_embd.weight",
+        np.zeros((8, 8 * 34), dtype=np.uint8),
+        raw_dtype=gguf.GGMLQuantizationType.Q8_0,
+    )
+    writer.add_tensor(
+        "output.weight",
+        np.zeros((8, 8 * 34), dtype=np.uint8),
+        raw_dtype=gguf.GGMLQuantizationType.Q8_0,
+    )
+    writer.add_tensor("output_norm.weight", np.arange(1, 5, dtype=np.float32))
+    writer.add_tensor(
+        "blk.0.hc_attn_base.weight", np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    )
+    writer.add_tensor(
+        "blk.0.attn_q_a.weight",
+        np.zeros((8, 8 * 34), dtype=np.uint8),
+        raw_dtype=gguf.GGMLQuantizationType.Q8_0,
+    )
+    writer.add_tensor(
+        "blk.0.ffn_gate_exps.weight",
+        np.zeros((2, 8, 8 * 34), dtype=np.uint8),
+        raw_dtype=gguf.GGMLQuantizationType.Q8_0,
+    )
+    writer.add_tensor(
+        "blk.0.indexer.attn_k.weight",
+        torch.full((4, 4), 5.0, dtype=torch.bfloat16).view(torch.uint8).numpy(),
+        raw_dtype=gguf.GGMLQuantizationType.BF16,
+    )
+    writer.add_tensor(
+        "blk.0.indexer.k_norm.weight",
+        np.array([1.5, 2.5, 3.5, 4.5], dtype=np.float32),
+    )
+    writer.add_tensor(
+        "blk.1.hc_attn_base.weight",
+        np.array([0.25, 0.5, -0.75], dtype=np.float32),
+    )
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+    audit = load_plain_parameters(root, [path], tp_rank=0, tp_size=1)
+    assert set(audit["parameters"]) == {
+        "model.layers.0.attn.indexer.wk.weight",
+        "model.layers.0.attn.indexer.k_norm.weight",
+        "model.layers.1.hc_attn_base",
+    }
+    assert torch.equal(
+        proxy.attn.indexer.wk.weight,
+        torch.full((4, 4), 5.0, dtype=torch.bfloat16),
+    )
+    assert torch.equal(
+        proxy.attn.indexer.k_norm.weight,
+        torch.tensor([1.5, 2.5, 3.5, 4.5], dtype=torch.bfloat16),
+    )
+    assert torch.equal(
+        layer1.hc_attn_base,
+        torch.tensor([0.25, 0.5, -0.75], dtype=torch.float32),
+    )

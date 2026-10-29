@@ -108,6 +108,84 @@ def index_plain(paths):
     return plain, all_names
 
 
+def _compact_target(name):
+    if name == "token_embd.weight":
+        return "model.embed_tokens.weight"
+    if name == "output.weight":
+        return "lm_head.weight"
+    if name == "per_layer_token_embd.weight":
+        return None
+    match = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
+    if match is None:
+        return None
+    number, tail = match.groups()
+    mapping = {
+        "attn_q_a.weight": "attn.fused_wqa_wkv.weight",
+        "attn_kv.weight": "attn.fused_wqa_wkv.weight",
+        "attn_q_b.weight": "attn.wq_b.weight",
+        "attn_output_a.weight": "attn.wo_a.weight",
+        "attn_output_b.weight": "attn.wo_b.weight",
+        "indexer.attn_q_b.weight": "attn.indexer.wq_b.weight",
+        "engram_kv.weight": "engram.wkv.weight",
+        "ffn_gate_shexp.weight": "ffn.shared_experts.gate_up_proj.weight",
+        "ffn_up_shexp.weight": "ffn.shared_experts.gate_up_proj.weight",
+        "ffn_down_shexp.weight": "ffn.shared_experts.down_proj.weight",
+        "ffn_gate_exps.weight": "ffn.experts.routed_experts.weight",
+        "ffn_up_exps.weight": "ffn.experts.routed_experts.weight",
+        "ffn_down_exps.weight": "ffn.experts.routed_experts.weight",
+    }
+    if tail not in mapping:
+        return None
+    return f"model.layers.{number}.{mapping[tail]}"
+
+
+def _inner_model(model):
+    lm = getattr(model, "language_model", model)
+    return getattr(lm, "model", lm)
+
+
+def _is_pp_missing_compact(name, model):
+    from vllm.model_executor.models.utils import is_pp_missing_parameter
+
+    inner = _inner_model(model)
+    if name == "per_layer_token_embd.weight":
+        engram_batch = getattr(inner, "engram_batch", "unconfigured")
+        return engram_batch is None
+    target = _compact_target(name)
+    if target is None:
+        return False
+    for candidate in (target, f"language_model.{target}"):
+        if is_pp_missing_parameter(candidate, model):
+            return True
+    match = re.match(r"model\.layers\.(\d+)\.", target)
+    if match is not None:
+        layer_id = int(match.group(1))
+        start_layer = getattr(inner, "start_layer", 0)
+        end_layer = getattr(inner, "end_layer", layer_id + 1)
+        if not (start_layer <= layer_id < end_layer):
+            return True
+    return False
+
+
+def _is_pp_missing_plain(suffix, model, params):
+    from vllm.model_executor.models.utils import is_pp_missing_parameter
+
+    for candidate in (suffix, f"language_model.{suffix}"):
+        if is_pp_missing_parameter(candidate, model):
+            return True
+    match = re.match(r"model\.layers\.(\d+)\.", suffix)
+    if match is not None:
+        layer_id = int(match.group(1))
+        inner = _inner_model(model)
+        start_layer = getattr(inner, "start_layer", 0)
+        end_layer = getattr(inner, "end_layer", layer_id + 1)
+        if not (start_layer <= layer_id < end_layer):
+            return not any(
+                name == suffix or name.endswith("." + suffix) for name in params
+            )
+    return False
+
+
 def _resolve(params, suffix):
     matches = [name for name in params if name == suffix or name.endswith("." + suffix)]
     if len(matches) != 1:
@@ -147,13 +225,19 @@ def load_plain_parameters(model, paths, *, tp_rank, tp_size, audit_only=False):
         raise ValueError(
             f"Compact owners reference missing tensors: {sorted(compact - all_names)}"
         )
-    extra = all_names - set(plain) - compact
+    extra = {
+        name
+        for name in (all_names - set(plain) - compact)
+        if not _is_pp_missing_compact(name, model)
+    }
     if extra:
         raise ValueError(f"GGUF tensors have no model owner: {sorted(extra)}")
     routes, covered = [], set()
     merged: dict[str, set[Any]] = {}
     for source in plain.values():
         suffix, shard, transform = plain_target(source.name)
+        if _is_pp_missing_plain(suffix, model, params):
+            continue
         name = _resolve(params, suffix)
         if name in covered and shard is None:
             raise ValueError(f"Multiple GGUF tensors target {name}")

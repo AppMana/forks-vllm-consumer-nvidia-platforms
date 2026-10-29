@@ -215,7 +215,7 @@ class Dsv41GGUFConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls):
-        return 120
+        return 80
 
     @staticmethod
     def get_config_filenames():
@@ -277,15 +277,43 @@ class Dsv41GGUFConfig(QuantizationConfig):
             ):
                 raise ValueError("Native GGUF vocabulary geometry differs from model")
             if isinstance(layer, ParallelLMHead):
-                return B12xGGUFLinearMethod(
-                    (
-                        GGUFLinearSlice(
-                            source,
-                            layer.num_embeddings_per_partition,
-                            source.columns,
-                            row_start=layer.shard_indices.org_vocab_start_index,
-                        ),
+                slices = (
+                    GGUFLinearSlice(
+                        source,
+                        layer.num_embeddings_per_partition,
+                        source.columns,
+                        row_start=layer.shard_indices.org_vocab_start_index,
                     ),
+                )
+                if self.q6_backend == "consumer_cuda" and source.quant_type == "Q6_K":
+                    from .consumer_q6 import ConsumerQ6LinearMethod
+
+                    return ConsumerQ6LinearMethod(
+                        slices,
+                        max_tokens=capacity,
+                        expand_min_tokens=self.q6_expand_min_tokens,
+                    )
+                if (
+                    self.q8_backend in {"consumer_cuda", "consumer_w8a8"}
+                    and source.quant_type == "Q8_0"
+                ):
+                    from .consumer_q8 import (
+                        ConsumerQ8LinearMethod,
+                        ConsumerQ8W8A8LinearMethod,
+                    )
+
+                    method = (
+                        ConsumerQ8W8A8LinearMethod
+                        if self.q8_backend == "consumer_w8a8"
+                        else ConsumerQ8LinearMethod
+                    )
+                    return method(
+                        slices,
+                        max_tokens=capacity,
+                        expand_min_tokens=self.q8_expand_min_tokens,
+                    )
+                return B12xGGUFLinearMethod(
+                    slices,
                     max_tokens=capacity,
                     retain_output_buffers=not self.b12x_ephemeral_outputs,
                 )

@@ -215,7 +215,7 @@ def test_native_grouped_wo_a_dispatch(
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if (
-        backend in ("b12x", "b12x_ephemeral", "consumer_q6")
+        backend in ("b12x", "b12x_ephemeral")
         and torch.cuda.get_device_capability()[0] < 12
     ):
         pytest.skip("b12x A16 arm requires SM120/121")
@@ -367,8 +367,9 @@ def test_native_grouped_wo_a_dispatch(
 
 
 @pytest.mark.parametrize("ephemeral", [False, True])
+@pytest.mark.parametrize("q6_backend", ["b12x", "consumer_cuda"])
 def test_native_vocab_and_lm_head_tp(
-    tmp_path, monkeypatch, default_vllm_config, ephemeral
+    tmp_path, monkeypatch, default_vllm_config, ephemeral, q6_backend
 ):
     import gguf
     import torch
@@ -378,7 +379,7 @@ def test_native_vocab_and_lm_head_tp(
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    if torch.cuda.get_device_capability()[0] < 12:
+    if q6_backend == "b12x" and torch.cuda.get_device_capability()[0] < 12:
         pytest.skip("b12x A16 arm requires SM120/121")
     expert_path, vocab_path = tmp_path / "expert.gguf", tmp_path / "vocab.gguf"
     write_shard(expert_path)
@@ -413,7 +414,10 @@ def test_native_vocab_and_lm_head_tp(
     writer.write_tensors_to_file()
     writer.close()
     config = Dsv41GGUFConfig(
-        [expert_path, vocab_path], max_tokens=17, b12x_ephemeral_outputs=ephemeral
+        [expert_path, vocab_path],
+        max_tokens=17,
+        b12x_ephemeral_outputs=ephemeral,
+        q6_backend=q6_backend,
     )
     monkeypatch.setattr(vocab, "get_tensor_model_parallel_world_size", lambda: 2)
     # Exercise actual vocabulary masking, but inspect the local contributions

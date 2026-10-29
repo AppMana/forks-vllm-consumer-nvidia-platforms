@@ -51,8 +51,6 @@ def _compile_warmup_units(
 def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
     if not current_platform.is_cuda():
         return
-    if not current_platform.is_device_capability_family(120):
-        return
 
     output_dtype = getattr(
         getattr(worker, "model_config", None),

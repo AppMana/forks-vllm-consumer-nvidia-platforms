@@ -347,6 +347,11 @@ class DeepseekCompressor(nn.Module):
         self._static_forward_context = (
             vllm_config.compilation_config.static_forward_context
         )
+        self.latent_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            self.head_dim,
+            dtype=torch.bfloat16,
+        )
 
     def forward(
         self,
@@ -387,12 +392,7 @@ class DeepseekCompressor(nn.Module):
                 prev_row_indices = state_metadata.prev_row_indices
                 ring_write_slots = state_metadata.ring_write_slots
 
-        latent = torch.empty(
-            kv_score.shape[0],
-            self.head_dim,
-            dtype=torch.bfloat16,
-            device=kv_score.device,
-        )
+        latent = self.latent_buffer[: kv_score.shape[0]]
         fused_save_compress_norm(
             kv_score,
             positions,

@@ -35,14 +35,34 @@ class ConsumerQ6LinearMethod(B12xGGUFLinearMethod):
 
     @torch.inference_mode()
     def warmup_launches(self, layer, *, token_counts):
-        counts = tuple(token_counts)
-        super().warmup_launches(layer, token_counts=counts)
-        if self._output is None:
-            raise RuntimeError("Q6 warmup requires prepared output storage")
+        counts = tuple(int(n) for n in token_counts)
+        if not counts or min(counts) <= 0 or max(counts) > self.max_tokens:
+            raise ValueError("Warmup exceeds native GGUF linear capacity")
         if any(s.source.quant_type != "Q6_K" for s in self.slices):
             raise ValueError("Consumer Q6 requires only Q6_K slices")
-        if self.max_tokens < self.expand_min_tokens:
-            return
+        device = layer._b12x_gguf_device.device
+        if torch.cuda.get_device_capability(device)[0] >= 12:
+            super().warmup_launches(layer, token_counts=counts)
+            if self._output is None:
+                raise RuntimeError("Q6 warmup requires prepared output storage")
+            if self.max_tokens < self.expand_min_tokens:
+                return
+            min_expand = self.expand_min_tokens
+            extra_counts = {self.max_tokens, self.expand_min_tokens}
+        else:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Native GGUF linear planning must precede capture")
+            if not self.weights:
+                raise RuntimeError("Load native GGUF linear weights before warmup")
+            if self._output is None:
+                self._output = torch.empty(
+                    self.max_tokens,
+                    sum(s.rows for s in self.slices),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+            min_expand = 1
+            extra_counts = {self.max_tokens}
         if not is_workspace_manager_initialized() and self._weight_workspace is None:
             self._weight_workspace = torch.empty(
                 sum(s.rows for s in self.slices),
@@ -50,14 +70,11 @@ class ConsumerQ6LinearMethod(B12xGGUFLinearMethod):
                 dtype=torch.bfloat16,
                 device=self._output.device,
             )
-        expansion_counts = sorted(
-            (set(counts) | {self.max_tokens, self.expand_min_tokens})
-            - self._expanded_counts
-        )
+        expansion_counts = sorted((set(counts) | extra_counts) - self._expanded_counts)
         grouped = isinstance(self, B12xGGUFGroupedLinearMethod)
         groups = len(self.slices) if grouped else 1
         for count in expansion_counts:
-            if count < self.expand_min_tokens:
+            if count < min_expand:
                 continue
             x = torch.zeros(
                 count,
@@ -99,11 +116,10 @@ class ConsumerQ6LinearMethod(B12xGGUFLinearMethod):
         if x.ndim < 2 or x.shape[-1] != self.slices[0].columns:
             raise ValueError("Q6 linear activation geometry mismatch")
         m = x.numel() // x.shape[-1]
-        if m < self.expand_min_tokens:
+        if self._states and m < self.expand_min_tokens:
             return super().apply(layer, x, bias)
         if (
             self._output is None
-            or not self._states
             or m > self.max_tokens
             or not x.is_contiguous()
             or x.dtype != torch.bfloat16
@@ -127,11 +143,10 @@ class ConsumerQ6GroupedLinearMethod(
     def apply_grouped(self, layer, x):
         if x.ndim != 3:
             raise ValueError("Q6 grouped input must have shape [M,G,K]")
-        if x.shape[0] < self.expand_min_tokens:
+        if self._states and x.shape[0] < self.expand_min_tokens:
             return super().apply_grouped(layer, x)
         if (
             self._output is None
-            or not self._states
             or x.shape[0] > self.max_tokens
             or x.shape[1:] != (len(self.slices), self.slices[0].columns)
             or x.dtype != torch.bfloat16

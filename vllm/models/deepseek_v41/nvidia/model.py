@@ -11,6 +11,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.cache import CacheDType
 from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_engram_dp_size,
@@ -84,7 +85,10 @@ from vllm.models.deepseek_v4.nvidia.model import (
     make_deepseek_v4_expert_params_mapping,
     prepare_mega_gate_routing_metadata,
 )
-from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+from vllm.models.deepseek_v41.attention import (
+    DeepseekV4Attention,
+    DeepseekV4PPProxyKVSource,
+)
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
     DeepseekV4MegaAttnAttention,
@@ -707,6 +711,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.attn.forward_kv(positions, x)
 
 
+class DeepseekV4PPProxyDecoderLayer(nn.Module):
+    """Hold a proxy KV/indexer source on a PP rank consuming an upstream KV source."""
+
+    def __init__(self, attn: DeepseekV4PPProxyKVSource):
+        super().__init__()
+        self.attn = attn
+
+
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -835,7 +847,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # ranks to belong to one NVLink domain. Collective: run before layers.
         self.run_gemm_rs = maybe_init_gemm_rs(vllm_config, self.use_sequence_parallel)
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
+        from vllm.distributed.utils import get_pp_indices
+
+        pp = get_pp_group()
+        self.start_layer, self.end_layer = get_pp_indices(
+            config.num_hidden_layers, pp.rank_in_group, pp.world_size
+        )
+        self._pp_proxy_kv_sources: dict[int, DeepseekV4PPProxyKVSource] = {}
+        self._init_pp_proxy_kv_sources(vllm_config, prefix=f"{prefix}.layers")
+
+        _, _, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
                 vllm_config,
@@ -851,6 +872,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        for src_id, proxy in self._pp_proxy_kv_sources.items():
+            self.layers[src_id] = DeepseekV4PPProxyDecoderLayer(proxy)
         self.engram_batch = EngramBatch.create(
             [
                 layer.engram
@@ -957,6 +980,73 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self._mtp_hidden_buffer = None
 
+    def _init_pp_proxy_kv_sources(self, vllm_config: VllmConfig, prefix: str) -> None:
+        config = self.config
+        compress_ratios = getattr(config, "compress_ratios", None) or ()
+        kv_sources = tuple(getattr(config, "kv_source_layer_ids", None) or ())
+        index_sources = set(getattr(config, "index_source_layer_ids", None) or ())
+        if not kv_sources or self.start_layer == 0:
+            return
+        needed_kv_sources: dict[int, bool] = {}
+        for layer_id in range(self.start_layer, self.end_layer):
+            cr = (
+                int(compress_ratios[layer_id]) if layer_id < len(compress_ratios) else 0
+            )
+            if cr <= 0:
+                continue
+            src = max(s for s in kv_sources if s <= layer_id)
+            if src < self.start_layer:
+                needs_idx = needed_kv_sources.get(src, False) or (
+                    layer_id in index_sources
+                )
+                needed_kv_sources[src] = needs_idx
+        if not needed_kv_sources:
+            return
+        attn_cls = _select_dsv4_attn_cls(vllm_config)
+        packed_dtype: CacheDType = (
+            "nvfp4_ds_mla" if attn_cls is DeepseekV4MegaAttnAttention else "fp8_ds_mla"
+        )
+        for src, needs_idx in sorted(needed_kv_sources.items()):
+            self._pp_proxy_kv_sources[src] = DeepseekV4PPProxyKVSource(
+                vllm_config,
+                prefix=f"{prefix}.{src}.attn",
+                backend_cls=attn_cls.backend_cls,
+                use_fp8_ds_mla_layout=attn_cls.use_fp8_ds_mla_layout,
+                packed_kv_cache_dtype=packed_dtype,
+                needs_indexer_k=needs_idx,
+            )
+
+    def _pp_boundary_specs(self, boundary_layer: int) -> tuple[set[int], bool, bool]:
+        config = self.config
+        compress_ratios = getattr(config, "compress_ratios", None) or ()
+        kv_sources = tuple(getattr(config, "kv_source_layer_ids", None) or ())
+        index_sources = tuple(getattr(config, "index_source_layer_ids", None) or ())
+        candidate_source = getattr(config, "candidate_source_layer_id", -1)
+        latent_sources: set[int] = set()
+        needs_topk = False
+        needs_candidates = False
+        if not kv_sources or not (0 < boundary_layer < config.num_hidden_layers):
+            return latent_sources, needs_topk, needs_candidates
+        for layer_id in range(boundary_layer, config.num_hidden_layers):
+            cr = (
+                int(compress_ratios[layer_id]) if layer_id < len(compress_ratios) else 0
+            )
+            if cr <= 0:
+                continue
+            kv_src = max(s for s in kv_sources if s <= layer_id)
+            if kv_src < boundary_layer:
+                latent_sources.add(kv_src)
+            idx_src = max(s for s in index_sources if s <= layer_id)
+            if idx_src < boundary_layer:
+                needs_topk = True
+            if (
+                layer_id in index_sources
+                and 0 <= candidate_source < boundary_layer
+                and self.candidate_block_buffer is not None
+            ):
+                needs_candidates = True
+        return latent_sources, needs_topk, needs_candidates
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -971,21 +1061,44 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # token embedding to hc_mult streams before the first decoder
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
-        # for its attention collapse.
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-                "pre_mix": torch.zeros(
-                    (batch_size, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
+        # for its attention collapse, and any cross-stage compressor latents,
+        # top-k indices, or candidate blocks needed by downstream layers.
+        tensors: dict[str, torch.Tensor] = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "pre_mix": torch.zeros(
+                (batch_size, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        latent_sources, needs_topk, needs_candidates = self._pp_boundary_specs(
+            self.start_layer
         )
+        for src in sorted(latent_sources):
+            tensors[f"latent_{src}"] = torch.zeros(
+                (batch_size, self.config.head_dim),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        if needs_topk:
+            tensors["topk_indices"] = torch.full(
+                (batch_size, self.config.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+        if needs_candidates and self.candidate_block_buffer is not None:
+            tensors["candidate_blocks"] = torch.full(
+                (batch_size, self.candidate_block_buffer.shape[1]),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
 
     def forward(
         self,
@@ -1100,6 +1213,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
+            in_latents, in_topk, in_candidates = self._pp_boundary_specs(
+                self.start_layer
+            )
+            for src in sorted(in_latents):
+                latent_in = intermediate_tensors[f"latent_{src}"]
+                if src in self._pp_proxy_kv_sources:
+                    self._pp_proxy_kv_sources[src].stage_latent(latent_in)
+            if in_topk:
+                topk_in = intermediate_tensors["topk_indices"]
+                self.topk_indices_buffer[: topk_in.shape[0]].copy_(topk_in)
+            if in_candidates and self.candidate_block_buffer is not None:
+                cand_in = intermediate_tensors["candidate_blocks"]
+                self.candidate_block_buffer[: cand_in.shape[0]].copy_(cand_in)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
         hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
             range(self.start_layer, self.decoder_replay_start),
@@ -1144,9 +1270,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ] + late_aux
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+            assert pre_mix is not None
+            out_tensors: dict[str, torch.Tensor] = {
+                "hidden_states": hidden_states,
+                "pre_mix": pre_mix,
+            }
+            out_latents, out_topk, out_candidates = self._pp_boundary_specs(
+                self.end_layer
             )
+            num_out = hidden_states.shape[0]
+            for src in sorted(out_latents):
+                if self.start_layer <= src < self.end_layer:
+                    comp = self.layers[src].attn.compressor
+                    assert comp is not None
+                    out_tensors[f"latent_{src}"] = comp.latent_buffer[:num_out]
+                else:
+                    assert intermediate_tensors is not None
+                    out_tensors[f"latent_{src}"] = intermediate_tensors[f"latent_{src}"]
+            if out_topk:
+                out_tensors["topk_indices"] = self.topk_indices_buffer[:num_out]
+            if out_candidates and self.candidate_block_buffer is not None:
+                out_tensors["candidate_blocks"] = self.candidate_block_buffer[:num_out]
+            return IntermediateTensors(out_tensors)
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.

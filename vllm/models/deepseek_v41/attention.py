@@ -964,6 +964,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 aux_stream,
             )
         else:
+            if self.compressed_cache_prefix is not None:
+                source = self._static_forward_context[self.compressed_cache_prefix]
+                insert_fn = getattr(source, "maybe_insert_proxy_cache", None)
+                if insert_fn is not None:
+                    insert_fn(cache_positions)
             indexer_result = prepare_indexer()
         index_q, index_q_scale, index_weights_out = indexer_result
 
@@ -1276,6 +1281,209 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert self.compressed_cache_prefix is not None
         source = self._static_forward_context[self.compressed_cache_prefix]
         return source.kv_cache
+
+
+class DeepseekV4PPProxyIndexer(nn.Module):
+    """Hold the shared indexer K cache and wk/k_norm on a downstream PP rank."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+        compress_ratio: int,
+        main_head_dim: int,
+    ):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        assert cache_config is not None
+        self.head_dim = config.index_head_dim
+        self.compress_ratio = compress_ratio
+        self.use_fp4_kv = dsa_indexer_uses_fp4(vllm_config)
+        self.wk = ReplicatedLinear(
+            main_head_dim,
+            self.head_dim,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.wk",
+        )
+        self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.k_cache = DeepseekV4IndexerCache(
+            head_dim=_indexer_k_cache_head_dim(self.head_dim, self.use_fp4_kv),
+            dtype=torch.uint8,
+            prefix=f"{prefix}.k_cache",
+            cache_config=cache_config,
+            compress_ratio=compress_ratio,
+        )
+
+    def produce_k(
+        self,
+        latent: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+    ) -> None:
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+        indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+        k_pre, _ = self.wk(latent)
+        indexer_k_norm_rope_store(
+            k_pre,
+            positions,
+            rotary_emb.cos_sin_cache,
+            self.k_norm.weight,
+            self.k_norm.variance_epsilon,
+            self.k_cache.kv_cache,
+            indexer_metadata.slot_mapping,
+            self.compress_ratio,
+            self.use_fp4_kv,
+        )
+
+
+class DeepseekV4PPProxyKVSource(nn.Module, AttentionLayerBase):
+    """Receive an upstream PP stage's compressor latent and populate local caches."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+        backend_cls: type[AttentionBackend],
+        use_fp8_ds_mla_layout: bool,
+        packed_kv_cache_dtype: CacheDType,
+        needs_indexer_k: bool,
+    ):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        assert cache_config is not None
+        self.layer_id = extract_layer_index(prefix)
+        self.prefix = prefix
+        self.backend_cls = backend_cls
+        self.head_dim = config.head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.compress_ratio = int(config.compress_ratios[self.layer_id])
+        self.rotary_emb = build_deepseek_v4_rope(
+            config,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            compress_ratio=self.compress_ratio,
+        )
+        self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
+            use_fp8_ds_mla_layout,
+            cache_config.cache_dtype,
+            cache_config,
+            packed_kv_cache_dtype,
+        )
+        self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
+        self.swa_bytes_per_token = (
+            528 if self.kv_cache_dtype == "int8_ds_mla" or self.kv_mxfp8 else 584
+        )
+        self.compressed_bytes_per_token = (
+            288 if self.kv_cache_dtype == "nvfp4_ds_mla" else self.swa_bytes_per_token
+        )
+        self.kv_page_alignment = (
+            528
+            if self.kv_cache_dtype == "int8_ds_mla"
+            else (512 if self.kv_mxfp8 else 576)
+        )
+        self.kv_cache = torch.tensor([])
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        self.latent_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            self.head_dim,
+            dtype=torch.bfloat16,
+        )
+        self._pending_tokens = 0
+        self.indexer = (
+            DeepseekV4PPProxyIndexer(
+                vllm_config,
+                prefix=f"{prefix}.indexer",
+                compress_ratio=self.compress_ratio,
+                main_head_dim=self.head_dim,
+            )
+            if needs_indexer_k
+            else None
+        )
+
+    def stage_latent(self, latent: torch.Tensor) -> None:
+        num_tokens = latent.shape[0]
+        self.latent_buffer[:num_tokens].copy_(latent)
+        self._pending_tokens = num_tokens
+
+    def maybe_insert_proxy_cache(self, positions: torch.Tensor) -> None:
+        if self._pending_tokens <= 0:
+            return
+        num_tokens = self._pending_tokens
+        self._pending_tokens = 0
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+        latent = self.latent_buffer[:num_tokens]
+        k_cache_metadata = cast(Any, attn_metadata[self.prefix])
+        if self.kv_cache_dtype == "int8_ds_mla":
+            rope_kv_int8_ds_mla_insert(
+                latent,
+                self.kv_cache,
+                k_cache_metadata.slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                k_cache_metadata.block_size // self.compress_ratio,
+                compress_ratio=self.compress_ratio,
+            )
+        else:
+            from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
+                rope_quant_insert,
+            )
+
+            fp8_scale = (
+                getattr(self, "_flashinfer_fp8_kv_scale", None)
+                if self.kv_cache.dtype == torch.float8_e4m3fn
+                else None
+            )
+            rope_quant_insert(
+                latent,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.kv_cache,
+                k_cache_metadata.slot_mapping,
+                self.compress_ratio,
+                fp8_scale=fp8_scale,
+            )
+        if self.indexer is not None:
+            self.indexer.produce_k(latent, positions, self.rotary_emb)
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        self.kv_cache = kv_cache.squeeze(1)
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return self.backend_cls
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        uses_fp8_ds_mla_layout = self.kv_cache_dtype in (
+            "fp8_ds_mla",
+            "nvfp4_ds_mla",
+            "int8_ds_mla",
+        )
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
+            tokens_per_state=self.compress_ratio,
+            cache_dtype_str=self.kv_cache_dtype,
+            alignment=self.kv_page_alignment if uses_fp8_ds_mla_layout else 512,
+            model_version="deepseek_v4",
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            state_content_bytes=(
+                self.compressed_bytes_per_token if uses_fp8_ds_mla_layout else None
+            ),
+        )
+
+    def forward(self): ...
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
