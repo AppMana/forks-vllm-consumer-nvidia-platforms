@@ -41,7 +41,7 @@ STABLE_TORCH_LIBRARY_IMPL(cutlass_arch_probe, CUDA, m) {
   m.impl("mm", &boxed_mm);
 }
 """)
-    base = root / "csrc/libtorch_stable"
+    base = root / "csrc"
     flags = ["-DTORCH_STABLE_ONLY", "-DENABLE_SCALED_MM_C2X=1", "-DUSE_CUDA"]
     path = load(
         name="cutlass_arch_probe",

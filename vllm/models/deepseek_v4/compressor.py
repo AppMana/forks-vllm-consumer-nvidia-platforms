@@ -7,7 +7,7 @@ from typing import Any, ClassVar, cast
 import torch
 from torch import nn
 
-from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -1074,10 +1074,8 @@ class DeepseekCompressor(nn.Module):
         state_metadata = cast(
             CompressorMetadata, attn_metadata[self.state_cache.prefix]
         )
-        token_to_req_indices = state_metadata.token_to_req_indices
         slot_mapping = state_metadata.slot_mapping
         tail_slot_mapping = state_metadata.tail_slot_mapping
-        num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
 
@@ -1089,10 +1087,10 @@ class DeepseekCompressor(nn.Module):
         ring_cache = state_cache
         ring_stage = state_metadata.ring_stage
 
-        # full graph cannot branch on per-step CPU metadata after capture
+        # A captured graph would replay the capture batch's skip decision.
         skip_compress = (
             self._cuda_c128_boundary_shortcut
-            and forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
+            and not torch.cuda.is_current_stream_capturing()
             and state_metadata.c128_boundary is False
         )
         if ring_stage is not None and not skip_compress:
@@ -1155,6 +1153,61 @@ class DeepseekCompressor(nn.Module):
             )
             return
 
+        self._step_kv = kv
+        self._step_score = score
+        self._step_slot_mapping = slot_mapping
+        self._step_block_table = block_table
+        try:
+            self._compress_norm_rope_store(
+                state_metadata,
+                state_cache,
+                state_width,
+                positions,
+                rotary_emb,
+                attn_metadata,
+                self._pdl_kwargs,
+            )
+        finally:
+            self._step_kv = None
+            self._step_score = None
+            self._step_slot_mapping = None
+            self._step_block_table = None
+        if state_metadata.is_circular:
+            _SAVE_PARTIAL_STATES_KERNEL(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                state_cache=ring_cache,
+                slot_mapping=tail_slot_mapping,
+                block_size=block_size,
+                state_width=state_width,
+                compress_ratio=self.compress_ratio,
+                pdl_kwargs=self._pdl_kwargs,
+            )
+
+    def _compress_norm_rope_store(
+        self,
+        state_metadata: CompressorMetadata,
+        state_cache: torch.Tensor,
+        state_width: int,
+        positions: torch.Tensor,
+        rotary_emb,
+        attn_metadata: dict[str, Any],
+        pdl_kwargs: dict,
+    ) -> None:
+        """Compress the saved states and write K to the cache; a platform
+        subclass overrides it to write its own cache layout."""
+        token_to_req_indices = state_metadata.token_to_req_indices
+        slot_mapping = getattr(self, "_step_slot_mapping", None)
+        if slot_mapping is None:
+            slot_mapping = state_metadata.slot_mapping
+        num_actual = slot_mapping.shape[0]
+        block_table = getattr(self, "_step_block_table", None)
+        if block_table is None:
+            block_table = state_metadata.block_table
+        block_size = state_metadata.block_size
+
         # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
         # RoPE requirements (kernel applies forward GPT-J style rotation):
         # - is_neox_style=False (interleaved pairs, NOT split-half)
@@ -1184,8 +1237,8 @@ class DeepseekCompressor(nn.Module):
             # layout and the plain full-cache layout. The full-cache flags
             # are consumed only here.
             extra_kwargs: dict[str, Any] = dict(
-                kv=kv,
-                score=score,
+                kv=getattr(self, "_step_kv", None),
+                score=getattr(self, "_step_score", None),
                 ape=self.ape,
                 query_start_loc=state_metadata.query_start_loc,
                 is_circular=state_metadata.is_circular,
@@ -1232,16 +1285,3 @@ class DeepseekCompressor(nn.Module):
             int8_ds_mla=self._int8_ds_mla and self.head_dim == 512,
             **extra_kwargs,
         )
-        if state_metadata.is_circular:
-            _SAVE_PARTIAL_STATES_KERNEL(
-                kv=kv,
-                score=score,
-                ape=self.ape,
-                positions=positions,
-                state_cache=ring_cache,
-                slot_mapping=tail_slot_mapping,
-                block_size=block_size,
-                state_width=state_width,
-                compress_ratio=self.compress_ratio,
-                pdl_kwargs=self._pdl_kwargs,
-            )

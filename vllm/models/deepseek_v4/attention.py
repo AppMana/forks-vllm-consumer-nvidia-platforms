@@ -21,6 +21,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.models.common.ops.fused_qk_rmsnorm import (
     _FUSED_Q_KV_RMSNORM_KERNEL,
     fused_q_kv_rmsnorm,
@@ -67,6 +68,7 @@ from vllm.transformers_utils.configs.dsv4.kernel_config import (
     activate_kernel_config,
     resolve_kernel_config_from_hf_config,
 )
+from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -202,10 +204,11 @@ def _resolve_dsv4_kv_cache_dtype(
 
 def resolve_layer_compress_ratio(config, layer_id: int) -> tuple[int, bool]:
     """Resolve the cache ratio and rotary embedding mode for a layer."""
+    compress_ratios = get_compress_ratios(config)
     if layer_id < config.num_hidden_layers:
-        return max(1, config.compress_ratios[layer_id]), False
-    if layer_id < len(config.compress_ratios):
-        raw_compress_ratio = config.compress_ratios[layer_id]
+        return max(1, compress_ratios[layer_id]), False
+    if layer_id < len(compress_ratios):
+        raw_compress_ratio = compress_ratios[layer_id]
         return max(1, raw_compress_ratio), raw_compress_ratio == 0
     return 1, False
 
@@ -274,6 +277,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """Return whether this instance stores fp8 KV in fp8_ds_mla layout."""
         return self.use_fp8_ds_mla_layout
 
+    def _get_indexer_cls(self, vllm_config: VllmConfig) -> type["DeepseekV4Indexer"]:
+        """The indexer for this layer. A platform subclass returns one that
+        writes and scores its own index K cache layout."""
+        return DeepseekV4Indexer
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -324,10 +332,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.padded_heads = self.get_padded_num_q_heads(self.n_local_heads)
         # Sink padded to the same head count, initialized to -inf (no sink
         # effect). Weight loading fills the first n_local_heads slots.
-        self.attn_sink = nn.Parameter(
-            torch.full((self.padded_heads,), -float("inf"), dtype=torch.float32),
-            requires_grad=False,
-        )
+        self.attn_sink = make_attention_sink(self.padded_heads, torch.float32)
 
         self.fused_wqa_wkv = MergedColumnParallelLinear(
             self.hidden_size,
@@ -388,7 +393,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer_aux_stream = (
                 aux_stream_list[2] if aux_stream_list is not None else None
             )
-            self.indexer = DeepseekV4Indexer(
+            self.indexer = self._get_indexer_cls(vllm_config)(
                 vllm_config,
                 config=config,
                 hidden_size=self.hidden_size,
@@ -1133,6 +1138,17 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
 
 
 class DeepseekV4Indexer(nn.Module):
+    # The index K cache, its writer and the scoring layer; a platform subclass
+    # returns its own.
+    def _get_cache_cls(self) -> type[DeepseekV4IndexerCache]:
+        return DeepseekV4IndexerCache
+
+    def _get_compressor_cls(self) -> type[DeepseekCompressor]:
+        return DeepseekCompressor
+
+    def _get_attn_cls(self) -> type[SparseAttnIndexer]:
+        return SparseAttnIndexer
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1239,14 +1255,14 @@ class DeepseekV4Indexer(nn.Module):
             k_cache_head_dim = (
                 self.head_dim + self.head_dim // self.quant_block_size * 4
             )
-        self.k_cache = DeepseekV4IndexerCache(
+        self.k_cache = self._get_cache_cls()(
             head_dim=k_cache_head_dim,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
             compress_ratio=self.compress_ratio,
         )
-        self.compressor = DeepseekCompressor(
+        self.compressor = self._get_compressor_cls()(
             vllm_config=vllm_config,
             compress_ratio=self.compress_ratio,
             hidden_size=hidden_size,
@@ -1257,7 +1273,7 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4_cache=self.use_fp4_kv,
         )
 
-        self.indexer_op = SparseAttnIndexer(
+        self.indexer_op = self._get_attn_cls()(
             self.k_cache,
             self.quant_block_size,
             self.scale_fmt,
@@ -1278,11 +1294,11 @@ class DeepseekV4Indexer(nn.Module):
             torch.cuda.Event(),
         ]
 
-        if (
-            vllm_config.kernel_config.enable_jit_warmup
-            and not has_cutedsl()
-            and not current_platform.is_xpu()
-        ):
+        if vllm_config.kernel_config.enable_jit_warmup:
+            self._register_q_quant_warmup()
+
+    def _register_q_quant_warmup(self) -> None:
+        if not has_cutedsl() and not current_platform.is_xpu():
             from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
                 _FUSED_INDEXER_Q_ROPE_MXFP4_TRITON_KERNEL,
                 _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL,
@@ -1293,6 +1309,29 @@ class DeepseekV4Indexer(nn.Module):
                 if self.use_fp4_kv
                 else _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL
             ).register_warmup()
+
+    def _q_rope_quant(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        rotary_emb: nn.Module,
+        indexer_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """RoPE and quantize the index Q; returns (q_quant, weights)."""
+        return fused_indexer_q_rope_quant(
+            positions,
+            q,
+            rotary_emb.cos_sin_cache,
+            indexer_weights,
+            self.softmax_scale,
+            self.n_head**-0.5,
+            use_fp4=self.use_fp4_kv,
+            q_is_int8=self._indexer_query_is_int8,
+            use_cutedsl=self._indexer_use_cutedsl,
+            is_xpu=self._indexer_is_xpu,
+            fp8_dtype=self._indexer_fp8_dtype,
+            supports_fp8e4nv_in_triton=(self._indexer_supports_fp8e4nv_in_triton),
+        )
 
     def forward(
         self,
@@ -1339,20 +1378,7 @@ class DeepseekV4Indexer(nn.Module):
             # into indexer_weights) so the logits run as s8 x s8 integer-MMA.
             q = self._wq_b_proj(qr, qr_scale)
             q = q.view(-1, self.n_head, self.head_dim)
-            return fused_indexer_q_rope_quant(
-                positions,
-                q,
-                rotary_emb.cos_sin_cache,
-                indexer_weights,
-                self.softmax_scale,
-                self.n_head**-0.5,
-                use_fp4=self.use_fp4_kv,
-                q_is_int8=self._indexer_query_is_int8,
-                use_cutedsl=self._indexer_use_cutedsl,
-                is_xpu=self._indexer_is_xpu,
-                fp8_dtype=self._indexer_fp8_dtype,
-                supports_fp8e4nv_in_triton=(self._indexer_supports_fp8e4nv_in_triton),
-            )
+            return self._q_rope_quant(positions, q, rotary_emb, indexer_weights)
 
         if not skip_compressor:
             # compressor returns None and writes K to the indexer KV cache; the

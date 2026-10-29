@@ -13,7 +13,7 @@ import torch
 from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, get_current_vllm_config_or_none
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -254,15 +254,11 @@ class DefaultModelLoader(BaseModelLoader):
                     subfolder=subfolder,
                     revision=revision,
                 )
-            hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files,
-                hf_folder,
-                index_file,
-                # An explicit allow_patterns override selects a deliberate
-                # subset of the checkpoint; the index completeness check
-                # must not demand the excluded shards.
-                allow_partial=allow_patterns_overrides is not None,
-            )
+            # only filter the weights from index without explicit allow patterns
+            if allow_patterns_overrides is None:
+                hf_weights_files = filter_duplicate_safetensors_files(
+                    hf_weights_files, hf_folder, index_file
+                )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -326,9 +322,15 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                 )
             elif self.load_config.load_format == "instanttensor":
+                vllm_config = get_current_vllm_config_or_none()
+                engram_config = vllm_config.engram_config if vllm_config else None
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    local_expert_ids=self.local_expert_ids,
+                    load_engram_on_cpu=bool(
+                        engram_config and engram_config.cpu_offload
+                    ),
                 )
             else:
                 if extra_config.get("enable_multithread_load"):

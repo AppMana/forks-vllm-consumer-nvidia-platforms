@@ -32,7 +32,8 @@ ARG TRITON_INSTALL_FROM_SOURCE_REVISION=
 # This version is used for CUDA 12+ builds to keep the DeepEP build and
 # runtime NCCL versions compatible. The final image replaces this stock
 # wheel library with the AppMana 2.32.3 build.
-ARG NCCL_VERSION=2.30.7
+# DeepEPv2 GDA over EFA requires NCCL 2.31.x or later.
+ARG NCCL_VERSION=2.31.2
 
 # By parameterizing the base images, we allow third-party to use their own
 # base images. One use case is hermetic builds with base images stored in
@@ -333,8 +334,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     else \
+        # Keep the CUDA-specific PyTorch index first. Using it as an extra
+        # index with unsafe-best-match can select a higher, incompatible
+        # torch build from the base image (for example cu130 in a cu129 image).
         uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        --extra-index-url https://pypi.org/simple \
+        --index-strategy unsafe-first-match; \
     fi
 
 # Track PyTorch lib versions used during build and match in downstream instances.
@@ -474,7 +480,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         echo "Installing build requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        --extra-index-url https://pypi.org/simple \
+        --index-strategy unsafe-first-match; \
     fi
 
 WORKDIR /workspace
@@ -651,7 +659,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             > /tmp/nccl-override.txt && \
         export UV_OVERRIDE=/tmp/nccl-override.txt; \
     fi && \
-    export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
+    DEEPEP_ARCH_LIST='9.0a 10.0a' && \
+    if [ "$(printf '%s\n' 12.9 "$CUDA_VERSION" | sort -V | head -n1)" = 12.9 ]; then \
+        DEEPEP_ARCH_LIST="$DEEPEP_ARCH_LIST 10.3a"; \
+    fi && \
+    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+        DEEPEP_ARCH_LIST="$DEEPEP_ARCH_LIST 10.7a"; \
+    fi && \
+    export TORCH_CUDA_ARCH_LIST="$DEEPEP_ARCH_LIST" && \
     /tmp/install_python_libraries.sh \
         --workspace /tmp/ep_kernels_workspace \
         --mode wheel \
@@ -954,7 +969,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         echo "Installing dev requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/dev.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        --extra-index-url https://pypi.org/simple \
+        --index-strategy unsafe-first-match; \
     fi
 
 #################### DEV IMAGE ####################
@@ -991,6 +1008,7 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
 # Install Python and system dependencies
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
+        ca-certificates \
         software-properties-common \
         curl \
         sudo \
@@ -1217,7 +1235,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         uv pip install --system \
             -r /tmp/requirements-cuda.txt \
-            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+            --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+            --extra-index-url https://pypi.org/simple \
+            --index-strategy unsafe-first-match; \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
@@ -1250,12 +1270,15 @@ RUN set -eux; \
 
 # Install vllm-openai dependencies (saves ~2.6s per build)
 # These are stable packages that don't depend on vLLM itself
-# From versions.json: .openai_server_extras.timm, .openai_server_extras.runai_model_streamer
+# From versions.json: .openai_server_extras.timm, .openai_server_extras.runai_model_streamer,
+# .openai_server_extras.gguf (NVFP4 GGUF checkpoints, e.g. RecursiveSI/flint-nvfp4-gguf)
 ARG TIMM_VERSION=">=1.0.17"
 ARG RUNAI_MODEL_STREAMER_VERSION=">=0.15.7"
+ARG GGUF_VERSION=">=0.19.0"
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system accelerate 'modelscope<1.38' \
-        "timm${TIMM_VERSION}" "runai-model-streamer[s3,gcs,azure]${RUNAI_MODEL_STREAMER_VERSION}"
+        "timm${TIMM_VERSION}" "runai-model-streamer[s3,gcs,azure]${RUNAI_MODEL_STREAMER_VERSION}" \
+        "gguf${GGUF_VERSION}"
 
 # ============================================================
 # VLLM INSTALLATION (depends on build stage)
@@ -1297,7 +1320,9 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
     else \
         echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        --extra-index-url https://pypi.org/simple \
+        --index-strategy unsafe-first-match; \
     fi
 
 RUN if [ "${REPLACE_TORCH_BUNDLED_NCCL}" = "true" ]; then \
@@ -1436,7 +1461,9 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
     else \
         echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        --extra-index-url https://pypi.org/simple \
+        --index-strategy unsafe-first-match; \
     fi
 
 # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
@@ -1446,7 +1473,9 @@ COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-w
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        --extra-index-url https://pypi.org/simple \
+        --index-strategy unsafe-first-match
 
 # See the matching comment in the vllm-base stage.
 ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}

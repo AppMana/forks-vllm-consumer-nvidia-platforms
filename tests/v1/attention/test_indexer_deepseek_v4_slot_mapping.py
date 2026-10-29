@@ -17,6 +17,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
 from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLABackend as DeepseekV41SparseMLABackend,
 )
+from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla import indexer as indexer_module
 from vllm.v1.attention.backends.mla import sparse_swa as sparse_swa_module
@@ -118,10 +119,17 @@ def test_indexer_draft_decode_metadata_update_is_capture_safe():
         num_reqs, 4
     )
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    # SM100's paged MQA logits only take varlen rows.
+    indices = (
+        torch.arange(num_reqs, dtype=torch.int32, device=device)
+        if mqa_logits_use_mx_scales()
+        else None
+    )
     schedule_metadata = indexer_module.get_paged_mqa_logits_metadata(
         torch.div(seq_lens, 16, rounding_mode="floor").unsqueeze(1),
         64,
         num_sms,
+        indices=indices,
     ).clone()
 
     builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
@@ -145,6 +153,7 @@ def test_indexer_draft_decode_metadata_update_is_capture_safe():
             decode_lens=torch.zeros(num_reqs, dtype=torch.int32, device=device),
             requires_padding=False,
             schedule_metadata=schedule_metadata,
+            indices=indices,
             max_context_len=128 // 16,
         ),
         block_table=block_table,
@@ -164,7 +173,7 @@ def test_indexer_draft_decode_metadata_update_is_capture_safe():
     torch.testing.assert_close(
         schedule_metadata,
         indexer_module.get_paged_mqa_logits_metadata(
-            expected_decode_seq_lens.unsqueeze(1), 64, num_sms
+            expected_decode_seq_lens.unsqueeze(1), 64, num_sms, indices=indices
         ),
     )
     assert metadata.decode is not None
@@ -287,7 +296,9 @@ def test_device_token_request_mapping(query_lens, use_sparse_mla_builder):
 def test_indexer_shares_uncompressed_block_size_with_deepseek_v4_mla():
     """Packed MLA/indexer groups must retain 64 compressed rows per page."""
     kernel_block_size = select_common_block_size(
-        256, [DeepseekV4SparseMLABackend, DeepseekV4IndexerBackend]
+        256,
+        # indexer backend has no impl class
+        [DeepseekV4SparseMLABackend, DeepseekV4IndexerBackend],  # type: ignore[type-abstract]
     )
     spec = MLAAttentionSpec(
         block_size=256,
@@ -310,7 +321,9 @@ def test_indexer_preserves_deepseek_v41_mla_block_size():
     assert isinstance(block_size, int)
     assert (
         select_common_block_size(
-            block_size, [DeepseekV41SparseMLABackend, DeepseekV41IndexerBackend]
+            block_size,
+            # indexer backend has no impl class
+            [DeepseekV41SparseMLABackend, DeepseekV41IndexerBackend],  # type: ignore[type-abstract]
         )
         == block_size
     )
@@ -444,6 +457,7 @@ def test_compressed_slot_mapping_dcp_uses_rank_local_state_positions():
 
 def test_index_conversion_warmup_uses_physical_block_stride():
     config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         cache_config=SimpleNamespace(block_size=64),
         model_config=SimpleNamespace(
             max_model_len=1024,
@@ -564,11 +578,16 @@ def test_sparse_swa_short_prompt_tail_stays_on_prefill_metadata_path(monkeypatch
         is_prefilling=torch.tensor([True]),
     )
 
+    common._token_to_req_indices_cache = torch.zeros(query_len, dtype=torch.int32)
+
     builder = object.__new__(DeepseekSparseSWAMetadataBuilder)
     builder.decode_threshold = 6
     builder.window_size = 128
+    builder.prefill_index_width = 128
     builder.block_size = 256
     builder.is_dspark = False
+    builder.max_image_tokens = 0
+    builder.no_replay_start = torch.zeros(1, dtype=torch.int32)
     builder.token_to_req_indices = torch.zeros(1024, dtype=torch.int32)
     builder.is_valid_token = torch.zeros(1024, dtype=torch.bool)
     builder.decode_swa_indices = torch.zeros((1024, 1, 128), dtype=torch.int32)
@@ -578,16 +597,16 @@ def test_sparse_swa_short_prompt_tail_stays_on_prefill_metadata_path(monkeypatch
     builder._build_deepseek_v4_metadata = lambda *args: {}
     builder.build_tile_scheduler = lambda _num_tokens: {
         "swaonly": None,
+        "c1a": None,
+        "c2a": None,
         "c4a": None,
         "c128a": None,
     }
 
-    class NoopKernel:
-        def __getitem__(self, _grid):
-            return lambda *args, **kwargs: None
-
     monkeypatch.setattr(
-        sparse_swa_module, "_compute_swa_indices_and_lens_kernel", NoopKernel()
+        sparse_swa_module,
+        "_COMPUTE_SWA_INDICES_AND_LENS_KERNEL",
+        lambda *args, **kwargs: None,
     )
 
     metadata = builder.build(0, common)
@@ -775,7 +794,7 @@ def test_deepseek_v4_mtp_verifier_rows_stay_on_decode_metadata_path():
         num_kv_heads=1,
         head_size=512,
         dtype=torch.bfloat16,
-        compress_ratio=4,
+        tokens_per_state=4,
         model_version="deepseek_v4",
     )
     vllm_config = create_vllm_config(
@@ -790,6 +809,7 @@ def test_deepseek_v4_mtp_verifier_rows_stay_on_decode_metadata_path():
     vllm_config.speculative_config = SimpleNamespace(
         num_speculative_tokens=1,
         parallel_drafting=False,
+        enable_adaptive_verification=False,
         use_dspark=lambda: False,
     )
 
@@ -798,6 +818,7 @@ def test_deepseek_v4_mtp_verifier_rows_stay_on_decode_metadata_path():
         layer_names=["dummy_indexer"],
         vllm_config=vllm_config,
         device=device,
+        block_table_width=16,
     )
     flashmla = DeepseekV4FlashMLAMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
@@ -826,7 +847,7 @@ def test_deepseek_v4_pp_mtp_forces_flattened_indexer_decode_metadata():
         num_kv_heads=1,
         head_size=512,
         dtype=torch.bfloat16,
-        compress_ratio=128,
+        tokens_per_state=128,
         model_version="deepseek_v4",
     )
     vllm_config = create_vllm_config(
@@ -849,6 +870,7 @@ def test_deepseek_v4_pp_mtp_forces_flattened_indexer_decode_metadata():
         layer_names=["dummy_indexer"],
         vllm_config=vllm_config,
         device=device,
+        block_table_width=16,
     )
 
     assert indexer.use_flattening

@@ -3,66 +3,7 @@
 
 from types import SimpleNamespace
 
-import numpy as np
-
-from vllm.distributed.aux_output_connector.connector import (
-    AuxRequestOutput,
-)
-from vllm.v1.executor.ray_executor import RayDistributedExecutor
 from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
-from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
-from vllm.v1.outputs import (
-    LogprobsLists,
-    LogprobsTensors,
-    ModelRunnerOutput,
-)
-
-
-def _make_readonly(arr: np.ndarray) -> np.ndarray:
-    arr.setflags(write=False)
-    return arr
-
-
-def test_detach_zero_copy_from_model_runner_output_copies_only_numpy_views():
-    cu_num_generated_tokens = [0, 2]
-    prompt_logprobs = LogprobsTensors.empty_cpu(1, 2)
-    output = ModelRunnerOutput(
-        req_ids=["req-0"],
-        req_id_to_index={"req-0": 0},
-        logprobs=LogprobsLists(
-            logprob_token_ids=_make_readonly(
-                np.array([[1, 2], [3, 4]], dtype=np.int32)
-            ),
-            logprobs=_make_readonly(
-                np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32)
-            ),
-            sampled_token_ranks=_make_readonly(np.array([1, 2], dtype=np.int32)),
-            cu_num_generated_tokens=cu_num_generated_tokens,
-        ),
-        prompt_logprobs_dict={"req-0": prompt_logprobs},
-    )
-
-    original_logprobs = output.logprobs
-    assert original_logprobs is not None
-
-    detach_zero_copy_from_model_runner_output(output)
-
-    detached_logprobs = output.logprobs
-    assert detached_logprobs is not None
-    assert detached_logprobs is not original_logprobs
-    assert (
-        detached_logprobs.logprob_token_ids is not original_logprobs.logprob_token_ids
-    )
-    assert detached_logprobs.logprobs is not original_logprobs.logprobs
-    assert (
-        detached_logprobs.sampled_token_ranks
-        is not original_logprobs.sampled_token_ranks
-    )
-    assert detached_logprobs.logprob_token_ids.flags.writeable
-    assert detached_logprobs.logprobs.flags.writeable
-    assert detached_logprobs.sampled_token_ranks.flags.writeable
-    assert detached_logprobs.cu_num_generated_tokens is cu_num_generated_tokens
-    assert output.prompt_logprobs_dict["req-0"] is prompt_logprobs
 
 
 def _assert_bounded_nsight_capture(runtime_env: dict) -> None:
@@ -75,14 +16,6 @@ def _assert_bounded_nsight_capture(runtime_env: dict) -> None:
     assert nsight["cuda-graph-trace"] == "node"
 
 
-def test_ray_distributed_executor_uses_bounded_nsight_capture() -> None:
-    executor = object.__new__(RayDistributedExecutor)
-
-    remote_kwargs = executor._configure_ray_workers_use_nsight({})
-
-    _assert_bounded_nsight_capture(remote_kwargs["runtime_env"])
-
-
 def test_ray_executor_v2_uses_bounded_nsight_capture() -> None:
     executor = object.__new__(RayExecutorV2)
     executor.parallel_config = SimpleNamespace(
@@ -93,21 +26,3 @@ def test_ray_executor_v2_uses_bounded_nsight_capture() -> None:
     runtime_env = executor._build_runtime_env()
 
     _assert_bounded_nsight_capture(runtime_env)
-
-
-def test_detach_zero_copy_aux_output_without_logprobs():
-    rows = _make_readonly(np.arange(12, dtype=np.uint8).reshape(2, 3, 2))
-    output = ModelRunnerOutput(
-        req_ids=["req-0"],
-        req_id_to_index={"req-0": 0},
-        aux_output_connector_output={"req-0": AuxRequestOutput(0, rows)},
-    )
-
-    detach_zero_copy_from_model_runner_output(output)
-
-    aux_output = output.aux_output_connector_output
-    assert aux_output is not None
-    detached = aux_output["req-0"].rows
-    assert detached is not rows
-    assert detached.flags.writeable
-    np.testing.assert_array_equal(detached, rows)

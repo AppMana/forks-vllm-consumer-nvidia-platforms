@@ -8,7 +8,6 @@ ARG VLLM_IMAGE_TAG
 COPY vllm/model_executor/model_loader/default_loader.py /tmp/vllm-overlay/model_executor/model_loader/default_loader.py
 COPY vllm/model_executor/layers/quantization/dsv4_int.py /tmp/vllm-overlay/model_executor/layers/quantization/dsv4_int.py
 COPY vllm/models/deepseek_v4/nvidia/dspark.py /tmp/vllm-overlay/models/deepseek_v4/nvidia/dspark.py
-COPY vllm/v1/executor/ray_executor.py /tmp/vllm-overlay/v1/executor/ray_executor.py
 COPY vllm/v1/executor/ray_executor_v2.py /tmp/vllm-overlay/v1/executor/ray_executor_v2.py
 COPY vllm/v1/executor/ray_utils.py /tmp/vllm-overlay/v1/executor/ray_utils.py
 COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm-overlay/v1/worker/gpu/warmup.py
@@ -29,7 +28,6 @@ runtime_files = (
     "model_executor/layers/quantization/dsv4_int.py",
     "model_executor/model_loader/default_loader.py",
     "models/deepseek_v4/nvidia/dspark.py",
-    "v1/executor/ray_executor.py",
     "v1/executor/ray_executor_v2.py",
     "v1/executor/ray_utils.py",
     "v1/worker/gpu/warmup.py",

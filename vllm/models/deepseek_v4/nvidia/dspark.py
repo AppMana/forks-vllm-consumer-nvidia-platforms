@@ -21,11 +21,7 @@ import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
-from vllm.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -51,7 +47,11 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
 )
-from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
+from vllm.model_executor.models.utils import (
+    PPMissingLayer,
+    extract_layer_index,
+    maybe_prefix,
+)
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -60,6 +60,7 @@ from vllm.models.common.ops.sequence_parallel import (
 from vllm.models.deepseek_v4.attention import (
     fused_qnorm_rope_kv_int8_ds_mla_insert,
 )
+from vllm.models.deepseek_v4.common.eplb_util import collect_moe_layers
 from vllm.models.deepseek_v4.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from vllm.sequence import IntermediateTensors
 
@@ -67,6 +68,7 @@ from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Model,
+    DeepseekV4MoE,
     _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
     prepare_mega_gate_routing_metadata,
@@ -600,6 +602,16 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.set_moe_parameters()
+
+    def set_moe_parameters(self) -> None:
+        collect_moe_layers(
+            self,
+            self.model.layers,
+            self.config,
+            decoder_layer_type=DeepseekV4DecoderLayer,
+            moe_type=DeepseekV4MoE,
+        )
 
     def make_empty_intermediate_tensors(
         self,
@@ -718,6 +730,7 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 ckpt_down_proj_name="w2",
                 ckpt_up_proj_name="w3",
                 num_experts=self.config.n_routed_experts,
+                num_redundant_experts=first_layer.ffn.n_redundant_experts,
             )
         # Mirror the target model's weights mapper (model.py
         # _make_deepseek_v4_weights_mapper): fp4 AND int4 experts register
@@ -744,12 +757,6 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         seen_checkpoint_names: set[str] = set()
         loaded_confidence_head = False
 
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        n_local_head = self.config.num_attention_heads // tp_size
-        head_start = n_local_head * tp_rank
-        head_end = n_local_head * (tp_rank + 1)
-
         weights = _duplicate_context_wkv_weights(weights, len(self.model.layers))
         for name, loaded_weight in weights:
             checkpoint_name = name
@@ -773,6 +780,13 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                     else ".weight_scale_inv"
                 )
                 name = name.removesuffix(".scale") + suffix
+            if ".shared_experts." in name:
+                experts = self.model.layers[extract_layer_index(name)].ffn.experts
+                if getattr(experts, "has_fused_shared_experts", False):
+                    loaded_params.add(
+                        experts.load_shared_expert_weight(name, loaded_weight)
+                    )
+                    continue
             if ".shared_experts.w2" in name:
                 name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
             if self.pad_shared_expert and ".shared_experts." in name:
@@ -824,11 +838,6 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 loaded_params.add(name)
                 break
             else:
-                if "attn_sink" in name:
-                    narrow = loaded_weight[head_start:head_end]
-                    params_dict[name][: narrow.shape[0]].copy_(narrow)
-                    loaded_params.add(name)
-                    continue
                 if name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
@@ -841,7 +850,6 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
         self._validate_loaded_parameters(loaded_params, seen_checkpoint_names)
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
-        self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -885,12 +893,8 @@ class DSparkDeepseekV4ForCausalLM(DeepseekV4ForCausalLM):
                 f"{missing}"
             )
 
-    def _finalize_moe(self) -> None:
-        for layer in self.model.layers:
-            layer.ffn.finalize_mega_moe_weights()
-
     def process_weights_after_loading(self) -> None:
-        self._finalize_moe()
+        pass
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.

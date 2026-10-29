@@ -59,6 +59,7 @@ CHECK_IMPORTS = {
             "vllm/distributed/device_communicators/shm_tensor_arena.py",
             "vllm/distributed/weight_transfer/ipc_engine.py",
             "vllm/distributed/weight_transfer/clients.py",
+            "examples/rl/rlhf_http_ipc_no_vllm.py",
             "vllm/model_executor/model_loader/weight_cache/protocol.py",
             # Round-trip the trusted kernel configuration through Ray serialization.
             "tests/models/test_deepseek_v4_kernel_config.py",
@@ -75,7 +76,6 @@ CHECK_IMPORTS = {
             "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
-            "vllm/v1/executor/ray_executor.py",
             "vllm/entrypoints/llm.py",
             "tests/utils.py",
             # pickle and cloudpickle

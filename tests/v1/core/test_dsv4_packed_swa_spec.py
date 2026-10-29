@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from vllm.v1.core.kv_cache_utils import _promote_local_kv_cache_specs
+from vllm.v1.core.kv_cache_planning import _promote_local_kv_cache_specs
 from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     MLAAttentionSpec,
@@ -21,13 +21,12 @@ def _packed_dsv4_swa_spec(
         num_kv_heads=1,
         head_size=512,
         dtype=torch.uint8,
-        kv_quant_mode=(
-            KVQuantMode.FP8_PER_TENSOR if is_fp8 else KVQuantMode.NONE
-        ),
+        kv_quant_mode=(KVQuantMode.FP8_PER_TENSOR if is_fp8 else KVQuantMode.NONE),
         sliding_window=128,
         cache_dtype_str=cache_dtype,
+        state_content_bytes=584 if is_fp8 else 528,
         alignment=576 if is_fp8 else 528,
-        compress_ratio=1,
+        tokens_per_state=1,
         model_version="deepseek_v4",
     )
 
@@ -74,8 +73,9 @@ def test_dsv4_packed_swa_promotion_preserves_quantized_shape_selection(
         dtype=torch.uint8,
         kv_quant_mode=quant_mode,
         cache_dtype_str=cache_dtype,
+        state_content_bytes=bytes_per_token,
         alignment=alignment,
-        compress_ratio=4,
+        tokens_per_state=4,
         model_version="deepseek_v4",
     )
 

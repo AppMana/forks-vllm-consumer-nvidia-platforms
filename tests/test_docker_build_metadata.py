@@ -47,7 +47,6 @@ RUNTIME_OVERLAY_FILES = (
     "vllm/model_executor/layers/quantization/dsv4_int.py",
     "vllm/model_executor/model_loader/default_loader.py",
     "vllm/models/deepseek_v4/nvidia/dspark.py",
-    "vllm/v1/executor/ray_executor.py",
     "vllm/v1/executor/ray_executor_v2.py",
     "vllm/v1/executor/ray_utils.py",
     "vllm/v1/worker/gpu/warmup.py",

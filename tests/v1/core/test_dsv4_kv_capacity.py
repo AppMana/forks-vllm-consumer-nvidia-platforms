@@ -19,10 +19,12 @@ import torch
 
 from vllm.config import CacheConfig
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
     _get_kv_cache_bytes_per_block,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
+)
+from vllm.v1.core.kv_cache_utils import (
     get_max_concurrency_for_kv_cache_config,
 )
 from vllm.v1.kv_cache_interface import (
