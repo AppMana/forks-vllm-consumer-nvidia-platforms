@@ -311,7 +311,7 @@ release gate in `MERGING.md` gives the steps.
   checkpoint's GB10 attention and MoE kernels and the selectable SparkInfer mHC,
   plus the isolated `b12x==1.3.0` (`v1.3.0` / `b12x-v1.3.0`) runtime for native
   GGUF mixed-IQ execution;
-- the KV connectors: the AppMana LMCache fork (tag `appmana-v0.5.6.dev1`), NIXL and
+- the KV connectors: the AppMana LMCache fork (tag `appmana-v0.5.7.dev1`), NIXL and
   Mooncake, with OpenTelemetry pinned back afterwards. The Dockerfile default
   is `INSTALL_KV_CONNECTORS=false`; both build scripts pass `true`.
 

@@ -131,7 +131,7 @@
       "default": "true"
     },
     "LMCACHE_GIT_REF": {
-      "default": "0982a7f901aa727b225513a8f526432887bfa4b2"
+      "default": "706ef2841412b7b2728189720252aeb8223d4375"
     },
     "FLASHMLA_INDEX_URL": {
       "default": "https://appmana.github.io/forks-flash-mla-int/"
