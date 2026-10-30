@@ -51,7 +51,7 @@ variable "VLLM_IMAGE_TAG" {
 }
 
 variable "B12X_GIT_REF" {
-  default = "f2afc780a091e1484d11550845ae548fffdc7878"
+  default = "8a973c46bf017bf4c28e130578ae2fa7a2b5d912"
 }
 
 # Groups

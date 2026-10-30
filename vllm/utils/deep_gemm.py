@@ -753,10 +753,16 @@ def int8_mqa_logits_sparkinfer(
     cu_seqlen_ke: torch.Tensor,
 ) -> torch.Tensor:
     """Run the exact SM12x contiguous INT8 indexer contract in SparkInfer."""
-    from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
-        run_contiguous_logits_kernel,
-        supports_contiguous_logits_kernel,
-    )
+    try:
+        from b12x.attention.dsa_indexer.contiguous_kernel import (
+            run_contiguous_logits_kernel,
+            supports_contiguous_logits_kernel,
+        )
+    except ImportError:
+        from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
+            run_contiguous_logits_kernel,
+            supports_contiguous_logits_kernel,
+        )
 
     k_values, k_scales = kv
     contract = {

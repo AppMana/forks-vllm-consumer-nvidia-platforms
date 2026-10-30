@@ -1693,8 +1693,8 @@ print(f'sparkinfer AOT extensions: {len(found)}')"; \
 # VLLM_PLUGINS='' /opt/b12x/bin/python -m vllm.entrypoints.cli.main serve ...
 # GGUF is registered in vLLM itself; b12x's optional FP6/safetensors plugins
 # target a different vLLM integration API.
-# Release tag v1.3.0 (b12x-v1.3.0) on AppMana/forks-sparkinfer (branch appmana/b12x)
-ARG B12X_GIT_REF=f2afc780a091e1484d11550845ae548fffdc7878
+# Release tag b12x-v1.3.0.post1 on AppMana/forks-sparkinfer (branch appmana/main)
+ARG B12X_GIT_REF=8a973c46bf017bf4c28e130578ae2fa7a2b5d912
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ -n "${B12X_GIT_REF}" ]; then \
         echo "${B12X_GIT_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
