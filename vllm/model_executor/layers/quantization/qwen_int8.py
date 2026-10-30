@@ -314,13 +314,14 @@ class QwenInt8KVCacheMethod(BaseKVCacheMethod):
                 current_platform.is_cuda()
                 and current_platform.is_device_capability(86)
                 and layer.head_size == 256
-                and layer.kv_cache_dtype == "int8_per_token_head"
+                and layer.kv_cache_dtype
+                in ("int8_per_token_head", "int4_per_token_head")
                 and layer.num_heads in (12, 24)
                 and layer.num_heads == 6 * layer.num_kv_heads
             ):
                 raise ValueError(
                     "consumer_int8 attention requires SM86, Qwen D256/GQA6 "
-                    "and INT8 per-head cache"
+                    "and INT8/INT4 per-head cache"
                 )
             from consumer_int8.ops import paged_attention, paged_decode
 
@@ -336,11 +337,12 @@ class QwenInt8KVCacheMethod(BaseKVCacheMethod):
                 current_platform.is_cuda()
                 and current_platform.is_device_capability(86)
                 and layer.head_size == 256
-                and layer.kv_cache_dtype == "int8_per_token_head"
+                and layer.kv_cache_dtype
+                in ("int8_per_token_head", "int4_per_token_head")
             ):
                 raise ValueError(
                     "consumer_int8 KV writer requires SM86, D256 "
-                    "and INT8 per-head cache"
+                    "and INT8/INT4 per-head cache"
                 )
             # Import during construction, before graph capture or serving.
             from consumer_int8.ops import kv_cache_update

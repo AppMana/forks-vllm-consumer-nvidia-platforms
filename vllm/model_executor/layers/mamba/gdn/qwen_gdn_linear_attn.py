@@ -2124,9 +2124,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # while the active state fits the small-batch working set. Retain the
         # existing kernel for larger batches and speculative verification.
         local_heads = self.num_v_heads // self.tp_size
-        if self._consumer_gdn_decode is not None and (
-            (local_heads == 48 and num_actual_tokens == 1)
-            or (local_heads == 24 and 0 < num_actual_tokens <= 2)
+        if (
+            self._consumer_gdn_decode is not None
+            and ssm_state.dtype == torch.float32
+            and (
+                (local_heads == 48 and num_actual_tokens == 1)
+                or (local_heads == 24 and 0 < num_actual_tokens <= 2)
+            )
         ):
             assert non_spec_state_indices_tensor is not None
             self._consumer_gdn_decode(

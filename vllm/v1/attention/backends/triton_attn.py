@@ -702,13 +702,15 @@ class TritonAttentionImpl(AttentionImpl):
             native_attention is not None
             and (
                 max_seqlen_q >= 64
+                or self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
                 or (
                     max_seqlen_q <= 8
                     and getattr(layer, "_consumer_int8_decode", None) is not None
                 )
             )
             and attn_metadata.causal is True
-            and self._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+            and self._kv_quant_mode
+            in (KVQuantMode.INT8_PER_TOKEN_HEAD, KVQuantMode.INT4_PER_TOKEN_HEAD)
             and query.dtype == torch.bfloat16
             and self.sliding_window == (-1, -1)
             and self.alibi_slopes is None
@@ -749,11 +751,22 @@ class TritonAttentionImpl(AttentionImpl):
                 return output
             converted_fa2 = getattr(layer, "_consumer_int8_fa2", None)
             sequences = seqused_k.numel()
-            capacity = cdiv(max_seqlen_k, 16) * 16
+            if max_seqlen_k > 16384:
+                bucket = max(16384, 65536 // max(1, sequences))
+                capacity = cdiv(max_seqlen_k, bucket) * bucket
+            else:
+                capacity = cdiv(max_seqlen_k, 16) * 16
             scratch_bytes = sequences * capacity * self.num_kv_heads * 256 * 4
             # One transient layer, bounded independently of the persistent cache.
-            # Larger batches retain the direct packed CUDA implementation.
+            # Larger batches/contexts retain the direct packed CUDA implementation.
             if converted_fa2 is not None and scratch_bytes <= 512 * 1024**2:
+                fa2_shape = (sequences, capacity)
+                if (
+                    capacity > 16384
+                    and getattr(self, "_last_fa2_shape", None) != fa2_shape
+                ):
+                    self._last_fa2_shape = fa2_shape
+                    current_platform.empty_cache()
                 unpack, flash_attention = converted_fa2
                 key_scratch = torch.empty(
                     (sequences, capacity, self.num_kv_heads, 256),

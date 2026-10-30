@@ -32,15 +32,19 @@ state stays FP32, and Qwen's hybrid architecture has no sparse indexer.
 The opt-in `consumer_int8_prefill` backend uses fused integer GEMMs for at
 least 1,024 rows and AllSpark W8A16 for smaller requests. Runtime dispatch
 inside a custom operator preserves this policy during AOT graph reuse.
-Native CUDA implementations handle small-batch GDN decode and INT8 cache
-insertion. The `consumer_fa2` attention backend converts active INT8 cache
-rows to temporary BF16 pages for FlashAttention 2, with direct packed CUDA
-attention above its 512-MiB scratch cap. Short-query decode and MTP
-verification (`max_seqlen_q <= 8`) use `consumer_int8.ops.paged_decode` over
-the packed INT8 cache with high-plus-residual BF16 PV accumulation and
-two-CTA-per-SM occupancy (`target = 2 * SMs`, `2.58x–36.35x` faster than
-Triton `unified_attention` across `q=1..8` and `Hkv=2,4` on RTX A5000). GDN
-prefill retains FLA. INT8 storage does not imply integer attention arithmetic.
+
+- Native CUDA implementations handle small-batch GDN decode and INT8/INT4 cache
+  insertion (`kv_cache_update`, `kv_cache_update_int4`). The `consumer_fa2`
+  attention backend converts active INT8 or INT4 (`int4_per_token_head`,
+  264 bytes/head/token) cache rows to temporary BF16 pages in bounded
+  64k-token buckets for FlashAttention 2, with direct packed CUDA attention
+  above its 512-MiB scratch cap. Short-query decode and MTP verification
+  (`max_seqlen_q <= 8`) use `consumer_int8.ops.paged_decode` /
+  `paged_decode_int4` over the packed INT8/INT4 cache with high-plus-residual
+  BF16 PV accumulation and two-CTA-per-SM occupancy (`target = 2 * SMs`,
+  `2.58x–36.35x` faster than Triton `unified_attention` across `q=1..8` and
+  `Hkv=2,4` on RTX A5000). GDN prefill retains FLA. INT8/INT4 storage does not
+  imply integer attention arithmetic.
 
 The package's `benchmarks/run_quality.py` checks fixed text and vision
 fixtures. `benchmarks/run_matrix.py` measures separate aggregate and
@@ -153,13 +157,14 @@ memory reservation; `N/A` where exceeding the model's `max_position_embeddings`)
 
 Two DGX Spark GB10 nodes (`spark-2ab3` and `spark-5867`) linked by dual-rail
 200 Gb/s RoCE; `TP=2, EP=2, PP=1`, `quant_method=dsv41_gguf` (`UD-Q2_K_XL` at
-revision `60ad3651641b5c97679c807e064ab1d7a3ca1455`), `int8_ds_mla` cache
-(`1 GiB` per rank, `95.11 GiB` model weights per rank inside the `121 GiB`
-unified memory budget), disk-backed Engram embeddings (`io_uring`),
-`max_num_batched_tokens=2048`, `max_num_seqs=8`, PIECEWISE CUDA graphs at
-`[1,2,4,8]`, grouped W8A8 `attn.wo_a` and live-row transient BF16 expansion
-(`ghcr.io/appmana/vllm-consumer:sm86-sm121-efd38faff6`). Measured 2026-10-29
-with `tools/ampere/dsv4_needle_bench.py`:
+revision `60ad3651641b5c97679c807e064ab1d7a3ca1455`), `int8_ds_mla` cache +
+INT8 Lightning Indexer (`1.0–2.0 GiB` per rank = up to `1,276,734` tokens
+capacity, `94.24–95.11 GiB` model weights per rank inside the `121 GiB`
+unified memory budget), bounded-slab `streaming_prefill_topk`, disk-backed
+Engram embeddings (`io_uring`), PIECEWISE CUDA graphs (`[1,2,4,8]` /
+`[1,2,4,8,16,32]`), grouped W8A8 `attn.wo_a` and live-row transient BF16
+expansion (`ghcr.io/appmana/vllm-consumer:sm86-sm121-efd38faff6`). Measured
+2026-10-29 with `tools/ampere/dsv4_needle_bench.py`:
 
 | Input / Output tokens | C | TTFT s | Prefill tok/s per stream | Prefill tok/s aggregate | Output tok/s per stream | Output tok/s aggregate | Verbatim |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -167,9 +172,11 @@ with `tools/ampere/dsv4_needle_bench.py`:
 | 8,000 / 1,000 | 2 | 6.2 | 1,429 | 1,943 | 16.3 | 29.6 | 2/2 |
 | 8,000 / 1,000 | 4 | 10.7 | 783 | 1,918 | 13.2 | 46.1 | 3/4 |
 | 8,000 / 1,000 | 8 | 19.2 | 422 | 1,907 | 10.2 | 67.8 | 8/8 |
-| 8,000 / 1,000 | 32 | OOM | OOM | OOM | OOM | OOM | OOM |
-| 242,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM | OOM |
-| 950,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM | OOM |
+| 8,000 / 1,000 | 32 | 98.6 | 81 | 1,346 | 4.1 | 92.6 | 31/32 |
+| 242,000 / 1,000 | 1 | 196.5 | 1,232 | 1,232 | 18.4 | 4.0 | 1/1 |
+| 242,000 / 1,000 | 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM | OOM |
+| 950,000 / 1,000 | 1 | 952.2 | 998 | 998 | 16.0 | 1.0 | 1/1 |
+| 950,000 / 1,000 | 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM | OOM |
 
 GSM8K 128-question diagnostic subset (5-shot, `C=8`, `max_tokens=512`,
 `temperature=0`, `thinking=false`): **126/128 (98.44%)**, `0` invalid,
@@ -185,12 +192,13 @@ KV-sharing groups (`[2, 8, 14, 20]`) through `DeepseekV4PPProxyKVSource` /
 ### `Qwen3.8-27B` INT8 (`qwen_int8`), 2 RTX A5000s (`SM86`)
 
 Two RTX A5000 GPUs (24 GB/GPU, PCIe, `NCCL_P2P_DISABLE=1`), `qwen_int8`
-checkpoint (`consumer_int8_prefill`, `consumer_fa2`, `paged_decode` 2-CTA/SM
-split-KV, `int8` KV cache, `2.0 GiB` KV reservation on `MTP=0` and `3.35 GiB`
-on `MTP=7`). Measured with `benchmarks/needle_matrix.py` (1 warmup + 3 measured
-cohorts per cell, cold prefix cache; `242,000 / 1,000` and `C=32` exceed the
-`2.98 GiB` post-weight per-GPU VRAM ceiling on 2x 24 GB; `950,000 / 1,000`
-exceeds `max_position_embeddings = 262,144`):
+checkpoint (`consumer_int8_prefill`, `consumer_fa2` with 64k-token bucketed
+BF16 unpack, `paged_decode` / `paged_decode_int4` 2-CTA/SM split-KV, `int8` KV
+cache for `C=1..8` at `8k/1k` and `int4_per_token_head` KV cache for `242k/1k`
+and `C=32`, `2.0–3.2 GiB` KV reservation on `MTP=0` and `3.35 GiB` on `MTP=7`).
+Measured with `benchmarks/needle_matrix.py` (cold prefix cache; `242,000 / 1,000`
+at `C >= 2` exceeds the `2.98 GiB` post-weight per-GPU VRAM ceiling on 2x 24 GB;
+`950,000 / 1,000` exceeds `max_position_embeddings = 262,144`):
 
 | Topology | Input / Output tokens | C | Prefill tok/s per stream | Prefill tok/s aggregate | Decode tok/s per stream | Decode tok/s aggregate | Verbatim |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -198,8 +206,9 @@ exceeds `max_position_embeddings = 262,144`):
 | `TP=2` (`MTP=0`) | 8,000 / 1,000 | 2 | 3,496 | 4,181 | 32.8 | 63.5 | 5/6 |
 | `TP=2` (`MTP=0`) | 8,000 / 1,000 | 4 | 2,078 | 4,145 | 29.4 | 108.0 | 12/12 |
 | `TP=2` (`MTP=0`) | 8,000 / 1,000 | 8 | 1,827 | 3,722 | 22.7 | 153.8 | 24/24 |
-| `TP=2` (`MTP=0`) | 8,000 / 1,000 | 32 | OOM | OOM | OOM | OOM | OOM |
-| `TP=2` (`MTP=0`) | 242,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
+| `TP=2` (`MTP=0`, `int4_per_token_head`) | 8,000 / 1,000 | 32 | 1,981 | 3,759 | 12.9 | 216.0 | 31/32 |
+| `TP=2` (`MTP=0`, `int4_per_token_head`) | 242,000 / 1,000 | 1 | 1,743 | 1,743 | 26.2 | 26.2 | 1/1 |
+| `TP=2` (`MTP=0`, `int4_per_token_head`) | 242,000 / 1,000 | 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
 | `TP=2` (`MTP=0`) | 950,000 / 1,000 | 1, 2, 4, 8, 32 | N/A | N/A | N/A | N/A | N/A |
 | `TP=2` (`MTP=7`) | 8,000 / 1,000 | 1 | 4,114 | 4,114 | 142.1 | 142.1 | 3/3 |
 | `TP=2` (`MTP=7`) | 8,000 / 1,000 | 2 | 3,034 | 4,048 | 122.7 | 215.7 | 5/6 |
@@ -211,8 +220,9 @@ exceeds `max_position_embeddings = 262,144`):
 | `PP=2` (`MTP=0`) | 8,000 / 1,000 | 2 | 2,836 | 3,260 | 17.9 | 35.0 | 5/6 |
 | `PP=2` (`MTP=0`) | 8,000 / 1,000 | 4 | 1,895 | 4,251 | 17.7 | 67.7 | 12/12 |
 | `PP=2` (`MTP=0`) | 8,000 / 1,000 | 8 | 1,675 | 3,851 | 14.5 | 105.1 | 24/24 |
-| `PP=2` (`MTP=0`) | 8,000 / 1,000 | 32 | OOM | OOM | OOM | OOM | OOM |
-| `PP=2` (`MTP=0`) | 242,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
+| `PP=2` (`MTP=0`, `int4_per_token_head`) | 8,000 / 1,000 | 32 | 1,725 | 3,873 | 9.6 | 161.6 | 31/32 |
+| `PP=2` (`MTP=0`, `int4_per_token_head`) | 242,000 / 1,000 | 1 | 903 | 903 | 14.8 | 14.8 | 1/1 |
+| `PP=2` (`MTP=0`, `int4_per_token_head`) | 242,000 / 1,000 | 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
 | `PP=2` (`MTP=0`) | 950,000 / 1,000 | 1, 2, 4, 8, 32 | N/A | N/A | N/A | N/A | N/A |
 
 ### `appmana/deepseek-v4-int4-int8`, 11 RTX 3090s (`PP=11`)
