@@ -60,12 +60,12 @@ ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 # 2.29.7 -- two minor versions behind what Ampere was running.
 ARG APPMANA_NCCL_GENCODE="-gencode=arch=compute_86,code=sm_86 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_121,code=compute_121"
 ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
-# Release tag v2.32.3 on AppMana/forks-nccl-rdma-routing
+# Release tag v2.32.3 / v2.32.3.post1 on AppMana/forks-nccl-rdma-routing
 ARG APPMANA_NCCL_GIT_REF=0dd53af6f900ff0d3b7b27a8d8baab8e71e8333f
 ARG BUILD_DEEPEP=1
 ARG CONSUMER_INT8_GIT_REPO=https://github.com/AppMana/consumer-int8-kernels.git
-# Release tag v0.1.0 on AppMana/consumer-int8-kernels
-ARG CONSUMER_INT8_GIT_REF=ade8c34ef81a3b9b9dadc04700e9c7f1f169fd03
+# Release tag v0.1.0.post1 on AppMana/consumer-int8-kernels
+ARG CONSUMER_INT8_GIT_REF=8b9da104bfee233eb1ff9e9174e1918e590c3a51
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
 # 0.2.73 ships libtbrxe for tbrxe.ko (thunderbolt_frame_rxe, stock rxe uverbs
@@ -1513,7 +1513,7 @@ ARG INSTALL_KV_CONNECTORS=false
 ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
 ARG CUDA_VERSION
-# Tag appmana-v0.5.7.dev1 on AppMana/forks-lmcache
+# Tag appmana-v0.5.7.post1 on AppMana/forks-lmcache
 ARG LMCACHE_GIT_REF=706ef2841412b7b2728189720252aeb8223d4375
 ARG CONSUMER_INT8_GIT_REPO
 ARG CONSUMER_INT8_GIT_REF
