@@ -117,7 +117,7 @@ if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
 else
     resolved_commit="$(git ls-remote "$REPO_URL" "refs/heads/$REF" | awk 'NR == 1 { print $1 }')"
     if [ -z "$resolved_commit" ]; then
-        resolved_commit="$(git ls-remote "$REPO_URL" "refs/tags/$REF^{}" "refs/tags/$REF" | awk 'NR == 1 { print $1 }')"
+        resolved_commit="$(git ls-remote "$REPO_URL" "refs/tags/$REF^{}" "refs/tags/$REF" | awk '{ sha = $1 } END { print sha }')"
     fi
 fi
 if ! [[ "$resolved_commit" =~ ^[0-9a-f]{40}$ ]]; then
