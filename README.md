@@ -24,7 +24,7 @@ quantization and kernel configuration.
 
 The `qwen_int8` adapter loads text, vision and MTP weights encoded by the
 independent [`consumer-int8-kernels`](https://github.com/AppMana/consumer-int8-kernels)
-(`v0.1.0`) package, which also provides AOT SM86/SM121 CUDA kernels and benchmark harnesses.
+(`v0.1.0.post1`) package, which also provides AOT SM86/SM121 CUDA kernels and benchmark harnesses.
 Language/MTP linears use biased UINT8 weights with BF16 channel scales;
 vision linears use signed INT8 group-32 weights with FP32 scales. Recurrent
 state stays FP32, and Qwen's hybrid architecture has no sparse indexer.
@@ -317,14 +317,13 @@ release gate in `MERGING.md` gives the steps.
 `docker/Dockerfile` builds one image with:
 
 - native vLLM extensions for RTX 30xx and GB10;
-- [`consumer-int8-kernels`](https://github.com/AppMana/consumer-int8-kernels) `v0.1.0` (`consumer-int8-kernels==0.1.0`);
+- [`consumer-int8-kernels`](https://github.com/AppMana/consumer-int8-kernels) `v0.1.0.post1` (`consumer-int8-kernels==0.1.0.post1`);
 - the AppMana NCCL fork (`nccl-usb4==2.32.3`, tag `v2.32.3`);
 - the external FlashMLA wheel (`flash-mla==2.0.1.dev1`, tag `v2.0.1.dev1`);
-- SparkInfer (`sparkinfer==1.0.2.dev1`, tag `appmana-v1.0.2.post1`), for the FP8/NVFP4
-  checkpoint's GB10 attention and MoE kernels and the selectable SparkInfer mHC,
-  plus the isolated `b12x==1.3.0` (`b12x-v1.3.0.post1` on `appmana/main`) runtime for native
-  GGUF mixed-IQ execution;
-- the KV connectors: the AppMana LMCache fork (tag `appmana-v0.5.7.dev1`), NIXL and
+- [`b12x`](https://github.com/AppMana/forks-sparkinfer) (`b12x==1.3.0.post1`, tag `b12x-v1.3.0.post1` on `appmana/main`) and
+  `sparkinfer==1.0.2.post1` (tag `appmana-v1.0.2.post1`), installed directly into `--system` Python via `uv pip install`
+  for the FP8/NVFP4 and GGUF mixed-IQ GB10 attention, MoE, and mHC kernels;
+- the KV connectors: the AppMana LMCache fork (`lmcache==0.5.7.post1`, tag `v0.5.7.post1`), NIXL and
   Mooncake, with OpenTelemetry pinned back afterwards. The Dockerfile default
   is `INSTALL_KV_CONNECTORS=false`; both build scripts pass `true`.
 

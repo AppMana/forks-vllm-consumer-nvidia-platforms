@@ -34,11 +34,11 @@
     "BUILD_DEEPEP": {
       "default": "1"
     },
-    "CONSUMER_INT8_GIT_REPO": {
-      "default": "https://github.com/AppMana/consumer-int8-kernels.git"
+    "CONSUMER_INT8_INDEX_URL": {
+      "default": "https://appmana.github.io/consumer-int8-kernels/"
     },
-    "CONSUMER_INT8_GIT_REF": {
-      "default": "8b9da104bfee233eb1ff9e9174e1918e590c3a51"
+    "CONSUMER_INT8_SPEC": {
+      "default": "consumer-int8-kernels==0.1.0.post1"
     },
     "APPMANA_THUNDERBOLT_RELEASE_REPO": {
       "default": "https://github.com/AppMana/forks-thunderbolt"
@@ -133,8 +133,11 @@
     "REPLACE_TORCH_BUNDLED_NCCL": {
       "default": "true"
     },
-    "LMCACHE_GIT_REF": {
-      "default": "706ef2841412b7b2728189720252aeb8223d4375"
+    "LMCACHE_INDEX_URL": {
+      "default": "https://appmana.github.io/forks-lmcache/"
+    },
+    "LMCACHE_SPEC": {
+      "default": "lmcache==0.5.7.post1"
     },
     "FLASHMLA_INDEX_URL": {
       "default": "https://appmana.github.io/forks-flash-mla-int/"
@@ -142,20 +145,20 @@
     "FLASHMLA_SPEC": {
       "default": "flash-mla==2.0.1.dev1"
     },
-    "VLLM_SOURCE_REPO": {
-      "default": "https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms"
-    },
     "SPARKINFER_INDEX_URL": {
       "default": "https://appmana.github.io/forks-sparkinfer/"
     },
+    "SPARKINFER_FIND_LINKS_URL": {
+      "default": "https://raw.githubusercontent.com/AppMana/forks-sparkinfer/gh-pages/index.html"
+    },
     "SPARKINFER_SPEC": {
-      "default": "sparkinfer==1.0.2.dev1"
+      "default": "sparkinfer==1.0.2.post1"
     },
-    "SPARKINFER_REF": {
-      "default": "d91c0a600c0a18d008c649d2aa30e89514ffba16"
+    "B12X_SPEC": {
+      "default": "b12x==1.3.0.post1"
     },
-    "B12X_GIT_REF": {
-      "default": "8a973c46bf017bf4c28e130578ae2fa7a2b5d912"
+    "VLLM_SOURCE_REPO": {
+      "default": "https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms"
     }
   }
 }

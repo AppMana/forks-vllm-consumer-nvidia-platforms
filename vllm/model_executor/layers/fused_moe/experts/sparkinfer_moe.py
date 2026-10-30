@@ -83,10 +83,18 @@ def _modelopt_activation_gscales(
     ).contiguous()
 
 
+def _load_fused_moe():
+    try:
+        from b12x.moe import fused_moe
+    except ImportError:
+        from sparkinfer.moe import fused_moe
+    return fused_moe
+
+
 def _sparkinfer_moe_unavailable_reason() -> str | None:
     """None when the sparkinfer NVFP4 MoE can run; else why it cannot."""
     try:
-        from sparkinfer.moe import fused_moe
+        fused_moe = _load_fused_moe()
     except ImportError as exc:
         return f"sparkinfer.moe is not importable ({exc})"
     if not fused_moe.is_supported():
@@ -248,7 +256,7 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
     # -- weight preparation -------------------------------------------------
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sparkinfer.moe import fused_moe
+        fused_moe = _load_fused_moe()
 
         self._weight_plan = fused_moe.plan_weights(
             quant_modes="nvfp4",
@@ -295,7 +303,7 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
         it in the kernel regime that ``run`` will re-derive for that count, so
         the bound workspace metadata matches (a single max-token plan is always
         'dynamic' and mismatches decode-sized 'micro' launches)."""
-        from sparkinfer.moe import fused_moe
+        fused_moe = _load_fused_moe()
 
         cached = self._plan_cache.get(num_tokens)
         if cached is not None:
@@ -352,7 +360,7 @@ class SparkInferExperts(mk.FusedMoEExpertsModular):
         assert self._experts is not None and self._weight_plan is not None, (
             "process_weights_after_loading must run before SparkInferExperts.apply"
         )
-        from sparkinfer.moe import fused_moe
+        fused_moe = _load_fused_moe()
 
         num_tokens = int(hidden_states.shape[0])
         plan, scratch = self._get_plan_scratch(num_tokens, hidden_states.device)

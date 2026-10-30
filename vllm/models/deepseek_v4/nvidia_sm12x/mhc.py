@@ -46,13 +46,21 @@ def _fail_on_uncompiled_cuda_graph(tensor: torch.Tensor) -> None:
         )
 
 
+def _load_mhc_module():
+    try:
+        from b12x.norm import mhc
+    except ImportError:
+        from sparkinfer.norm import mhc
+    return mhc
+
+
 def sparkinfer_mhc_unavailable_reason() -> str | None:
     if not (
         current_platform.is_cuda() and current_platform.is_device_capability_family(120)
     ):
         return "requires an SM120/SM121 CUDA device"
     try:
-        from sparkinfer.norm import mhc
+        mhc = _load_mhc_module()
     except ImportError as exc:
         return f"sparkinfer.norm.mhc is not importable ({exc})"
     if not mhc.is_supported():
@@ -109,7 +117,7 @@ def sparkinfer_mhc_pre_broadcast(
     norm_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Broadcast a 2D first-layer input and fuse its following RMSNorm."""
-    from sparkinfer.norm import mhc
+    mhc = _load_mhc_module()
 
     _fail_on_uncompiled_cuda_graph(x)
     split_k = _sparkinfer_mhc_split_k(x.shape[-1], mhc.DEFAULT_BLOCK_K)
@@ -134,7 +142,7 @@ def sparkinfer_mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    from sparkinfer.norm import mhc
+    mhc = _load_mhc_module()
 
     _fail_on_uncompiled_cuda_graph(x)
     return mhc.run_post(x, residual, post_layer_mix, comb_res_mix)
@@ -156,7 +164,7 @@ def sparkinfer_mhc_post_pre(
     norm_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run fused post/pre, optionally including the following RMSNorm."""
-    from sparkinfer.norm import mhc
+    mhc = _load_mhc_module()
 
     _fail_on_uncompiled_cuda_graph(x)
     split_k = _sparkinfer_mhc_split_k(residual.shape[-1], mhc.DEFAULT_BLOCK_K)

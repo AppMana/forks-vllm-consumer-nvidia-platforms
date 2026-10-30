@@ -50,8 +50,8 @@ variable "VLLM_IMAGE_TAG" {
   default = "local/vllm-openai:dev"
 }
 
-variable "B12X_GIT_REF" {
-  default = "8a973c46bf017bf4c28e130578ae2fa7a2b5d912"
+variable "B12X_SPEC" {
+  default = "b12x==1.3.0.post1"
 }
 
 # Groups
@@ -77,7 +77,7 @@ target "_common" {
     VLLM_BUILD_PIPELINE  = VLLM_BUILD_PIPELINE
     VLLM_BUILD_URL       = VLLM_BUILD_URL
     VLLM_IMAGE_TAG       = VLLM_IMAGE_TAG
-    B12X_GIT_REF         = B12X_GIT_REF
+    B12X_SPEC            = B12X_SPEC
   }
 }
 

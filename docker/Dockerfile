@@ -63,9 +63,8 @@ ARG APPMANA_NCCL_GIT_REPO=https://github.com/AppMana/forks-nccl-rdma-routing.git
 # Release tag v2.32.3 / v2.32.3.post1 on AppMana/forks-nccl-rdma-routing
 ARG APPMANA_NCCL_GIT_REF=0dd53af6f900ff0d3b7b27a8d8baab8e71e8333f
 ARG BUILD_DEEPEP=1
-ARG CONSUMER_INT8_GIT_REPO=https://github.com/AppMana/consumer-int8-kernels.git
-# Release tag v0.1.0.post1 on AppMana/consumer-int8-kernels
-ARG CONSUMER_INT8_GIT_REF=8b9da104bfee233eb1ff9e9174e1918e590c3a51
+ARG CONSUMER_INT8_INDEX_URL=https://appmana.github.io/consumer-int8-kernels/
+ARG CONSUMER_INT8_SPEC=consumer-int8-kernels==0.1.0.post1
 ARG APPMANA_THUNDERBOLT_RELEASE_REPO=https://github.com/AppMana/forks-thunderbolt
 ARG INSTALL_USB4_RDMA_PROVIDER=true
 # 0.2.73 ships libtbrxe for tbrxe.ko (thunderbolt_frame_rxe, stock rxe uverbs
@@ -627,8 +626,6 @@ ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
 ARG TRITON_INSTALL_FROM_SOURCE_REVISION
 ARG max_jobs
-ARG CONSUMER_INT8_GIT_REPO
-ARG CONSUMER_INT8_GIT_REF
 ARG USE_SCCACHE
 ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME
@@ -748,35 +745,6 @@ RUN --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
         MAX_JOBS="${max_jobs:-}" \
             python3 /tmp/build_nixl_for_rubin.py --skip-system-deps --build-only; \
     fi
-# Build the independent consumer kernels for the selected GPU architectures. No GPU or
-# inference-time compiler is needed. Submodule revisions come from the pin.
-RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=cache,target=/workspace/tmp/sccache,sharing=shared \
-    --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
-    set -eu; \
-    git init /tmp/consumer-int8-src; \
-    git -C /tmp/consumer-int8-src remote add origin "${CONSUMER_INT8_GIT_REPO}"; \
-    git -C /tmp/consumer-int8-src fetch --depth=1 origin "${CONSUMER_INT8_GIT_REF}"; \
-    git -C /tmp/consumer-int8-src checkout --detach FETCH_HEAD; \
-    test "$(git -C /tmp/consumer-int8-src rev-parse HEAD)" = "${CONSUMER_INT8_GIT_REF}"; \
-    git -C /tmp/consumer-int8-src submodule update --init --recursive --depth=1; \
-    uv pip install --python /opt/venv/bin/python 'setuptools>=77' wheel ninja; \
-    export TORCH_CUDA_ARCH_LIST="${torch_cuda_arch_list}" MAX_JOBS="${max_jobs:-2}"; \
-    if [ "${USE_SCCACHE:-0}" = "1" ]; then \
-        mkdir -p /workspace/tmp/sccache; \
-        if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT; fi; \
-        export SCCACHE_BUCKET="${SCCACHE_BUCKET_NAME}" \
-            SCCACHE_REGION="${SCCACHE_REGION_NAME}" \
-            SCCACHE_S3_NO_CREDENTIALS="${SCCACHE_S3_NO_CREDENTIALS}" \
-            SCCACHE_DIR=/workspace/tmp/sccache \
-            SCCACHE_SERVER_UDS=/workspace/tmp/sccache-consumer-int8.sock \
-            SCCACHE_IDLE_TIMEOUT=0 \
-            PYTORCH_NVCC="sccache /usr/local/cuda/bin/nvcc"; \
-    fi; \
-    uv build --wheel --no-build-isolation --python /opt/venv/bin/python \
-        --out-dir /tmp/consumer-int8-dist /tmp/consumer-int8-src; \
-    cd /tmp/consumer-int8-dist; \
-    sha256sum *.whl > wheels.sha256
 #################### EXTENSIONS BUILD IMAGE ####################
 
 #################### WHEEL BUILD IMAGE ####################
@@ -1513,15 +1481,19 @@ ARG INSTALL_KV_CONNECTORS=false
 ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
 ARG CUDA_VERSION
-# Tag appmana-v0.5.7.post1 on AppMana/forks-lmcache
-ARG LMCACHE_GIT_REF=706ef2841412b7b2728189720252aeb8223d4375
-ARG CONSUMER_INT8_GIT_REPO
-ARG CONSUMER_INT8_GIT_REF
+ARG LMCACHE_INDEX_URL=https://appmana.github.io/forks-lmcache/
+ARG LMCACHE_SPEC=lmcache==0.5.7.post1
+ARG CONSUMER_INT8_INDEX_URL
+ARG CONSUMER_INT8_SPEC
 # FlashMLA (int8 + sparse MLA) comes from the fork's PEP 503 simple index, not
 # a pinned wheel URL: the URL baked in an x86_64 filename, so an aarch64 build
 # could not install it at all. The index lets pip resolve per platform.
 ARG FLASHMLA_INDEX_URL=https://appmana.github.io/forks-flash-mla-int/
 ARG FLASHMLA_SPEC=flash-mla==2.0.1.dev1
+ARG SPARKINFER_INDEX_URL=https://appmana.github.io/forks-sparkinfer/
+ARG SPARKINFER_FIND_LINKS_URL=https://raw.githubusercontent.com/AppMana/forks-sparkinfer/gh-pages/index.html
+ARG SPARKINFER_SPEC=sparkinfer==1.0.2.post1
+ARG B12X_SPEC=b12x==1.3.0.post1
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
@@ -1592,38 +1564,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         rm /tmp/otel-pins.txt; \
     fi
 
-RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
-        apt-get update -y && \
-        apt-get install -y --no-install-recommends git && \
-        rm -rf /var/lib/apt/lists/*; \
-    fi
-
 RUN --mount=type=cache,target=/opt/uv/cache \
     set -e; \
-    CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-'); \
-    BUILD_PKGS="libcusparse-dev-${CUDA_VERSION_DASH} \
-                libcublas-dev-${CUDA_VERSION_DASH} \
-                libcusolver-dev-${CUDA_VERSION_DASH}"; \
     if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
-        apt-get update -y && \
-        apt-get install -y --no-install-recommends --allow-change-held-packages ${BUILD_PKGS} && \
-        # LMCache's build_py regenerates its gRPC stubs (the generated
-        # *_pb2.py files are gitignored) with grpc_tools, which
-        # --no-build-isolation expects in the image; grpcio stays for the
-        # multiprocess transport at run time. Pinned to LMCache's build.txt.
         uv pip install --system "grpcio==1.78.0" "grpcio-tools==1.78.0" && \
-        CUDA_HOME=/usr/local/cuda \
-        uv pip install --system --no-deps --no-build-isolation --force-reinstall \
-            "lmcache @ git+https://github.com/AppMana/forks-lmcache.git@${LMCACHE_GIT_REF}" && \
-        apt-get purge -y --allow-change-held-packages ${BUILD_PKGS} && \
-        apt-get autoremove -y && \
-        rm -rf /var/lib/apt/lists/*; \
-    fi
-
-RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
-        apt-get purge -y git && \
-        apt-get autoremove -y && \
-        rm -rf /var/lib/apt/lists/*; \
+        uv pip install --system --no-deps --force-reinstall \
+            --extra-index-url "${LMCACHE_INDEX_URL}" \
+            --find-links "${SPARKINFER_FIND_LINKS_URL}" \
+            "${LMCACHE_SPEC}"; \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -1657,56 +1605,39 @@ assert callable(flash_mla.sparse_mla_decode_int8); \
 assert callable(flash_mla.sparse_mla_prefill_int8); \
 print('flash_mla 2.0.1.dev1 native INT8 decode/prefill importable')"
 
-# sparkinfer supplies SM12x CuTe-DSL kernels: mHC (sparkinfer.norm.mhc), the
-# compressed sparse MLA and NVFP4 fused MoE of the nvfp4-fp8 checkpoint, and
-# its PCIe collectives. The int4-int8 checkpoint's INT8 indexer runs the Triton
-# IMMA kernels on both families, not sparkinfer. SPARKINFER_REF is the fork
-# commit (AppMana/forks-sparkinfer appmana/main) the wheel was built from.
-# Install order matters -- it pins nvidia-cutlass-dsl, which quack must not
-# drag backwards; requirements/cuda.txt already pins 4.6.0 for both.
-ARG SPARKINFER_INDEX_URL=https://appmana.github.io/forks-sparkinfer/
-ARG SPARKINFER_SPEC=sparkinfer==1.0.2.dev1
-ARG SPARKINFER_REF=d91c0a600c0a18d008c649d2aa30e89514ffba16
+# b12x and sparkinfer supply SM12x CuTe-DSL and AOT kernels (mHC, compressed
+# sparse MLA, NVFP4/W4A16 fused MoE, GGUF IQ/Q6/Q8 loaders, Q5K Engram tables,
+# and PCIe collectives) in the shared system Python environment alongside the
+# global CUTLASS 4.8.0 and QuACK 0.6.5 toolchain from requirements/cuda.txt.
 RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ -n "${SPARKINFER_SPEC}" ]; then \
+    apt-get update && apt-get install -y --no-install-recommends liburing-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/* && \
+    if [ -n "${SPARKINFER_SPEC}" ] || [ -n "${B12X_SPEC}" ]; then \
         uv pip install --system --no-deps \
-            --extra-index-url "${SPARKINFER_INDEX_URL}" "${SPARKINFER_SPEC}"; \
-    fi
+            --extra-index-url "${SPARKINFER_INDEX_URL}" \
+            --find-links "${SPARKINFER_FIND_LINKS_URL}" \
+            ${SPARKINFER_SPEC} ${B12X_SPEC}; \
+    fi && \
+    mkdir -p /opt/b12x/bin && \
+    ln -sf /usr/bin/python3 /opt/b12x/bin/python && \
+    ln -sf /usr/bin/python3 /opt/b12x/bin/python3
 
-# The published wheel must carry the PCIe extensions. Without them the first
-# collective nvcc-compiles inside a live request. Assert the artifacts rather
-# than trusting package metadata.
-RUN if [ -n "${SPARKINFER_SPEC}" ]; then \
+# The published wheels must carry the PCIe extensions and native loader storage
+# helper. Assert the artifacts rather than trusting package metadata alone.
+RUN if [ -n "${SPARKINFER_SPEC}" ] || [ -n "${B12X_SPEC}" ]; then \
         python3 -c "\
-import glob, importlib.metadata, sysconfig; \
-assert importlib.metadata.version('sparkinfer') == '1.0.2.dev1'; \
+import glob, importlib.metadata as m, pathlib, sysconfig, b12x.loader._native as bn; \
+from b12x.loader.gguf_experts import ExpertTensor; \
+from b12x.loader.gguf_dense import DenseTensor; \
+from quack.compile_utils import make_fake_tensor; \
+assert m.version('sparkinfer') == '1.0.2.post1'; \
+assert m.version('b12x') == '1.3.0.post1'; \
 sp = sysconfig.get_paths()['platlib']; \
 found = glob.glob(sp + '/sparkinfer_pcie_*_ext*.so'); \
 assert found, 'sparkinfer PCIe extensions are absent from the published wheel'; \
-print(f'sparkinfer AOT extensions: {len(found)}')"; \
-    fi
-
-# Native GGUF IQ uses the separately qualified CUTLASS 4.6.2 toolchain.
-# QuACK 0.6.1 supplies router GEMM helpers compatible with this toolchain.
-# Its metadata pins CUTLASS 4.6.0; retain the GPU-qualified 4.6.2 pair below.
-# Keep FA4/MSA's global toolchain intact. Serve this variant with
-# VLLM_PLUGINS='' /opt/b12x/bin/python -m vllm.entrypoints.cli.main serve ...
-# GGUF is registered in vLLM itself; b12x's optional FP6/safetensors plugins
-# target a different vLLM integration API.
-# Release tag b12x-v1.3.0.post1 on AppMana/forks-sparkinfer (branch appmana/main)
-ARG B12X_GIT_REF=8a973c46bf017bf4c28e130578ae2fa7a2b5d912
-RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ -n "${B12X_GIT_REF}" ]; then \
-        echo "${B12X_GIT_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
-        apt-get update && apt-get install -y --no-install-recommends git liburing-dev pkg-config && \
-        rm -rf /var/lib/apt/lists/* && \
-        uv venv --python /usr/bin/python3 --system-site-packages /opt/b12x && \
-        uv pip install --python /opt/b12x/bin/python \
-            'nvidia-cutlass-dsl[cu13]==4.6.2' 'gguf==0.18.0' && \
-        uv pip install --python /opt/b12x/bin/python --no-deps \
-            'quack-kernels==0.6.1' \
-            "b12x @ git+https://github.com/AppMana/forks-sparkinfer.git@${B12X_GIT_REF}" && \
-        /opt/b12x/bin/python -c "import importlib.metadata as m; from b12x.loader.gguf_experts import ExpertTensor; from b12x.loader.gguf_dense import DenseTensor; from quack.compile_utils import make_fake_tensor; assert m.version('b12x') == '1.3.0'; assert m.version('nvidia-cutlass-dsl') == '4.6.2'; assert m.version('gguf') == '0.18.0'; assert m.version('quack-kernels') == '0.6.1'"; \
+loader_so = list(pathlib.Path(bn.__file__).parent.glob('_b12x_loader_storage*.so')); \
+assert loader_so, 'b12x native loader extension is absent from the published wheel'; \
+print(f'sparkinfer AOT extensions: {len(found)}, b12x loader: {loader_so[0].name}')"; \
     fi
 
 # Fail the build, not the first request, if the sm12x kernel FQNs stop
@@ -1811,10 +1742,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             print('NIXL EP extension:', ext[0])"; \
     fi
 
-COPY --from=extensions-build /tmp/consumer-int8-dist/wheels.sha256 /tmp/consumer-int8-wheels.sha256
-RUN --mount=type=bind,from=extensions-build,src=/tmp/consumer-int8-dist,target=/tmp/consumer-int8-dist,ro \
-    --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system --no-deps /tmp/consumer-int8-dist/*.whl
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ -n "${CONSUMER_INT8_SPEC}" ]; then \
+        uv pip install --system --no-deps \
+            --extra-index-url "${CONSUMER_INT8_INDEX_URL}" \
+            --find-links "${SPARKINFER_FIND_LINKS_URL}" \
+            "${CONSUMER_INT8_SPEC}"; \
+    fi
 RUN python3 -c "import importlib.metadata as m, consumer_int8, consumer_int8.ops as ops; assert m.version('consumer-int8-kernels') == '0.1.0.post1'; assert consumer_int8.__version__ == '0.1.0.post1'; assert callable(ops.kv_cache_update); assert callable(ops.gdn_packed_decode); assert callable(ops.cutlass_channel_mm); import consumer_int8.gguf as gguf; from consumer_int8.gguf_moe import ExecutionPlan, prepare_experts; assert all(callable(op) for op in (gguf.q8_packed_mm, gguf.q8_expand_mm, gguf.q6_packed_expand, gguf.mixed_iq_moe, gguf.plan_routes, ExecutionPlan, prepare_experts))"
 
 RUN INSTALL_KV_CONNECTORS="${INSTALL_KV_CONNECTORS}" INSTALL_USB4_RDMA_PROVIDER="${INSTALL_USB4_RDMA_PROVIDER}" USB4_RDMA_PROVIDER_VERSION="${USB4_RDMA_PROVIDER_VERSION}" python3 - <<'PY'
@@ -1950,13 +1884,11 @@ LABEL org.opencontainers.image.source="${VLLM_SOURCE_REPO}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
       ai.vllm.source.repo="${VLLM_SOURCE_REPO}" \
-      ai.appmana.consumer-int8.repo="${CONSUMER_INT8_GIT_REPO}" \
-      ai.appmana.consumer-int8.ref="${CONSUMER_INT8_GIT_REF}" \
-      ai.appmana.lmcache.ref="${LMCACHE_GIT_REF}" \
+      ai.appmana.consumer-int8.spec="${CONSUMER_INT8_SPEC} from ${CONSUMER_INT8_INDEX_URL}" \
+      ai.appmana.lmcache.spec="${LMCACHE_SPEC} from ${LMCACHE_INDEX_URL}" \
       ai.appmana.flashmla.spec="${FLASHMLA_SPEC} from ${FLASHMLA_INDEX_URL}" \
       ai.appmana.sparkinfer.spec="${SPARKINFER_SPEC} from ${SPARKINFER_INDEX_URL}" \
-      ai.appmana.sparkinfer.ref="${SPARKINFER_REF}" \
-      ai.appmana.b12x.ref="${B12X_GIT_REF}" \
+      ai.appmana.b12x.spec="${B12X_SPEC} from ${SPARKINFER_INDEX_URL}" \
       ai.appmana.nccl.repo="${APPMANA_NCCL_GIT_REPO}" \
       ai.appmana.nccl.ref="${APPMANA_NCCL_GIT_REF}" \
       ai.appmana.usb4_rdma.provider="${USB4_RDMA_PROVIDER_VERSION}" \

@@ -41,8 +41,10 @@ CONSUMER_BUILD_HELPER = REPO_ROOT / "docker" / "build-consumer-platforms.sh"
 # The architectures this branch exists to serve: sm_86 (Ampere consumer) and
 # sm_121a (GB10 / DGX Spark).
 REQUIRED_ARCHES = ("8.6", "12.1a")
-REQUIRED_SPARKINFER_REF = "d91c0a600c0a18d008c649d2aa30e89514ffba16"
-REQUIRED_SPARKINFER_SPEC = "sparkinfer==1.0.2.dev1"
+REQUIRED_SPARKINFER_SPEC = "sparkinfer==1.0.2.post1"
+REQUIRED_B12X_SPEC = "b12x==1.3.0.post1"
+REQUIRED_CONSUMER_INT8_SPEC = "consumer-int8-kernels==0.1.0.post1"
+REQUIRED_LMCACHE_SPEC = "lmcache==0.5.7.post1"
 RUNTIME_OVERLAY_FILES = (
     "vllm/model_executor/layers/quantization/dsv4_int.py",
     "vllm/model_executor/model_loader/default_loader.py",
@@ -150,8 +152,10 @@ def test_versions_json_matches_the_dockerfile() -> None:
         ("nvcc_threads", "NVCC_THREADS"),
         ("BUILD_DEEPEP", "BUILD_DEEPEP"),
         ("APPMANA_NCCL_GIT_REF", "APPMANA_NCCL_GIT_REF"),
-        ("CONSUMER_INT8_GIT_REF", "CONSUMER_INT8_GIT_REF"),
-        ("B12X_GIT_REF", "B12X_GIT_REF"),
+        ("CONSUMER_INT8_SPEC", "CONSUMER_INT8_SPEC"),
+        ("LMCACHE_SPEC", "LMCACHE_SPEC"),
+        ("SPARKINFER_SPEC", "SPARKINFER_SPEC"),
+        ("B12X_SPEC", "B12X_SPEC"),
         ("USB4_RDMA_PROVIDER_VERSION", "USB4_RDMA_PROVIDER_VERSION"),
         ("APPMANA_THUNDERBOLT_RELEASE_TAG", "APPMANA_THUNDERBOLT_RELEASE_TAG"),
     ):
@@ -464,19 +468,24 @@ def test_gdrcopy_os_version_tracks_ubuntu_version() -> None:
 
 
 def test_sparkinfer_is_installed_from_the_published_wheel() -> None:
-    """Image builds must not recompile Sparkinfer from a mutable source tree."""
-    install_lines = [
-        line
-        for line in dockerfile_run_blocks()
-        if "SPARKINFER_SPEC" in line and "pip install" in line
-    ]
-    assert install_lines, "no sparkinfer install found in docker/Dockerfile"
-    for line in install_lines:
-        assert "--extra-index-url" in line
-        assert "git+" not in line
-        assert "--no-build-isolation" not in line
-
-    assert dockerfile_arg_defaults("SPARKINFER_SPEC") == [REQUIRED_SPARKINFER_SPEC]
+    """Image builds must install packages from published wheels, never git+ refs."""
+    for spec_var, expected in (
+        ("SPARKINFER_SPEC", REQUIRED_SPARKINFER_SPEC),
+        ("B12X_SPEC", REQUIRED_B12X_SPEC),
+        ("CONSUMER_INT8_SPEC", REQUIRED_CONSUMER_INT8_SPEC),
+        ("LMCACHE_SPEC", REQUIRED_LMCACHE_SPEC),
+    ):
+        install_lines = [
+            line
+            for line in dockerfile_run_blocks()
+            if spec_var in line and "pip install" in line
+        ]
+        assert install_lines, f"no {spec_var} install found in docker/Dockerfile"
+        for line in install_lines:
+            assert "--extra-index-url" in line
+            assert "git+" not in line
+            assert "--no-build-isolation" not in line
+        assert dockerfile_arg_defaults(spec_var) == [expected]
 
 
 def test_flashmla_release_check_uses_distribution_metadata() -> None:
@@ -487,11 +496,16 @@ def test_flashmla_release_check_uses_distribution_metadata() -> None:
     assert "flash_mla.__version__ == '2.0.1.dev1'" not in dockerfile
 
 
-def test_sparkinfer_ref_includes_native_int8_indexer_kernels() -> None:
-    """The shared image needs both paged decode and contiguous prefill."""
-    defaults = dockerfile_arg_defaults("SPARKINFER_REF")
-    assert defaults == [REQUIRED_SPARKINFER_REF]
-    assert bake_variable_default("SPARKINFER_REF") == REQUIRED_SPARKINFER_REF
+def test_b12x_and_sparkinfer_are_harmonized_in_system_python() -> None:
+    """b12x and sparkinfer must share the system Python environment without git refs."""
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert "B12X_GIT_REF" not in dockerfile
+    assert "SPARKINFER_REF" not in dockerfile
+    assert "LMCACHE_GIT_REF" not in dockerfile
+    assert "CONSUMER_INT8_GIT_REF" not in dockerfile
+    assert "uv venv /opt/b12x" not in dockerfile
+    assert bake_variable_default("B12X_SPEC") == REQUIRED_B12X_SPEC
+    assert bake_hcl_variable_default("B12X_SPEC") == REQUIRED_B12X_SPEC
 
 
 def test_sparkinfer_extension_artifacts_are_asserted() -> None:
@@ -501,6 +515,9 @@ def test_sparkinfer_extension_artifacts_are_asserted() -> None:
     assert "sparkinfer_pcie_" in dockerfile, (
         "docker/Dockerfile no longer asserts the sparkinfer AOT extensions "
         "exist; the pure-Python fallback would regress unnoticed"
+    )
+    assert "_b12x_loader_storage" in dockerfile, (
+        "docker/Dockerfile no longer asserts the b12x prebuilt native loader extension"
     )
 
 

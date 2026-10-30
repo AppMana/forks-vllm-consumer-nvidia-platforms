@@ -151,10 +151,13 @@ class DeepseekV4SparkInferSM12xAttention(DeepseekV4FlashInferSM120Attention):
 
     def _check_kernel_available(self) -> None:
         try:
-            from sparkinfer.attention import compressed_mla
+            try:
+                from b12x.attention import compressed_sparse_mla as compressed_mla
+            except ImportError:
+                from sparkinfer.attention import compressed_mla
         except ImportError as exc:  # pragma: no cover - environment specific
             raise RuntimeError(
-                "DeepSeek V4 sm12x attention requires sparkinfer "
+                "DeepSeek V4 sm12x attention requires b12x or sparkinfer "
                 "(install from the AppMana/forks-sparkinfer fork)."
             ) from exc
         if not compressed_mla.is_supported():

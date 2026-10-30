@@ -25,6 +25,8 @@ capture — vLLM's dummy/profile runs satisfy this.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from vllm.logger import init_logger
@@ -34,7 +36,7 @@ logger = init_logger(__name__)
 # (device_index, heads, max_q_rows, swa_width, extra_width, mode) -> plan.
 # Capacities are stable per layer type, so this holds a handful of entries
 # per process.
-_PLAN_CACHE: dict[tuple, object] = {}
+_PLAN_CACHE: dict[tuple, Any] = {}
 # One shared scratch buffer per device, grown to the largest plan spec seen.
 # Growth only happens at plan creation, which vLLM's eager warmup runs drive
 # before any CUDA-graph capture, so captured launches see a stable address.
@@ -50,9 +52,7 @@ _PAD_TARGETS = (512, 1024, 2048)
 _PAD_BUFFERS: dict[tuple, torch.Tensor] = {}
 
 
-def _pad_extend_indices(
-    indices: torch.Tensor, max_q_rows: int
-) -> torch.Tensor:
+def _pad_extend_indices(indices: torch.Tensor, max_q_rows: int) -> torch.Tensor:
     width = int(indices.shape[-1])
     if width in _SINGLE_CACHE_EXTEND_WIDTHS:
         return indices
@@ -95,6 +95,14 @@ def _as_page_bytes(cache: torch.Tensor) -> tuple[torch.Tensor, int]:
     return view.reshape(view.shape[0], -1), page_size
 
 
+def _load_compressed_mla():
+    try:
+        from b12x.attention import compressed_sparse_mla as compressed_mla
+    except ImportError:
+        from sparkinfer.attention import compressed_mla
+    return compressed_mla
+
+
 def _get_binding(
     *,
     mode: str,
@@ -105,7 +113,7 @@ def _get_binding(
     extra_lens: torch.Tensor | None,
     max_q_rows: int,
 ):
-    from sparkinfer.attention import compressed_mla
+    compressed_mla = _load_compressed_mla()
 
     heads = int(q.shape[1])
     swa_width = int(swa_indices.shape[-1])
@@ -186,7 +194,7 @@ def _run(
     out: torch.Tensor,
     max_q_rows: int,
 ) -> None:
-    from sparkinfer.attention import compressed_mla
+    compressed_mla = _load_compressed_mla()
 
     swa_pages, swa_page_size = _as_page_bytes(swa_cache)
     extra_pages = None
