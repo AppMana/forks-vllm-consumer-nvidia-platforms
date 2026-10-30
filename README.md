@@ -177,6 +177,8 @@ expansion (`ghcr.io/appmana/vllm-consumer:sm86-sm121-efd38faff6`). Measured
 | 242,000 / 1,000 | 2 | 300.9 | 913 | 1,196 | 10.4 | 4.3 | 2/2 |
 | 242,000 / 1,000 | 4 | 509.7 | 496 | 1,176 | 3.2 | 4.5 | 4/4 |
 | 242,000 / 1,000 | 8, 32 | OOM | OOM | OOM | OOM | OOM | OOM |
+| 260,000 / 1,000 | 1 | 213.0 | 1,221 | 1,221 | 18.0 | 3.7 | 1/1 |
+| 260,000 / 1,000 | 2 | 325.9 | 906 | 1,186 | 10.4 | 4.0 | 2/2 |
 | 950,000 / 1,000 | 1 | 952.2 | 998 | 998 | 16.0 | 1.0 | 1/1 |
 | 950,000 / 1,000 | 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM | OOM |
 
@@ -196,11 +198,12 @@ KV-sharing groups (`[2, 8, 14, 20]`) through `DeepseekV4PPProxyKVSource` /
 Two RTX A5000 GPUs (24 GB/GPU, PCIe, `NCCL_P2P_DISABLE=1`), `qwen_int8`
 checkpoint (`consumer_int8_prefill`, `consumer_fa2` with 64k-token bucketed
 BF16 unpack, `paged_decode` / `paged_decode_int4` 2-CTA/SM split-KV, `int8` KV
-cache for `C=1..8` at `8k/1k` and `int4_per_token_head` KV cache for `242k/1k`
-and `C=32`, `2.0–3.2 GiB` KV reservation on `MTP=0` and `3.35 GiB` on `MTP=7`).
-Measured with `benchmarks/needle_matrix.py` (cold prefix cache; `242,000 / 1,000`
-at `C >= 2` exceeds the `2.98 GiB` post-weight per-GPU VRAM ceiling on 2x 24 GB;
-`950,000 / 1,000` exceeds `max_position_embeddings = 262,144`):
+cache for `C=1..8` at `8k/1k` and `int4_per_token_head` KV cache for
+`242k–260k/1k` and `C=32`, `2.0–3.2 GiB` KV reservation on `MTP=0` and
+`3.35 GiB` on `MTP=7`). Measured with `benchmarks/needle_matrix.py` (cold
+prefix cache; `242,000–260,000 / 1,000` at `C >= 2` exceeds the `2.98 GiB`
+post-weight per-GPU VRAM ceiling on 2x 24 GB; `950,000 / 1,000` exceeds
+`max_position_embeddings = 262,144`):
 
 | Topology | Input / Output tokens | C | Prefill tok/s per stream | Prefill tok/s aggregate | Decode tok/s per stream | Decode tok/s aggregate | Verbatim |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -211,12 +214,15 @@ at `C >= 2` exceeds the `2.98 GiB` post-weight per-GPU VRAM ceiling on 2x 24 GB;
 | `TP=2` (`MTP=0`, `int4_per_token_head`) | 8,000 / 1,000 | 32 | 1,981 | 3,759 | 12.9 | 216.0 | 31/32 |
 | `TP=2` (`MTP=0`, `int4_per_token_head`) | 242,000 / 1,000 | 1 | 1,743 | 1,743 | 26.2 | 26.2 | 1/1 |
 | `TP=2` (`MTP=0`, `int4_per_token_head`) | 242,000 / 1,000 | 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
+| `TP=2` (`MTP=0`, `int4_per_token_head`) | 260,000 / 1,000 | 1 | 1,664 | 1,664 | 25.2 | 25.2 | 1/1 |
+| `TP=2` (`MTP=0`, `int4_per_token_head`) | 260,000 / 1,000 | 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
 | `TP=2` (`MTP=0`) | 950,000 / 1,000 | 1, 2, 4, 8, 32 | N/A | N/A | N/A | N/A | N/A |
 | `TP=2` (`MTP=7`) | 8,000 / 1,000 | 1 | 4,114 | 4,114 | 142.1 | 142.1 | 3/3 |
 | `TP=2` (`MTP=7`) | 8,000 / 1,000 | 2 | 3,034 | 4,048 | 122.7 | 215.7 | 5/6 |
 | `TP=2` (`MTP=7`) | 8,000 / 1,000 | 4 | 2,003 | 4,000 | 89.3 | 272.6 | 12/12 |
 | `TP=2` (`MTP=7`) | 8,000 / 1,000 | 8, 32 | OOM | OOM | OOM | OOM | OOM |
 | `TP=2` (`MTP=7`) | 242,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
+| `TP=2` (`MTP=7`) | 260,000 / 1,000 | 1, 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
 | `TP=2` (`MTP=7`) | 950,000 / 1,000 | 1, 2, 4, 8, 32 | N/A | N/A | N/A | N/A | N/A |
 | `PP=2` (`MTP=0`) | 8,000 / 1,000 | 1 | 3,310 | 3,310 | 20.0 | 20.0 | 3/3 |
 | `PP=2` (`MTP=0`) | 8,000 / 1,000 | 2 | 2,836 | 3,260 | 17.9 | 35.0 | 5/6 |
@@ -225,6 +231,8 @@ at `C >= 2` exceeds the `2.98 GiB` post-weight per-GPU VRAM ceiling on 2x 24 GB;
 | `PP=2` (`MTP=0`, `int4_per_token_head`) | 8,000 / 1,000 | 32 | 1,725 | 3,873 | 9.6 | 161.6 | 31/32 |
 | `PP=2` (`MTP=0`, `int4_per_token_head`) | 242,000 / 1,000 | 1 | 903 | 903 | 14.8 | 14.8 | 1/1 |
 | `PP=2` (`MTP=0`, `int4_per_token_head`) | 242,000 / 1,000 | 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
+| `PP=2` (`MTP=0`, `int4_per_token_head`) | 260,000 / 1,000 | 1 | 819 | 819 | 14.5 | 14.5 | 1/1 |
+| `PP=2` (`MTP=0`, `int4_per_token_head`) | 260,000 / 1,000 | 2, 4, 8, 32 | OOM | OOM | OOM | OOM | OOM |
 | `PP=2` (`MTP=0`) | 950,000 / 1,000 | 1, 2, 4, 8, 32 | N/A | N/A | N/A | N/A | N/A |
 
 ### `appmana/deepseek-v4-int4-int8`, 11 RTX 3090s (`PP=11`)
